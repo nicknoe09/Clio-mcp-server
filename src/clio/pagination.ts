@@ -9,12 +9,8 @@ export function buildQueryString(params: Record<string, any>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null) continue;
-    parts.push(
-      `${encodeURIComponent(key)}=${encodeURIComponent(String(value))
-        .replace(/%7B/gi, "{")
-        .replace(/%7D/gi, "}")
-        .replace(/%2C/gi, ",")}`
-    );
+    // Keep everything fully URL-encoded — Clio's server will decode %7B/%7D/%2C
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
   return parts.join("&");
 }
