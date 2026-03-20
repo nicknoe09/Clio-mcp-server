@@ -14,6 +14,14 @@ export function getClioClient(): AxiosInstance {
     headers: {
       "Content-Type": "application/json",
     },
+    paramsSerializer: (params) => {
+      const parts: string[] = [];
+      for (const [key, value] of Object.entries(params)) {
+        if (value === undefined || value === null) continue;
+        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+      }
+      return parts.join("&");
+    },
   });
 
   // Request interceptor: attach current access token
