@@ -97,7 +97,7 @@ app.post("/messages", async (req, res) => {
 
 // --- Health Check ---
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "clio-mcp", version: "1.0.0" });
+  res.json({ status: "ok", server: "clio-mcp", version: "1.0.1", build: "no-axios-params" });
 });
 
 // --- OAuth Bootstrap ---
