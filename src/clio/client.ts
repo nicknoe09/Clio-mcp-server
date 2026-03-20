@@ -18,7 +18,12 @@ export function getClioClient(): AxiosInstance {
       const parts: string[] = [];
       for (const [key, value] of Object.entries(params)) {
         if (value === undefined || value === null) continue;
-        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+        // Clio requires curly braces and commas unencoded in fields like matter{id,name}
+        const encoded = encodeURIComponent(String(value))
+          .replace(/%7B/gi, "{")
+          .replace(/%7D/gi, "}")
+          .replace(/%2C/gi, ",");
+        parts.push(`${encodeURIComponent(key)}=${encoded}`);
       }
       return parts.join("&");
     },
