@@ -17,24 +17,57 @@ import { registerPerformanceTools } from "./tools/performance";
 import { registerReconcileTools } from "./tools/reconcile";
 
 const app = express();
-app.use(express.json());
 
-// --- MCP Server ---
-const mcpServer = new McpServer({
-  name: "clio-mcp",
-  version: "1.0.0",
+// Only parse JSON on non-MCP routes — SSEServerTransport reads the raw body itself
+app.use((req, res, next) => {
+  if (req.path === "/messages") return next();
+  express.json()(req, res, next);
 });
 
-// Register all tools
-registerMatterTools(mcpServer);
-registerTimeTools(mcpServer);
-registerExpenseTools(mcpServer);
-registerContactTools(mcpServer);
-registerTaskTools(mcpServer);
-registerBillTools(mcpServer);
-registerARTools(mcpServer);
-registerPerformanceTools(mcpServer);
-registerReconcileTools(mcpServer);
+// --- MCP Server Factory ---
+function createMcpServer(): McpServer {
+  try {
+    const server = new McpServer({
+      name: "clio-mcp",
+      version: "1.0.0",
+    });
+    console.log("[MCP] McpServer instance created");
+
+    registerMatterTools(server);
+    console.log("[MCP] registerMatterTools OK");
+
+    registerTimeTools(server);
+    console.log("[MCP] registerTimeTools OK");
+
+    registerExpenseTools(server);
+    console.log("[MCP] registerExpenseTools OK");
+
+    registerContactTools(server);
+    console.log("[MCP] registerContactTools OK");
+
+    registerTaskTools(server);
+    console.log("[MCP] registerTaskTools OK");
+
+    registerBillTools(server);
+    console.log("[MCP] registerBillTools OK");
+
+    registerARTools(server);
+    console.log("[MCP] registerARTools OK");
+
+    registerPerformanceTools(server);
+    console.log("[MCP] registerPerformanceTools OK");
+
+    registerReconcileTools(server);
+    console.log("[MCP] registerReconcileTools OK");
+
+    console.log("[MCP] All 19 tools registered successfully");
+    return server;
+  } catch (err: any) {
+    console.error("[MCP] FATAL: tool registration failed");
+    console.error(err.stack || err);
+    throw err;
+  }
+}
 
 // --- SSE Transport for Claude.ai ---
 // Track active transports by session
@@ -42,6 +75,7 @@ const transports: Record<string, SSEServerTransport> = {};
 
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
+  const mcpServer = createMcpServer();
   transports[transport.sessionId] = transport;
 
   res.on("close", () => {
