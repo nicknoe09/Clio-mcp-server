@@ -1,28 +1,65 @@
-import fs from "fs";
-import path from "path";
+import https from "https";
 
-const ENV_PATH = path.resolve(process.cwd(), ".env");
+const RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2";
 
-export function persistTokens(access: string, refresh: string): void {
-  process.env.CLIO_ACCESS_TOKEN = access;
-  process.env.CLIO_REFRESH_TOKEN = refresh;
+async function persistToRailway(access: string, refresh: string): Promise<void> {
+    const token = process.env.RAILWAY_API_TOKEN;
+    const projectId = process.env.RAILWAY_PROJECT_ID;
+    const environmentId = process.env.RAILWAY_ENVIRONMENT_ID;
+    const serviceId = process.env.RAILWAY_SERVICE_ID;
 
-  try {
-    if (fs.existsSync(ENV_PATH)) {
-      let env = fs.readFileSync(ENV_PATH, "utf8");
-      env = env.replace(/CLIO_ACCESS_TOKEN=.*/, `CLIO_ACCESS_TOKEN=${access}`);
-      env = env.replace(/CLIO_REFRESH_TOKEN=.*/, `CLIO_REFRESH_TOKEN=${refresh}`);
-      fs.writeFileSync(ENV_PATH, env);
-    }
-  } catch {
-    // In production (e.g. Railway), .env may not exist — tokens live in process.env only
-  }
+  if (!token || !projectId || !environmentId || !serviceId) return;
+
+  const body = JSON.stringify({
+        query: `mutation variableCollectionUpsert($input: VariableCollectionUpsertInput!) {
+              variableCollectionUpsert(input: $input)
+                  }`,
+        variables: {
+                input: {
+                          projectId,
+                          environmentId,
+                          serviceId,
+                          variables: {
+                                      CLIO_ACCESS_TOKEN: access,
+                                      CLIO_REFRESH_TOKEN: refresh,
+                          },
+                },
+        },
+  });
+
+  await new Promise<void>((resolve, reject) => {
+        const req = https.request(
+                RAILWAY_API_URL,
+          {
+                    method: "POST",
+                    headers: {
+                                "Content-Type": "application/json",
+                                Authorization: `Bearer ${token}`,
+                    },
+          },
+                (res) => {
+                          res.resume();
+                          res.on("end", resolve);
+                }
+              );
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+  });
+}
+
+export async function persistTokens(access: string, refresh: string): Promise<void> {
+    process.env.CLIO_ACCESS_TOKEN = access;
+    process.env.CLIO_REFRESH_TOKEN = refresh;
+    await persistToRailway(access, refresh).catch((err) =>
+          console.error("[tokenStore] Failed to persist tokens to Railway:", err)
+                                                    );
 }
 
 export function getAccessToken(): string {
-  return process.env.CLIO_ACCESS_TOKEN ?? "";
+    return process.env.CLIO_ACCESS_TOKEN ?? "";
 }
 
 export function getRefreshToken(): string {
-  return process.env.CLIO_REFRESH_TOKEN ?? "";
+    return process.env.CLIO_REFRESH_TOKEN ?? "";
 }
