@@ -14,27 +14,32 @@ export function getClioClient(): AxiosInstance {
     headers: {
       "Content-Type": "application/json",
     },
-    paramsSerializer: (params) => {
-      const parts: string[] = [];
-      for (const [key, value] of Object.entries(params)) {
-        if (value === undefined || value === null) continue;
-        // Clio requires curly braces and commas unencoded in fields like matter{id,name}
-        const encoded = encodeURIComponent(String(value))
-          .replace(/%7B/gi, "{")
-          .replace(/%7D/gi, "}")
-          .replace(/%2C/gi, ",");
-        parts.push(`${encodeURIComponent(key)}=${encoded}`);
-      }
-      return parts.join("&");
-    },
   });
 
-  // Request interceptor: attach current access token
+  // Request interceptor: attach token AND manually serialize params to prevent
+  // axios from mangling Clio field syntax like matter{id,name}
   clioClient.interceptors.request.use((config) => {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+
+    // Bypass axios param serialization entirely — build query string ourselves
+    if (config.params && Object.keys(config.params).length > 0) {
+      const parts: string[] = [];
+      for (const [key, value] of Object.entries(config.params)) {
+        if (value === undefined || value === null) continue;
+        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))
+          .replace(/%7B/gi, "{")
+          .replace(/%7D/gi, "}")
+          .replace(/%2C/gi, ",")}`);
+      }
+      const qs = parts.join("&");
+      const separator = (config.url || "").includes("?") ? "&" : "?";
+      config.url = `${config.url}${separator}${qs}`;
+      config.params = {};  // Clear params so axios doesn't re-serialize
+    }
+
     return config;
   });
 
