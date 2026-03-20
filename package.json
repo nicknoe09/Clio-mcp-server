@@ -1,24 +1,24 @@
 {
-  "name": "clio-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server integrating Claude.ai with Clio Manage API v4",
-  "main": "dist/index.js",
-  "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "axios": "^1.7.9",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "@types/express": "^5.0.0",
-    "@types/node": "^22.10.5",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.7.3"
-  }
+    "name": "clio-mcp-server",
+    "version": "1.0.0",
+    "description": "MCP server integrating Claude.ai with Clio Manage API v4",
+    "main": "dist/index.js",
+    "scripts": {
+          "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+          "build": "node --max-old-space-size=4096 ./node_modules/.bin/tsc",
+          "start": "node dist/index.js"
+    },
+    "dependencies": {
+          "@modelcontextprotocol/sdk": "^1.12.1",
+          "axios": "^1.7.9",
+          "dotenv": "^16.4.7",
+          "express": "^4.21.2",
+          "zod": "^3.24.1"
+    },
+    "devDependencies": {
+          "@types/express": "^5.0.0",
+          "@types/node": "^22.10.5",
+          "ts-node-dev": "^2.0.0",
+          "typescript": "^5.7.3"
+    }
 }
