@@ -16,30 +16,12 @@ export function getClioClient(): AxiosInstance {
     },
   });
 
-  // Request interceptor: attach token AND manually serialize params to prevent
-  // axios from mangling Clio field syntax like matter{id,name}
+  // Request interceptor: attach current access token
   clioClient.interceptors.request.use((config) => {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
-
-    // Bypass axios param serialization entirely — build query string ourselves
-    if (config.params && Object.keys(config.params).length > 0) {
-      const parts: string[] = [];
-      for (const [key, value] of Object.entries(config.params)) {
-        if (value === undefined || value === null) continue;
-        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))
-          .replace(/%7B/gi, "{")
-          .replace(/%7D/gi, "}")
-          .replace(/%2C/gi, ",")}`);
-      }
-      const qs = parts.join("&");
-      const separator = (config.url || "").includes("?") ? "&" : "?";
-      config.url = `${config.url}${separator}${qs}`;
-      config.params = {};  // Clear params so axios doesn't re-serialize
-    }
-
     return config;
   });
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, buildQueryString } from "../clio/pagination";
 import { getClioClient } from "../clio/client";
 import { withBackoff } from "../clio/rateLimit";
 
@@ -87,10 +87,9 @@ export function registerMatterTools(server: McpServer): void {
         const client = getClioClient();
 
         if (params.matter_id) {
+          const qs = buildQueryString({ fields: MATTER_FIELDS });
           const res = await withBackoff(() =>
-            client.get(`/matters/${params.matter_id}`, {
-              params: { fields: MATTER_FIELDS },
-            })
+            client.get(`/matters/${params.matter_id}?${qs}`)
           );
           return {
             content: [
