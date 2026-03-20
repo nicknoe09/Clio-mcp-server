@@ -5,12 +5,13 @@
     "main": "dist/index.js",
     "scripts": {
           "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-          "build": "node --max-old-space-size=4096 ./node_modules/.bin/tsc",
+          "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --outfile=dist/index.js --external:express --external:axios --external:dotenv --external:zod --external:@modelcontextprotocol/sdk",
           "start": "npm run build && node dist/index.js"
     },
     "dependencies": {
           "@modelcontextprotocol/sdk": "^1.12.1",
           "axios": "^1.7.9",
+          "esbuild": "^0.20.0",
           "dotenv": "^16.4.7",
           "express": "^4.21.2",
           "zod": "^3.24.1"
