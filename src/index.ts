@@ -113,22 +113,23 @@ app.get("/debug-fields", (_req, res) => {
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { rawGetSingle, fetchAllPages, buildQueryString } = require("./clio/pagination");
-    const fields = "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client}";
-    // Test 1: rawGetSingle on bills (works for get_matter)
-    let single: any, singleErr: any;
-    try {
-      single = await rawGetSingle("/bills", { fields, state: "outstanding", limit: 1 });
-    } catch (e: any) { singleErr = { error: e.message, clio_error: e.response?.data }; }
-    // Test 2: fetchAllPages on bills (fails for get_bills)
-    let paged: any, pagedErr: any;
-    try {
-      const result = await fetchAllPages("/bills", { fields, state: "outstanding" });
-      paged = { count: result.length };
-    } catch (e: any) { pagedErr = { error: e.message, clio_error: e.response?.data }; }
-    // Test 3: show the actual URLs being built
-    const singleQs = buildQueryString({ fields, state: "outstanding", limit: 1 });
-    const pagedQs = buildQueryString({ order: "id(asc)", fields, state: "outstanding", limit: 200 });
-    res.json({ single: single ? { success: true } : singleErr, paged: paged ? { success: true, ...paged } : pagedErr, urls: { single: `/bills?${singleQs}`, paged: `/bills?${pagedQs}` } });
+    const { rawGetSingle, fetchAllPages } = require("./clio/pagination");
+    // Test different field combos on /bills to discover valid fields
+    const tests: Record<string, any> = {};
+    const combos: Record<string, string> = {
+      minimal: "id,number,state",
+      with_matter: "id,number,matter",
+      with_matters: "id,number,matters",
+      with_subject: "id,number,subject",
+      full_no_assoc: "id,number,issued_at,due_at,balance,total,state",
+    };
+    for (const [name, fields] of Object.entries(combos)) {
+      try {
+        const r = await rawGetSingle("/bills", { fields, limit: 1 });
+        tests[name] = { success: true, sample: r.data?.[0] ?? r.data };
+      } catch (e: any) { tests[name] = { error: e.response?.data?.error?.message ?? e.message }; }
+    }
+    res.json(tests);
   } catch (err: any) {
     res.json({
       success: false,
