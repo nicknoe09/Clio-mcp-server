@@ -116,37 +116,23 @@ app.get("/debug-clio", async (_req, res) => {
     const results: Record<string, any> = {};
 
     // Probe each endpoint with limit=1 to validate fields and params
-    const probes: Record<string, Record<string, any>> = {
-      // Activities - TimeEntry
-      "activities_TimeEntry": { fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}", type: "TimeEntry", limit: 1 },
-      // Activities - ExpenseEntry (not "Expense")
-      "activities_ExpenseEntry": { fields: "id,date,price,note,type,billed,matter{id,display_number,client},user{id,name},expense_category{name}", type: "ExpenseEntry", limit: 1 },
-      // Activities - Expense (current code uses this)
-      "activities_Expense": { fields: "id,date,price,note,type,billed,matter{id,display_number,client},user{id,name}", type: "Expense", limit: 1 },
-      // Bills
-      "bills_matters": { fields: "id,number,issued_at,due_at,balance,total,state,matters", limit: 1 },
-      // Contacts - try different field names
-      "contacts_matters": { fields: "id,name,type,email_addresses,phone_numbers,matters{id,display_number}", query: "a", limit: 1 },
-      "contacts_matters_plain": { fields: "id,name,type,email_addresses,phone_numbers,matters", query: "a", limit: 1 },
-      "contacts_no_matters": { fields: "id,name,first_name,last_name,type,email_addresses,phone_numbers", query: "a", limit: 1 },
-      // Tasks - try status values
-      "tasks_pending": { fields: "id,name,due_at,status,matter{id,display_number},assignee{id,name}", status: "pending", limit: 1 },
-      "tasks_no_status": { fields: "id,name,due_at,status,matter{id,display_number},assignee{id,name}", limit: 1 },
-      // Matters
-      "matters": { fields: "id,display_number,description,status,client{id,name}", limit: 1 },
-      // Bank accounts
-      "bank_accounts": { fields: "id,name,type,balance", limit: 1 },
-      // Trust ledger
-      "trust_ledger": { fields: "id,date,amount,balance,description,type,matter{id,display_number,client},bank_account{id,name,type}", limit: 1 },
-    };
+    // Only probe the broken/unknown endpoints — run in parallel to avoid timeout
+    const probes = [
+      { name: "expense_ExpenseEntry", ep: "/activities", p: { fields: "id,date", type: "ExpenseEntry", limit: 1 } },
+      { name: "expense_Expense", ep: "/activities", p: { fields: "id,date", type: "Expense", limit: 1 } },
+      { name: "contacts_matters_nested", ep: "/contacts", p: { fields: "id,name,matters{id}", query: "a", limit: 1 } },
+      { name: "contacts_matters_plain", ep: "/contacts", p: { fields: "id,name,matters", query: "a", limit: 1 } },
+      { name: "contacts_no_matters", ep: "/contacts", p: { fields: "id,name,type,email_addresses", query: "a", limit: 1 } },
+      { name: "tasks_pending", ep: "/tasks", p: { fields: "id,name,status", status: "pending", limit: 1 } },
+      { name: "trust_ledger", ep: "/trust_ledger_entries", p: { fields: "id,date,amount,matter{id},bank_account{id}", limit: 1 } },
+    ];
 
-    const endpoints: Record<string, string> = {
-      activities_TimeEntry: "/activities", activities_ExpenseEntry: "/activities", activities_Expense: "/activities",
-      bills_matters: "/bills",
-      contacts_matters: "/contacts", contacts_matters_plain: "/contacts", contacts_no_matters: "/contacts",
-      tasks_pending: "/tasks", tasks_no_status: "/tasks",
-      matters: "/matters", bank_accounts: "/bank_accounts", trust_ledger: "/trust_ledger_entries",
-    };
+    await Promise.all(probes.map(async ({ name, ep, p }) => {
+      try {
+        const r = await rawGetSingle(ep, p);
+        results[name] = { ok: true, count: r.meta?.records, sample: r.data?.[0] };
+      } catch (e: any) { results[name] = { ok: false, error: e.response?.data?.error?.message ?? e.message }; }
+    }));
 
     for (const [name, params] of Object.entries(probes)) {
       try {
