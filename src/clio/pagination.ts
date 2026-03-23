@@ -1,15 +1,16 @@
-import { getClioClient } from "./client";
+import { ENV } from "../utils/env";
+import { getAccessToken } from "../utils/tokenStore";
+import { refreshAccessToken } from "./auth";
 import { withBackoff } from "./rateLimit";
+import https from "https";
 
 /**
  * Build a query string preserving Clio field syntax (curly braces, commas).
- * Axios mangles these, so we build the URL ourselves.
  */
 export function buildQueryString(params: Record<string, any>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null) continue;
-    // Encode value but restore { } , which Clio requires as literal characters
     const encoded = encodeURIComponent(String(value))
       .replace(/%7B/gi, "{")
       .replace(/%7D/gi, "}")
@@ -20,15 +21,53 @@ export function buildQueryString(params: Record<string, any>): string {
 }
 
 /**
+ * Make a raw HTTPS GET request, bypassing axios entirely.
+ * Axios mangles curly braces in URLs which breaks Clio field syntax.
+ */
+function rawGet(fullUrl: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(fullUrl);
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      // Use raw path+search to preserve curly braces — parsed.pathname + parsed.search
+      // would go through URL normalization. Instead, extract from the original string.
+      path: fullUrl.slice(fullUrl.indexOf(parsed.pathname)),
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${getAccessToken()}`,
+        "Content-Type": "application/json",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(JSON.parse(body));
+        } else {
+          const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+          err.response = { status: res.statusCode, data: JSON.parse(body), headers: res.headers };
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
  * Fetch all pages from a Clio API endpoint.
- * Clio paginates all list endpoints at 200 records max per page.
- * Without this, you silently receive only the first page.
+ * Uses raw HTTPS to avoid axios mangling curly braces in field syntax.
  */
 export async function fetchAllPages<T>(
   url: string,
   params: Record<string, any> = {}
 ): Promise<T[]> {
-  const client = getClioClient();
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const results: T[] = [];
   let pageToken: string | undefined;
 
@@ -39,16 +78,24 @@ export async function fetchAllPages<T>(
       ...(pageToken ? { page_token: pageToken } : {}),
     };
     const qs = buildQueryString(allParams);
-    const fullUrl = qs ? `${url}?${qs}` : url;
+    const fullUrl = `${baseUrl}${url}?${qs}`;
 
-    const res = await withBackoff(() =>
-      client.get(fullUrl)
-    );
+    const data = await withBackoff(async () => {
+      try {
+        return await rawGet(fullUrl);
+      } catch (err: any) {
+        if (err.response?.status === 401) {
+          await refreshAccessToken();
+          return await rawGet(fullUrl);
+        }
+        throw err;
+      }
+    });
 
-    const data = res.data.data ?? [];
-    results.push(...data);
+    const items = data.data ?? [];
+    results.push(...items);
 
-    const next: string | undefined = res.data.meta?.paging?.next;
+    const next: string | undefined = data.meta?.paging?.next;
     if (!next) break;
 
     try {
