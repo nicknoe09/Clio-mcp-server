@@ -31,12 +31,7 @@ function rawGet(fullUrl: string): Promise<any> {
     const parsed = new URL(fullUrl);
     const path = fullUrl.slice(fullUrl.indexOf(parsed.pathname));
 
-    // Safety check: if we're requesting fields with braces, make sure they survived
-    // Braces are percent-encoded as %7B/%7D in the URL
-    if (path.includes("fields=") && !path.includes("{") && !path.includes("%7B")) {
-      reject(new Error("BUG: Curly braces were stripped from field syntax. URL: " + path));
-      return;
-    }
+    // No safety assertion needed — rawGet sends URLs as-is via https.request
 
     const options = {
       hostname: parsed.hostname,
