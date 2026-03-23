@@ -112,8 +112,7 @@ app.get("/debug-fields", (_req, res) => {
 // --- Debug: compare rawGetSingle vs fetchAllPages ---
 app.get("/debug-clio", async (_req, res) => {
   try {
-    const { rawGetSingle, fetchAllPages, buildQueryString } = require("./clio/pagination");
-    const { rawGetSingle, fetchAllPages } = require("./clio/pagination");
+    const { rawGetSingle } = require("./clio/pagination");
     // Test different field combos on /bills to discover valid fields
     const tests: Record<string, any> = {};
     const combos: Record<string, string> = {
