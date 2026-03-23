@@ -97,7 +97,7 @@ app.post("/messages", async (req, res) => {
 
 // --- Health Check ---
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "clio-mcp", version: "1.0.2", build: "debug-qs" });
+  res.json({ status: "ok", server: "clio-mcp", version: "1.0.3", build: "literal-braces" });
 });
 
 // --- Debug: show exactly what query string is built ---
