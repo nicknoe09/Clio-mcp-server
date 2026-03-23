@@ -74,24 +74,19 @@ export async function fetchAllPages<T>(
 ): Promise<T[]> {
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const results: T[] = [];
-  let pageToken: string | undefined;
 
-  while (true) {
-    const allParams = {
-      ...params,
-      limit: 200,
-      ...(pageToken ? { page_token: pageToken } : {}),
-    };
-    const qs = buildQueryString(allParams);
-    const fullUrl = `${baseUrl}${url}?${qs}`;
+  // Build initial URL
+  const qs = buildQueryString({ ...params, limit: 200 });
+  let nextUrl: string | undefined = `${baseUrl}${url}?${qs}`;
 
+  while (nextUrl) {
     const data = await withBackoff(async () => {
       try {
-        return await rawGet(fullUrl);
+        return await rawGet(nextUrl!);
       } catch (err: any) {
         if (err.response?.status === 401) {
           await refreshAccessToken();
-          return await rawGet(fullUrl);
+          return await rawGet(nextUrl!);
         }
         throw err;
       }
@@ -100,17 +95,8 @@ export async function fetchAllPages<T>(
     const items = data.data ?? [];
     results.push(...items);
 
-    const next: string | undefined = data.meta?.paging?.next;
-    if (!next) break;
-
-    try {
-      const nextUrl = new URL(next);
-      pageToken = nextUrl.searchParams.get("page_token") ?? undefined;
-    } catch {
-      pageToken = undefined;
-    }
-
-    if (!pageToken) break;
+    // Follow Clio's next URL directly (cursor pagination)
+    nextUrl = data.meta?.paging?.next ?? undefined;
   }
 
   return results;
