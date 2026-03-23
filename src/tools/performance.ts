@@ -343,7 +343,7 @@ export function registerPerformanceTools(server: McpServer): void {
           }),
           fetchAllPages<any>("/bills", {
             fields:
-              "id,number,issued_at,total,state,matter{id,display_number},line_items{id,total,type}",
+              "id,number,issued_at,total,state,matters,line_items{id,total,type}",
             issued_after: params.start_date,
             issued_before: params.end_date,
           }),
@@ -475,7 +475,7 @@ export function registerPerformanceTools(server: McpServer): void {
 
           const billedByMatter: Record<number, number> = {};
           for (const b of bills) {
-            const mid = b.matter?.id ?? 0;
+            const mid = b.matters?.[0]?.id ?? 0;
             billedByMatter[mid] = (billedByMatter[mid] || 0) + (b.total || 0);
           }
 
@@ -556,7 +556,7 @@ export function registerPerformanceTools(server: McpServer): void {
           fetchAllPages<any>("/activities", timeParams),
           fetchAllPages<any>("/bills", {
             fields:
-              "id,number,issued_at,total,balance,state,matter{id}",
+              "id,number,issued_at,total,balance,state,matters",
             issued_after: params.start_date,
             issued_before: params.end_date,
           }),

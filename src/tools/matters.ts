@@ -321,14 +321,15 @@ export function registerMatterTools(server: McpServer): void {
 
         // Get most recent bill per matter
         const bills = await fetchAllPages<any>("/bills", {
-          fields: "id,issued_at,matter{id}",
+          fields: "id,issued_at,matters",
           order: "issued_at(desc)",
         });
 
         const lastBillByMatter: Record<number, string> = {};
         for (const bill of bills) {
-          if (!bill.matter?.id) continue;
-          const mid = bill.matter.id;
+          const bm = bill.matters?.[0];
+          if (!bm?.id) continue;
+          const mid = bm.id;
           if (!lastBillByMatter[mid] || bill.issued_at > lastBillByMatter[mid]) {
             lastBillByMatter[mid] = bill.issued_at;
           }

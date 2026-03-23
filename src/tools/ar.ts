@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client,responsible_attorney}";
+  "id,number,issued_at,due_at,balance,total,state,matters";
 
 const TRUST_FIELDS =
   "id,date,amount,balance,description,type,matter{id,display_number,client},bank_account{id,name,type}";
@@ -71,24 +71,20 @@ export function registerARTools(server: McpServer): void {
             (asOf.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)
           );
 
-          const clientEmails = b.matter?.client?.email_addresses;
-          const clientEmail =
-            Array.isArray(clientEmails) && clientEmails.length > 0
-              ? clientEmails[0]?.address ?? clientEmails[0]?.name ?? null
-              : null;
+          const m = b.matters?.[0];
 
           const invoice: Invoice = {
             bill_id: b.id,
             bill_number: b.number,
-            matter_id: b.matter?.id,
-            matter_number: b.matter?.display_number,
-            client_name: b.matter?.client?.name ?? "Unknown",
-            client_email: clientEmail,
+            matter_id: m?.id,
+            matter_number: m?.display_number,
+            client_name: m?.client?.name ?? "Unknown",
+            client_email: null,
             issued_at: b.issued_at,
             due_at: b.due_at,
             balance: b.balance,
             days_outstanding: Math.max(daysOut, 0),
-            responsible_attorney: b.matter?.responsible_attorney?.name ?? null,
+            responsible_attorney: m?.responsible_attorney?.name ?? null,
           };
 
           if (daysOut <= 30) buckets.current.push(invoice);
