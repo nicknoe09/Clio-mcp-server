@@ -113,13 +113,14 @@ app.get("/debug-fields", (_req, res) => {
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { rawGetSingle } = require("./clio/pagination");
-    // Test time entry date filtering — try different param names
     const tests: Record<string, any> = {};
     const dateTests: Record<string, Record<string, any>> = {
       no_filter: { fields: "id,date", type: "TimeEntry", limit: 3 },
       date_from_to: { fields: "id,date", type: "TimeEntry", limit: 3, date_from: "2026-02-18", date_to: "2026-02-18" },
-      created_since: { fields: "id,date", type: "TimeEntry", limit: 3, created_since: "2026-02-18" },
-      updated_since: { fields: "id,date", type: "TimeEntry", limit: 3, updated_since: "2026-02-18" },
+      bracket_gte: { fields: "id,date", type: "TimeEntry", limit: 3, "date[]": ">=2026-02-18" },
+      bracket_range: { fields: "id,date", type: "TimeEntry", limit: 3, "date[]": [">=2026-02-01", "<=2026-02-28"] },
+      created_iso: { fields: "id,date", type: "TimeEntry", limit: 3, created_since: "2026-02-18T00:00:00+00:00" },
+      updated_iso: { fields: "id,date", type: "TimeEntry", limit: 3, updated_since: "2026-02-18T00:00:00+00:00" },
     };
     for (const [name, params] of Object.entries(dateTests)) {
       try {
