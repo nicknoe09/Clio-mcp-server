@@ -11,11 +11,9 @@ export function buildQueryString(params: Record<string, any>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null) continue;
-    const encoded = encodeURIComponent(String(value))
-      .replace(/%7B/gi, "{")
-      .replace(/%7D/gi, "}")
-      .replace(/%2C/gi, ",");
-    parts.push(`${encodeURIComponent(key)}=${encoded}`);
+    // Keep everything percent-encoded — Clio accepts %7B/%7D/%2C
+    // (confirmed: Clio's own pagination URLs use this encoding)
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
   return parts.join("&");
 }
@@ -30,7 +28,8 @@ function rawGet(fullUrl: string): Promise<any> {
     const path = fullUrl.slice(fullUrl.indexOf(parsed.pathname));
 
     // Safety check: if we're requesting fields with braces, make sure they survived
-    if (path.includes("fields=") && !path.includes("{")) {
+    // Braces are percent-encoded as %7B/%7D in the URL
+    if (path.includes("fields=") && !path.includes("%7B") && !path.includes("{")) {
       reject(new Error("BUG: Curly braces were stripped from field syntax. URL: " + path));
       return;
     }
