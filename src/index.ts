@@ -127,12 +127,12 @@ app.get("/debug-clio", async (_req, res) => {
       { name: "trust_ledger", ep: "/trust_ledger_entries", p: { fields: "id,date,amount,matter{id},bank_account{id}", limit: 1 } },
     ];
 
-    await Promise.all(probes.map(async ({ name, ep, p }) => {
+    for (const { name, ep, p } of probes) {
       try {
         const r = await rawGetSingle(ep, p);
-        results[name] = { ok: true, count: r.meta?.records, sample: r.data?.[0] };
+        results[name] = { ok: true, count: r.meta?.records };
       } catch (e: any) { results[name] = { ok: false, error: e.response?.data?.error?.message ?? e.message }; }
-    }));
+    }
 
     for (const [name, params] of Object.entries(probes)) {
       try {
