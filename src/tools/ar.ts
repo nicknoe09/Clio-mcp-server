@@ -1,8 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
-import { getClioClient } from "../clio/client";
-import { withBackoff } from "../clio/rateLimit";
 
 const BILL_FIELDS =
   "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client{id,name,email_addresses},responsible_attorney{id,name}}";
@@ -368,8 +366,6 @@ export function registerARTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const client = getClioClient();
-
         // Get trust bank accounts
         const bankAccounts = await fetchAllPages<any>("/bank_accounts", {
           fields: "id,name,type,balance",

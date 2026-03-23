@@ -27,12 +27,18 @@ export function buildQueryString(params: Record<string, any>): string {
 function rawGet(fullUrl: string): Promise<any> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
+    const path = fullUrl.slice(fullUrl.indexOf(parsed.pathname));
+
+    // Safety check: if we're requesting fields with braces, make sure they survived
+    if (path.includes("fields=") && !path.includes("{")) {
+      reject(new Error("BUG: Curly braces were stripped from field syntax. URL: " + path));
+      return;
+    }
+
     const options = {
       hostname: parsed.hostname,
       port: 443,
-      // Use raw path+search to preserve curly braces — parsed.pathname + parsed.search
-      // would go through URL normalization. Instead, extract from the original string.
-      path: fullUrl.slice(fullUrl.indexOf(parsed.pathname)),
+      path,
       method: "GET",
       headers: {
         "Authorization": `Bearer ${getAccessToken()}`,
@@ -109,4 +115,29 @@ export async function fetchAllPages<T>(
   }
 
   return results;
+}
+
+/**
+ * Fetch a single resource from Clio (non-paginated).
+ * Uses raw HTTPS like fetchAllPages. Returns the full JSON body.
+ */
+export async function rawGetSingle(
+  url: string,
+  params: Record<string, any> = {}
+): Promise<any> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const qs = buildQueryString(params);
+  const fullUrl = qs ? `${baseUrl}${url}?${qs}` : `${baseUrl}${url}`;
+
+  return withBackoff(async () => {
+    try {
+      return await rawGet(fullUrl);
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        await refreshAccessToken();
+        return await rawGet(fullUrl);
+      }
+      throw err;
+    }
+  });
 }

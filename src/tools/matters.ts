@@ -1,8 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, buildQueryString } from "../clio/pagination";
-import { getClioClient } from "../clio/client";
-import { withBackoff } from "../clio/rateLimit";
+import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
@@ -84,16 +82,11 @@ export function registerMatterTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const client = getClioClient();
-
         if (params.matter_id) {
-          const qs = buildQueryString({ fields: MATTER_FIELDS });
-          const res = await withBackoff(() =>
-            client.get(`/matters/${params.matter_id}?${qs}`)
-          );
+          const res = await rawGetSingle(`/matters/${params.matter_id}`, { fields: MATTER_FIELDS });
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify(res.data.data, null, 2) },
+              { type: "text" as const, text: JSON.stringify(res.data, null, 2) },
             ],
           };
         }
@@ -259,8 +252,6 @@ export function registerMatterTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const client = getClioClient();
-
         // Get all unbilled time entries
         const timeEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
