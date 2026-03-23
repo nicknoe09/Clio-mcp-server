@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const TIME_ENTRY_FIELDS =
-  "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client{id,name}},user{id,name}";
+  "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
 
 export function registerTimeTools(server: McpServer): void {
   // get_time_entries

@@ -83,7 +83,7 @@ export function registerReconcileTools(server: McpServer): void {
         const queryParams: Record<string, any> = {
           type: "Expense",
           fields:
-            "id,date,price,note,matter{id,display_number,client{id,name}},user{id,name},expense_category{name}",
+            "id,date,price,note,matter{id,display_number,client},user{id,name},expense_category{name}",
         };
         if (startDate) queryParams.date_from = startDate;
         if (endDate) queryParams.date_to = endDate;

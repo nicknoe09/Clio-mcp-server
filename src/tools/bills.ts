@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client{id,name}}";
+  "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client}";
 
 export function registerBillTools(server: McpServer): void {
   server.tool(

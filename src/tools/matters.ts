@@ -257,7 +257,7 @@ export function registerMatterTools(server: McpServer): void {
           type: "TimeEntry",
           billed: false,
           fields:
-            "id,date,quantity,price,total,matter{id,display_number,description,client{id,name},responsible_attorney{id,name}}",
+            "id,date,quantity,price,total,matter{id,display_number,description,client,responsible_attorney}",
         });
 
         // Get all unbilled expenses
@@ -265,7 +265,7 @@ export function registerMatterTools(server: McpServer): void {
           type: "Expense",
           billed: false,
           fields:
-            "id,date,price,matter{id,display_number,description,client{id,name},responsible_attorney{id,name}}",
+            "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
         });
 
         // Group WIP by matter

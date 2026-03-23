@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const EXPENSE_FIELDS =
-  "id,date,price,note,type,billed,matter{id,display_number,client{id,name}},user{id,name},expense_category{name}";
+  "id,date,price,note,type,billed,matter{id,display_number,client},user{id,name},expense_category{name}";
 
 export function registerExpenseTools(server: McpServer): void {
   // get_expenses

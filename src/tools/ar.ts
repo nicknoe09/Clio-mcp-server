@@ -3,10 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client{id,name,email_addresses},responsible_attorney{id,name}}";
+  "id,number,issued_at,due_at,balance,total,state,matter{id,display_number,client,responsible_attorney}";
 
 const TRUST_FIELDS =
-  "id,date,amount,balance,description,type,matter{id,display_number,client{id,name}},bank_account{id,name,type}";
+  "id,date,amount,balance,description,type,matter{id,display_number,client},bank_account{id,name,type}";
 
 interface Invoice {
   bill_id: number;
@@ -190,13 +190,13 @@ export function registerARTools(server: McpServer): void {
           type: "TimeEntry",
           billed: false,
           fields:
-            "id,date,quantity,price,matter{id,display_number,description,client{id,name},responsible_attorney{id,name}}",
+            "id,date,quantity,price,matter{id,display_number,description,client,responsible_attorney}",
         };
         const expenseParams: Record<string, any> = {
           type: "Expense",
           billed: false,
           fields:
-            "id,date,price,matter{id,display_number,description,client{id,name},responsible_attorney{id,name}}",
+            "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
         };
 
         const [timeEntries, expenses] = await Promise.all([
