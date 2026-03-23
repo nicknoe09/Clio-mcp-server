@@ -112,22 +112,20 @@ app.get("/debug-fields", (_req, res) => {
 // --- Debug: test nested vs flat fields against Clio ---
 app.get("/debug-clio", async (_req, res) => {
   try {
-    const { fetchAllPages } = require("./clio/pagination");
-    // Test 1: flat fields (no nesting) — should work
-    const FLAT_FIELDS = "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}";
-    const flat = await fetchAllPages("/activities", { fields: FLAT_FIELDS, type: "TimeEntry" });
-    // Test 2: nested fields — the suspected problem
-    let nested: any = null;
-    let nestedError: any = null;
+    const { rawGetSingle } = require("./clio/pagination");
+    // Test 1: flat fields (no nesting)
+    let flat: any, flatErr: any;
     try {
-      const NESTED_FIELDS = "id,date,matter{id,display_number,client{id,name}},user{id,name}";
-      nested = await fetchAllPages("/activities", { fields: NESTED_FIELDS, type: "TimeEntry" });
-    } catch (e: any) {
-      nestedError = { error: e.message, status: e.response?.status, clio_error: e.response?.data };
-    }
+      flat = await rawGetSingle("/activities", { fields: "id,date,matter{id,display_number,description},user{id,name}", type: "TimeEntry", limit: 1 });
+    } catch (e: any) { flatErr = { error: e.message, clio_error: e.response?.data }; }
+    // Test 2: nested fields
+    let nested: any, nestedErr: any;
+    try {
+      nested = await rawGetSingle("/activities", { fields: "id,date,matter{id,display_number,client{id,name}},user{id,name}", type: "TimeEntry", limit: 1 });
+    } catch (e: any) { nestedErr = { error: e.message, clio_error: e.response?.data }; }
     res.json({
-      flat: { success: true, count: flat.length, first: flat[0] ?? null },
-      nested: nested ? { success: true, count: nested.length, first: nested[0] ?? null } : nestedError,
+      flat: flat ? { success: true, data: flat.data } : flatErr,
+      nested: nested ? { success: true, data: nested.data } : nestedErr,
     });
   } catch (err: any) {
     res.json({
