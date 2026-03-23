@@ -48,11 +48,18 @@ function rawGet(fullUrl: string): Promise<any> {
       let body = "";
       res.on("data", (chunk) => (body += chunk));
       res.on("end", () => {
-        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(JSON.parse(body));
-        } else {
-          const err: any = new Error(`Request failed with status code ${res.statusCode}`);
-          err.response = { status: res.statusCode, data: JSON.parse(body), headers: res.headers };
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+            err.response = { status: res.statusCode, data: parsed, headers: res.headers };
+            reject(err);
+          }
+        } catch (parseErr) {
+          const err: any = new Error(`Request failed with status ${res.statusCode}: ${body.slice(0, 200)}`);
+          err.response = { status: res.statusCode, data: body.slice(0, 500), headers: res.headers };
           reject(err);
         }
       });
