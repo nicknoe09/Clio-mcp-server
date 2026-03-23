@@ -109,16 +109,26 @@ app.get("/debug-fields", (_req, res) => {
   res.json({ fields_input: testFields, query_string: qs, full_url: fullUrl });
 });
 
-// --- Debug: live Clio API call using exact same path as get_time_entries ---
+// --- Debug: test nested vs flat fields against Clio ---
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { fetchAllPages } = require("./clio/pagination");
-    const TIME_ENTRY_FIELDS = "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client{id,name}},user{id,name}";
-    const result = await fetchAllPages("/activities", {
-      fields: TIME_ENTRY_FIELDS,
-      type: "TimeEntry",
+    // Test 1: flat fields (no nesting) — should work
+    const FLAT_FIELDS = "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}";
+    const flat = await fetchAllPages("/activities", { fields: FLAT_FIELDS, type: "TimeEntry" });
+    // Test 2: nested fields — the suspected problem
+    let nested: any = null;
+    let nestedError: any = null;
+    try {
+      const NESTED_FIELDS = "id,date,matter{id,display_number,client{id,name}},user{id,name}";
+      nested = await fetchAllPages("/activities", { fields: NESTED_FIELDS, type: "TimeEntry" });
+    } catch (e: any) {
+      nestedError = { error: e.message, status: e.response?.status, clio_error: e.response?.data };
+    }
+    res.json({
+      flat: { success: true, count: flat.length, first: flat[0] ?? null },
+      nested: nested ? { success: true, count: nested.length, first: nested[0] ?? null } : nestedError,
     });
-    res.json({ success: true, count: result.length, first: result[0] ?? null });
   } catch (err: any) {
     res.json({
       success: false,
