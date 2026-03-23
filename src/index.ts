@@ -113,22 +113,48 @@ app.get("/debug-fields", (_req, res) => {
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { rawGetSingle } = require("./clio/pagination");
-    const tests: Record<string, any> = {};
-    const dateTests: Record<string, Record<string, any>> = {
-      no_filter: { fields: "id,date", type: "TimeEntry", limit: 3 },
-      date_from_to: { fields: "id,date", type: "TimeEntry", limit: 3, date_from: "2026-02-18", date_to: "2026-02-18" },
-      bracket_gte: { fields: "id,date", type: "TimeEntry", limit: 3, "date[]": ">=2026-02-18" },
-      bracket_range: { fields: "id,date", type: "TimeEntry", limit: 3, "date[]": [">=2026-02-01", "<=2026-02-28"] },
-      created_iso: { fields: "id,date", type: "TimeEntry", limit: 3, created_since: "2026-02-18T00:00:00+00:00" },
-      updated_iso: { fields: "id,date", type: "TimeEntry", limit: 3, updated_since: "2026-02-18T00:00:00+00:00" },
+    const results: Record<string, any> = {};
+
+    // Probe each endpoint with limit=1 to validate fields and params
+    const probes: Record<string, Record<string, any>> = {
+      // Activities - TimeEntry
+      "activities_TimeEntry": { fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}", type: "TimeEntry", limit: 1 },
+      // Activities - ExpenseEntry (not "Expense")
+      "activities_ExpenseEntry": { fields: "id,date,price,note,type,billed,matter{id,display_number,client},user{id,name},expense_category{name}", type: "ExpenseEntry", limit: 1 },
+      // Activities - Expense (current code uses this)
+      "activities_Expense": { fields: "id,date,price,note,type,billed,matter{id,display_number,client},user{id,name}", type: "Expense", limit: 1 },
+      // Bills
+      "bills_matters": { fields: "id,number,issued_at,due_at,balance,total,state,matters", limit: 1 },
+      // Contacts - try different field names
+      "contacts_matters": { fields: "id,name,type,email_addresses,phone_numbers,matters{id,display_number}", query: "a", limit: 1 },
+      "contacts_matters_plain": { fields: "id,name,type,email_addresses,phone_numbers,matters", query: "a", limit: 1 },
+      "contacts_no_matters": { fields: "id,name,first_name,last_name,type,email_addresses,phone_numbers", query: "a", limit: 1 },
+      // Tasks - try status values
+      "tasks_pending": { fields: "id,name,due_at,status,matter{id,display_number},assignee{id,name}", status: "pending", limit: 1 },
+      "tasks_no_status": { fields: "id,name,due_at,status,matter{id,display_number},assignee{id,name}", limit: 1 },
+      // Matters
+      "matters": { fields: "id,display_number,description,status,client{id,name}", limit: 1 },
+      // Bank accounts
+      "bank_accounts": { fields: "id,name,type,balance", limit: 1 },
+      // Trust ledger
+      "trust_ledger": { fields: "id,date,amount,balance,description,type,matter{id,display_number,client},bank_account{id,name,type}", limit: 1 },
     };
-    for (const [name, params] of Object.entries(dateTests)) {
+
+    const endpoints: Record<string, string> = {
+      activities_TimeEntry: "/activities", activities_ExpenseEntry: "/activities", activities_Expense: "/activities",
+      bills_matters: "/bills",
+      contacts_matters: "/contacts", contacts_matters_plain: "/contacts", contacts_no_matters: "/contacts",
+      tasks_pending: "/tasks", tasks_no_status: "/tasks",
+      matters: "/matters", bank_accounts: "/bank_accounts", trust_ledger: "/trust_ledger_entries",
+    };
+
+    for (const [name, params] of Object.entries(probes)) {
       try {
-        const r = await rawGetSingle("/activities", params);
-        tests[name] = { success: true, count: r.meta?.records, sample: r.data?.slice(0, 3) };
-      } catch (e: any) { tests[name] = { error: e.response?.data?.error?.message ?? e.message }; }
+        const r = await rawGetSingle(endpoints[name], params);
+        results[name] = { ok: true, count: r.meta?.records, sample: r.data?.[0] };
+      } catch (e: any) { results[name] = { ok: false, error: e.response?.data?.error?.message ?? e.message }; }
     }
-    res.json(tests);
+    res.json(results);
   } catch (err: any) {
     res.json({
       success: false,
