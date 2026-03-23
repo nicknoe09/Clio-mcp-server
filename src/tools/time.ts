@@ -29,11 +29,15 @@ export function registerTimeTools(server: McpServer): void {
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
-        if (params.start_date) queryParams.date_from = params.start_date;
-        if (params.end_date) queryParams.date_to = params.end_date;
+        // Clio ignores date_from/date_to — use created_since for server-side filtering
+        if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
         if (params.billed !== "all") queryParams.billed = params.billed === "true";
 
-        const entries = await fetchAllPages<any>("/activities", queryParams);
+        let entries = await fetchAllPages<any>("/activities", queryParams);
+
+        // Client-side date filtering (created_since filters by creation, not activity date)
+        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
+        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date);
 
         const formatted = entries.map((e: any) => ({
           id: e.id,
@@ -113,7 +117,7 @@ export function registerTimeTools(server: McpServer): void {
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
-        if (params.start_date) queryParams.date_from = params.start_date;
+        if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
 
         const entries = await fetchAllPages<any>("/activities", queryParams);
 

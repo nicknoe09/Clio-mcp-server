@@ -29,11 +29,12 @@ export function registerExpenseTools(server: McpServer): void {
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
-        if (params.start_date) queryParams.date_from = params.start_date;
-        if (params.end_date) queryParams.date_to = params.end_date;
+        if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
         if (params.billed !== "all") queryParams.billed = params.billed === "true";
 
-        const entries = await fetchAllPages<any>("/activities", queryParams);
+        let entries = await fetchAllPages<any>("/activities", queryParams);
+        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
+        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date);
 
         const formatted = entries.map((e: any) => ({
           id: e.id,

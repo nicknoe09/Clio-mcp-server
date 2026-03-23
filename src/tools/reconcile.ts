@@ -85,10 +85,11 @@ export function registerReconcileTools(server: McpServer): void {
           fields:
             "id,date,price,note,matter{id,display_number,client},user{id,name},expense_category{name}",
         };
-        if (startDate) queryParams.date_from = startDate;
-        if (endDate) queryParams.date_to = endDate;
+        if (startDate) queryParams.created_since = `${startDate}T00:00:00+00:00`;
 
-        const rawExpenses = await fetchAllPages<any>("/activities", queryParams);
+        let rawExpenses = await fetchAllPages<any>("/activities", queryParams);
+        if (startDate) rawExpenses = rawExpenses.filter((e: any) => e.date >= startDate);
+        if (endDate) rawExpenses = rawExpenses.filter((e: any) => e.date <= endDate);
         const clioExpenses: ClioExpense[] = rawExpenses.map((e: any) => ({
           id: e.id,
           date: e.date,

@@ -181,7 +181,7 @@ export function registerMatterTools(server: McpServer): void {
           const recentEntries = await fetchAllPages<any>("/activities", {
             type: "TimeEntry",
             matter_id: matter.id,
-            date_from: cutoffStr,
+            created_since: `${cutoffStr}T00:00:00+00:00`,
             fields: timeFields,
             limit: 1,
           });

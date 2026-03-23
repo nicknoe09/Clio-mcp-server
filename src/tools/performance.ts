@@ -50,12 +50,12 @@ export function registerPerformanceTools(server: McpServer): void {
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
           fields: TIME_FIELDS,
-          date_from: params.start_date,
-          date_to: params.end_date,
+          created_since: `${params.start_date}T00:00:00+00:00`,
         };
         if (params.user_id) queryParams.user_id = params.user_id;
 
-        const entries = await fetchAllPages<any>("/activities", queryParams);
+        let entries = await fetchAllPages<any>("/activities", queryParams);
+        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
         const byUser: Record<
           number,
@@ -182,12 +182,12 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const entries = await fetchAllPages<any>("/activities", {
+        let entries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           fields: TIME_FIELDS,
-          date_from: params.start_date,
-          date_to: params.end_date,
+          created_since: `${params.start_date}T00:00:00+00:00`,
         });
+        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
         const workingDays = getWorkingDays(params.start_date, params.end_date);
         const targetHours = workingDays * params.target_hours_per_day;
@@ -334,12 +334,11 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const [timeEntries, bills] = await Promise.all([
+        const [rawTimeEntries, bills] = await Promise.all([
           fetchAllPages<any>("/activities", {
             type: "TimeEntry",
             fields: TIME_FIELDS,
-            date_from: params.start_date,
-            date_to: params.end_date,
+            created_since: `${params.start_date}T00:00:00+00:00`,
           }),
           fetchAllPages<any>("/bills", {
             fields:
@@ -348,6 +347,7 @@ export function registerPerformanceTools(server: McpServer): void {
             issued_before: params.end_date,
           }),
         ]);
+        const timeEntries = rawTimeEntries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
         // Firm-wide worked value
         const totalWorkedValue = timeEntries.reduce(
@@ -547,12 +547,11 @@ export function registerPerformanceTools(server: McpServer): void {
         const timeParams: Record<string, any> = {
           type: "TimeEntry",
           fields: TIME_FIELDS,
-          date_from: params.start_date,
-          date_to: params.end_date,
+          created_since: `${params.start_date}T00:00:00+00:00`,
         };
         if (params.user_id) timeParams.user_id = params.user_id;
 
-        const [timeEntries, bills] = await Promise.all([
+        const [rawTimeEntries, bills] = await Promise.all([
           fetchAllPages<any>("/activities", timeParams),
           fetchAllPages<any>("/bills", {
             fields:
@@ -561,6 +560,7 @@ export function registerPerformanceTools(server: McpServer): void {
             issued_before: params.end_date,
           }),
         ]);
+        const timeEntries = rawTimeEntries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
         // Compute collected: total - remaining balance on paid/partially paid bills
         const totalCollected = bills.reduce(
