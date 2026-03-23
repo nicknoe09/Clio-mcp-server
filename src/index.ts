@@ -97,7 +97,16 @@ app.post("/messages", async (req, res) => {
 
 // --- Health Check ---
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "clio-mcp", version: "1.0.1", build: "no-axios-params" });
+  res.json({ status: "ok", server: "clio-mcp", version: "1.0.2", build: "debug-qs" });
+});
+
+// --- Debug: show exactly what query string is built ---
+app.get("/debug-fields", (_req, res) => {
+  const { buildQueryString } = require("./clio/pagination");
+  const testFields = "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client{id,name}},user{id,name}";
+  const qs = buildQueryString({ fields: testFields, limit: 200, type: "TimeEntry" });
+  const fullUrl = `/activities?${qs}`;
+  res.json({ fields_input: testFields, query_string: qs, full_url: fullUrl });
 });
 
 // --- OAuth Bootstrap ---
