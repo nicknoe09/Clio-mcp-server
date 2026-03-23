@@ -11,9 +11,13 @@ export function buildQueryString(params: Record<string, any>): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null) continue;
-    // Keep everything percent-encoded — Clio accepts %7B/%7D/%2C
-    // (confirmed: Clio's own pagination URLs use this encoding)
-    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+    // Encode then restore { } , as literal chars — Clio requires these unencoded
+    // (Clio's own pagination URLs use %7B/%7D but initial requests need literal braces)
+    const encoded = encodeURIComponent(String(value))
+      .replace(/%7B/gi, "{")
+      .replace(/%7D/gi, "}")
+      .replace(/%2C/gi, ",");
+    parts.push(`${encodeURIComponent(key)}=${encoded}`);
   }
   return parts.join("&");
 }
@@ -29,7 +33,7 @@ function rawGet(fullUrl: string): Promise<any> {
 
     // Safety check: if we're requesting fields with braces, make sure they survived
     // Braces are percent-encoded as %7B/%7D in the URL
-    if (path.includes("fields=") && !path.includes("%7B") && !path.includes("{")) {
+    if (path.includes("fields=") && !path.includes("{") && !path.includes("%7B")) {
       reject(new Error("BUG: Curly braces were stripped from field syntax. URL: " + path));
       return;
     }
@@ -75,8 +79,10 @@ export async function fetchAllPages<T>(
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const results: T[] = [];
 
-  // Build initial URL
-  const qs = buildQueryString({ ...params, limit: 200 });
+  // Build initial URL — use order=id(asc) for unlimited cursor pagination
+  // unless the caller specifies their own order (which falls back to offset pagination)
+  const allParams = { order: "id(asc)", ...params, limit: 200 };
+  const qs = buildQueryString(allParams);
   let nextUrl: string | undefined = `${baseUrl}${url}?${qs}`;
 
   while (nextUrl) {
