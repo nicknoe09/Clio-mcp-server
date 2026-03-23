@@ -109,16 +109,16 @@ app.get("/debug-fields", (_req, res) => {
   res.json({ fields_input: testFields, query_string: qs, full_url: fullUrl });
 });
 
-// --- Debug: live Clio API call to verify braces survive end-to-end ---
+// --- Debug: live Clio API call using exact same path as get_time_entries ---
 app.get("/debug-clio", async (_req, res) => {
   try {
-    const { rawGetSingle } = require("./clio/pagination");
-    const result = await rawGetSingle("/activities", {
-      fields: "id,matter{id,display_number}",
-      limit: 1,
+    const { fetchAllPages } = require("./clio/pagination");
+    const TIME_ENTRY_FIELDS = "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client{id,name}},user{id,name}";
+    const result = await fetchAllPages("/activities", {
+      fields: TIME_ENTRY_FIELDS,
       type: "TimeEntry",
     });
-    res.json({ success: true, sample: result });
+    res.json({ success: true, count: result.length, first: result[0] ?? null });
   } catch (err: any) {
     res.json({
       success: false,
