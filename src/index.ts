@@ -113,19 +113,18 @@ app.get("/debug-fields", (_req, res) => {
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { rawGetSingle } = require("./clio/pagination");
-    // Test different field combos on /bills to discover valid fields
+    // Test time entry date filtering — try different param names
     const tests: Record<string, any> = {};
-    const combos: Record<string, string> = {
-      minimal: "id,number,state",
-      with_matter: "id,number,matter",
-      with_matters: "id,number,matters",
-      with_subject: "id,number,subject",
-      full_no_assoc: "id,number,issued_at,due_at,balance,total,state",
+    const dateTests: Record<string, Record<string, any>> = {
+      no_filter: { fields: "id,date", type: "TimeEntry", limit: 3 },
+      date_from_to: { fields: "id,date", type: "TimeEntry", limit: 3, date_from: "2026-02-18", date_to: "2026-02-18" },
+      created_since: { fields: "id,date", type: "TimeEntry", limit: 3, created_since: "2026-02-18" },
+      updated_since: { fields: "id,date", type: "TimeEntry", limit: 3, updated_since: "2026-02-18" },
     };
-    for (const [name, fields] of Object.entries(combos)) {
+    for (const [name, params] of Object.entries(dateTests)) {
       try {
-        const r = await rawGetSingle("/bills", { fields, limit: 1 });
-        tests[name] = { success: true, sample: r.data?.[0] ?? r.data };
+        const r = await rawGetSingle("/activities", params);
+        tests[name] = { success: true, count: r.meta?.records, sample: r.data?.slice(0, 3) };
       } catch (e: any) { tests[name] = { error: e.response?.data?.error?.message ?? e.message }; }
     }
     res.json(tests);
