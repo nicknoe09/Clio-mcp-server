@@ -6,6 +6,43 @@ const CONTACT_FIELDS =
   "id,name,first_name,last_name,type,email_addresses,phone_numbers";
 
 export function registerContactTools(server: McpServer): void {
+  // get_users — list all firm users with IDs
+  server.tool(
+    "get_users",
+    "List all users (timekeepers/staff) in the firm with their IDs, names, and roles. Use this to look up user_id values for other tools.",
+    {},
+    async () => {
+      try {
+        const users = await fetchAllPages<any>("/users", {
+          fields: "id,name,email,enabled,subscription_type",
+        });
+
+        const formatted = users.map((u: any) => ({
+          user_id: u.id,
+          name: u.name,
+          email: u.email,
+          enabled: u.enabled,
+          role: u.subscription_type,
+        }));
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: formatted.length, users: formatted }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   server.tool(
     "get_contacts",
     "Search contacts by name or email, optionally filter by type (Person/Company). Use matter_id to get contacts associated with a specific matter.",
