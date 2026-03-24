@@ -110,16 +110,19 @@ export function registerTimeTools(server: McpServer): void {
     },
     async (params) => {
       try {
+        // Default to last 365 days to avoid fetching all 178k+ records
+        const defaultStart = params.start_date ?? new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: false,
           fields: TIME_ENTRY_FIELDS,
+          created_since: `${defaultStart}T00:00:00+00:00`,
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
-        if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
 
-        const entries = await fetchAllPages<any>("/activities", queryParams);
+        let entries = await fetchAllPages<any>("/activities", queryParams);
+        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
 
         // Group by matter
         const byMatter: Record<

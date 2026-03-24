@@ -172,32 +172,28 @@ export function registerMatterTools(server: McpServer): void {
         cutoffDate.setDate(cutoffDate.getDate() - params.days_inactive);
         const cutoffStr = cutoffDate.toISOString().split("T")[0];
 
-        const timeFields =
-          "id,date,matter{id}";
+        // Fetch all recent time entries in one call instead of per-matter
+        const recentEntries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          fields: "id,matter{id}",
+          created_since: `${cutoffStr}T00:00:00+00:00`,
+        });
 
-        const staleMatterResults: any[] = [];
+        // Build set of matter IDs with recent activity
+        const activeMatters = new Set(recentEntries.map((e: any) => e.matter?.id).filter(Boolean));
 
-        for (const matter of matters) {
-          const recentEntries = await fetchAllPages<any>("/activities", {
-            type: "TimeEntry",
-            matter_id: matter.id,
-            created_since: `${cutoffStr}T00:00:00+00:00`,
-            fields: timeFields,
-            limit: 1,
-          });
-
-          if (recentEntries.length === 0) {
-            staleMatterResults.push({
-              id: matter.id,
-              display_number: matter.display_number,
-              description: matter.description,
-              client: matter.client,
-              responsible_attorney: matter.responsible_attorney,
-              open_date: matter.open_date,
-              days_inactive: params.days_inactive,
-            });
-          }
-        }
+        // Matters with no recent entries are stale
+        const staleMatterResults = matters
+          .filter((m: any) => !activeMatters.has(m.id))
+          .map((m: any) => ({
+            id: m.id,
+            display_number: m.display_number,
+            description: m.description,
+            client: m.client,
+            responsible_attorney: m.responsible_attorney,
+            open_date: m.open_date,
+            days_inactive: params.days_inactive,
+          }));
 
         return {
           content: [
@@ -252,20 +248,23 @@ export function registerMatterTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Get all unbilled time entries
+        const defaultStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
+        // Get all unbilled time entries (last 365 days)
         const timeEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           billed: false,
           fields:
             "id,date,quantity,price,total,matter{id,display_number,description,client,responsible_attorney}",
+          created_since: `${defaultStart}T00:00:00+00:00`,
         });
 
-        // Get all unbilled expenses
+        // Get all unbilled expenses (last 365 days)
         const expenses = await fetchAllPages<any>("/activities", {
           type: "ExpenseEntry",
           billed: false,
           fields:
             "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
+          created_since: `${defaultStart}T00:00:00+00:00`,
         });
 
         // Group WIP by matter

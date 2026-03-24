@@ -92,10 +92,12 @@ export function registerExpenseTools(server: McpServer): void {
     },
     async (params) => {
       try {
+        const defaultStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
         const queryParams: Record<string, any> = {
           type: "ExpenseEntry",
           billed: false,
           fields: EXPENSE_FIELDS,
+          created_since: `${defaultStart}T00:00:00+00:00`,
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;

@@ -182,17 +182,20 @@ export function registerARTools(server: McpServer): void {
     },
     async (params) => {
       try {
+        const defaultStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
         const timeParams: Record<string, any> = {
           type: "TimeEntry",
           billed: false,
           fields:
             "id,date,quantity,price,matter{id,display_number,description,client,responsible_attorney}",
+          created_since: `${defaultStart}T00:00:00+00:00`,
         };
         const expenseParams: Record<string, any> = {
           type: "ExpenseEntry",
           billed: false,
           fields:
             "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
+          created_since: `${defaultStart}T00:00:00+00:00`,
         };
 
         const [timeEntries, expenses] = await Promise.all([
@@ -379,7 +382,7 @@ export function registerARTools(server: McpServer): void {
         if (params.matter_id) ledgerParams.matter_id = params.matter_id;
 
         const ledgerEntries = await fetchAllPages<any>(
-          "/trust_ledger_entries",
+          "/trust_line_items",
           ledgerParams
         );
 
