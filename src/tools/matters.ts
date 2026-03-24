@@ -318,11 +318,13 @@ export function registerMatterTools(server: McpServer): void {
           }
         }
 
-        // Get most recent bill per matter
-        const bills = await fetchAllPages<any>("/bills", {
+        // Get bills from last year to find most recent bill per matter
+        const billsStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
+        const allBills = await fetchAllPages<any>("/bills", {
           fields: "id,issued_at,matters",
-          order: "issued_at(desc)",
+          created_since: `${billsStart}T00:00:00+00:00`,
         });
+        const bills = allBills.slice(0, 5000); // Hard cap
 
         const lastBillByMatter: Record<number, string> = {};
         for (const bill of bills) {

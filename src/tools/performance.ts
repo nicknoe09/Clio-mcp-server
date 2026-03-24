@@ -551,15 +551,18 @@ export function registerPerformanceTools(server: McpServer): void {
         };
         if (params.user_id) timeParams.user_id = params.user_id;
 
-        const [rawTimeEntries, bills] = await Promise.all([
+        const [rawTimeEntries, allBills] = await Promise.all([
           fetchAllPages<any>("/activities", timeParams),
           fetchAllPages<any>("/bills", {
             fields:
               "id,number,issued_at,total,balance,state,matters",
-            issued_after: params.start_date,
-            issued_before: params.end_date,
+            created_since: `${params.start_date}T00:00:00+00:00`,
           }),
         ]);
+        // Cap bills and filter by date range client-side
+        const bills = allBills
+          .filter((b: any) => b.issued_at >= params.start_date && b.issued_at <= params.end_date)
+          .slice(0, 5000);
         const timeEntries = rawTimeEntries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
         // Compute collected: total - remaining balance on paid/partially paid bills

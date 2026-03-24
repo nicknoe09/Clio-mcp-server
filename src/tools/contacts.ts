@@ -27,7 +27,9 @@ export function registerContactTools(server: McpServer): void {
           queryParams.type = params.type;
         }
 
-        const contacts = await fetchAllPages<any>("/contacts", queryParams);
+        // Cap at first page (200 results) to prevent timeout on broad searches
+        const allContacts = await fetchAllPages<any>("/contacts", queryParams);
+        const contacts = allContacts.slice(0, 100);
 
         const formatted = contacts.map((c: any) => ({
           id: c.id,
