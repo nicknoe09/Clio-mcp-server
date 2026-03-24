@@ -110,8 +110,8 @@ export function registerTimeTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Default to last 90 days to keep response times reasonable
-        const defaultStart = params.start_date ?? new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
+        // Default to last 30 days to keep response times reasonable
+        const defaultStart = params.start_date ?? new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: false,

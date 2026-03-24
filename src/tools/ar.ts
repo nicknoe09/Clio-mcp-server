@@ -377,7 +377,6 @@ export function registerARTools(server: McpServer): void {
         // Get trust ledger entries
         const ledgerParams: Record<string, any> = {
           fields: TRUST_FIELDS,
-          order: "date(desc)",
         };
         if (params.matter_id) ledgerParams.matter_id = params.matter_id;
 
