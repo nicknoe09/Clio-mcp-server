@@ -342,7 +342,7 @@ export function registerPerformanceTools(server: McpServer): void {
           }),
           fetchAllPages<any>("/bills", {
             fields:
-              "id,number,issued_at,total,state,matters,line_items{id,total,type}",
+              "id,number,issued_at,total,state,matters",
             issued_after: params.start_date,
             issued_before: params.end_date,
           }),

@@ -115,16 +115,14 @@ app.get("/debug-clio", async (_req, res) => {
     const { rawGetSingle } = require("./clio/pagination");
     const results: Record<string, any> = {};
 
-    // Probe each endpoint with limit=1 to validate fields and params
-    // Only probe the broken/unknown endpoints — run in parallel to avoid timeout
+    // Probe trust-related endpoints to find the right one
     const probes = [
-      { name: "expense_ExpenseEntry", ep: "/activities", p: { fields: "id,date", type: "ExpenseEntry", limit: 1 } },
-      { name: "expense_Expense", ep: "/activities", p: { fields: "id,date", type: "Expense", limit: 1 } },
-      { name: "contacts_matters_nested", ep: "/contacts", p: { fields: "id,name,matters{id}", query: "a", limit: 1 } },
-      { name: "contacts_matters_plain", ep: "/contacts", p: { fields: "id,name,matters", query: "a", limit: 1 } },
-      { name: "contacts_no_matters", ep: "/contacts", p: { fields: "id,name,type,email_addresses", query: "a", limit: 1 } },
-      { name: "tasks_pending", ep: "/tasks", p: { fields: "id,name,status", status: "pending", limit: 1 } },
-      { name: "trust_ledger", ep: "/trust_ledger_entries", p: { fields: "id,date,amount,matter{id},bank_account{id}", limit: 1 } },
+      { name: "trust_line_items", ep: "/trust_line_items", p: { fields: "id", limit: 1 } },
+      { name: "trust_requests", ep: "/trust_requests", p: { fields: "id", limit: 1 } },
+      { name: "transactions", ep: "/transactions", p: { fields: "id", limit: 1 } },
+      { name: "bank_transactions", ep: "/bank_transactions", p: { fields: "id", limit: 1 } },
+      { name: "trust_ledger_entries", ep: "/trust_ledger_entries", p: { fields: "id", limit: 1 } },
+      { name: "bank_accounts", ep: "/bank_accounts", p: { fields: "id,name,type,balance", limit: 1 } },
     ];
 
     for (const { name, ep, p } of probes) {
