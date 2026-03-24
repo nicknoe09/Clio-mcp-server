@@ -233,183 +233,88 @@ export function registerMatterTools(server: McpServer): void {
   // get_billing_gaps
   server.tool(
     "get_billing_gaps",
-    "Matters with significant WIP that have not had a bill issued in 30+ days. Revenue sitting on the table.",
+    "Matters with significant WIP that have not been billed. Shows unbilled time and expense value per matter above a threshold, sorted by total WIP value.",
     {
       min_wip_value: z
         .number()
         .optional()
         .default(500)
         .describe("Minimum WIP value to include (default $500)"),
-      days_since_last_bill: z
-        .number()
-        .optional()
-        .default(30)
-        .describe("Minimum days since last bill (default 30)"),
     },
     async (params) => {
       try {
         const defaultStart = new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
-        // Get all unbilled time entries (last 365 days)
-        const timeEntries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          billed: false,
-          fields:
-            "id,date,quantity,price,total,matter{id,display_number,description,client,responsible_attorney}",
-          created_since: `${defaultStart}T00:00:00+00:00`,
-        });
+        const [timeEntries, expenses] = await Promise.all([
+          fetchAllPages<any>("/activities", {
+            type: "TimeEntry",
+            billed: false,
+            fields: "id,date,quantity,price,matter{id,display_number,description,client,responsible_attorney}",
+            created_since: `${defaultStart}T00:00:00+00:00`,
+          }),
+          fetchAllPages<any>("/activities", {
+            type: "ExpenseEntry",
+            billed: false,
+            fields: "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
+            created_since: `${defaultStart}T00:00:00+00:00`,
+          }),
+        ]);
 
-        // Get all unbilled expenses (last 365 days)
-        const expenses = await fetchAllPages<any>("/activities", {
-          type: "ExpenseEntry",
-          billed: false,
-          fields:
-            "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
-          created_since: `${defaultStart}T00:00:00+00:00`,
-        });
+        const matterWip: Record<number, { matter: any; time_value: number; expense_value: number; oldest_entry: string }> = {};
 
-        // Group WIP by matter
-        const matterWip: Record<
-          number,
-          {
-            matter: any;
-            time_value: number;
-            expense_value: number;
-            total_wip: number;
-            oldest_entry: string;
-          }
-        > = {};
-
-        for (const entry of timeEntries) {
-          if (!entry.matter?.id) continue;
-          const mid = entry.matter.id;
-          if (!matterWip[mid]) {
-            matterWip[mid] = {
-              matter: entry.matter,
-              time_value: 0,
-              expense_value: 0,
-              total_wip: 0,
-              oldest_entry: entry.date,
-            };
-          }
-          const value = (entry.quantity / 3600) * (entry.price || 0);
-          matterWip[mid].time_value += value;
-          matterWip[mid].total_wip += value;
-          if (entry.date < matterWip[mid].oldest_entry) {
-            matterWip[mid].oldest_entry = entry.date;
-          }
+        for (const e of timeEntries) {
+          if (!e.matter?.id) continue;
+          const mid = e.matter.id;
+          if (!matterWip[mid]) matterWip[mid] = { matter: e.matter, time_value: 0, expense_value: 0, oldest_entry: e.date };
+          matterWip[mid].time_value += (e.quantity / 3600) * (e.price || 0);
+          if (e.date < matterWip[mid].oldest_entry) matterWip[mid].oldest_entry = e.date;
         }
 
-        for (const exp of expenses) {
-          if (!exp.matter?.id) continue;
-          const mid = exp.matter.id;
-          if (!matterWip[mid]) {
-            matterWip[mid] = {
-              matter: exp.matter,
-              time_value: 0,
-              expense_value: 0,
-              total_wip: 0,
-              oldest_entry: exp.date,
-            };
-          }
-          matterWip[mid].expense_value += exp.price || 0;
-          matterWip[mid].total_wip += exp.price || 0;
-          if (exp.date < matterWip[mid].oldest_entry) {
-            matterWip[mid].oldest_entry = exp.date;
-          }
-        }
-
-        // Get bills from last year to find most recent bill per matter
-        const billsStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
-        const allBills = await fetchAllPages<any>("/bills", {
-          fields: "id,issued_at,matters",
-          created_since: `${billsStart}T00:00:00+00:00`,
-        });
-        const bills = allBills.slice(0, 5000); // Hard cap
-
-        const lastBillByMatter: Record<number, string> = {};
-        for (const bill of bills) {
-          const bm = bill.matters?.[0];
-          if (!bm?.id) continue;
-          const mid = bm.id;
-          if (!lastBillByMatter[mid] || bill.issued_at > lastBillByMatter[mid]) {
-            lastBillByMatter[mid] = bill.issued_at;
-          }
+        for (const e of expenses) {
+          if (!e.matter?.id) continue;
+          const mid = e.matter.id;
+          if (!matterWip[mid]) matterWip[mid] = { matter: e.matter, time_value: 0, expense_value: 0, oldest_entry: e.date };
+          matterWip[mid].expense_value += e.price || 0;
+          if (e.date < matterWip[mid].oldest_entry) matterWip[mid].oldest_entry = e.date;
         }
 
         const today = new Date();
-        const results: any[] = [];
-
-        for (const [midStr, wip] of Object.entries(matterWip)) {
-          const mid = parseInt(midStr, 10);
-          if (wip.total_wip < params.min_wip_value) continue;
-
-          const lastBill = lastBillByMatter[mid];
-          let daysSinceLastBill: number;
-
-          if (!lastBill) {
-            daysSinceLastBill = Math.floor(
-              (today.getTime() - new Date(wip.oldest_entry).getTime()) /
-                (1000 * 60 * 60 * 24)
-            );
-          } else {
-            daysSinceLastBill = Math.floor(
-              (today.getTime() - new Date(lastBill).getTime()) /
-                (1000 * 60 * 60 * 24)
-            );
-          }
-
-          if (daysSinceLastBill >= params.days_since_last_bill) {
-            results.push({
-              matter_id: mid,
-              matter_number: wip.matter.display_number,
-              matter_description: wip.matter.description,
-              client: wip.matter.client,
-              responsible_attorney: wip.matter.responsible_attorney,
-              total_wip_value: Math.round(wip.total_wip * 100) / 100,
-              unbilled_time_value: Math.round(wip.time_value * 100) / 100,
-              unbilled_expense_value:
-                Math.round(wip.expense_value * 100) / 100,
-              last_bill_date: lastBill || "Never billed",
-              days_since_last_bill: daysSinceLastBill,
-            });
-          }
-        }
-
-        results.sort((a, b) => b.total_wip_value - a.total_wip_value);
+        const results = Object.values(matterWip)
+          .map((w) => {
+            const total = w.time_value + w.expense_value;
+            const daysAging = Math.floor((today.getTime() - new Date(w.oldest_entry).getTime()) / 86400000);
+            return {
+              matter_id: w.matter.id,
+              matter_number: w.matter.display_number,
+              matter_description: w.matter.description,
+              client: w.matter.client,
+              responsible_attorney: w.matter.responsible_attorney,
+              unbilled_time_value: Math.round(w.time_value * 100) / 100,
+              unbilled_expense_value: Math.round(w.expense_value * 100) / 100,
+              total_wip: Math.round(total * 100) / 100,
+              oldest_unbilled_entry: w.oldest_entry,
+              days_aging: daysAging,
+            };
+          })
+          .filter((r) => r.total_wip >= params.min_wip_value)
+          .sort((a, b) => b.total_wip - a.total_wip);
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  count: results.length,
-                  min_wip_threshold: params.min_wip_value,
-                  days_threshold: params.days_since_last_bill,
-                  total_at_risk_wip: Math.round(
-                    results.reduce((s, r) => s + r.total_wip_value, 0) * 100
-                  ) / 100,
-                  matters: results,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              count: results.length,
+              min_wip_threshold: params.min_wip_value,
+              total_unbilled_wip: Math.round(results.reduce((s, r) => s + r.total_wip, 0) * 100) / 100,
+              matters: results,
+            }, null, 2),
+          }],
         };
       } catch (err: any) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: true,
-                message: err.message,
-                status: err.response?.status,
-                clio_error: err.response?.data,
-              }),
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }),
+          }],
           isError: true,
         };
       }

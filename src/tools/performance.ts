@@ -546,50 +546,35 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const timeParams: Record<string, any> = {
+        // Only fetch this user's time entries — no bills needed
+        const rawEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           fields: TIME_FIELDS,
           user_id: params.user_id,
           created_since: `${params.start_date}T00:00:00+00:00`,
-        };
-
-        const [rawTimeEntries, allBills] = await Promise.all([
-          fetchAllPages<any>("/activities", timeParams),
-          fetchAllPages<any>("/bills", {
-            fields: "id,number,issued_at,total,balance,state,matters",
-            created_since: `${params.start_date}T00:00:00+00:00`,
-          }),
-        ]);
-        const bills = allBills
-          .filter((b: any) => b.issued_at >= params.start_date && b.issued_at <= params.end_date)
-          .slice(0, 5000);
-        const timeEntries = rawTimeEntries.filter(
+        });
+        const entries = rawEntries.filter(
           (e: any) => e.date >= params.start_date && e.date <= params.end_date
         );
 
-        // Helper: compute realization stats for a set of entries and bills
-        function computeStats(entries: any[], periodBills: any[]) {
+        // Compute realization from time entries alone (billed flag = was it invoiced)
+        function computeStats(items: any[]) {
           let worked_hours = 0, worked_value = 0, billed_hours = 0, billed_value = 0;
           let standard_rate = 0;
 
-          for (const e of entries) {
+          for (const e of items) {
             const hours = e.quantity / 3600;
+            const value = hours * (e.price || 0);
             worked_hours += hours;
-            worked_value += hours * (e.price || 0);
+            worked_value += value;
             if (e.price && e.price > standard_rate) standard_rate = e.price;
             if (e.billed) {
               billed_hours += hours;
-              billed_value += hours * (e.price || 0);
+              billed_value += value;
             }
           }
 
-          const totalBilledFromBills = periodBills.reduce((s: number, b: any) => s + (b.total || 0), 0);
-          const totalCollected = periodBills.reduce((s: number, b: any) => s + ((b.total || 0) - (b.balance || 0)), 0);
-          const firmCollectionRatio = totalBilledFromBills > 0 ? totalCollected / totalBilledFromBills : 0;
-          const estimatedCollected = billed_value * firmCollectionRatio;
-          const effectiveRate = worked_hours > 0 ? estimatedCollected / worked_hours : 0;
           const realizationPct = worked_value > 0 ? (billed_value / worked_value) * 100 : 0;
-          const collectionPct = billed_value > 0 ? (estimatedCollected / billed_value) * 100 : 0;
 
           return {
             standard_rate,
@@ -597,53 +582,42 @@ export function registerPerformanceTools(server: McpServer): void {
             worked_value: Math.round(worked_value * 100) / 100,
             billed_hours: Math.round(billed_hours * 100) / 100,
             billed_value: Math.round(billed_value * 100) / 100,
-            collected_value: Math.round(estimatedCollected * 100) / 100,
-            effective_rate: Math.round(effectiveRate * 100) / 100,
+            unbilled_hours: Math.round((worked_hours - billed_hours) * 100) / 100,
+            unbilled_value: Math.round((worked_value - billed_value) * 100) / 100,
             realization_pct: Math.round(realizationPct * 10) / 10,
-            collection_pct: Math.round(collectionPct * 10) / 10,
           };
         }
 
-        // Helper: get period key from a date string
         function periodKey(dateStr: string): string {
-          if (params.breakdown === "monthly") return dateStr.slice(0, 7); // YYYY-MM
-          if (params.breakdown === "yearly") return dateStr.slice(0, 4);  // YYYY
+          if (params.breakdown === "monthly") return dateStr.slice(0, 7);
+          if (params.breakdown === "yearly") return dateStr.slice(0, 4);
           return "total";
         }
 
         if (params.breakdown === "none") {
-          const stats = computeStats(timeEntries, bills);
           return {
             content: [{
               type: "text" as const,
-              text: JSON.stringify({ period: { start: params.start_date, end: params.end_date }, ...stats }, null, 2),
+              text: JSON.stringify({
+                period: { start: params.start_date, end: params.end_date },
+                ...computeStats(entries),
+              }, null, 2),
             }],
           };
         }
 
-        // Group entries and bills by period
-        const entryBuckets: Record<string, any[]> = {};
-        const billBuckets: Record<string, any[]> = {};
-
-        for (const e of timeEntries) {
+        // Group by period
+        const buckets: Record<string, any[]> = {};
+        for (const e of entries) {
           const key = periodKey(e.date);
-          if (!entryBuckets[key]) entryBuckets[key] = [];
-          entryBuckets[key].push(e);
-        }
-        for (const b of bills) {
-          const key = periodKey(b.issued_at);
-          if (!billBuckets[key]) billBuckets[key] = [];
-          billBuckets[key].push(b);
+          if (!buckets[key]) buckets[key] = [];
+          buckets[key].push(e);
         }
 
-        const allKeys = [...new Set([...Object.keys(entryBuckets), ...Object.keys(billBuckets)])].sort();
-        const periods = allKeys.map((key) => ({
+        const periods = Object.keys(buckets).sort().map((key) => ({
           period: key,
-          ...computeStats(entryBuckets[key] ?? [], billBuckets[key] ?? []),
+          ...computeStats(buckets[key]),
         }));
-
-        // Also compute overall totals
-        const overall = computeStats(timeEntries, bills);
 
         return {
           content: [{
@@ -651,7 +625,7 @@ export function registerPerformanceTools(server: McpServer): void {
             text: JSON.stringify({
               date_range: { start: params.start_date, end: params.end_date },
               breakdown: params.breakdown,
-              overall,
+              overall: computeStats(entries),
               periods,
             }, null, 2),
           }],
