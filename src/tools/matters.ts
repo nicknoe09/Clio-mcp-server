@@ -248,7 +248,7 @@ export function registerMatterTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const defaultStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
+        const defaultStart = new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
         // Get all unbilled time entries (last 365 days)
         const timeEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",

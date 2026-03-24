@@ -5,8 +5,8 @@ import { fetchAllPages } from "../clio/pagination";
 const BILL_FIELDS =
   "id,number,issued_at,due_at,balance,total,state,matters";
 
-const TRUST_FIELDS =
-  "id,date,amount,balance,description,type,matter{id,display_number,client},bank_account{id,name,type}";
+// trust_line_items has limited fields — use defaults + matter association
+const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
 
 interface Invoice {
   bill_id: number;
@@ -182,7 +182,7 @@ export function registerARTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const defaultStart = new Date(Date.now() - 365 * 86400000).toISOString().split("T")[0];
+        const defaultStart = new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
         const timeParams: Record<string, any> = {
           type: "TimeEntry",
           billed: false,
@@ -401,6 +401,7 @@ export function registerARTools(server: McpServer): void {
         for (const entry of ledgerEntries) {
           const mid = entry.matter?.id;
           if (!mid) continue;
+          const amount = entry.total || 0;
 
           if (!byMatter[mid]) {
             byMatter[mid] = {
@@ -412,24 +413,18 @@ export function registerARTools(server: McpServer): void {
             };
           }
 
-          // Use the latest balance from entries
-          if (byMatter[mid].entries.length === 0) {
-            byMatter[mid].balance = entry.balance || 0;
-          }
+          byMatter[mid].balance += amount;
 
           byMatter[mid].entries.push({
             id: entry.id,
             date: entry.date,
-            amount: entry.amount,
-            balance: entry.balance,
-            description: entry.description,
-            type: entry.type,
+            amount,
           });
 
-          if (entry.amount > 0 && !byMatter[mid].last_deposit) {
+          if (amount > 0 && !byMatter[mid].last_deposit) {
             byMatter[mid].last_deposit = entry.date;
           }
-          if (entry.amount < 0 && !byMatter[mid].last_disbursement) {
+          if (amount < 0 && !byMatter[mid].last_disbursement) {
             byMatter[mid].last_disbursement = entry.date;
           }
         }
