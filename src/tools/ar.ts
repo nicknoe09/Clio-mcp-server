@@ -189,7 +189,7 @@ export function registerARTools(server: McpServer): void {
             "id,date,quantity,price,matter{id,display_number,description,client,responsible_attorney}",
         };
         const expenseParams: Record<string, any> = {
-          type: "Expense",
+          type: "ExpenseEntry",
           billed: false,
           fields:
             "id,date,price,matter{id,display_number,description,client,responsible_attorney}",

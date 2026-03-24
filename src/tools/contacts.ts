@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 const CONTACT_FIELDS =
-  "id,name,first_name,last_name,type,email_addresses,phone_numbers,matters{id,display_number}";
+  "id,name,first_name,last_name,type,email_addresses,phone_numbers";
 
 export function registerContactTools(server: McpServer): void {
   server.tool(

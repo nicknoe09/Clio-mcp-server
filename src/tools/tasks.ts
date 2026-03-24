@@ -13,10 +13,10 @@ export function registerTaskTools(server: McpServer): void {
       matter_id: z.number().optional().describe("Filter by matter ID"),
       assignee_id: z.number().optional().describe("Filter by assignee user ID"),
       status: z
-        .enum(["incomplete", "complete", "all"])
+        .enum(["pending", "in_progress", "in_review", "complete", "draft", "all"])
         .optional()
-        .default("incomplete")
-        .describe("Filter by task status"),
+        .default("pending")
+        .describe("Filter by task status (pending, in_progress, in_review, complete, draft, all)"),
       due_before: z.string().optional().describe("Due before date (YYYY-MM-DD)"),
       due_after: z.string().optional().describe("Due after date (YYYY-MM-DD)"),
     },

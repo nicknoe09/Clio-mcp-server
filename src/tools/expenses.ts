@@ -24,7 +24,7 @@ export function registerExpenseTools(server: McpServer): void {
     async (params) => {
       try {
         const queryParams: Record<string, any> = {
-          type: "Expense",
+          type: "ExpenseEntry",
           fields: EXPENSE_FIELDS,
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
@@ -93,7 +93,7 @@ export function registerExpenseTools(server: McpServer): void {
     async (params) => {
       try {
         const queryParams: Record<string, any> = {
-          type: "Expense",
+          type: "ExpenseEntry",
           billed: false,
           fields: EXPENSE_FIELDS,
         };

@@ -13,7 +13,7 @@ export function registerBillTools(server: McpServer): void {
       matter_id: z.number().optional().describe("Filter by matter ID"),
       client_id: z.number().optional().describe("Filter by client ID"),
       state: z
-        .enum(["draft", "outstanding", "paid", "all"])
+        .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
         .optional()
         .default("all")
         .describe("Filter by bill state"),

@@ -81,7 +81,7 @@ export function registerReconcileTools(server: McpServer): void {
 
         // Fetch Clio expenses in the window
         const queryParams: Record<string, any> = {
-          type: "Expense",
+          type: "ExpenseEntry",
           fields:
             "id,date,price,note,matter{id,display_number,client},user{id,name},expense_category{name}",
         };

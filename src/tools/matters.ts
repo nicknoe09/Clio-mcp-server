@@ -262,7 +262,7 @@ export function registerMatterTools(server: McpServer): void {
 
         // Get all unbilled expenses
         const expenses = await fetchAllPages<any>("/activities", {
-          type: "Expense",
+          type: "ExpenseEntry",
           billed: false,
           fields:
             "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
