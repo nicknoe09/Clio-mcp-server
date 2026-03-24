@@ -102,24 +102,35 @@ export function registerTimeTools(server: McpServer): void {
   // get_unbilled_time
   server.tool(
     "get_unbilled_time",
-    "Get all unbilled time entries grouped by matter with subtotals and firm-wide totals",
+    "Get all unbilled time entries grouped by matter with subtotals and firm-wide totals. Requires user_id or matter_id to keep response sizes manageable.",
     {
       matter_id: z.number().optional().describe("Filter by matter ID"),
       user_id: z.number().optional().describe("Filter by user/timekeeper ID"),
-      start_date: z.string().optional().describe("Start date (YYYY-MM-DD)"),
+      start_date: z.string().optional().describe("Start date (YYYY-MM-DD) — defaults to last 90 days if no user/matter filter"),
     },
     async (params) => {
       try {
-        // Default to last 14 days to keep response times reasonable for large firms
-        const defaultStart = params.start_date ?? new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+        if (!params.user_id && !params.matter_id) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: "Provide user_id or matter_id to filter unbilled time. Use get_user_productivity for firm-wide summaries." }),
+            }],
+            isError: true,
+          };
+        }
+
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: false,
           fields: TIME_ENTRY_FIELDS,
-          created_since: `${defaultStart}T00:00:00+00:00`,
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
+        // Only apply date filter if explicitly provided or as safety net without narrow filter
+        if (params.start_date) {
+          queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
+        }
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
         if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 
 const CONTACT_FIELDS =
   "id,name,first_name,last_name,type,email_addresses,phone_numbers";
@@ -8,9 +8,10 @@ const CONTACT_FIELDS =
 export function registerContactTools(server: McpServer): void {
   server.tool(
     "get_contacts",
-    "Search contacts by name or email, optionally filter by type (Person/Company)",
+    "Search contacts by name or email, optionally filter by type (Person/Company). Use matter_id to get contacts associated with a specific matter.",
     {
-      search: z.string().describe("Search query (name or email)"),
+      search: z.string().optional().describe("Search query (name or email)"),
+      matter_id: z.number().optional().describe("Get contacts associated with a specific matter"),
       type: z
         .enum(["Person", "Company", "all"])
         .optional()
@@ -19,17 +20,38 @@ export function registerContactTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const queryParams: Record<string, any> = {
-          fields: CONTACT_FIELDS,
-          query: params.search,
-        };
-        if (params.type !== "all") {
-          queryParams.type = params.type;
+        if (!params.search && !params.matter_id) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: "Provide either 'search' or 'matter_id'" }),
+            }],
+            isError: true,
+          };
         }
 
-        // Cap at first page (200 results) to prevent timeout on broad searches
-        const allContacts = await fetchAllPages<any>("/contacts", queryParams);
-        const contacts = allContacts.slice(0, 100);
+        let contacts: any[] = [];
+
+        if (params.matter_id) {
+          // Get matter details which include the client contact
+          const matterData = await rawGetSingle(`/matters/${params.matter_id}`, {
+            fields: "id,display_number,description,client{id,name,first_name,last_name,type,email_addresses,phone_numbers}",
+          });
+          const client = matterData?.data?.client;
+          if (client) {
+            contacts = [client];
+          }
+        } else if (params.search) {
+          const queryParams: Record<string, any> = {
+            fields: CONTACT_FIELDS,
+            query: params.search,
+          };
+          if (params.type !== "all") {
+            queryParams.type = params.type;
+          }
+          const allContacts = await fetchAllPages<any>("/contacts", queryParams);
+          contacts = allContacts.slice(0, 200);
+        }
 
         const formatted = contacts.map((c: any) => ({
           id: c.id,
@@ -39,7 +61,6 @@ export function registerContactTools(server: McpServer): void {
           type: c.type,
           emails: c.email_addresses ?? [],
           phones: c.phone_numbers ?? [],
-          open_matters: c.matters ?? [],
         }));
 
         return {

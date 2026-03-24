@@ -533,155 +533,128 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_timekeeper_realization
   server.tool(
     "get_timekeeper_realization",
-    "Deep per-attorney breakdown: worked, billed, collected, effective hourly rate. Associate management report.",
+    "Deep per-attorney breakdown: worked, billed, collected, effective hourly rate. Associate management report. Supports monthly or yearly breakdowns. Requires user_id for per-timekeeper detail.",
     {
+      user_id: z.number().describe("User/timekeeper ID (required)"),
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
-      user_id: z
-        .number()
+      breakdown: z
+        .enum(["none", "monthly", "yearly"])
         .optional()
-        .describe("Filter to a specific user (all users if omitted)"),
+        .default("none")
+        .describe("Break results into monthly or yearly periods"),
     },
     async (params) => {
       try {
         const timeParams: Record<string, any> = {
           type: "TimeEntry",
           fields: TIME_FIELDS,
+          user_id: params.user_id,
           created_since: `${params.start_date}T00:00:00+00:00`,
         };
-        if (params.user_id) timeParams.user_id = params.user_id;
 
         const [rawTimeEntries, allBills] = await Promise.all([
           fetchAllPages<any>("/activities", timeParams),
           fetchAllPages<any>("/bills", {
-            fields:
-              "id,number,issued_at,total,balance,state,matters",
+            fields: "id,number,issued_at,total,balance,state,matters",
             created_since: `${params.start_date}T00:00:00+00:00`,
           }),
         ]);
-        // Cap bills and filter by date range client-side
         const bills = allBills
           .filter((b: any) => b.issued_at >= params.start_date && b.issued_at <= params.end_date)
           .slice(0, 5000);
-        const timeEntries = rawTimeEntries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
-
-        // Compute collected: total - remaining balance on paid/partially paid bills
-        const totalCollected = bills.reduce(
-          (s: number, b: any) => s + ((b.total || 0) - (b.balance || 0)),
-          0
-        );
-        const totalBilledFromBills = bills.reduce(
-          (s: number, b: any) => s + (b.total || 0),
-          0
+        const timeEntries = rawTimeEntries.filter(
+          (e: any) => e.date >= params.start_date && e.date <= params.end_date
         );
 
-        const byUser: Record<
-          number,
-          {
-            name: string;
-            standard_rate: number;
-            worked_hours: number;
-            worked_value: number;
-            billed_hours: number;
-            billed_value: number;
-          }
-        > = {};
+        // Helper: compute realization stats for a set of entries and bills
+        function computeStats(entries: any[], periodBills: any[]) {
+          let worked_hours = 0, worked_value = 0, billed_hours = 0, billed_value = 0;
+          let standard_rate = 0;
 
-        for (const e of timeEntries) {
-          const uid = e.user?.id ?? 0;
-          if (!byUser[uid]) {
-            byUser[uid] = {
-              name: e.user?.name ?? "Unknown",
-              standard_rate: e.price || 0,
-              worked_hours: 0,
-              worked_value: 0,
-              billed_hours: 0,
-              billed_value: 0,
-            };
-          }
-          const hours = e.quantity / 3600;
-          byUser[uid].worked_hours += hours;
-          byUser[uid].worked_value += hours * (e.price || 0);
-
-          // Track standard rate as the most common rate
-          if (e.price && e.price > byUser[uid].standard_rate) {
-            byUser[uid].standard_rate = e.price;
+          for (const e of entries) {
+            const hours = e.quantity / 3600;
+            worked_hours += hours;
+            worked_value += hours * (e.price || 0);
+            if (e.price && e.price > standard_rate) standard_rate = e.price;
+            if (e.billed) {
+              billed_hours += hours;
+              billed_value += hours * (e.price || 0);
+            }
           }
 
-          if (e.billed) {
-            byUser[uid].billed_hours += hours;
-            byUser[uid].billed_value += hours * (e.price || 0);
-          }
+          const totalBilledFromBills = periodBills.reduce((s: number, b: any) => s + (b.total || 0), 0);
+          const totalCollected = periodBills.reduce((s: number, b: any) => s + ((b.total || 0) - (b.balance || 0)), 0);
+          const firmCollectionRatio = totalBilledFromBills > 0 ? totalCollected / totalBilledFromBills : 0;
+          const estimatedCollected = billed_value * firmCollectionRatio;
+          const effectiveRate = worked_hours > 0 ? estimatedCollected / worked_hours : 0;
+          const realizationPct = worked_value > 0 ? (billed_value / worked_value) * 100 : 0;
+          const collectionPct = billed_value > 0 ? (estimatedCollected / billed_value) * 100 : 0;
+
+          return {
+            standard_rate,
+            worked_hours: Math.round(worked_hours * 100) / 100,
+            worked_value: Math.round(worked_value * 100) / 100,
+            billed_hours: Math.round(billed_hours * 100) / 100,
+            billed_value: Math.round(billed_value * 100) / 100,
+            collected_value: Math.round(estimatedCollected * 100) / 100,
+            effective_rate: Math.round(effectiveRate * 100) / 100,
+            realization_pct: Math.round(realizationPct * 10) / 10,
+            collection_pct: Math.round(collectionPct * 10) / 10,
+          };
         }
 
-        // Collection ratio (firm-wide, applied proportionally since bills aren't per-user)
-        const firmCollectionRatio =
-          totalBilledFromBills > 0
-            ? totalCollected / totalBilledFromBills
-            : 0;
+        // Helper: get period key from a date string
+        function periodKey(dateStr: string): string {
+          if (params.breakdown === "monthly") return dateStr.slice(0, 7); // YYYY-MM
+          if (params.breakdown === "yearly") return dateStr.slice(0, 4);  // YYYY
+          return "total";
+        }
 
-        const results = Object.entries(byUser)
-          .map(([uid, u]) => {
-            // Approximate collected per user using firm collection ratio
-            const estimatedCollected =
-              u.billed_value * firmCollectionRatio;
-            const effectiveRate =
-              u.worked_hours > 0
-                ? estimatedCollected / u.worked_hours
-                : 0;
-            const realizationPct =
-              u.worked_value > 0
-                ? (u.billed_value / u.worked_value) * 100
-                : 0;
-            const collectionPct =
-              u.billed_value > 0
-                ? (estimatedCollected / u.billed_value) * 100
-                : 0;
+        if (params.breakdown === "none") {
+          const stats = computeStats(timeEntries, bills);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ period: { start: params.start_date, end: params.end_date }, ...stats }, null, 2),
+            }],
+          };
+        }
 
-            const rateDelta =
-              u.standard_rate > 0
-                ? ((u.standard_rate - effectiveRate) / u.standard_rate) *
-                  100
-                : 0;
+        // Group entries and bills by period
+        const entryBuckets: Record<string, any[]> = {};
+        const billBuckets: Record<string, any[]> = {};
 
-            return {
-              user_id: parseInt(uid, 10),
-              name: u.name,
-              standard_rate: u.standard_rate,
-              worked_hours: Math.round(u.worked_hours * 100) / 100,
-              worked_value: Math.round(u.worked_value * 100) / 100,
-              billed_hours: Math.round(u.billed_hours * 100) / 100,
-              billed_value: Math.round(u.billed_value * 100) / 100,
-              collected_value:
-                Math.round(estimatedCollected * 100) / 100,
-              effective_rate: Math.round(effectiveRate * 100) / 100,
-              realization_pct: Math.round(realizationPct * 10) / 10,
-              collection_pct: Math.round(collectionPct * 10) / 10,
-              flag:
-                rateDelta > 20 ? "EFFECTIVE_RATE_LOW" : null,
-            };
-          })
-          .sort((a, b) => b.worked_value - a.worked_value);
+        for (const e of timeEntries) {
+          const key = periodKey(e.date);
+          if (!entryBuckets[key]) entryBuckets[key] = [];
+          entryBuckets[key].push(e);
+        }
+        for (const b of bills) {
+          const key = periodKey(b.issued_at);
+          if (!billBuckets[key]) billBuckets[key] = [];
+          billBuckets[key].push(b);
+        }
+
+        const allKeys = [...new Set([...Object.keys(entryBuckets), ...Object.keys(billBuckets)])].sort();
+        const periods = allKeys.map((key) => ({
+          period: key,
+          ...computeStats(entryBuckets[key] ?? [], billBuckets[key] ?? []),
+        }));
+
+        // Also compute overall totals
+        const overall = computeStats(timeEntries, bills);
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  period: {
-                    start: params.start_date,
-                    end: params.end_date,
-                  },
-                  firm_collection_ratio:
-                    Math.round(firmCollectionRatio * 1000) / 10,
-                  timekeepers: results,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              date_range: { start: params.start_date, end: params.end_date },
+              breakdown: params.breakdown,
+              overall,
+              periods,
+            }, null, 2),
+          }],
         };
       } catch (err: any) {
         return {
