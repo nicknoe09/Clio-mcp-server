@@ -48,7 +48,7 @@ export function registerARTools(server: McpServer): void {
       try {
         const queryParams: Record<string, any> = {
           fields: BILL_FIELDS,
-          state: "outstanding",
+          state: "awaiting_payment",
         };
         if (params.responsible_attorney_id) {
           queryParams.responsible_attorney_id = params.responsible_attorney_id;
