@@ -64,7 +64,7 @@ function createMcpServer(): McpServer {
     registerScorecardTools(server);
     console.log("[MCP] registerScorecardTools OK");
 
-    console.log("[MCP] All tools registered successfully");
+    console.log("[MCP] All 21 tools registered successfully");
     return server;
   } catch (err: any) {
     console.error("[MCP] FATAL: tool registration failed");
