@@ -267,26 +267,32 @@ app.get("/debug-alloc", async (_req, res) => {
       (a.matter?.display_number || "").includes("Storms")
     );
 
-    // 3. Check for negative allocations firm-wide in Feb
+    // 3. Fetch ALL Feb allocations with description to analyze patterns
     const febAllocations = await fetchAllPages("/allocations", {
-      fields: "id,amount,date,bill{id,number},matter{id}",
+      fields: "id,amount,date,description,bill{id,number},matter{id}",
       created_since: "2026-02-01T00:00:00+00:00",
     });
-    const febFiltered = febAllocations.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28");
-    const negatives = febFiltered.filter((a: any) => a.amount < 0);
-    const positives = febFiltered.filter((a: any) => a.amount > 0);
+    const febFiltered = febAllocations.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28" && a.amount > 0);
 
-    // 4. Group by bill to find duplicates
-    const byBill: Record<string, any[]> = {};
-    for (const a of febFiltered) {
-      const key = a.bill?.number ?? "no-bill";
-      if (!byBill[key]) byBill[key] = [];
-      byBill[key].push({ id: a.id, amount: a.amount, date: a.date, matter: a.matter?.id });
-    }
-    const duplicateBills = Object.entries(byBill)
-      .filter(([, allocs]) => allocs.length > 2)
-      .slice(0, 5)
-      .map(([bill, allocs]) => ({ bill, count: allocs.length, allocs }));
+    // Categorize by description pattern
+    const billPattern = febFiltered.filter((a: any) => (a.description || "").startsWith("Payment for bill"));
+    const invoicePattern = febFiltered.filter((a: any) => (a.description || "").startsWith("Payment for invoice"));
+    const otherPattern = febFiltered.filter((a: any) => {
+      const d = a.description || "";
+      return !d.startsWith("Payment for bill") && !d.startsWith("Payment for invoice");
+    });
+
+    // Check: do ALL "invoice" allocations have a matching "bill" allocation?
+    const billKeys = new Set(billPattern.map((a: any) => `${a.bill?.id}_${a.amount}`));
+    const invoiceWithMatch = invoicePattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`));
+    const invoiceWithoutMatch = invoicePattern.filter((a: any) => !billKeys.has(`${a.bill?.id}_${a.amount}`));
+
+    // What does the total look like with only "bill" pattern?
+    const billOnlySum = Math.round(billPattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
+    const invoiceOnlySum = Math.round(invoicePattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
+    const otherSum = Math.round(otherPattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
+    const allSum = Math.round(febFiltered.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
+    const dedupedSum = Math.round((billOnlySum + otherSum) * 100) / 100;
 
     res.json({
       field_probes: probeResults,
@@ -294,15 +300,21 @@ app.get("/debug-alloc", async (_req, res) => {
         count: stormsFeb.length,
         allocations: stormsFeb,
       },
-      feb_summary: {
-        total: febFiltered.length,
-        positive_count: positives.length,
-        negative_count: negatives.length,
-        positive_sum: Math.round(positives.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
-        negative_sum: Math.round(negatives.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
-        net_sum: Math.round(febFiltered.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
+      feb_analysis: {
+        total_allocations: febFiltered.length,
+        bill_pattern_count: billPattern.length,
+        invoice_pattern_count: invoicePattern.length,
+        other_pattern_count: otherPattern.length,
+        other_descriptions: [...new Set(otherPattern.map((a: any) => a.description))].slice(0, 10),
+        invoice_with_matching_bill: invoiceWithMatch.length,
+        invoice_without_matching_bill: invoiceWithoutMatch.length,
+        invoice_unmatched_sample: invoiceWithoutMatch.slice(0, 5),
+        all_sum: allSum,
+        bill_only_sum: billOnlySum,
+        invoice_only_sum: invoiceOnlySum,
+        other_sum: otherSum,
+        deduped_sum_bill_plus_other: dedupedSum,
       },
-      duplicate_bills: duplicateBills,
     });
   } catch (err: any) {
     res.json({ error: err.message, status: err.response?.status });
