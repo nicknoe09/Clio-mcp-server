@@ -231,6 +231,79 @@ app.get("/debug-timing", async (_req, res) => {
   }
 });
 
+// --- Debug: investigate allocation duplicates ---
+app.get("/debug-alloc", async (_req, res) => {
+  try {
+    const { fetchAllPages, rawGetSingle } = require("./clio/pagination");
+
+    // 1. Check what fields exist on allocations
+    const fieldProbes = [
+      { name: "with_type", fields: "id,amount,date,type,bill{id,number},matter{id}" },
+      { name: "with_description", fields: "id,amount,date,description,bill{id,number}" },
+      { name: "with_category", fields: "id,amount,date,category,bill{id,number}" },
+      { name: "with_kind", fields: "id,amount,date,kind,bill{id,number}" },
+      { name: "with_parent_payment", fields: "id,amount,date,payment{id},bill{id,number}" },
+      { name: "with_credit_memo", fields: "id,amount,date,credit_memo{id},bill{id,number}" },
+    ];
+
+    const probeResults: Record<string, any> = {};
+    for (const p of fieldProbes) {
+      try {
+        const r = await rawGetSingle("/allocations", { fields: p.fields, limit: 2 });
+        probeResults[p.name] = { ok: true, sample: r.data?.[0] };
+      } catch (e: any) {
+        probeResults[p.name] = { ok: false, error: e.response?.data?.error?.message ?? e.message };
+      }
+    }
+
+    // 2. Fetch Storms matter allocations to inspect duplicates
+    const stormsAllocations = await fetchAllPages("/allocations", {
+      fields: "id,amount,date,bill{id,number},matter{id,display_number}",
+      matter_id: 1022933999,
+    });
+
+    // 3. Check for negative allocations firm-wide in Feb
+    const febAllocations = await fetchAllPages("/allocations", {
+      fields: "id,amount,date,bill{id,number},matter{id}",
+      created_since: "2026-02-01T00:00:00+00:00",
+    });
+    const febFiltered = febAllocations.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28");
+    const negatives = febFiltered.filter((a: any) => a.amount < 0);
+    const positives = febFiltered.filter((a: any) => a.amount > 0);
+
+    // 4. Group by bill to find duplicates
+    const byBill: Record<string, any[]> = {};
+    for (const a of febFiltered) {
+      const key = a.bill?.number ?? "no-bill";
+      if (!byBill[key]) byBill[key] = [];
+      byBill[key].push({ id: a.id, amount: a.amount, date: a.date, matter: a.matter?.id });
+    }
+    const duplicateBills = Object.entries(byBill)
+      .filter(([, allocs]) => allocs.length > 2)
+      .slice(0, 5)
+      .map(([bill, allocs]) => ({ bill, count: allocs.length, allocs }));
+
+    res.json({
+      field_probes: probeResults,
+      storms_matter: {
+        total_allocations: stormsAllocations.length,
+        sample: stormsAllocations.slice(0, 10),
+      },
+      feb_summary: {
+        total: febFiltered.length,
+        positive_count: positives.length,
+        negative_count: negatives.length,
+        positive_sum: Math.round(positives.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
+        negative_sum: Math.round(negatives.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
+        net_sum: Math.round(febFiltered.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
+      },
+      duplicate_bills: duplicateBills,
+    });
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status });
+  }
+});
+
 // --- OAuth Bootstrap ---
 app.get("/oauth/start", (_req, res) => {
   const url = getAuthorizationUrl();
