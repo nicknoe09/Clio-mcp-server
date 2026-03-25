@@ -120,15 +120,18 @@ app.get("/debug-clio", async (_req, res) => {
     const results: Record<string, any> = {};
 
     const probes = [
-      { name: "payments_fields_v1", ep: "/payments", p: { fields: "id,amount,date,description", limit: 2 } },
-      { name: "payments_fields_v2", ep: "/payments", p: { fields: "id,total,date", limit: 2 } },
-      { name: "payments_fields_v3", ep: "/payments", p: { fields: "id,amount", limit: 2 } },
-      { name: "payments_minimal", ep: "/payments", p: { limit: 2 } },
-      { name: "allocations_fields_v1", ep: "/allocations", p: { fields: "id,amount,date,bill,matter,payment", limit: 2 } },
-      { name: "allocations_fields_v2", ep: "/allocations", p: { fields: "id,amount,date", limit: 2 } },
-      { name: "allocations_minimal", ep: "/allocations", p: { limit: 2 } },
-      { name: "calendar_entries", ep: "/calendar_entries", p: { fields: "id,summary,start_at,end_at,matter", limit: 2 } },
-      { name: "calendar_minimal", ep: "/calendar_entries", p: { limit: 2 } },
+      // Payment associations
+      { name: "payment_bill", ep: "/payments", p: { fields: "id,amount,date,description,bill{id,number}", limit: 2 } },
+      { name: "payment_matter", ep: "/payments", p: { fields: "id,amount,date,matter{id}", limit: 2 } },
+      { name: "payment_type_state", ep: "/payments", p: { fields: "id,amount,date,type,state,method", limit: 2 } },
+      { name: "payment_contact", ep: "/payments", p: { fields: "id,amount,date,contact{id,name}", limit: 2 } },
+      // Allocation associations
+      { name: "alloc_bill", ep: "/allocations", p: { fields: "id,amount,date,bill{id,number}", limit: 2 } },
+      { name: "alloc_matter", ep: "/allocations", p: { fields: "id,amount,date,matter{id}", limit: 2 } },
+      { name: "alloc_contact", ep: "/allocations", p: { fields: "id,amount,date,contact{id,name}", limit: 2 } },
+      { name: "alloc_parent", ep: "/allocations", p: { fields: "id,amount,date,parent{id}", limit: 2 } },
+      // Calendar full fields
+      { name: "calendar_full", ep: "/calendar_entries", p: { fields: "id,summary,description,start_at,end_at,all_day,location,matter{id,display_number},attendees,calendar_owner{id,name}", limit: 2 } },
     ];
 
     for (const { name, ep, p } of probes) {
