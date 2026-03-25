@@ -660,14 +660,30 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Get allocations (actual payments) in the date range
+        // Get allocations (actual payments) in the date range, include description for dedup
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,amount,date,bill{id,number},matter{id,display_number}",
+          fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
-        const allocations = allAllocations.filter((a: any) =>
+        const rawAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
+
+        // Dedup: Clio sometimes creates both "Payment for bill #X" and "Payment for invoice #X"
+        // for the same payment. If same (bill_id, amount) has both patterns, keep only the "bill" one.
+        const billPatternKeys = new Set(
+          rawAllocations
+            .filter((a: any) => (a.description || "").startsWith("Payment for bill"))
+            .map((a: any) => `${a.bill?.id}_${a.amount}`)
+        );
+        const allocations = rawAllocations.filter((a: any) => {
+          const desc = a.description || "";
+          if (desc.startsWith("Payment for invoice")) {
+            const key = `${a.bill?.id}_${a.amount}`;
+            if (billPatternKeys.has(key)) return false; // duplicate — bill version exists
+          }
+          return true;
+        });
 
         // Collect unique matter IDs that had payments
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
@@ -817,16 +833,29 @@ export function registerPerformanceTools(server: McpServer): void {
           359576660: "May Huynh",
         };
 
-        // Get allocations (actual payment dates) in the period
+        // Get allocations (actual payment dates) in the period, include description for dedup
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,amount,date,bill{id,number},matter{id,display_number}",
+          fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
-        const allocations = allAllocations.filter((a: any) =>
+        const rawAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
 
-        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
+        // Dedup: same logic as get_fee_allocation
+        const billPatternKeys = new Set(
+          rawAllocations
+            .filter((a: any) => (a.description || "").startsWith("Payment for bill"))
+            .map((a: any) => `${a.bill?.id}_${a.amount}`)
+        );
+        const allocations = rawAllocations.filter((a: any) => {
+          const desc = a.description || "";
+          if (desc.startsWith("Payment for invoice")) {
+            const key = `${a.bill?.id}_${a.amount}`;
+            if (billPatternKeys.has(key)) return false;
+          }
+          return true;
+        });
 
         // Bulk fetch billed entries capped at 4000, filter to matters with payments
         const matterIds2 = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
