@@ -152,6 +152,44 @@ app.get("/debug-clio", async (_req, res) => {
   }
 });
 
+// --- Debug: test new tools via HTTP so we don't need MCP reconnect ---
+app.get("/debug-test", async (req, res) => {
+  try {
+    const tool = req.query.tool as string;
+    const { fetchAllPages, rawGetSingle, rawPostSingle } = require("./clio/pagination");
+
+    if (tool === "calendar") {
+      const entries = await fetchAllPages("/calendar_entries", {
+        fields: "id,summary,start_at,end_at,matter{id,display_number},calendar_owner{id,name}",
+        from: "2026-03-01",
+        to: "2026-03-31",
+        limit: 5,
+      });
+      res.json({ ok: true, count: entries.length, sample: entries.slice(0, 3) });
+    } else if (tool === "fee_allocation") {
+      const allocs = await fetchAllPages("/allocations", {
+        fields: "id,amount,date,bill{id,number},matter{id,display_number}",
+        created_since: "2026-03-01T00:00:00+00:00",
+        limit: 5,
+      });
+      const filtered = allocs.filter((a: any) => a.date >= "2026-03-01" && a.date <= "2026-03-31");
+      res.json({ ok: true, total_allocations: filtered.length, sample: filtered.slice(0, 3) });
+    } else if (tool === "responsible_collections") {
+      // Quick sanity test — just verify allocations + time entries fetch works
+      const allocs = await fetchAllPages("/allocations", {
+        fields: "id,amount,date,matter{id}",
+        created_since: "2026-03-01T00:00:00+00:00",
+        limit: 5,
+      });
+      res.json({ ok: true, alloc_count: allocs.length, sample: allocs.slice(0, 2) });
+    } else {
+      res.json({ error: "Use ?tool=calendar|fee_allocation|responsible_collections" });
+    }
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status, clio_error: err.response?.data });
+  }
+});
+
 // --- OAuth Bootstrap ---
 app.get("/oauth/start", (_req, res) => {
   const url = getAuthorizationUrl();
