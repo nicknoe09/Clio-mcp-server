@@ -48,7 +48,7 @@ export function registerContactTools(server: McpServer): void {
     "Search contacts by name or email, optionally filter by type (Person/Company). Use matter_id to get contacts associated with a specific matter.",
     {
       search: z.string().optional().describe("Search query (name or email)"),
-      matter_id: z.number().optional().describe("Get contacts associated with a specific matter"),
+      matter_id: z.coerce.number().optional().describe("Get contacts associated with a specific matter"),
       type: z
         .enum(["Person", "Company", "all"])
         .optional()

@@ -11,8 +11,8 @@ export function registerExpenseTools(server: McpServer): void {
     "get_expenses",
     "Get expense entries with optional filters",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      user_id: z.number().optional().describe("Filter by user ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      user_id: z.coerce.number().optional().describe("Filter by user ID"),
       start_date: z.string().optional().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().optional().describe("End date (YYYY-MM-DD)"),
       billed: z
@@ -87,8 +87,8 @@ export function registerExpenseTools(server: McpServer): void {
     "get_unbilled_expenses",
     "Get all unbilled expenses grouped by matter with totals",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      user_id: z.number().optional().describe("Filter by user ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      user_id: z.coerce.number().optional().describe("Filter by user ID"),
     },
     async (params) => {
       try {

@@ -5,7 +5,7 @@ import { jaccardSimilarity, hasTokenOverlap, normalizeText } from "../utils/norm
 
 const TransactionSchema = z.object({
   date: z.string().describe("Transaction date (YYYY-MM-DD)"),
-  amount: z.number().describe("Transaction amount"),
+  amount: z.coerce.number().describe("Transaction amount"),
   description: z.string().describe("Transaction description"),
   merchant: z.string().describe("Merchant name"),
 });

@@ -535,7 +535,7 @@ export function registerPerformanceTools(server: McpServer): void {
     "get_timekeeper_realization",
     "Deep per-attorney breakdown: worked, billed, collected, effective hourly rate. Associate management report. Supports monthly or yearly breakdowns. Requires user_id for per-timekeeper detail.",
     {
-      user_id: z.number().describe("User/timekeeper ID (required)"),
+      user_id: z.coerce.number().describe("User/timekeeper ID (required)"),
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
       breakdown: z
@@ -656,7 +656,7 @@ export function registerPerformanceTools(server: McpServer): void {
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
-      user_id: z.number().optional().describe("Filter to a specific timekeeper"),
+      user_id: z.coerce.number().optional().describe("Filter to a specific timekeeper"),
     },
     async (params) => {
       try {

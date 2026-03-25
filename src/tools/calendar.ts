@@ -13,8 +13,8 @@ export function registerCalendarTools(server: McpServer): void {
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
-      user_id: z.number().optional().describe("Filter by calendar owner user ID"),
-      matter_id: z.number().optional().describe("Filter by matter ID"),
+      user_id: z.coerce.number().optional().describe("Filter by calendar owner user ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       query: z.string().optional().describe("Search term to filter by summary/description (e.g. 'Potential' for consultation calls)"),
     },
     async (params) => {
@@ -83,8 +83,8 @@ export function registerCalendarTools(server: McpServer): void {
       description: z.string().optional().describe("Event description/notes"),
       location: z.string().optional().describe("Event location"),
       all_day: z.boolean().optional().default(false).describe("Whether this is an all-day event"),
-      matter_id: z.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.number().optional().describe("Assign to a specific user (defaults to token owner)"),
+      matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
+      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user (defaults to token owner)"),
     },
     async (params) => {
       try {

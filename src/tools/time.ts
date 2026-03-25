@@ -11,8 +11,8 @@ export function registerTimeTools(server: McpServer): void {
     "get_time_entries",
     "Get time entries with filters. Hours are returned in decimal (quantity from Clio is seconds / 3600).",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      user_id: z.number().optional().describe("Filter by user/timekeeper ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      user_id: z.coerce.number().optional().describe("Filter by user/timekeeper ID"),
       start_date: z.string().optional().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().optional().describe("End date (YYYY-MM-DD)"),
       billed: z
@@ -104,8 +104,8 @@ export function registerTimeTools(server: McpServer): void {
     "get_unbilled_time",
     "Get all unbilled time entries grouped by matter with subtotals and firm-wide totals. Requires user_id or matter_id to keep response sizes manageable.",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      user_id: z.number().optional().describe("Filter by user/timekeeper ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      user_id: z.coerce.number().optional().describe("Filter by user/timekeeper ID"),
       start_date: z.string().optional().describe("Start date (YYYY-MM-DD) — defaults to last 90 days if no user/matter filter"),
     },
     async (params) => {

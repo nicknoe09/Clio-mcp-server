@@ -313,10 +313,10 @@ export function registerScorecardTools(server: McpServer): void {
     "generate_weekly_goals",
     "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking.",
     {
-      user_id: z.number().describe("User/timekeeper ID"),
-      year: z.number().describe("Year (e.g. 2026)"),
-      weekly_billable_goal: z.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
-      hours_per_day: z.number().optional().default(8).describe("Hours in a work day (default 8)"),
+      user_id: z.coerce.number().describe("User/timekeeper ID"),
+      year: z.coerce.number().describe("Year (e.g. 2026)"),
+      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
+      hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
     },
     async (params) => {
       try {

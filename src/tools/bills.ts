@@ -10,8 +10,8 @@ export function registerBillTools(server: McpServer): void {
     "get_bills",
     "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days.",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      client_id: z.number().optional().describe("Filter by client ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      client_id: z.coerce.number().optional().describe("Filter by client ID"),
       state: z
         .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
         .optional()

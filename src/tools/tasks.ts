@@ -10,8 +10,8 @@ export function registerTaskTools(server: McpServer): void {
     "get_tasks",
     "Get tasks with filters. Defaults to incomplete tasks sorted by due date ascending.",
     {
-      matter_id: z.number().optional().describe("Filter by matter ID"),
-      assignee_id: z.number().optional().describe("Filter by assignee user ID"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      assignee_id: z.coerce.number().optional().describe("Filter by assignee user ID"),
       status: z
         .enum(["pending", "in_progress", "in_review", "complete", "draft", "all"])
         .optional()
