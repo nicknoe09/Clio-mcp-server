@@ -120,15 +120,15 @@ app.get("/debug-clio", async (_req, res) => {
     const results: Record<string, any> = {};
 
     const probes = [
-      { name: "payments", ep: "/payments", p: { limit: 2 } },
-      { name: "payments_with_fields", ep: "/payments", p: { fields: "id,amount,date,description,type,matter,bill", limit: 2 } },
-      { name: "allocations", ep: "/allocations", p: { limit: 2 } },
-      { name: "line_items", ep: "/line_items", p: { limit: 2 } },
-      { name: "bill_line_items", ep: "/bill_line_items", p: { limit: 2 } },
-      { name: "credit_memos", ep: "/credit_memos", p: { limit: 2 } },
-      { name: "transactions", ep: "/transactions", p: { limit: 2 } },
-      { name: "bank_transactions", ep: "/bank_transactions", p: { limit: 2 } },
-      { name: "bills_paid_sample", ep: "/bills", p: { state: "paid", fields: "id,number,issued_at,total,balance,state,matters,updated_at", limit: 2 } },
+      { name: "payments_fields_v1", ep: "/payments", p: { fields: "id,amount,date,description", limit: 2 } },
+      { name: "payments_fields_v2", ep: "/payments", p: { fields: "id,total,date", limit: 2 } },
+      { name: "payments_fields_v3", ep: "/payments", p: { fields: "id,amount", limit: 2 } },
+      { name: "payments_minimal", ep: "/payments", p: { limit: 2 } },
+      { name: "allocations_fields_v1", ep: "/allocations", p: { fields: "id,amount,date,bill,matter,payment", limit: 2 } },
+      { name: "allocations_fields_v2", ep: "/allocations", p: { fields: "id,amount,date", limit: 2 } },
+      { name: "allocations_minimal", ep: "/allocations", p: { limit: 2 } },
+      { name: "calendar_entries", ep: "/calendar_entries", p: { fields: "id,summary,start_at,end_at,matter", limit: 2 } },
+      { name: "calendar_minimal", ep: "/calendar_entries", p: { limit: 2 } },
     ];
 
     for (const { name, ep, p } of probes) {
