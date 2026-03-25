@@ -231,117 +231,79 @@ app.get("/debug-timing", async (_req, res) => {
   }
 });
 
-// --- Debug: investigate allocation duplicates ---
+// --- Debug: probe Clio API for line items and bill associations ---
 app.get("/debug-alloc", async (_req, res) => {
   try {
-    const { fetchAllPages, rawGetSingle } = require("./clio/pagination");
+    const { rawGetSingle } = require("./clio/pagination");
+    const results: Record<string, any> = {};
 
-    // 1. Check what fields exist on allocations
-    const fieldProbes = [
-      { name: "with_type", fields: "id,amount,date,type,bill{id,number},matter{id}" },
-      { name: "with_description", fields: "id,amount,date,description,bill{id,number}" },
-      { name: "with_category", fields: "id,amount,date,category,bill{id,number}" },
-      { name: "with_kind", fields: "id,amount,date,kind,bill{id,number}" },
-      { name: "with_parent_payment", fields: "id,amount,date,payment{id},bill{id,number}" },
-      { name: "with_credit_memo", fields: "id,amount,date,credit_memo{id},bill{id,number}" },
-    ];
-
-    const probeResults: Record<string, any> = {};
-    for (const p of fieldProbes) {
-      try {
-        const r = await rawGetSingle("/allocations", { fields: p.fields, limit: 2 });
-        probeResults[p.name] = { ok: true, sample: r.data?.[0] };
-      } catch (e: any) {
-        probeResults[p.name] = { ok: false, error: e.response?.data?.error?.message ?? e.message };
-      }
+    // 1. Check if /line_items endpoint exists and what fields it supports
+    try {
+      const r = await rawGetSingle("/line_items", {
+        fields: "id,amount,date,description,quantity,price,type,bill{id,number},matter{id},user{id,name},activity{id}",
+        limit: 3,
+      });
+      results.line_items = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.line_items = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
     }
 
-    // 2. Fetch Storms matter allocations with description to find duplication pattern
-    // Matter 1770770314 is Storms, Sara (from the Paul fee_allocation output)
-    const stormsAllocations = await fetchAllPages("/allocations", {
-      fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
-      created_since: "2026-02-01T00:00:00+00:00",
-    });
-    const stormsFeb = stormsAllocations.filter((a: any) =>
-      a.date >= "2026-02-01" && a.date <= "2026-02-28" &&
-      (a.matter?.display_number || "").includes("Storms")
-    );
+    // 2a. Check if /bills can include line_items as a nested field (flat)
+    try {
+      const r = await rawGetSingle("/bills", {
+        fields: "id,number,state,total,balance,issued_at,due_at,line_items",
+        limit: 2,
+      });
+      results.bills_with_line_items_flat = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.bills_with_line_items_flat = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
 
-    // 3. Fetch ALL Feb allocations with description to analyze patterns
-    const febAllocations = await fetchAllPages("/allocations", {
-      fields: "id,amount,date,description,bill{id,number},matter{id}",
-      created_since: "2026-02-01T00:00:00+00:00",
-    });
-    const febFiltered = febAllocations.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28" && a.amount > 0);
+    // 2b. Check if /bills can include line_items with nested fields
+    try {
+      const r = await rawGetSingle("/bills", {
+        fields: "id,number,state,total,balance,matters,line_items{id,amount,user}",
+        limit: 2,
+      });
+      results.bills_with_line_items_nested = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.bills_with_line_items_nested = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
 
-    // Categorize by description pattern
-    const billPattern = febFiltered.filter((a: any) => (a.description || "").startsWith("Payment for bill"));
-    const invoicePattern = febFiltered.filter((a: any) => (a.description || "").startsWith("Payment for invoice"));
-    const otherPattern = febFiltered.filter((a: any) => {
-      const d = a.description || "";
-      return !d.startsWith("Payment for bill") && !d.startsWith("Payment for invoice");
-    });
+    // 3. Check /activities with bill association
+    try {
+      const r = await rawGetSingle("/activities", {
+        fields: "id,date,quantity,price,bill{id,number,state},user{id,name},matter{id}",
+        limit: 2,
+      });
+      results.activities_with_bill = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.activities_with_bill = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
 
-    // Check: do ALL "invoice" allocations have a matching "bill" allocation?
-    const billKeys = new Set(billPattern.map((a: any) => `${a.bill?.id}_${a.amount}`));
-    const invoiceWithMatch = invoicePattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`));
-    const invoiceWithoutMatch = invoicePattern.filter((a: any) => !billKeys.has(`${a.bill?.id}_${a.amount}`));
+    // 4a. Check if /bill_line_items endpoint exists
+    try {
+      const r = await rawGetSingle("/bill_line_items", {
+        fields: "id,amount",
+        limit: 2,
+      });
+      results.bill_line_items = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.bill_line_items = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
 
-    // What does the total look like with only "bill" pattern?
-    const billOnlySum = Math.round(billPattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
-    const invoiceOnlySum = Math.round(invoicePattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
-    const otherSum = Math.round(otherPattern.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
-    const allSum = Math.round(febFiltered.reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100;
-    const dedupedSum = Math.round((billOnlySum + otherSum) * 100) / 100;
+    // 4b. Check if /invoice_line_items endpoint exists
+    try {
+      const r = await rawGetSingle("/invoice_line_items", {
+        fields: "id,amount",
+        limit: 2,
+      });
+      results.invoice_line_items = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.invoice_line_items = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
 
-    res.json({
-      field_probes: probeResults,
-      storms_feb: {
-        count: stormsFeb.length,
-        allocations: stormsFeb,
-      },
-      feb_analysis: {
-        total_allocations: febFiltered.length,
-        bill_pattern_count: billPattern.length,
-        invoice_pattern_count: invoicePattern.length,
-        other_pattern_count: otherPattern.length,
-        other_descriptions: [...new Set(otherPattern.map((a: any) => a.description))].slice(0, 10),
-        invoice_with_matching_bill: invoiceWithMatch.length,
-        invoice_without_matching_bill: invoiceWithoutMatch.length,
-        null_desc_count: otherPattern.filter((a: any) => !a.description).length,
-        null_desc_sum: Math.round(otherPattern.filter((a: any) => !a.description).reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
-        linked_count: otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).length,
-        linked_sum: Math.round(otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
-        linked_samples: otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).slice(0, 5).map((a: any) => ({ id: a.id, amount: a.amount, date: a.date, description: a.description, bill: a.bill?.number, matter: a.matter?.id })),
-        // Check if linked/null entries duplicate bill entries (same bill_id + amount)
-        linked_with_bill_match: otherPattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`)).length,
-        linked_with_bill_match_sum: Math.round(otherPattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`)).reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
-        // Also check if linked/null duplicate invoice entries
-        linked_with_invoice_match: otherPattern.filter((a: any) => {
-          const invoiceKeys2 = new Set(invoicePattern.map((i: any) => `${i.bill?.id}_${i.amount}`));
-          return invoiceKeys2.has(`${a.bill?.id}_${a.amount}`);
-        }).length,
-        // Grand dedup: for each (bill_id, amount), keep only one allocation regardless of description
-        grand_dedup_sum: (() => {
-          const seen = new Set<string>();
-          let total = 0;
-          for (const a of febFiltered) {
-            const key = `${a.bill?.id}_${a.amount}`;
-            if (!seen.has(key)) {
-              seen.add(key);
-              total += a.amount;
-            }
-          }
-          return Math.round(total * 100) / 100;
-        })(),
-        all_sum: allSum,
-        bill_only_sum: billOnlySum,
-        invoice_only_sum: invoiceOnlySum,
-        other_sum: otherSum,
-        bill_plus_invoice_deduped: Math.round((billOnlySum + invoiceOnlySum - invoiceWithMatch.reduce((s: number, a: any) => s + a.amount, 0)) * 100) / 100,
-        bill_plus_invoice_plus_linked_deduped: Math.round((billOnlySum + invoiceOnlySum - invoiceWithMatch.reduce((s: number, a: any) => s + a.amount, 0) + otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).reduce((s: number, a: any) => s + a.amount, 0)) * 100) / 100,
-      },
-    });
+    res.json(results);
   } catch (err: any) {
     res.json({ error: err.message, status: err.response?.status });
   }
