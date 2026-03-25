@@ -104,7 +104,7 @@ app.post("/messages", async (req, res) => {
 
 // --- Health Check ---
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "clio-mcp", version: "1.0.7", build: "cursor-pagination" });
+  res.json({ status: "ok", server: "clio-mcp", version: "1.1.0", build: "all-tools" });
 });
 
 // --- Debug: show query string construction ---
