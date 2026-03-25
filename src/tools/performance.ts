@@ -672,12 +672,13 @@ export function registerPerformanceTools(server: McpServer): void {
         // Collect unique matter IDs that had payments
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Fetch billed entries in one bulk call, capped at 4000 results for speed
-        // This gives accurate proportions without fetching every entry ever
+        // Fetch most recent billed entries, capped at 4000 for speed
+        // order=id(desc) ensures we get recent entries matching recent payments
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,matter{id},user{id,name}",
+          order: "id(desc)",
         };
         if (params.user_id) entryParams.user_id = params.user_id;
 
@@ -833,6 +834,7 @@ export function registerPerformanceTools(server: McpServer): void {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
+          order: "id(desc)",
         }, 4000);
 
         for (const e of entries) {
