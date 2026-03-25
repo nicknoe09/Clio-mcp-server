@@ -671,24 +671,17 @@ export function registerPerformanceTools(server: McpServer): void {
 
         // Build set of bill IDs paid in the period
         const paidBillIds = new Set(periodAllocations.map((a: any) => a.bill?.id).filter(Boolean));
-        const billIdList = [...paidBillIds];
 
-        // Step 2: Fetch billed time entries per paid bill (batched)
-        const entries: any[] = [];
-        for (let i = 0; i < billIdList.length; i += 5) {
-          const batch = billIdList.slice(i, i + 5);
-          const results = await Promise.all(batch.map((bid) => {
-            const ep: Record<string, any> = {
-              type: "TimeEntry",
-              billed: true,
-              fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
-              bill_id: bid,
-            };
-            if (params.user_id) ep.user_id = params.user_id;
-            return fetchAllPages<any>("/activities", ep);
-          }));
-          for (const r of results) entries.push(...r);
-        }
+        // Step 2: Fetch all billed time entries from last 3 years, filter to paid bills
+        const lookback = new Date(new Date(params.start_date).getTime() - 1095 * 86400000).toISOString().split("T")[0];
+        const entryParams: Record<string, any> = {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
+          created_since: `${lookback}T00:00:00+00:00`,
+        };
+        if (params.user_id) entryParams.user_id = params.user_id;
+        const entries = await fetchAllPages<any>("/activities", entryParams);
 
         // Step 3: Sum collected hours value per timekeeper
         const userResults: Record<number, {
@@ -802,22 +795,15 @@ export function registerPerformanceTools(server: McpServer): void {
         }
         const paidBillIds = new Set(Object.keys(billPaymentDate).map(Number));
 
-        // Step 2: Fetch billed time entries per paid bill (batched)
-        // Can't use a global fetch — old entries on recently-paid bills would be missed
-        const billIdList = [...paidBillIds];
-        const entries: any[] = [];
-        for (let i = 0; i < billIdList.length; i += 5) {
-          const batch = billIdList.slice(i, i + 5);
-          const results = await Promise.all(batch.map((bid) =>
-            fetchAllPages<any>("/activities", {
-              type: "TimeEntry",
-              billed: true,
-              fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
-              bill_id: bid,
-            })
-          ));
-          for (const r of results) entries.push(...r);
-        }
+        // Step 2: Fetch all billed time entries from last 3 years, filter to paid bills
+        // One bulk fetch is faster than per-bill queries
+        const lookback = new Date(new Date(params.start_date).getTime() - 1095 * 86400000).toISOString().split("T")[0];
+        const entries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
+          created_since: `${lookback}T00:00:00+00:00`,
+        });
 
         // Step 3: For each entry on a paid bill, compute collected hours value
         function getPeriodKey(dateStr: string): string {
