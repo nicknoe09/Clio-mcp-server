@@ -113,43 +113,36 @@ app.get("/debug-fields", (_req, res) => {
   res.json({ fields_input: testFields, query_string: qs, full_url: fullUrl });
 });
 
-// --- Debug: compare rawGetSingle vs fetchAllPages ---
+// --- Debug: probe Clio API endpoints ---
 app.get("/debug-clio", async (_req, res) => {
   try {
     const { rawGetSingle } = require("./clio/pagination");
     const results: Record<string, any> = {};
 
-    // Probe trust-related endpoints to find the right one
     const probes = [
-      { name: "trust_line_items", ep: "/trust_line_items", p: { fields: "id", limit: 1 } },
-      { name: "trust_requests", ep: "/trust_requests", p: { fields: "id", limit: 1 } },
-      { name: "transactions", ep: "/transactions", p: { fields: "id", limit: 1 } },
-      { name: "bank_transactions", ep: "/bank_transactions", p: { fields: "id", limit: 1 } },
-      { name: "trust_ledger_entries", ep: "/trust_ledger_entries", p: { fields: "id", limit: 1 } },
-      { name: "bank_accounts", ep: "/bank_accounts", p: { fields: "id,name,type,balance", limit: 1 } },
+      { name: "payments", ep: "/payments", p: { limit: 2 } },
+      { name: "payments_with_fields", ep: "/payments", p: { fields: "id,amount,date,description,type,matter,bill", limit: 2 } },
+      { name: "allocations", ep: "/allocations", p: { limit: 2 } },
+      { name: "line_items", ep: "/line_items", p: { limit: 2 } },
+      { name: "bill_line_items", ep: "/bill_line_items", p: { limit: 2 } },
+      { name: "credit_memos", ep: "/credit_memos", p: { limit: 2 } },
+      { name: "transactions", ep: "/transactions", p: { limit: 2 } },
+      { name: "bank_transactions", ep: "/bank_transactions", p: { limit: 2 } },
+      { name: "bills_paid_sample", ep: "/bills", p: { state: "paid", fields: "id,number,issued_at,total,balance,state,matters,updated_at", limit: 2 } },
     ];
 
     for (const { name, ep, p } of probes) {
       try {
         const r = await rawGetSingle(ep, p);
-        results[name] = { ok: true, count: r.meta?.records };
-      } catch (e: any) { results[name] = { ok: false, error: e.response?.data?.error?.message ?? e.message }; }
+        results[name] = { ok: true, count: r.meta?.records, sample: r.data };
+      } catch (e: any) {
+        results[name] = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+      }
     }
 
-    for (const [name, params] of Object.entries(probes)) {
-      try {
-        const r = await rawGetSingle(endpoints[name], params);
-        results[name] = { ok: true, count: r.meta?.records, sample: r.data?.[0] };
-      } catch (e: any) { results[name] = { ok: false, error: e.response?.data?.error?.message ?? e.message }; }
-    }
     res.json(results);
   } catch (err: any) {
-    res.json({
-      success: false,
-      error: err.message,
-      status: err.response?.status,
-      clio_error: err.response?.data,
-    });
+    res.json({ error: err.message });
   }
 });
 
