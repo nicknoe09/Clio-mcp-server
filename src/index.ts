@@ -256,11 +256,16 @@ app.get("/debug-alloc", async (_req, res) => {
       }
     }
 
-    // 2. Fetch Storms matter allocations to inspect duplicates
+    // 2. Fetch Storms matter allocations with description to find duplication pattern
+    // Matter 1770770314 is Storms, Sara (from the Paul fee_allocation output)
     const stormsAllocations = await fetchAllPages("/allocations", {
-      fields: "id,amount,date,bill{id,number},matter{id,display_number}",
-      matter_id: 1022933999,
+      fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
+      created_since: "2026-02-01T00:00:00+00:00",
     });
+    const stormsFeb = stormsAllocations.filter((a: any) =>
+      a.date >= "2026-02-01" && a.date <= "2026-02-28" &&
+      (a.matter?.display_number || "").includes("Storms")
+    );
 
     // 3. Check for negative allocations firm-wide in Feb
     const febAllocations = await fetchAllPages("/allocations", {
@@ -285,9 +290,9 @@ app.get("/debug-alloc", async (_req, res) => {
 
     res.json({
       field_probes: probeResults,
-      storms_matter: {
-        total_allocations: stormsAllocations.length,
-        sample: stormsAllocations.slice(0, 10),
+      storms_feb: {
+        count: stormsFeb.length,
+        allocations: stormsFeb,
       },
       feb_summary: {
         total: febFiltered.length,
