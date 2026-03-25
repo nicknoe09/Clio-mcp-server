@@ -277,6 +277,40 @@ app.get("/debug-billfilter", async (_req, res) => {
   }
 });
 
+// --- Debug: probe Clio reports API ---
+app.get("/debug-reports", async (_req, res) => {
+  try {
+    const { rawGetSingle } = require("./clio/pagination");
+    const results: Record<string, any> = {};
+
+    const endpoints = [
+      { name: "reports", ep: "/reports", p: { limit: 2 } },
+      { name: "report_presets", ep: "/report_presets", p: { limit: 2 } },
+      { name: "report_schedules", ep: "/report_schedules", p: { limit: 2 } },
+      { name: "billing_reports", ep: "/billing_reports", p: { limit: 2 } },
+      { name: "collection_reports", ep: "/collection_reports", p: { limit: 2 } },
+      { name: "fee_allocations", ep: "/fee_allocations", p: { limit: 2 } },
+      { name: "payment_allocations", ep: "/payment_allocations", p: { limit: 2 } },
+      { name: "line_items_minimal", ep: "/line_items", p: { fields: "id,total,quantity,price,type", limit: 2 } },
+      { name: "line_items_with_bill_user", ep: "/line_items", p: { fields: "id,total,type,bill,user", limit: 2 } },
+      { name: "line_items_default", ep: "/line_items", p: { limit: 2 } },
+    ];
+
+    for (const { name, ep, p } of endpoints) {
+      try {
+        const r = await rawGetSingle(ep, p);
+        results[name] = { ok: true, count: r.meta?.records, sample: r.data };
+      } catch (e: any) {
+        results[name] = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+      }
+    }
+
+    res.json(results);
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status });
+  }
+});
+
 // --- Debug: probe Clio API for line items and bill associations ---
 app.get("/debug-alloc", async (_req, res) => {
   try {
