@@ -670,38 +670,33 @@ export function registerPerformanceTools(server: McpServer): void {
         );
 
         // Collect unique matter IDs that had payments
-        const matterIds = [...new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean))];
+        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Fetch billed time entries PER MATTER (much faster than firm-wide fetch)
+        // Fetch billed entries in one bulk call, capped at 4000 results for speed
+        // This gives accurate proportions without fetching every entry ever
+        const entryParams: Record<string, any> = {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,quantity,price,matter{id},user{id,name}",
+        };
+        if (params.user_id) entryParams.user_id = params.user_id;
+
+        const entries = await fetchAllPages<any>("/activities", entryParams, 4000);
+
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
 
-        // Process matters in batches of 5 concurrent requests
-        for (let i = 0; i < matterIds.length; i += 5) {
-          const batch = matterIds.slice(i, i + 5);
-          const results = await Promise.all(batch.map((mid) => {
-            const ep: Record<string, any> = {
-              type: "TimeEntry",
-              billed: true,
-              fields: "id,quantity,price,user{id,name}",
-              matter_id: mid,
-            };
-            if (params.user_id) ep.user_id = params.user_id;
-            return fetchAllPages<any>("/activities", ep).then(entries => ({ mid, entries }));
-          }));
-
-          for (const { mid, entries } of results) {
-            for (const e of entries) {
-              const uid = e.user?.id ?? 0;
-              const value = (e.quantity / 3600) * (e.price || 0);
-              if (!matterUserValue[mid]) matterUserValue[mid] = {};
-              if (!matterUserValue[mid][uid]) {
-                matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
-              }
-              matterUserValue[mid][uid].value += value;
-              matterTotal[mid] = (matterTotal[mid] || 0) + value;
-            }
+        for (const e of entries) {
+          const mid = e.matter?.id ?? 0;
+          if (!matterIds.has(mid)) continue;
+          const uid = e.user?.id ?? 0;
+          const value = (e.quantity / 3600) * (e.price || 0);
+          if (!matterUserValue[mid]) matterUserValue[mid] = {};
+          if (!matterUserValue[mid][uid]) {
+            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
           }
+          matterUserValue[mid][uid].value += value;
+          matterTotal[mid] = (matterTotal[mid] || 0) + value;
         }
 
         // Allocate each payment proportionally to timekeepers
@@ -828,39 +823,33 @@ export function registerPerformanceTools(server: McpServer): void {
 
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Fetch billed time entries PER MATTER + responsible attorney lookup
-        const matterIds2 = [...new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean))];
+        // Bulk fetch billed entries capped at 4000, filter to matters with payments
+        const matterIds2 = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
         const matterResponsible: Record<number, number> = {};
 
-        for (let i = 0; i < matterIds2.length; i += 5) {
-          const batch = matterIds2.slice(i, i + 5);
-          const results = await Promise.all(batch.map((mid) =>
-            fetchAllPages<any>("/activities", {
-              type: "TimeEntry",
-              billed: true,
-              fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
-              matter_id: mid,
-            }).then(entries => ({ mid, entries }))
-          ));
+        const entries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
+        }, 4000);
 
-          for (const { mid, entries } of results) {
-            for (const e of entries) {
-              const uid = e.user?.id ?? 0;
-              const value = (e.quantity / 3600) * (e.price || 0);
+        for (const e of entries) {
+          const mid = e.matter?.id ?? 0;
+          if (!matterIds2.has(mid)) continue;
+          const uid = e.user?.id ?? 0;
+          const value = (e.quantity / 3600) * (e.price || 0);
 
-              if (!matterUserValue[mid]) matterUserValue[mid] = {};
-              if (!matterUserValue[mid][uid]) {
-                matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
-              }
-              matterUserValue[mid][uid].value += value;
-              matterTotal[mid] = (matterTotal[mid] || 0) + value;
+          if (!matterUserValue[mid]) matterUserValue[mid] = {};
+          if (!matterUserValue[mid][uid]) {
+            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+          }
+          matterUserValue[mid][uid].value += value;
+          matterTotal[mid] = (matterTotal[mid] || 0) + value;
 
-              if (e.matter?.responsible_attorney?.id) {
-                matterResponsible[mid] = e.matter.responsible_attorney.id;
-              }
-            }
+          if (e.matter?.responsible_attorney?.id) {
+            matterResponsible[mid] = e.matter.responsible_attorney.id;
           }
         }
 
