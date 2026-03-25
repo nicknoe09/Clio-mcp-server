@@ -648,4 +648,318 @@ export function registerPerformanceTools(server: McpServer): void {
       }
     }
   );
+
+  // get_fee_allocation
+  server.tool(
+    "get_fee_allocation",
+    "Fee allocation by timekeeper: for each payment received, allocates the collected amount to timekeepers based on their billed dollar contribution to the matter. Use for individual or firm-wide allocation reports.",
+    {
+      start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
+      end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
+      user_id: z.number().optional().describe("Filter to a specific timekeeper"),
+    },
+    async (params) => {
+      try {
+        // Get paid bills in the period
+        const bills = await fetchAllPages<any>("/bills", {
+          fields: "id,number,issued_at,total,state,balance,matters",
+          state: "paid",
+          created_since: `${params.start_date}T00:00:00+00:00`,
+        });
+
+        // Filter to bills issued in our date range
+        const periodBills = bills.filter((b: any) => {
+          const issued = b.issued_at;
+          return issued && issued >= params.start_date && issued <= params.end_date;
+        });
+
+        // Get all billed time entries for the same period to calculate proportions
+        const entryParams: Record<string, any> = {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,date,quantity,price,matter{id,display_number},user{id,name}",
+          created_since: `${params.start_date}T00:00:00+00:00`,
+        };
+        if (params.user_id) entryParams.user_id = params.user_id;
+
+        let entries = await fetchAllPages<any>("/activities", entryParams);
+        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
+
+        // Build matter → timekeeper billed value map
+        const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
+        const matterTotal: Record<number, number> = {};
+
+        for (const e of entries) {
+          const mid = e.matter?.id ?? 0;
+          const uid = e.user?.id ?? 0;
+          const value = (e.quantity / 3600) * (e.price || 0);
+
+          if (!matterUserValue[mid]) matterUserValue[mid] = {};
+          if (!matterUserValue[mid][uid]) {
+            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+          }
+          matterUserValue[mid][uid].value += value;
+          matterTotal[mid] = (matterTotal[mid] || 0) + value;
+        }
+
+        // Allocate each bill's collected amount proportionally
+        const userAllocations: Record<number, {
+          name: string;
+          total_allocated: number;
+          bills: { bill_id: number; bill_number: string; matter: string; collected: number; allocated: number }[];
+        }> = {};
+
+        for (const bill of periodBills) {
+          const mid = bill.matters?.[0]?.id ?? 0;
+          const matterDesc = bill.matters?.[0]?.display_number ?? "Unknown";
+          const collected = (bill.total || 0) - (bill.balance || 0);
+          if (collected <= 0) continue;
+
+          const matterTotalValue = matterTotal[mid] || 0;
+          const userValues = matterUserValue[mid] || {};
+
+          for (const [uidStr, u] of Object.entries(userValues)) {
+            const uid = parseInt(uidStr, 10);
+            const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
+            const allocated = collected * proportion;
+
+            if (!userAllocations[uid]) {
+              userAllocations[uid] = { name: u.name, total_allocated: 0, bills: [] };
+            }
+            userAllocations[uid].total_allocated += allocated;
+            userAllocations[uid].bills.push({
+              bill_id: bill.id,
+              bill_number: bill.number,
+              matter: matterDesc,
+              collected: Math.round(collected * 100) / 100,
+              allocated: Math.round(allocated * 100) / 100,
+            });
+          }
+        }
+
+        // Filter to specific user if requested
+        let results = Object.entries(userAllocations).map(([uid, u]) => ({
+          user_id: parseInt(uid, 10),
+          name: u.name,
+          total_allocated: Math.round(u.total_allocated * 100) / 100,
+          bill_count: u.bills.length,
+          bills: u.bills,
+        }));
+
+        if (params.user_id) {
+          results = results.filter((r) => r.user_id === params.user_id);
+        }
+
+        results.sort((a, b) => b.total_allocated - a.total_allocated);
+
+        const firmTotal = Math.round(results.reduce((s, r) => s + r.total_allocated, 0) * 100) / 100;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              period: { start: params.start_date, end: params.end_date },
+              total_collected: firmTotal,
+              timekeeper_count: results.length,
+              allocations: results,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // get_responsible_collections
+  server.tool(
+    "get_responsible_collections",
+    "Collections rolled up to responsible attorneys. Nick Noe gets credit for Tzipora + Kaz. Kenny Sumner gets Anna + Jonathan. Paul Romano gets Angela + Nick Fernelius. May Huynh flows to the responsible attorney on each matter.",
+    {
+      start_date: z.string().describe("Start date (YYYY-MM-DD)"),
+      end_date: z.string().describe("End date (YYYY-MM-DD)"),
+      breakdown: z
+        .enum(["none", "monthly"])
+        .optional()
+        .default("none")
+        .describe("Break results into monthly periods"),
+    },
+    async (params) => {
+      try {
+        // Responsibility map (timekeeper user_id → responsible attorney user_id)
+        const RESPONSIBILITY_MAP: Record<number, number> = {
+          // Nick Noe's reports
+          359711375: 348755029, // Tzipora Simmons → Nick Noe
+          358550509: 348755029, // Kaz Gonzalez → Nick Noe
+          // Kenny Sumner's reports
+          358108805: 344134017, // Anna Lozano → Kenny Sumner
+          360091325: 344134017, // Jonathan Barbee → Kenny Sumner
+          // Paul Romano's reports
+          358528744: 344117381, // Angela Alanis → Paul Romano
+          359380639: 344117381, // Nick Fernelius → Paul Romano
+        };
+        const MAY_HUYNH_ID = 359576660;
+
+        // Responsible attorney names for display
+        const ATTORNEY_NAMES: Record<number, string> = {
+          348755029: "Nicholas Noe",
+          344134017: "Kenny Sumner",
+          344117381: "Paul Romano",
+        };
+
+        // Get paid bills
+        const bills = await fetchAllPages<any>("/bills", {
+          fields: "id,number,issued_at,total,state,balance,matters",
+          state: "paid",
+          created_since: `${params.start_date}T00:00:00+00:00`,
+        });
+
+        const periodBills = bills.filter((b: any) => {
+          const issued = b.issued_at;
+          return issued && issued >= params.start_date && issued <= params.end_date;
+        });
+
+        // Get billed time entries
+        let entries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,date,quantity,price,matter{id,display_number,responsible_attorney},user{id,name}",
+          created_since: `${params.start_date}T00:00:00+00:00`,
+        });
+        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
+
+        // Build matter → timekeeper billed value map
+        const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
+        const matterTotal: Record<number, number> = {};
+        // Track matter → responsible_attorney for May's dynamic lookup
+        const matterResponsible: Record<number, number> = {};
+
+        for (const e of entries) {
+          const mid = e.matter?.id ?? 0;
+          const uid = e.user?.id ?? 0;
+          const value = (e.quantity / 3600) * (e.price || 0);
+
+          if (!matterUserValue[mid]) matterUserValue[mid] = {};
+          if (!matterUserValue[mid][uid]) {
+            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+          }
+          matterUserValue[mid][uid].value += value;
+          matterTotal[mid] = (matterTotal[mid] || 0) + value;
+
+          if (e.matter?.responsible_attorney?.id) {
+            matterResponsible[mid] = e.matter.responsible_attorney.id;
+          }
+        }
+
+        // Allocate and roll up to responsible attorneys
+        function getPeriodKey(dateStr: string): string {
+          return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
+        }
+
+        // Structure: responsibleId → period → amount
+        const rollup: Record<number, Record<string, number>> = {};
+
+        function addToRollup(responsibleId: number, period: string, amount: number) {
+          if (!rollup[responsibleId]) rollup[responsibleId] = {};
+          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + amount;
+        }
+
+        for (const bill of periodBills) {
+          const mid = bill.matters?.[0]?.id ?? 0;
+          const collected = (bill.total || 0) - (bill.balance || 0);
+          if (collected <= 0) continue;
+
+          const matterTotalValue = matterTotal[mid] || 0;
+          const userValues = matterUserValue[mid] || {};
+          const period = getPeriodKey(bill.issued_at);
+
+          for (const [uidStr, u] of Object.entries(userValues)) {
+            const uid = parseInt(uidStr, 10);
+            const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
+            const allocated = collected * proportion;
+
+            // Determine responsible attorney
+            let responsibleId: number;
+            if (uid === MAY_HUYNH_ID) {
+              // May flows to matter's responsible attorney
+              responsibleId = matterResponsible[mid] || uid;
+            } else if (RESPONSIBILITY_MAP[uid]) {
+              responsibleId = RESPONSIBILITY_MAP[uid];
+            } else {
+              // Self-responsible (the attorney themselves)
+              responsibleId = uid;
+            }
+
+            addToRollup(responsibleId, period, allocated);
+          }
+        }
+
+        // Format results
+        const results = Object.entries(rollup).map(([ridStr, periods]) => {
+          const rid = parseInt(ridStr, 10);
+          const totalCollections = Object.values(periods).reduce((s, v) => s + v, 0);
+
+          const result: any = {
+            responsible_attorney_id: rid,
+            name: ATTORNEY_NAMES[rid] || `User ${rid}`,
+            total_responsible_collections: Math.round(totalCollections * 100) / 100,
+          };
+
+          if (params.breakdown === "monthly") {
+            result.monthly = Object.entries(periods)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([period, amount]) => ({
+                period,
+                collections: Math.round(amount * 100) / 100,
+              }));
+          }
+
+          return result;
+        }).sort((a, b) => b.total_responsible_collections - a.total_responsible_collections);
+
+        const firmTotal = Math.round(results.reduce((s, r) => s + r.total_responsible_collections, 0) * 100) / 100;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              period: { start: params.start_date, end: params.end_date },
+              firm_total_collections: firmTotal,
+              responsible_attorneys: results,
+              responsibility_map: {
+                "Nick Noe (348755029)": "own + Tzipora Simmons + Kaz Gonzalez",
+                "Kenny Sumner (344134017)": "own + Anna Lozano + Jonathan Barbee",
+                "Paul Romano (344117381)": "own + Angela Alanis + Nick Fernelius",
+                "May Huynh (359576660)": "→ responsible attorney on each matter (dynamic)",
+              },
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

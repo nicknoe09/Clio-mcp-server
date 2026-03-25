@@ -127,13 +127,12 @@ export function registerTimeTools(server: McpServer): void {
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
         if (params.user_id) queryParams.user_id = params.user_id;
-        // Only apply date filter if explicitly provided or as safety net without narrow filter
-        if (params.start_date) {
-          queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
-        }
+        // Default to last 90 days if no start_date provided, to prevent timeouts
+        const effectiveStart = params.start_date ?? new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
+        queryParams.created_since = `${effectiveStart}T00:00:00+00:00`;
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
-        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
+        entries = entries.filter((e: any) => e.date >= effectiveStart);
 
         // Group by matter
         const byMatter: Record<
