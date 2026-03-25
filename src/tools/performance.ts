@@ -685,8 +685,14 @@ export function registerPerformanceTools(server: McpServer): void {
           return true;
         });
 
+        // Only include actual bill payments — exclude trust transfers, linked payments
+        const feeAllocations = allocations.filter((a: any) => {
+          const desc = a.description || "";
+          return desc.startsWith("Payment for bill") || desc.startsWith("Payment for invoice");
+        });
+
         // Collect unique matter IDs that had payments
-        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
+        const matterIds = new Set(feeAllocations.map((a: any) => a.matter?.id).filter(Boolean));
 
         // Fetch most recent billed entries, capped at 4000 for speed
         // order=id(desc) ensures we get recent entries matching recent payments
@@ -723,7 +729,7 @@ export function registerPerformanceTools(server: McpServer): void {
           payments: { date: string; bill_number: string; matter: string; payment_amount: number; allocated: number }[];
         }> = {};
 
-        for (const alloc of allocations) {
+        for (const alloc of feeAllocations) {
           const mid = alloc.matter?.id ?? 0;
           const matterDesc = alloc.matter?.display_number ?? "Unknown";
           const billNumber = alloc.bill?.number ?? "N/A";
@@ -843,6 +849,13 @@ export function registerPerformanceTools(server: McpServer): void {
           return true;
         });
 
+        // Only include actual bill payments — exclude trust transfers, linked payments, etc.
+        // Clio's Fee Allocation Report only includes "Payment for bill/invoice #X" allocations.
+        const feeAllocations = allocations.filter((a: any) => {
+          const desc = a.description || "";
+          return desc.startsWith("Payment for bill") || desc.startsWith("Payment for invoice");
+        });
+
         // Attribute full payment to the matter's responsible attorney
         function getPeriodKey(dateStr: string): string {
           return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
@@ -850,7 +863,7 @@ export function registerPerformanceTools(server: McpServer): void {
 
         const rollup: Record<number, Record<string, number>> = {};
 
-        for (const alloc of allocations) {
+        for (const alloc of feeAllocations) {
           const responsibleId = alloc.matter?.responsible_attorney?.id;
           if (!responsibleId) continue;
 
