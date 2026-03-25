@@ -672,16 +672,16 @@ export function registerPerformanceTools(server: McpServer): void {
         // Build set of bill IDs paid in the period
         const paidBillIds = new Set(periodAllocations.map((a: any) => a.bill?.id).filter(Boolean));
 
-        // Step 2: Fetch billed time entries (1yr lookback, capped at 10000)
-        const lookback = new Date(new Date(params.start_date).getTime() - 365 * 86400000).toISOString().split("T")[0];
+        // Step 2: Fetch 4000 newest billed entries (20 pages ≈ 10s)
+        // bill_id filter doesn't work on Clio — must fetch bulk + filter client-side
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
-          created_since: `${lookback}T00:00:00+00:00`,
+          order: "id(desc)",
         };
         if (params.user_id) entryParams.user_id = params.user_id;
-        const allEntries = await fetchAllPages<any>("/activities", entryParams, 10000);
+        const allEntries = await fetchAllPages<any>("/activities", entryParams, 4000);
 
         // Filter to entries on paid bills
         const entries = allEntries.filter((e: any) => e.bill?.id && paidBillIds.has(e.bill.id));
@@ -798,15 +798,15 @@ export function registerPerformanceTools(server: McpServer): void {
         }
         const paidBillIds = new Set(Object.keys(billPaymentDate).map(Number));
 
-        // Step 2: Fetch billed time entries (1yr lookback, capped at 10000)
-        // bill_id filter doesn't work on Clio activities — must fetch bulk + filter client-side
-        const lookback = new Date(new Date(params.start_date).getTime() - 365 * 86400000).toISOString().split("T")[0];
+        // Step 2: Fetch newest billed entries (4000 cap ≈ 20 pages ≈ 10s)
+        // bill_id filter doesn't work — must fetch bulk + filter client-side
+        // id(desc) gets newest entries first to maximize coverage of recent bills
         const allEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
-          created_since: `${lookback}T00:00:00+00:00`,
-        }, 10000);
+          order: "id(desc)",
+        }, 4000);
 
         // Filter to entries on paid bills
         const entries = allEntries.filter((e: any) => e.bill?.id && paidBillIds.has(e.bill.id));
