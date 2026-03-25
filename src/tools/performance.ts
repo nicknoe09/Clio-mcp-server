@@ -671,17 +671,24 @@ export function registerPerformanceTools(server: McpServer): void {
 
         // Build set of bill IDs paid in the period
         const paidBillIds = new Set(periodAllocations.map((a: any) => a.bill?.id).filter(Boolean));
+        const billIdList = [...paidBillIds];
 
-        // Step 2: Fetch billed time entries that are on paid bills
-        const entryParams: Record<string, any> = {
-          type: "TimeEntry",
-          billed: true,
-          fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
-          order: "id(desc)",
-        };
-        if (params.user_id) entryParams.user_id = params.user_id;
-
-        const entries = await fetchAllPages<any>("/activities", entryParams, 6000);
+        // Step 2: Fetch billed time entries per paid bill (batched)
+        const entries: any[] = [];
+        for (let i = 0; i < billIdList.length; i += 5) {
+          const batch = billIdList.slice(i, i + 5);
+          const results = await Promise.all(batch.map((bid) => {
+            const ep: Record<string, any> = {
+              type: "TimeEntry",
+              billed: true,
+              fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
+              bill_id: bid,
+            };
+            if (params.user_id) ep.user_id = params.user_id;
+            return fetchAllPages<any>("/activities", ep);
+          }));
+          for (const r of results) entries.push(...r);
+        }
 
         // Step 3: Sum collected hours value per timekeeper
         const userResults: Record<number, {
@@ -781,7 +788,7 @@ export function registerPerformanceTools(server: McpServer): void {
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const periodAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+          a.date && a.date >= params.start_date && a.date <= params.end_date
         );
 
         // Build bill_id → payment date map (use latest payment date per bill)
@@ -795,14 +802,22 @@ export function registerPerformanceTools(server: McpServer): void {
         }
         const paidBillIds = new Set(Object.keys(billPaymentDate).map(Number));
 
-        // Step 2: Fetch billed time entries that are on paid bills
-        // Activities link to bills via bill{id} — fetch recent billed entries
-        const entries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          billed: true,
-          fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
-          order: "id(desc)",
-        }, 6000);
+        // Step 2: Fetch billed time entries per paid bill (batched)
+        // Can't use a global fetch — old entries on recently-paid bills would be missed
+        const billIdList = [...paidBillIds];
+        const entries: any[] = [];
+        for (let i = 0; i < billIdList.length; i += 5) {
+          const batch = billIdList.slice(i, i + 5);
+          const results = await Promise.all(batch.map((bid) =>
+            fetchAllPages<any>("/activities", {
+              type: "TimeEntry",
+              billed: true,
+              fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
+              bill_id: bid,
+            })
+          ));
+          for (const r of results) entries.push(...r);
+        }
 
         // Step 3: For each entry on a paid bill, compute collected hours value
         function getPeriodKey(dateStr: string): string {
