@@ -134,3 +134,73 @@ export async function rawGetSingle(
     }
   });
 }
+
+/**
+ * Make a raw HTTPS POST request, bypassing axios entirely.
+ */
+function rawPost(fullUrl: string, body: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(fullUrl);
+    const data = JSON.stringify(body);
+
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${getAccessToken()}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let responseBody = "";
+      res.on("data", (chunk) => (responseBody += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = responseBody ? JSON.parse(responseBody) : {};
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+            err.response = { status: res.statusCode, data: parsed, headers: res.headers };
+            reject(err);
+          }
+        } catch (parseErr) {
+          const err: any = new Error(`Request failed with status ${res.statusCode}: ${responseBody.slice(0, 200)}`);
+          err.response = { status: res.statusCode, data: responseBody.slice(0, 500), headers: res.headers };
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * POST a resource to Clio. Returns the full JSON response body.
+ */
+export async function rawPostSingle(
+  url: string,
+  body: any
+): Promise<any> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const fullUrl = `${baseUrl}${url}`;
+
+  return withBackoff(async () => {
+    try {
+      return await rawPost(fullUrl, body);
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        await refreshAccessToken();
+        return await rawPost(fullUrl, body);
+      }
+      throw err;
+    }
+  });
+}

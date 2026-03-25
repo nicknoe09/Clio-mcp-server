@@ -652,7 +652,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_fee_allocation
   server.tool(
     "get_fee_allocation",
-    "Fee allocation by timekeeper: for each payment received, allocates the collected amount to timekeepers based on their billed dollar contribution to the matter. Use for individual or firm-wide allocation reports.",
+    "Fee allocation by timekeeper: uses Clio allocations (actual payment dates) to attribute collected amounts to timekeepers based on their billed dollar contribution to each matter.",
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
@@ -660,37 +660,36 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Get paid bills in the period
-        const bills = await fetchAllPages<any>("/bills", {
-          fields: "id,number,issued_at,total,state,balance,matters",
-          state: "paid",
+        // Get allocations (actual payments) in the date range
+        const allAllocations = await fetchAllPages<any>("/allocations", {
+          fields: "id,amount,date,bill{id,number},matter{id,display_number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
+        const allocations = allAllocations.filter((a: any) =>
+          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+        );
 
-        // Filter to bills issued in our date range
-        const periodBills = bills.filter((b: any) => {
-          const issued = b.issued_at;
-          return issued && issued >= params.start_date && issued <= params.end_date;
-        });
+        // Collect all matter IDs that had payments
+        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Get all billed time entries for the same period to calculate proportions
+        // Get billed time entries for those matters to calculate proportions
+        // Fetch ALL billed entries (not date-limited) since the bill could cover old work
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
-          fields: "id,date,quantity,price,matter{id,display_number},user{id,name}",
-          created_since: `${params.start_date}T00:00:00+00:00`,
+          fields: "id,quantity,price,matter{id},user{id,name}",
         };
         if (params.user_id) entryParams.user_id = params.user_id;
 
-        let entries = await fetchAllPages<any>("/activities", entryParams);
-        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
+        const entries = await fetchAllPages<any>("/activities", entryParams);
 
-        // Build matter → timekeeper billed value map
+        // Build matter → timekeeper billed $ map
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
 
         for (const e of entries) {
           const mid = e.matter?.id ?? 0;
+          if (!matterIds.has(mid)) continue; // Only care about matters with payments
           const uid = e.user?.id ?? 0;
           const value = (e.quantity / 3600) * (e.price || 0);
 
@@ -702,18 +701,18 @@ export function registerPerformanceTools(server: McpServer): void {
           matterTotal[mid] = (matterTotal[mid] || 0) + value;
         }
 
-        // Allocate each bill's collected amount proportionally
-        const userAllocations: Record<number, {
+        // Allocate each payment proportionally to timekeepers
+        const userResults: Record<number, {
           name: string;
           total_allocated: number;
-          bills: { bill_id: number; bill_number: string; matter: string; collected: number; allocated: number }[];
+          payments: { date: string; bill_number: string; matter: string; payment_amount: number; allocated: number }[];
         }> = {};
 
-        for (const bill of periodBills) {
-          const mid = bill.matters?.[0]?.id ?? 0;
-          const matterDesc = bill.matters?.[0]?.display_number ?? "Unknown";
-          const collected = (bill.total || 0) - (bill.balance || 0);
-          if (collected <= 0) continue;
+        for (const alloc of allocations) {
+          const mid = alloc.matter?.id ?? 0;
+          const matterDesc = alloc.matter?.display_number ?? "Unknown";
+          const billNumber = alloc.bill?.number ?? "N/A";
+          const amount = alloc.amount;
 
           const matterTotalValue = matterTotal[mid] || 0;
           const userValues = matterUserValue[mid] || {};
@@ -721,29 +720,28 @@ export function registerPerformanceTools(server: McpServer): void {
           for (const [uidStr, u] of Object.entries(userValues)) {
             const uid = parseInt(uidStr, 10);
             const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
-            const allocated = collected * proportion;
+            const allocated = amount * proportion;
 
-            if (!userAllocations[uid]) {
-              userAllocations[uid] = { name: u.name, total_allocated: 0, bills: [] };
+            if (!userResults[uid]) {
+              userResults[uid] = { name: u.name, total_allocated: 0, payments: [] };
             }
-            userAllocations[uid].total_allocated += allocated;
-            userAllocations[uid].bills.push({
-              bill_id: bill.id,
-              bill_number: bill.number,
+            userResults[uid].total_allocated += allocated;
+            userResults[uid].payments.push({
+              date: alloc.date,
+              bill_number: billNumber,
               matter: matterDesc,
-              collected: Math.round(collected * 100) / 100,
+              payment_amount: Math.round(amount * 100) / 100,
               allocated: Math.round(allocated * 100) / 100,
             });
           }
         }
 
-        // Filter to specific user if requested
-        let results = Object.entries(userAllocations).map(([uid, u]) => ({
+        let results = Object.entries(userResults).map(([uid, u]) => ({
           user_id: parseInt(uid, 10),
           name: u.name,
           total_allocated: Math.round(u.total_allocated * 100) / 100,
-          bill_count: u.bills.length,
-          bills: u.bills,
+          payment_count: u.payments.length,
+          payments: u.payments,
         }));
 
         if (params.user_id) {
@@ -751,7 +749,6 @@ export function registerPerformanceTools(server: McpServer): void {
         }
 
         results.sort((a, b) => b.total_allocated - a.total_allocated);
-
         const firmTotal = Math.round(results.reduce((s, r) => s + r.total_allocated, 0) * 100) / 100;
 
         return {
@@ -785,7 +782,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_responsible_collections
   server.tool(
     "get_responsible_collections",
-    "Collections rolled up to responsible attorneys. Nick Noe gets credit for Tzipora + Kaz. Kenny Sumner gets Anna + Jonathan. Paul Romano gets Angela + Nick Fernelius. May Huynh flows to the responsible attorney on each matter.",
+    "Collections rolled up to responsible attorneys using actual payment dates from Clio allocations. Nick Noe gets credit for Tzipora + Kaz. Kenny Sumner gets Anna + Jonathan. Paul Romano gets Angela + Nick Fernelius. May Huynh flows to the responsible attorney on each matter.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
@@ -811,38 +808,32 @@ export function registerPerformanceTools(server: McpServer): void {
         };
         const MAY_HUYNH_ID = 359576660;
 
-        // Responsible attorney names for display
         const ATTORNEY_NAMES: Record<number, string> = {
           348755029: "Nicholas Noe",
           344134017: "Kenny Sumner",
           344117381: "Paul Romano",
         };
 
-        // Get paid bills
-        const bills = await fetchAllPages<any>("/bills", {
-          fields: "id,number,issued_at,total,state,balance,matters",
-          state: "paid",
+        // Get allocations (actual payment dates) in the period
+        const allAllocations = await fetchAllPages<any>("/allocations", {
+          fields: "id,amount,date,bill{id,number},matter{id,display_number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
+        const allocations = allAllocations.filter((a: any) =>
+          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+        );
 
-        const periodBills = bills.filter((b: any) => {
-          const issued = b.issued_at;
-          return issued && issued >= params.start_date && issued <= params.end_date;
-        });
+        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Get billed time entries
-        let entries = await fetchAllPages<any>("/activities", {
+        // Get billed time entries to calculate proportions + responsible attorney lookup
+        const entries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           billed: true,
-          fields: "id,date,quantity,price,matter{id,display_number,responsible_attorney},user{id,name}",
-          created_since: `${params.start_date}T00:00:00+00:00`,
+          fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
         });
-        entries = entries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
 
-        // Build matter → timekeeper billed value map
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
-        // Track matter → responsible_attorney for May's dynamic lookup
         const matterResponsible: Record<number, number> = {};
 
         for (const e of entries) {
@@ -875,29 +866,27 @@ export function registerPerformanceTools(server: McpServer): void {
           rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + amount;
         }
 
-        for (const bill of periodBills) {
-          const mid = bill.matters?.[0]?.id ?? 0;
-          const collected = (bill.total || 0) - (bill.balance || 0);
-          if (collected <= 0) continue;
+        for (const alloc of allocations) {
+          const mid = alloc.matter?.id ?? 0;
+          const amount = alloc.amount;
+          if (amount <= 0) continue;
 
           const matterTotalValue = matterTotal[mid] || 0;
           const userValues = matterUserValue[mid] || {};
-          const period = getPeriodKey(bill.issued_at);
+          const period = getPeriodKey(alloc.date);
 
           for (const [uidStr, u] of Object.entries(userValues)) {
             const uid = parseInt(uidStr, 10);
             const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
-            const allocated = collected * proportion;
+            const allocated = amount * proportion;
 
             // Determine responsible attorney
             let responsibleId: number;
             if (uid === MAY_HUYNH_ID) {
-              // May flows to matter's responsible attorney
               responsibleId = matterResponsible[mid] || uid;
             } else if (RESPONSIBILITY_MAP[uid]) {
               responsibleId = RESPONSIBILITY_MAP[uid];
             } else {
-              // Self-responsible (the attorney themselves)
               responsibleId = uid;
             }
 
