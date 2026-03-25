@@ -76,7 +76,8 @@ function rawGet(fullUrl: string): Promise<any> {
  */
 export async function fetchAllPages<T>(
   url: string,
-  params: Record<string, any> = {}
+  params: Record<string, any> = {},
+  maxResults?: number
 ): Promise<T[]> {
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const results: T[] = [];
@@ -102,6 +103,11 @@ export async function fetchAllPages<T>(
 
     const items = data.data ?? [];
     results.push(...items);
+
+    // Stop early if we've hit the max results cap
+    if (maxResults && results.length >= maxResults) {
+      return results.slice(0, maxResults);
+    }
 
     // Follow Clio's next URL directly (cursor pagination)
     nextUrl = data.meta?.paging?.next ?? undefined;

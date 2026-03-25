@@ -212,7 +212,8 @@ export function registerMatterTools(server: McpServer): void {
           matterParams.responsible_attorney_id = params.responsible_attorney_id;
         }
 
-        const matters = await fetchAllPages<any>("/matters", matterParams);
+        // Cap at 500 open matters to prevent timeout — most firms won't exceed this
+        const matters = await fetchAllPages<any>("/matters", matterParams, 500);
 
         // Step 3: Filter to stale matters and apply limit
         const staleMatterResults: any[] = [];

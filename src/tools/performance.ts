@@ -672,12 +672,14 @@ export function registerPerformanceTools(server: McpServer): void {
         // Collect all matter IDs that had payments
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Get billed time entries for those matters to calculate proportions
-        // Fetch ALL billed entries (not date-limited) since the bill could cover old work
+        // Get billed time entries to calculate proportions
+        // Limit to 2 years back from start_date to keep response times reasonable
+        const lookbackDate = new Date(new Date(params.start_date).getTime() - 730 * 86400000).toISOString().split("T")[0];
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,matter{id},user{id,name}",
+          created_since: `${lookbackDate}T00:00:00+00:00`,
         };
         if (params.user_id) entryParams.user_id = params.user_id;
 
@@ -826,10 +828,13 @@ export function registerPerformanceTools(server: McpServer): void {
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
         // Get billed time entries to calculate proportions + responsible attorney lookup
+        // Limit to 2 years back from start_date
+        const lookbackDate2 = new Date(new Date(params.start_date).getTime() - 730 * 86400000).toISOString().split("T")[0];
         const entries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
+          created_since: `${lookbackDate2}T00:00:00+00:00`,
         });
 
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
