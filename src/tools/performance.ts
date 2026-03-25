@@ -811,6 +811,10 @@ export function registerPerformanceTools(server: McpServer): void {
           348755029: "Nicholas Noe",
           344134017: "Kenny Sumner",
           344117381: "Paul Romano",
+          359865560: "Courteney Daniel",
+          360049685: "Gus Vlahadamis",
+          359138569: "Christopher Winiecki",
+          359576660: "May Huynh",
         };
 
         // Get allocations (actual payment dates) in the period
