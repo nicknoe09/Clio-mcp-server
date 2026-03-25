@@ -170,7 +170,7 @@ export function registerMatterTools(server: McpServer): void {
         // Step 1: Fetch time entries from the last 180 days (or days_inactive,
         // whichever is larger) to find which matters have had recent activity.
         // This is bounded and much cheaper than fetching all open matters.
-        const lookbackDays = Math.max(params.days_inactive, 180);
+        const lookbackDays = Math.max(params.days_inactive, 60);
         const lookbackDate = new Date();
         lookbackDate.setDate(lookbackDate.getDate() - lookbackDays);
         const lookbackStr = lookbackDate.toISOString().split("T")[0];

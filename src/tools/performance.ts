@@ -669,38 +669,39 @@ export function registerPerformanceTools(server: McpServer): void {
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
 
-        // Collect all matter IDs that had payments
-        const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
+        // Collect unique matter IDs that had payments
+        const matterIds = [...new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean))];
 
-        // Get billed time entries to calculate proportions
-        // Limit to 2 years back from start_date to keep response times reasonable
-        const lookbackDate = new Date(new Date(params.start_date).getTime() - 730 * 86400000).toISOString().split("T")[0];
-        const entryParams: Record<string, any> = {
-          type: "TimeEntry",
-          billed: true,
-          fields: "id,quantity,price,matter{id},user{id,name}",
-          created_since: `${lookbackDate}T00:00:00+00:00`,
-        };
-        if (params.user_id) entryParams.user_id = params.user_id;
-
-        const entries = await fetchAllPages<any>("/activities", entryParams);
-
-        // Build matter → timekeeper billed $ map
+        // Fetch billed time entries PER MATTER (much faster than firm-wide fetch)
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
 
-        for (const e of entries) {
-          const mid = e.matter?.id ?? 0;
-          if (!matterIds.has(mid)) continue; // Only care about matters with payments
-          const uid = e.user?.id ?? 0;
-          const value = (e.quantity / 3600) * (e.price || 0);
+        // Process matters in batches of 5 concurrent requests
+        for (let i = 0; i < matterIds.length; i += 5) {
+          const batch = matterIds.slice(i, i + 5);
+          const results = await Promise.all(batch.map((mid) => {
+            const ep: Record<string, any> = {
+              type: "TimeEntry",
+              billed: true,
+              fields: "id,quantity,price,user{id,name}",
+              matter_id: mid,
+            };
+            if (params.user_id) ep.user_id = params.user_id;
+            return fetchAllPages<any>("/activities", ep).then(entries => ({ mid, entries }));
+          }));
 
-          if (!matterUserValue[mid]) matterUserValue[mid] = {};
-          if (!matterUserValue[mid][uid]) {
-            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+          for (const { mid, entries } of results) {
+            for (const e of entries) {
+              const uid = e.user?.id ?? 0;
+              const value = (e.quantity / 3600) * (e.price || 0);
+              if (!matterUserValue[mid]) matterUserValue[mid] = {};
+              if (!matterUserValue[mid][uid]) {
+                matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+              }
+              matterUserValue[mid][uid].value += value;
+              matterTotal[mid] = (matterTotal[mid] || 0) + value;
+            }
           }
-          matterUserValue[mid][uid].value += value;
-          matterTotal[mid] = (matterTotal[mid] || 0) + value;
         }
 
         // Allocate each payment proportionally to timekeepers
@@ -827,34 +828,39 @@ export function registerPerformanceTools(server: McpServer): void {
 
         const matterIds = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
 
-        // Get billed time entries to calculate proportions + responsible attorney lookup
-        // Limit to 2 years back from start_date
-        const lookbackDate2 = new Date(new Date(params.start_date).getTime() - 730 * 86400000).toISOString().split("T")[0];
-        const entries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          billed: true,
-          fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
-          created_since: `${lookbackDate2}T00:00:00+00:00`,
-        });
-
+        // Fetch billed time entries PER MATTER + responsible attorney lookup
+        const matterIds2 = [...new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean))];
         const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
         const matterTotal: Record<number, number> = {};
         const matterResponsible: Record<number, number> = {};
 
-        for (const e of entries) {
-          const mid = e.matter?.id ?? 0;
-          const uid = e.user?.id ?? 0;
-          const value = (e.quantity / 3600) * (e.price || 0);
+        for (let i = 0; i < matterIds2.length; i += 5) {
+          const batch = matterIds2.slice(i, i + 5);
+          const results = await Promise.all(batch.map((mid) =>
+            fetchAllPages<any>("/activities", {
+              type: "TimeEntry",
+              billed: true,
+              fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
+              matter_id: mid,
+            }).then(entries => ({ mid, entries }))
+          ));
 
-          if (!matterUserValue[mid]) matterUserValue[mid] = {};
-          if (!matterUserValue[mid][uid]) {
-            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
-          }
-          matterUserValue[mid][uid].value += value;
-          matterTotal[mid] = (matterTotal[mid] || 0) + value;
+          for (const { mid, entries } of results) {
+            for (const e of entries) {
+              const uid = e.user?.id ?? 0;
+              const value = (e.quantity / 3600) * (e.price || 0);
 
-          if (e.matter?.responsible_attorney?.id) {
-            matterResponsible[mid] = e.matter.responsible_attorney.id;
+              if (!matterUserValue[mid]) matterUserValue[mid] = {};
+              if (!matterUserValue[mid][uid]) {
+                matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
+              }
+              matterUserValue[mid][uid].value += value;
+              matterTotal[mid] = (matterTotal[mid] || 0) + value;
+
+              if (e.matter?.responsible_attorney?.id) {
+                matterResponsible[mid] = e.matter.responsible_attorney.id;
+              }
+            }
           }
         }
 
