@@ -21,8 +21,8 @@ export function registerCalendarTools(server: McpServer): void {
       try {
         const queryParams: Record<string, any> = {
           fields: CALENDAR_FIELDS,
-          from: params.start_date,
-          to: params.end_date,
+          from: `${params.start_date}T00:00:00+00:00`,
+          to: `${params.end_date}T23:59:59+00:00`,
         };
         if (params.user_id) queryParams.calendar_owner_id = params.user_id;
         if (params.matter_id) queryParams.matter_id = params.matter_id;

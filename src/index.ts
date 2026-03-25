@@ -161,8 +161,8 @@ app.get("/debug-test", async (req, res) => {
     if (tool === "calendar") {
       const entries = await fetchAllPages("/calendar_entries", {
         fields: "id,summary,start_at,end_at,matter{id,display_number},calendar_owner{id,name}",
-        from: "2026-03-01",
-        to: "2026-03-31",
+        from: "2026-03-01T00:00:00+00:00",
+        to: "2026-03-31T23:59:59+00:00",
         limit: 5,
       });
       res.json({ ok: true, count: entries.length, sample: entries.slice(0, 3) });
