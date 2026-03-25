@@ -797,7 +797,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_responsible_collections
   server.tool(
     "get_responsible_collections",
-    "Collections rolled up to responsible attorneys using actual payment dates from Clio allocations. Nick Noe gets credit for Tzipora + Kaz. Kenny Sumner gets Anna + Jonathan. Paul Romano gets Angela + Nick Fernelius. May Huynh flows to the responsible attorney on each matter.",
+    "Collections by responsible attorney. Matches Clio's Fee Allocation Report filtered by responsible attorney. The FULL payment amount is attributed to the matter's responsible attorney — no pro-rating by timekeeper.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
@@ -809,20 +809,6 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Responsibility map (timekeeper user_id → responsible attorney user_id)
-        const RESPONSIBILITY_MAP: Record<number, number> = {
-          // Nick Noe's reports
-          359711375: 348755029, // Tzipora Simmons → Nick Noe
-          358550509: 348755029, // Kaz Gonzalez → Nick Noe
-          // Kenny Sumner's reports
-          358108805: 344134017, // Anna Lozano → Kenny Sumner
-          360091325: 344134017, // Jonathan Barbee → Kenny Sumner
-          // Paul Romano's reports
-          358528744: 344117381, // Angela Alanis → Paul Romano
-          359380639: 344117381, // Nick Fernelius → Paul Romano
-        };
-        const MAY_HUYNH_ID = 359576660;
-
         const ATTORNEY_NAMES: Record<number, string> = {
           348755029: "Nicholas Noe",
           344134017: "Kenny Sumner",
@@ -833,16 +819,16 @@ export function registerPerformanceTools(server: McpServer): void {
           359576660: "May Huynh",
         };
 
-        // Get allocations (actual payment dates) in the period, include description for dedup
+        // Fetch allocations with matter's responsible_attorney
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
+          fields: "id,amount,date,description,bill{id,number},matter{id,display_number,responsible_attorney}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const rawAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
 
-        // Dedup: same logic as get_fee_allocation
+        // Dedup bill/invoice duplicates
         const billPatternKeys = new Set(
           rawAllocations
             .filter((a: any) => (a.description || "").startsWith("Payment for bill"))
@@ -857,79 +843,22 @@ export function registerPerformanceTools(server: McpServer): void {
           return true;
         });
 
-        // Bulk fetch billed entries capped at 4000, filter to matters with payments
-        const matterIds2 = new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean));
-        const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
-        const matterTotal: Record<number, number> = {};
-        const matterResponsible: Record<number, number> = {};
-
-        const entries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          billed: true,
-          fields: "id,quantity,price,matter{id,responsible_attorney},user{id,name}",
-          order: "id(desc)",
-        }, 4000);
-
-        for (const e of entries) {
-          const mid = e.matter?.id ?? 0;
-          if (!matterIds2.has(mid)) continue;
-          const uid = e.user?.id ?? 0;
-          const value = (e.quantity / 3600) * (e.price || 0);
-
-          if (!matterUserValue[mid]) matterUserValue[mid] = {};
-          if (!matterUserValue[mid][uid]) {
-            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
-          }
-          matterUserValue[mid][uid].value += value;
-          matterTotal[mid] = (matterTotal[mid] || 0) + value;
-
-          if (e.matter?.responsible_attorney?.id) {
-            matterResponsible[mid] = e.matter.responsible_attorney.id;
-          }
-        }
-
-        // Allocate and roll up to responsible attorneys
+        // Attribute full payment to the matter's responsible attorney
         function getPeriodKey(dateStr: string): string {
           return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
         }
 
-        // Structure: responsibleId → period → amount
         const rollup: Record<number, Record<string, number>> = {};
 
-        function addToRollup(responsibleId: number, period: string, amount: number) {
-          if (!rollup[responsibleId]) rollup[responsibleId] = {};
-          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + amount;
-        }
-
         for (const alloc of allocations) {
-          const mid = alloc.matter?.id ?? 0;
-          const amount = alloc.amount;
-          if (amount <= 0) continue;
+          const responsibleId = alloc.matter?.responsible_attorney?.id;
+          if (!responsibleId) continue;
 
-          const matterTotalValue = matterTotal[mid] || 0;
-          const userValues = matterUserValue[mid] || {};
           const period = getPeriodKey(alloc.date);
-
-          for (const [uidStr, u] of Object.entries(userValues)) {
-            const uid = parseInt(uidStr, 10);
-            const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
-            const allocated = amount * proportion;
-
-            // Determine responsible attorney
-            let responsibleId: number;
-            if (uid === MAY_HUYNH_ID) {
-              responsibleId = matterResponsible[mid] || uid;
-            } else if (RESPONSIBILITY_MAP[uid]) {
-              responsibleId = RESPONSIBILITY_MAP[uid];
-            } else {
-              responsibleId = uid;
-            }
-
-            addToRollup(responsibleId, period, allocated);
-          }
+          if (!rollup[responsibleId]) rollup[responsibleId] = {};
+          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + alloc.amount;
         }
 
-        // Format results
         const results = Object.entries(rollup).map(([ridStr, periods]) => {
           const rid = parseInt(ridStr, 10);
           const totalCollections = Object.values(periods).reduce((s, v) => s + v, 0);
@@ -961,12 +890,6 @@ export function registerPerformanceTools(server: McpServer): void {
               period: { start: params.start_date, end: params.end_date },
               firm_total_collections: firmTotal,
               responsible_attorneys: results,
-              responsibility_map: {
-                "Nick Noe (348755029)": "own + Tzipora Simmons + Kaz Gonzalez",
-                "Kenny Sumner (344134017)": "own + Anna Lozano + Jonathan Barbee",
-                "Paul Romano (344117381)": "own + Angela Alanis + Nick Fernelius",
-                "May Huynh (359576660)": "→ responsible attorney on each matter (dynamic)",
-              },
             }, null, 2),
           }],
         };
