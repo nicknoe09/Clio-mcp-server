@@ -313,6 +313,27 @@ app.get("/debug-alloc", async (_req, res) => {
         linked_count: otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).length,
         linked_sum: Math.round(otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
         linked_samples: otherPattern.filter((a: any) => (a.description || "").startsWith("Linked")).slice(0, 5).map((a: any) => ({ id: a.id, amount: a.amount, date: a.date, description: a.description, bill: a.bill?.number, matter: a.matter?.id })),
+        // Check if linked/null entries duplicate bill entries (same bill_id + amount)
+        linked_with_bill_match: otherPattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`)).length,
+        linked_with_bill_match_sum: Math.round(otherPattern.filter((a: any) => billKeys.has(`${a.bill?.id}_${a.amount}`)).reduce((s: number, a: any) => s + a.amount, 0) * 100) / 100,
+        // Also check if linked/null duplicate invoice entries
+        linked_with_invoice_match: otherPattern.filter((a: any) => {
+          const invoiceKeys2 = new Set(invoicePattern.map((i: any) => `${i.bill?.id}_${i.amount}`));
+          return invoiceKeys2.has(`${a.bill?.id}_${a.amount}`);
+        }).length,
+        // Grand dedup: for each (bill_id, amount), keep only one allocation regardless of description
+        grand_dedup_sum: (() => {
+          const seen = new Set<string>();
+          let total = 0;
+          for (const a of febFiltered) {
+            const key = `${a.bill?.id}_${a.amount}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              total += a.amount;
+            }
+          }
+          return Math.round(total * 100) / 100;
+        })(),
         all_sum: allSum,
         bill_only_sum: billOnlySum,
         invoice_only_sum: invoiceOnlySum,
