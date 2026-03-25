@@ -652,7 +652,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_fee_allocation
   server.tool(
     "get_fee_allocation",
-    "Fee allocation by timekeeper: uses Clio allocations (actual payment dates) to attribute collected amounts to timekeepers based on their billed dollar contribution to each matter.",
+    "Fee allocation by timekeeper. Replicates Clio's Fee Allocation Report: finds bills paid in the period, then attributes collected hours value to each timekeeper based on their time entries on those bills.",
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
@@ -660,126 +660,76 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Get allocations (actual payments) in the date range, include description for dedup
+        // Step 1: Get allocations to find which bills were paid and when
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,amount,date,description,bill{id,number},matter{id,display_number}",
+          fields: "id,date,bill{id}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
-        const rawAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+        const periodAllocations = allAllocations.filter((a: any) =>
+          a.date && a.date >= params.start_date && a.date <= params.end_date
         );
 
-        // Dedup: Clio sometimes creates both "Payment for bill #X" and "Payment for invoice #X"
-        // for the same payment. If same (bill_id, amount) has both patterns, keep only the "bill" one.
-        const billPatternKeys = new Set(
-          rawAllocations
-            .filter((a: any) => (a.description || "").startsWith("Payment for bill"))
-            .map((a: any) => `${a.bill?.id}_${a.amount}`)
-        );
-        const allocations = rawAllocations.filter((a: any) => {
-          const desc = a.description || "";
-          if (desc.startsWith("Payment for invoice")) {
-            const key = `${a.bill?.id}_${a.amount}`;
-            if (billPatternKeys.has(key)) return false; // duplicate — bill version exists
-          }
-          return true;
-        });
+        // Build set of bill IDs paid in the period
+        const paidBillIds = new Set(periodAllocations.map((a: any) => a.bill?.id).filter(Boolean));
 
-        // Only include actual bill payments — exclude trust transfers, linked payments
-        const feeAllocations = allocations.filter((a: any) => {
-          const desc = a.description || "";
-          return desc.startsWith("Payment for bill") || desc.startsWith("Payment for invoice");
-        });
-
-        // Collect unique matter IDs that had payments
-        const matterIds = new Set(feeAllocations.map((a: any) => a.matter?.id).filter(Boolean));
-
-        // Fetch most recent billed entries, capped at 4000 for speed
-        // order=id(desc) ensures we get recent entries matching recent payments
+        // Step 2: Fetch billed time entries that are on paid bills
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
-          fields: "id,quantity,price,matter{id},user{id,name}",
+          fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
           order: "id(desc)",
         };
         if (params.user_id) entryParams.user_id = params.user_id;
 
-        const entries = await fetchAllPages<any>("/activities", entryParams, 4000);
+        const entries = await fetchAllPages<any>("/activities", entryParams, 6000);
 
-        const matterUserValue: Record<number, Record<number, { name: string; value: number }>> = {};
-        const matterTotal: Record<number, number> = {};
-
-        for (const e of entries) {
-          const mid = e.matter?.id ?? 0;
-          if (!matterIds.has(mid)) continue;
-          const uid = e.user?.id ?? 0;
-          const value = (e.quantity / 3600) * (e.price || 0);
-          if (!matterUserValue[mid]) matterUserValue[mid] = {};
-          if (!matterUserValue[mid][uid]) {
-            matterUserValue[mid][uid] = { name: e.user?.name ?? "Unknown", value: 0 };
-          }
-          matterUserValue[mid][uid].value += value;
-          matterTotal[mid] = (matterTotal[mid] || 0) + value;
-        }
-
-        // Allocate each payment proportionally to timekeepers
+        // Step 3: Sum collected hours value per timekeeper
         const userResults: Record<number, {
           name: string;
-          total_allocated: number;
-          payments: { date: string; bill_number: string; matter: string; payment_amount: number; allocated: number }[];
+          total_collected: number;
+          collected_hours: number;
+          bill_count: Set<number>;
         }> = {};
 
-        for (const alloc of feeAllocations) {
-          const mid = alloc.matter?.id ?? 0;
-          const matterDesc = alloc.matter?.display_number ?? "Unknown";
-          const billNumber = alloc.bill?.number ?? "N/A";
-          const amount = alloc.amount;
+        for (const e of entries) {
+          const billId = e.bill?.id;
+          if (!billId || !paidBillIds.has(billId)) continue;
 
-          const matterTotalValue = matterTotal[mid] || 0;
-          const userValues = matterUserValue[mid] || {};
+          const uid = e.user?.id ?? 0;
+          const hours = e.quantity / 3600;
+          const hoursValue = hours * (e.price || 0);
 
-          for (const [uidStr, u] of Object.entries(userValues)) {
-            const uid = parseInt(uidStr, 10);
-            const proportion = matterTotalValue > 0 ? u.value / matterTotalValue : 0;
-            const allocated = amount * proportion;
-
-            if (!userResults[uid]) {
-              userResults[uid] = { name: u.name, total_allocated: 0, payments: [] };
-            }
-            userResults[uid].total_allocated += allocated;
-            userResults[uid].payments.push({
-              date: alloc.date,
-              bill_number: billNumber,
-              matter: matterDesc,
-              payment_amount: Math.round(amount * 100) / 100,
-              allocated: Math.round(allocated * 100) / 100,
-            });
+          if (!userResults[uid]) {
+            userResults[uid] = { name: e.user?.name ?? "Unknown", total_collected: 0, collected_hours: 0, bill_count: new Set() };
           }
+          userResults[uid].total_collected += hoursValue;
+          userResults[uid].collected_hours += hours;
+          userResults[uid].bill_count.add(billId);
         }
 
         let results = Object.entries(userResults).map(([uid, u]) => ({
           user_id: parseInt(uid, 10),
           name: u.name,
-          total_allocated: Math.round(u.total_allocated * 100) / 100,
-          payment_count: u.payments.length,
-          payments: u.payments,
+          collected_hours_value: Math.round(u.total_collected * 100) / 100,
+          collected_hours: Math.round(u.collected_hours * 100) / 100,
+          bills_paid: u.bill_count.size,
         }));
 
         if (params.user_id) {
           results = results.filter((r) => r.user_id === params.user_id);
         }
 
-        results.sort((a, b) => b.total_allocated - a.total_allocated);
-        const firmTotal = Math.round(results.reduce((s, r) => s + r.total_allocated, 0) * 100) / 100;
+        results.sort((a, b) => b.collected_hours_value - a.collected_hours_value);
+        const firmTotal = Math.round(results.reduce((s, r) => s + r.collected_hours_value, 0) * 100) / 100;
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
               period: { start: params.start_date, end: params.end_date },
-              total_collected: firmTotal,
+              total_collected_hours_value: firmTotal,
               timekeeper_count: results.length,
-              allocations: results,
+              timekeepers: results,
             }, null, 2),
           }],
         };
@@ -803,7 +753,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_responsible_collections
   server.tool(
     "get_responsible_collections",
-    "Collections by responsible attorney. Matches Clio's Fee Allocation Report filtered by responsible attorney. The FULL payment amount is attributed to the matter's responsible attorney — no pro-rating by timekeeper.",
+    "Collections by responsible attorney. Replicates Clio's Fee Allocation Report: finds bills paid in the period via allocations, then fetches time entries on those bills to get per-timekeeper collected hours value, grouped by responsible attorney.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
@@ -825,51 +775,55 @@ export function registerPerformanceTools(server: McpServer): void {
           359576660: "May Huynh",
         };
 
-        // Fetch allocations with matter's responsible_attorney
+        // Step 1: Get allocations to find which bills were paid and when
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,amount,date,description,bill{id,number},matter{id,display_number,responsible_attorney}",
+          fields: "id,date,bill{id},matter{id}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
-        const rawAllocations = allAllocations.filter((a: any) =>
+        const periodAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
 
-        // Dedup bill/invoice duplicates
-        const billPatternKeys = new Set(
-          rawAllocations
-            .filter((a: any) => (a.description || "").startsWith("Payment for bill"))
-            .map((a: any) => `${a.bill?.id}_${a.amount}`)
-        );
-        const allocations = rawAllocations.filter((a: any) => {
-          const desc = a.description || "";
-          if (desc.startsWith("Payment for invoice")) {
-            const key = `${a.bill?.id}_${a.amount}`;
-            if (billPatternKeys.has(key)) return false;
+        // Build bill_id → payment date map (use latest payment date per bill)
+        const billPaymentDate: Record<number, string> = {};
+        for (const a of periodAllocations) {
+          const bid = a.bill?.id;
+          if (!bid) continue;
+          if (!billPaymentDate[bid] || a.date > billPaymentDate[bid]) {
+            billPaymentDate[bid] = a.date;
           }
-          return true;
-        });
+        }
+        const paidBillIds = new Set(Object.keys(billPaymentDate).map(Number));
 
-        // Only include actual bill payments — exclude trust transfers, linked payments, etc.
-        // Clio's Fee Allocation Report only includes "Payment for bill/invoice #X" allocations.
-        const feeAllocations = allocations.filter((a: any) => {
-          const desc = a.description || "";
-          return desc.startsWith("Payment for bill") || desc.startsWith("Payment for invoice");
-        });
+        // Step 2: Fetch billed time entries that are on paid bills
+        // Activities link to bills via bill{id} — fetch recent billed entries
+        const entries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          billed: true,
+          fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
+          order: "id(desc)",
+        }, 6000);
 
-        // Attribute full payment to the matter's responsible attorney
+        // Step 3: For each entry on a paid bill, compute collected hours value
         function getPeriodKey(dateStr: string): string {
           return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
         }
 
         const rollup: Record<number, Record<string, number>> = {};
 
-        for (const alloc of feeAllocations) {
-          const responsibleId = alloc.matter?.responsible_attorney?.id;
+        for (const e of entries) {
+          const billId = e.bill?.id;
+          if (!billId || !paidBillIds.has(billId)) continue;
+
+          const responsibleId = e.matter?.responsible_attorney?.id;
           if (!responsibleId) continue;
 
-          const period = getPeriodKey(alloc.date);
+          const hoursValue = (e.quantity / 3600) * (e.price || 0);
+          const paymentDate = billPaymentDate[billId];
+          const period = getPeriodKey(paymentDate);
+
           if (!rollup[responsibleId]) rollup[responsibleId] = {};
-          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + alloc.amount;
+          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + hoursValue;
         }
 
         const results = Object.entries(rollup).map(([ridStr, periods]) => {
