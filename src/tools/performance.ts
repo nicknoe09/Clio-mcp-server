@@ -672,16 +672,16 @@ export function registerPerformanceTools(server: McpServer): void {
         // Build set of bill IDs paid in the period
         const paidBillIds = new Set(periodAllocations.map((a: any) => a.bill?.id).filter(Boolean));
 
-        // Step 2: Fetch 4000 newest billed entries (20 pages ≈ 10s)
-        // bill_id filter doesn't work on Clio — must fetch bulk + filter client-side
+        // Step 2: Fetch billed entries from last 18 months (covers most bills paid in period)
+        const lookback = new Date(new Date(params.start_date).getTime() - 548 * 86400000).toISOString().split("T")[0];
         const entryParams: Record<string, any> = {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,bill{id,number},matter{id,display_number},user{id,name}",
-          order: "id(desc)",
+          created_since: `${lookback}T00:00:00+00:00`,
         };
         if (params.user_id) entryParams.user_id = params.user_id;
-        const allEntries = await fetchAllPages<any>("/activities", entryParams, 4000);
+        const allEntries = await fetchAllPages<any>("/activities", entryParams, 8000);
 
         // Filter to entries on paid bills
         const entries = allEntries.filter((e: any) => e.bill?.id && paidBillIds.has(e.bill.id));
@@ -798,15 +798,16 @@ export function registerPerformanceTools(server: McpServer): void {
         }
         const paidBillIds = new Set(Object.keys(billPaymentDate).map(Number));
 
-        // Step 2: Fetch newest billed entries (4000 cap ≈ 20 pages ≈ 10s)
-        // bill_id filter doesn't work — must fetch bulk + filter client-side
-        // id(desc) gets newest entries first to maximize coverage of recent bills
+        // Step 2: Fetch billed entries from last 18 months (covers most bills paid in period)
+        // bill_id filter doesn't work on Clio — must fetch bulk + filter client-side
+        // 18mo lookback + 8000 cap ≈ 40 pages ≈ 20s
+        const lookback = new Date(new Date(params.start_date).getTime() - 548 * 86400000).toISOString().split("T")[0];
         const allEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
           billed: true,
           fields: "id,quantity,price,bill{id},matter{id,responsible_attorney},user{id,name}",
-          order: "id(desc)",
-        }, 4000);
+          created_since: `${lookback}T00:00:00+00:00`,
+        }, 8000);
 
         // Filter to entries on paid bills
         const entries = allEntries.filter((e: any) => e.bill?.id && paidBillIds.has(e.bill.id));
