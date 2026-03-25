@@ -190,6 +190,47 @@ app.get("/debug-test", async (req, res) => {
   }
 });
 
+// --- Debug: timing breakdown for fee_allocation ---
+app.get("/debug-timing", async (_req, res) => {
+  try {
+    const { fetchAllPages } = require("./clio/pagination");
+    const timings: Record<string, any> = {};
+    let t0 = Date.now();
+
+    // Step 1: Fetch allocations for March
+    const allAllocations = await fetchAllPages("/allocations", {
+      fields: "id,amount,date,bill{id,number},matter{id,display_number}",
+      created_since: "2026-03-01T00:00:00+00:00",
+    });
+    timings.allocations_fetch_ms = Date.now() - t0;
+    const allocations = allAllocations.filter((a: any) =>
+      a.date && a.date >= "2026-03-01" && a.date <= "2026-03-25" && a.amount > 0
+    );
+    timings.total_allocations = allAllocations.length;
+    timings.filtered_allocations = allocations.length;
+    const matterIds = [...new Set(allocations.map((a: any) => a.matter?.id).filter(Boolean))];
+    timings.unique_matters = matterIds.length;
+
+    // Step 2: Fetch entries for first 3 matters only (sample)
+    t0 = Date.now();
+    const sampleMatters = matterIds.slice(0, 3);
+    for (const mid of sampleMatters) {
+      const entries = await fetchAllPages("/activities", {
+        type: "TimeEntry",
+        billed: true,
+        fields: "id,quantity,price,user{id,name}",
+        matter_id: mid,
+      });
+      timings[`matter_${mid}_entries`] = entries.length;
+    }
+    timings.sample_entries_fetch_ms = Date.now() - t0;
+
+    res.json(timings);
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status });
+  }
+});
+
 // --- OAuth Bootstrap ---
 app.get("/oauth/start", (_req, res) => {
   const url = getAuthorizationUrl();
