@@ -231,6 +231,52 @@ app.get("/debug-timing", async (_req, res) => {
   }
 });
 
+// --- Debug: test bill_id filter + timing ---
+app.get("/debug-billfilter", async (_req, res) => {
+  try {
+    const { fetchAllPages, rawGetSingle } = require("./clio/pagination");
+    const t0 = Date.now();
+
+    // Step 1: Get allocations for Feb
+    const allocs = await fetchAllPages("/allocations", {
+      fields: "id,date,bill{id}",
+      created_since: "2026-02-01T00:00:00+00:00",
+    });
+    const febAllocs = allocs.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28");
+    const billIds = [...new Set(febAllocs.map((a: any) => a.bill?.id).filter(Boolean))];
+    const t1 = Date.now();
+
+    // Step 2: Test if bill_id filter works on activities
+    const testBillId = billIds[0];
+    const filtered = await rawGetSingle("/activities", {
+      type: "TimeEntry", billed: true, bill_id: testBillId,
+      fields: "id,quantity,price,bill{id},user{id,name}", limit: 5,
+    });
+    const t2 = Date.now();
+
+    // Step 3: Test without bill_id filter for comparison
+    const unfiltered = await rawGetSingle("/activities", {
+      type: "TimeEntry", billed: true,
+      fields: "id,quantity,price,bill{id},user{id,name}", limit: 5,
+    });
+    const t3 = Date.now();
+
+    res.json({
+      allocs_ms: t1 - t0,
+      total_feb_allocs: febAllocs.length,
+      unique_bills: billIds.length,
+      test_bill_id: testBillId,
+      filtered_count: filtered.meta?.records,
+      filtered_sample: filtered.data,
+      filtered_ms: t2 - t1,
+      unfiltered_total: unfiltered.meta?.records,
+      unfiltered_ms: t3 - t2,
+    });
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status });
+  }
+});
+
 // --- Debug: probe Clio API for line items and bill associations ---
 app.get("/debug-alloc", async (_req, res) => {
   try {
