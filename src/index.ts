@@ -18,6 +18,7 @@ import { registerPerformanceTools } from "./tools/performance";
 import { registerReconcileTools } from "./tools/reconcile";
 import { registerScorecardTools } from "./tools/scorecard";
 import { registerCalendarTools } from "./tools/calendar";
+import { registerCalcTools } from "./tools/calc";
 
 const app = express();
 
@@ -67,8 +68,10 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerScorecardTools OK");
     registerCalendarTools(server);
     console.log("[MCP] registerCalendarTools OK");
+    registerCalcTools(server);
+    console.log("[MCP] registerCalcTools OK");
 
-    console.log("[MCP] All 23 tools registered successfully");
+    console.log("[MCP] All 24 tools registered successfully");
     return server;
   } catch (err: any) {
     console.error("[MCP] FATAL: tool registration failed");
