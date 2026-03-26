@@ -738,16 +738,12 @@ export function registerPerformanceTools(server: McpServer): void {
       try {
         const rows = await getFeeAllocationCSV();
 
-        // Filter by issue date range (the report has Issue Date column)
-        const filtered = rows.filter((r) => {
-          const issueDate = r["Issue Date"];
-          if (!issueDate) return false;
-          // Convert MM/DD/YYYY to YYYY-MM-DD for comparison
-          const parts = issueDate.split("/");
-          if (parts.length !== 3) return false;
-          const isoDate = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
-          return isoDate >= params.start_date && isoDate <= params.end_date;
-        });
+        // The report is already pre-filtered by Clio to the configured date range
+        // (bill payment date). Use ALL rows — no additional date filtering needed.
+        // Only filter by user if requested.
+        const filtered = params.user_name
+          ? rows.filter((r) => (r["User"] ?? "").toLowerCase().includes(params.user_name!.toLowerCase()))
+          : rows;
 
         // Aggregate by user
         const userTotals: Record<string, {
@@ -849,15 +845,9 @@ export function registerPerformanceTools(server: McpServer): void {
       try {
         const rows = await getFeeAllocationCSV();
 
-        // Filter by issue date range
-        const filtered = rows.filter((r) => {
-          const issueDate = r["Issue Date"];
-          if (!issueDate) return false;
-          const parts = issueDate.split("/");
-          if (parts.length !== 3) return false;
-          const isoDate = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
-          return isoDate >= params.start_date && isoDate <= params.end_date;
-        });
+        // The report is already pre-filtered by Clio to the configured date range.
+        // Use ALL rows — no additional date filtering needed.
+        const filtered = rows;
 
         // Helper to get period key
         function getPeriodKey(issueDate: string): string {
