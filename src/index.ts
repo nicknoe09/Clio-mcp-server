@@ -370,6 +370,37 @@ app.get("/debug-alloc-types", async (_req, res) => {
   }
 });
 
+// --- Debug: check if Payment allocations have trust vs non-trust distinction ---
+app.get("/debug-alloc-trust", async (_req, res) => {
+  try {
+    const { fetchAllPages } = require("./clio/pagination");
+    const allocs = await fetchAllPages("/allocations", {
+      fields: "id,date,amount,description,parent{id,type,etag},bill{id,number},matter{id,display_number}",
+      created_since: "2026-02-01T00:00:00+00:00",
+    });
+    const febPayments = allocs.filter((a: any) =>
+      a.date >= "2026-02-01" && a.date <= "2026-02-28" && a.parent?.type === "Payment"
+    );
+
+    // Look for trust-related descriptions or patterns
+    const withTrust = febPayments.filter((a: any) =>
+      a.description && a.description.toLowerCase().includes("trust")
+    );
+    const withoutBill = febPayments.filter((a: any) => !a.bill?.id);
+    const descriptionSamples = [...new Set(febPayments.map((a: any) => a.description).filter(Boolean))].slice(0, 20);
+
+    res.json({
+      total_payments: febPayments.length,
+      total_amount: Math.round(febPayments.reduce((s: number, a: any) => s + (a.amount || 0), 0) * 100) / 100,
+      trust_in_description: { count: withTrust.length, samples: withTrust.slice(0, 5) },
+      no_bill_attached: { count: withoutBill.length, samples: withoutBill.slice(0, 5) },
+      unique_descriptions: descriptionSamples,
+    });
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
+
 // --- Debug: probe reports + line_items structure ---
 app.get("/debug-reports2", async (_req, res) => {
   try {
