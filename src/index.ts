@@ -311,6 +311,69 @@ app.get("/debug-reports", async (_req, res) => {
   }
 });
 
+// --- Debug: probe reports + line_items structure ---
+app.get("/debug-reports2", async (_req, res) => {
+  try {
+    const { rawGetSingle } = require("./clio/pagination");
+    const results: Record<string, any> = {};
+
+    // 1. Reports with fields
+    try {
+      const r = await rawGetSingle("/reports", { fields: "id,name,type,category", limit: 5 });
+      results.reports = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.reports = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // 2. Report presets with fields
+    try {
+      const r = await rawGetSingle("/report_presets", { fields: "id,name,type,category", limit: 5 });
+      results.report_presets = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.report_presets = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // 3. Line items full structure with bill+user+matter
+    try {
+      const r = await rawGetSingle("/line_items", {
+        fields: "id,total,quantity,price,type,date,bill{id,number,state},user{id,name},matter{id,display_number}",
+        limit: 3,
+      });
+      results.line_items_full = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.line_items_full = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // 4. Line items filtered to paid bills
+    try {
+      const r = await rawGetSingle("/line_items", {
+        fields: "id,total,type,bill{id,number},user{id,name}",
+        bill_state: "paid",
+        limit: 3,
+      });
+      results.line_items_paid = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.line_items_paid = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // 5. Line items filtered by specific bill_id
+    try {
+      const r = await rawGetSingle("/line_items", {
+        fields: "id,total,type,bill{id,number},user{id,name}",
+        bill_id: 5049358,
+        limit: 3,
+      });
+      results.line_items_by_bill = { ok: true, count: r.meta?.records, sample: r.data };
+    } catch (e: any) {
+      results.line_items_by_bill = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    res.json(results);
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status });
+  }
+});
+
 // --- Debug: probe Clio API for line items and bill associations ---
 app.get("/debug-alloc", async (_req, res) => {
   try {
