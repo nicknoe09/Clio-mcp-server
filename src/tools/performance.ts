@@ -652,7 +652,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_fee_allocation
   server.tool(
     "get_fee_allocation",
-    "Fee allocation by timekeeper using Clio line_items. Finds bills paid in the period via allocations, then uses line_items to get exact billed amounts per timekeeper per bill. Fast and accurate.",
+    "Fee allocation by timekeeper. Gets payments via allocations, then fetches billed activities per-matter to compute exact per-user dollar proportions. Filters by bill payment date.",
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
@@ -660,87 +660,84 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Step 1: Get allocations (actual payment records only, exclude CreditMemos)
+        // Step 1: Get allocations (actual payments only) in the date range
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,parent{id,type},bill{id,number}",
+          fields: "id,date,amount,parent{id,type},bill{id,number},matter{id,display_number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const periodAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date
           && a.amount > 0
-          && a.parent?.type === "Payment" // Exclude CreditMemos and other non-payment types
+          && a.parent?.type === "Payment"
         );
 
-        // Build bill_id → total payment amount map
-        const billPayments: Record<number, { number: string; total_paid: number }> = {};
+        // Build bill_id → payment amount and collect unique matter IDs
+        const billPayments: Record<number, { number: string; total_paid: number; matter_id: number }> = {};
+        const matterIds = new Set<number>();
         for (const a of periodAllocations) {
           const bid = a.bill?.id;
+          const mid = a.matter?.id;
           if (!bid) continue;
           if (!billPayments[bid]) {
-            billPayments[bid] = { number: a.bill?.number ?? "N/A", total_paid: 0 };
+            billPayments[bid] = { number: a.bill?.number ?? "N/A", total_paid: 0, matter_id: mid ?? 0 };
           }
           billPayments[bid].total_paid += a.amount;
+          if (mid) matterIds.add(mid);
         }
 
-        const billIds = Object.keys(billPayments).map(Number);
-
-        // Step 2: Fetch line_items for paid bills in parallel batches of 10
-        const lineItems: any[] = [];
-        const BATCH_SIZE = 10;
-        for (let i = 0; i < billIds.length; i += BATCH_SIZE) {
-          const batch = billIds.slice(i, i + BATCH_SIZE);
+        // Step 2: Fetch billed activities per-matter (parallel batches of 5)
+        // This is much faster than per-bill line_items queries
+        const matterIdList = Array.from(matterIds);
+        const allActivities: any[] = [];
+        const BATCH = 5;
+        for (let i = 0; i < matterIdList.length; i += BATCH) {
+          const batch = matterIdList.slice(i, i + BATCH);
           const batchResults = await Promise.all(
-            batch.map(billId =>
-              fetchAllPages<any>("/line_items", {
-                fields: "id,total,type,bill{id,number},user{id,name},matter{id,display_number}",
-                bill_id: billId,
-              }).catch(() => []) // Skip bills that error
+            batch.map(mid =>
+              fetchAllPages<any>("/activities", {
+                type: "TimeEntry",
+                billed: true,
+                matter_id: mid,
+                fields: "id,quantity,price,total,bill{id},user{id,name},matter{id}",
+              }).catch(() => [])
             )
           );
-          for (const items of batchResults) {
-            lineItems.push(...items);
-          }
+          for (const items of batchResults) allActivities.push(...items);
         }
 
-        // Step 3: For each bill, compute per-user proportional allocation
-        // Group line items by bill
-        const billLineItems: Record<number, { total: number; byUser: Record<number, { name: string; total: number }> }> = {};
-        for (const li of lineItems) {
-          if (li.type !== "ActivityLineItem") continue; // Skip expense/flat fee line items
-          const bid = li.bill?.id;
-          const uid = li.user?.id;
+        // Step 3: Group billed amounts by bill → user
+        const billUserTotals: Record<number, { billTotal: number; byUser: Record<number, { name: string; total: number }> }> = {};
+        for (const e of allActivities) {
+          const bid = e.bill?.id;
+          const uid = e.user?.id;
           if (!bid || !uid) continue;
+          // Only include bills that had payments in our period
+          if (!billPayments[bid]) continue;
 
-          if (!billLineItems[bid]) billLineItems[bid] = { total: 0, byUser: {} };
-          billLineItems[bid].total += li.total || 0;
-          if (!billLineItems[bid].byUser[uid]) {
-            billLineItems[bid].byUser[uid] = { name: li.user?.name ?? "Unknown", total: 0 };
+          const value = e.total || ((e.quantity / 3600) * (e.price || 0));
+
+          if (!billUserTotals[bid]) billUserTotals[bid] = { billTotal: 0, byUser: {} };
+          billUserTotals[bid].billTotal += value;
+          if (!billUserTotals[bid].byUser[uid]) {
+            billUserTotals[bid].byUser[uid] = { name: e.user?.name ?? "Unknown", total: 0 };
           }
-          billLineItems[bid].byUser[uid].total += li.total || 0;
+          billUserTotals[bid].byUser[uid].total += value;
         }
 
-        // Allocate payments proportionally
-        const userResults: Record<number, {
-          name: string;
-          total_allocated: number;
-          bill_count: number;
-        }> = {};
+        // Step 4: Pro-rate each payment across timekeepers
+        const userResults: Record<number, { name: string; total_allocated: number; bill_count: number }> = {};
 
         for (const [bidStr, bp] of Object.entries(billPayments)) {
           const bid = parseInt(bidStr, 10);
-          const bli = billLineItems[bid];
-          if (!bli || bli.total === 0) continue;
+          const bt = billUserTotals[bid];
+          if (!bt || bt.billTotal === 0) continue;
 
-          const paymentAmount = bp.total_paid;
-
-          for (const [uidStr, u] of Object.entries(bli.byUser)) {
+          for (const [uidStr, u] of Object.entries(bt.byUser)) {
             const uid = parseInt(uidStr, 10);
-            const proportion = u.total / bli.total;
-            const allocated = paymentAmount * proportion;
+            const proportion = u.total / bt.billTotal;
+            const allocated = bp.total_paid * proportion;
 
-            if (!userResults[uid]) {
-              userResults[uid] = { name: u.name, total_allocated: 0, bill_count: 0 };
-            }
+            if (!userResults[uid]) userResults[uid] = { name: u.name, total_allocated: 0, bill_count: 0 };
             userResults[uid].total_allocated += allocated;
             userResults[uid].bill_count++;
           }
@@ -753,10 +750,7 @@ export function registerPerformanceTools(server: McpServer): void {
           bills_paid: u.bill_count,
         }));
 
-        if (params.user_id) {
-          results = results.filter((r) => r.user_id === params.user_id);
-        }
-
+        if (params.user_id) results = results.filter((r) => r.user_id === params.user_id);
         results.sort((a, b) => b.total_allocated - a.total_allocated);
         const firmTotal = Math.round(results.reduce((s, r) => s + r.total_allocated, 0) * 100) / 100;
 
@@ -766,7 +760,8 @@ export function registerPerformanceTools(server: McpServer): void {
             text: JSON.stringify({
               period: { start: params.start_date, end: params.end_date },
               total_collected: firmTotal,
-              bills_with_payments: billIds.length,
+              bills_with_payments: Object.keys(billPayments).length,
+              matters_queried: matterIdList.length,
               timekeeper_count: results.length,
               timekeepers: results,
             }, null, 2),
