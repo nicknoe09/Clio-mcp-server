@@ -470,6 +470,62 @@ app.get("/debug-reports3", async (_req, res) => {
       results.fee_alloc_csv = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
     }
 
+    // Try more fields on reports
+    try {
+      const detail = await rawGetSingle("/reports/166221530", {
+        fields: "id,name,state,kind,format,created_at,report_preset,source",
+      });
+      results.fee_alloc_more_fields = { ok: true, data: detail.data };
+    } catch (e: any) {
+      // Try without source
+      try {
+        const detail2 = await rawGetSingle("/reports/166221530", {
+          fields: "id,name,state,kind,format,created_at,report_preset",
+        });
+        results.fee_alloc_more_fields = { ok: true, data: detail2.data, note: "source field invalid" };
+      } catch (e2: any) {
+        results.fee_alloc_more_fields = { ok: false, error: e.response?.data?.error?.message ?? e.message };
+      }
+    }
+
+    // Try /download sub-path
+    try {
+      const dl = await rawGetSingle("/reports/166221530/download", {});
+      results.fee_alloc_download = { ok: true, preview: typeof dl === "string" ? dl.slice(0, 500) : JSON.stringify(dl).slice(0, 500) };
+    } catch (e: any) {
+      results.fee_alloc_download = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // Try raw GET with Accept: text/csv header via custom rawGet
+    const https = require("https");
+    try {
+      const csvContent: string = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: "app.clio.com",
+          port: 443,
+          path: "/api/v4/reports/166221530.csv",
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${require("./utils/tokenStore").getAccessToken()}`,
+            "Accept": "text/csv",
+          },
+        };
+        const req = https.request(options, (res: any) => {
+          let body = "";
+          res.on("data", (chunk: any) => (body += chunk));
+          res.on("end", () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) resolve(body);
+            else reject(new Error(`Status ${res.statusCode}: ${body.slice(0, 300)}`));
+          });
+        });
+        req.on("error", reject);
+        req.end();
+      });
+      results.fee_alloc_csv_header = { ok: true, preview: csvContent.slice(0, 1000) };
+    } catch (e: any) {
+      results.fee_alloc_csv_header = { ok: false, error: e.message };
+    }
+
     res.json(results);
   } catch (err: any) {
     res.json({ error: err.message });
