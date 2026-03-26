@@ -680,19 +680,17 @@ export function registerPerformanceTools(server: McpServer): void {
           billPayments[bid].total_paid += a.amount;
         }
 
-        const billIds = Object.keys(billPayments).map(Number);
+        const paidBillIds = new Set(Object.keys(billPayments).map(Number));
 
-        // Step 2: For each paid bill, get line_items to see exact per-user billed amounts
-        // Batch fetch: get all line_items for paid bills
-        const lineItems: any[] = [];
-        // Fetch in batches of bill IDs (line_items supports bill_id filter)
-        for (const billId of billIds) {
-          const items = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,bill{id,number},user{id,name},matter{id,display_number}",
-            bill_id: billId,
-          });
-          lineItems.push(...items);
-        }
+        // Step 2: Bulk fetch line_items (6-month lookback covers most bills paid in period)
+        // One paginated request instead of per-bill calls
+        const lookback = new Date(new Date(params.start_date).getTime() - 180 * 86400000).toISOString().split("T")[0];
+        const allLineItems = await fetchAllPages<any>("/line_items", {
+          fields: "id,total,type,bill{id,number},user{id,name},matter{id,display_number}",
+          created_since: `${lookback}T00:00:00+00:00`,
+        });
+        // Filter to only line items on bills that had payments in our period
+        const lineItems = allLineItems.filter((li: any) => li.bill?.id && paidBillIds.has(li.bill.id));
 
         // Step 3: For each bill, compute per-user proportional allocation
         // Group line items by bill
@@ -837,17 +835,15 @@ export function registerPerformanceTools(server: McpServer): void {
           if (a.date > billPayments[bid].date) billPayments[bid].date = a.date;
         }
 
-        const billIds = Object.keys(billPayments).map(Number);
+        const paidBillIds = new Set(Object.keys(billPayments).map(Number));
 
-        // Step 2: Get line_items for each paid bill (includes user + matter)
-        const lineItems: any[] = [];
-        for (const billId of billIds) {
-          const items = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,bill{id},user{id,name},matter{id,responsible_attorney}",
-            bill_id: billId,
-          });
-          lineItems.push(...items);
-        }
+        // Step 2: Bulk fetch line_items (6-month lookback) then filter to paid bills
+        const lookback = new Date(new Date(params.start_date).getTime() - 180 * 86400000).toISOString().split("T")[0];
+        const allLineItems = await fetchAllPages<any>("/line_items", {
+          fields: "id,total,type,bill{id},user{id,name},matter{id,responsible_attorney}",
+          created_since: `${lookback}T00:00:00+00:00`,
+        });
+        const lineItems = allLineItems.filter((li: any) => li.bill?.id && paidBillIds.has(li.bill.id));
 
         // Step 3: Build bill → per-user totals + matter responsible attorney
         const billLineItems: Record<number, {

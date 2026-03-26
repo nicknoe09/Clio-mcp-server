@@ -210,3 +210,138 @@ export async function rawPostSingle(
     }
   });
 }
+
+/**
+ * Make a raw HTTPS PATCH request, bypassing axios entirely.
+ */
+function rawPatch(fullUrl: string, body: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(fullUrl);
+    const data = JSON.stringify(body);
+
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname,
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bearer ${getAccessToken()}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let responseBody = "";
+      res.on("data", (chunk) => (responseBody += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = responseBody ? JSON.parse(responseBody) : {};
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+            err.response = { status: res.statusCode, data: parsed, headers: res.headers };
+            reject(err);
+          }
+        } catch (parseErr) {
+          const err: any = new Error(`Request failed with status ${res.statusCode}: ${responseBody.slice(0, 200)}`);
+          err.response = { status: res.statusCode, data: responseBody.slice(0, 500), headers: res.headers };
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+/**
+ * PATCH a resource in Clio. Returns the full JSON response body.
+ */
+export async function rawPatchSingle(
+  url: string,
+  body: any
+): Promise<any> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const fullUrl = `${baseUrl}${url}`;
+
+  return withBackoff(async () => {
+    try {
+      return await rawPatch(fullUrl, body);
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        await refreshAccessToken();
+        return await rawPatch(fullUrl, body);
+      }
+      throw err;
+    }
+  });
+}
+
+/**
+ * Make a raw HTTPS DELETE request, bypassing axios entirely.
+ */
+function rawHttpDelete(fullUrl: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(fullUrl);
+    const path = fullUrl.slice(fullUrl.indexOf(parsed.pathname));
+
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path,
+      method: "DELETE",
+      headers: {
+        "Authorization": `Bearer ${getAccessToken()}`,
+        "Content-Type": "application/json",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+            err.response = { status: res.statusCode, data: parsed, headers: res.headers };
+            reject(err);
+          }
+        } catch (parseErr) {
+          const err: any = new Error(`Request failed with status ${res.statusCode}: ${body.slice(0, 200)}`);
+          err.response = { status: res.statusCode, data: body.slice(0, 500), headers: res.headers };
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * DELETE a resource in Clio. Returns the full JSON response body (usually empty).
+ */
+export async function rawDeleteSingle(url: string): Promise<any> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const fullUrl = `${baseUrl}${url}`;
+
+  return withBackoff(async () => {
+    try {
+      return await rawHttpDelete(fullUrl);
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        await refreshAccessToken();
+        return await rawHttpDelete(fullUrl);
+      }
+      throw err;
+    }
+  });
+}

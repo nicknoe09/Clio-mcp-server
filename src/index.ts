@@ -67,7 +67,7 @@ function createMcpServer(): McpServer {
     registerCalendarTools(server);
     console.log("[MCP] registerCalendarTools OK");
 
-    console.log("[MCP] All 21 tools registered successfully");
+    console.log("[MCP] All 23 tools registered successfully");
     return server;
   } catch (err: any) {
     console.error("[MCP] FATAL: tool registration failed");
