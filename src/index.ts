@@ -488,12 +488,40 @@ app.get("/debug-reports3", async (_req, res) => {
       }
     }
 
-    // Try /download sub-path
+    // Try /download sub-path — follow the 303 redirect
     try {
-      const dl = await rawGetSingle("/reports/166221530/download", {});
-      results.fee_alloc_download = { ok: true, preview: typeof dl === "string" ? dl.slice(0, 500) : JSON.stringify(dl).slice(0, 500) };
+      const downloadResult: any = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: "app.clio.com",
+          port: 443,
+          path: "/api/v4/reports/166221530/download",
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${require("./utils/tokenStore").getAccessToken()}`,
+          },
+        };
+        const req = https.request(options, (res: any) => {
+          if (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301) {
+            const redirectUrl = res.headers.location;
+            // Follow the redirect to get actual CSV
+            const https2 = require("https");
+            https2.get(redirectUrl, (res2: any) => {
+              let body = "";
+              res2.on("data", (chunk: any) => (body += chunk));
+              res2.on("end", () => resolve({ redirectUrl, status: res2.statusCode, preview: body.slice(0, 2000) }));
+            }).on("error", reject);
+          } else {
+            let body = "";
+            res.on("data", (chunk: any) => (body += chunk));
+            res.on("end", () => resolve({ status: res.statusCode, preview: body.slice(0, 500) }));
+          }
+        });
+        req.on("error", reject);
+        req.end();
+      });
+      results.fee_alloc_download = { ok: true, ...downloadResult };
     } catch (e: any) {
-      results.fee_alloc_download = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+      results.fee_alloc_download = { ok: false, error: e.message };
     }
 
     // Try raw GET with Accept: text/csv header via custom rawGet
