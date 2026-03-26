@@ -680,17 +680,25 @@ export function registerPerformanceTools(server: McpServer): void {
           billPayments[bid].total_paid += a.amount;
         }
 
-        const paidBillIds = new Set(Object.keys(billPayments).map(Number));
+        const billIds = Object.keys(billPayments).map(Number);
 
-        // Step 2: Bulk fetch line_items (6-month lookback covers most bills paid in period)
-        // One paginated request instead of per-bill calls
-        const lookback = new Date(new Date(params.start_date).getTime() - 180 * 86400000).toISOString().split("T")[0];
-        const allLineItems = await fetchAllPages<any>("/line_items", {
-          fields: "id,total,type,bill{id,number},user{id,name},matter{id,display_number}",
-          created_since: `${lookback}T00:00:00+00:00`,
-        });
-        // Filter to only line items on bills that had payments in our period
-        const lineItems = allLineItems.filter((li: any) => li.bill?.id && paidBillIds.has(li.bill.id));
+        // Step 2: Fetch line_items for paid bills in parallel batches of 10
+        const lineItems: any[] = [];
+        const BATCH_SIZE = 10;
+        for (let i = 0; i < billIds.length; i += BATCH_SIZE) {
+          const batch = billIds.slice(i, i + BATCH_SIZE);
+          const batchResults = await Promise.all(
+            batch.map(billId =>
+              fetchAllPages<any>("/line_items", {
+                fields: "id,total,type,bill{id,number},user{id,name},matter{id,display_number}",
+                bill_id: billId,
+              }).catch(() => []) // Skip bills that error
+            )
+          );
+          for (const items of batchResults) {
+            lineItems.push(...items);
+          }
+        }
 
         // Step 3: For each bill, compute per-user proportional allocation
         // Group line items by bill
@@ -814,65 +822,16 @@ export function registerPerformanceTools(server: McpServer): void {
           359576660: "May Huynh",
         };
 
-        // Step 1: Get allocations in the date range
+        // Step 1: Get allocations with matter info (actual payment records)
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,bill{id}",
+          fields: "id,date,amount,matter{id,responsible_attorney}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const periodAllocations = allAllocations.filter((a: any) =>
           a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
         );
 
-        // Build bill_id → { total_paid, payment_date }
-        const billPayments: Record<number, { total_paid: number; date: string }> = {};
-        for (const a of periodAllocations) {
-          const bid = a.bill?.id;
-          if (!bid) continue;
-          if (!billPayments[bid]) {
-            billPayments[bid] = { total_paid: 0, date: a.date };
-          }
-          billPayments[bid].total_paid += a.amount;
-          if (a.date > billPayments[bid].date) billPayments[bid].date = a.date;
-        }
-
-        const paidBillIds = new Set(Object.keys(billPayments).map(Number));
-
-        // Step 2: Bulk fetch line_items (6-month lookback) then filter to paid bills
-        const lookback = new Date(new Date(params.start_date).getTime() - 180 * 86400000).toISOString().split("T")[0];
-        const allLineItems = await fetchAllPages<any>("/line_items", {
-          fields: "id,total,type,bill{id},user{id,name},matter{id,responsible_attorney}",
-          created_since: `${lookback}T00:00:00+00:00`,
-        });
-        const lineItems = allLineItems.filter((li: any) => li.bill?.id && paidBillIds.has(li.bill.id));
-
-        // Step 3: Build bill → per-user totals + matter responsible attorney
-        const billLineItems: Record<number, {
-          total: number;
-          byUser: Record<number, { name: string; total: number }>;
-          matterResponsible: number | null;
-        }> = {};
-
-        for (const li of lineItems) {
-          if (li.type !== "ActivityLineItem") continue;
-          const bid = li.bill?.id;
-          const uid = li.user?.id;
-          if (!bid || !uid) continue;
-
-          if (!billLineItems[bid]) {
-            billLineItems[bid] = { total: 0, byUser: {}, matterResponsible: null };
-          }
-          billLineItems[bid].total += li.total || 0;
-          if (!billLineItems[bid].byUser[uid]) {
-            billLineItems[bid].byUser[uid] = { name: li.user?.name ?? "Unknown", total: 0 };
-          }
-          billLineItems[bid].byUser[uid].total += li.total || 0;
-
-          if (li.matter?.responsible_attorney?.id) {
-            billLineItems[bid].matterResponsible = li.matter.responsible_attorney.id;
-          }
-        }
-
-        // Step 4: Allocate and roll up to responsible attorneys
+        // Step 2: Roll up directly — each allocation has matter → responsible_attorney
         function getPeriodKey(dateStr: string): string {
           return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
         }
@@ -884,31 +843,11 @@ export function registerPerformanceTools(server: McpServer): void {
           rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + amount;
         }
 
-        for (const [bidStr, bp] of Object.entries(billPayments)) {
-          const bid = parseInt(bidStr, 10);
-          const bli = billLineItems[bid];
-          if (!bli || bli.total === 0) continue;
-
-          const paymentAmount = bp.total_paid;
-          const period = getPeriodKey(bp.date);
-
-          for (const [uidStr, u] of Object.entries(bli.byUser)) {
-            const uid = parseInt(uidStr, 10);
-            const proportion = u.total / bli.total;
-            const allocated = paymentAmount * proportion;
-
-            // Determine responsible attorney
-            let responsibleId: number;
-            if (uid === MAY_HUYNH_ID) {
-              responsibleId = bli.matterResponsible || uid;
-            } else if (RESPONSIBILITY_MAP[uid]) {
-              responsibleId = RESPONSIBILITY_MAP[uid];
-            } else {
-              responsibleId = uid;
-            }
-
-            addToRollup(responsibleId, period, allocated);
-          }
+        for (const a of periodAllocations) {
+          const responsibleId = a.matter?.responsible_attorney?.id;
+          if (!responsibleId) continue;
+          const period = getPeriodKey(a.date);
+          addToRollup(responsibleId, period, a.amount);
         }
 
         const results = Object.entries(rollup).map(([ridStr, periods]) => {
