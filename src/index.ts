@@ -504,8 +504,8 @@ app.get("/debug-reports3", async (_req, res) => {
           if (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301) {
             const redirectUrl = res.headers.location;
             // Follow the redirect to get actual CSV
-            const https2 = require("https");
-            https2.get(redirectUrl, (res2: any) => {
+            const httpsLib = require("https");
+            httpsLib.get(redirectUrl, (res2: any) => {
               let body = "";
               res2.on("data", (chunk: any) => (body += chunk));
               res2.on("end", () => resolve({ redirectUrl, status: res2.statusCode, preview: body.slice(0, 2000) }));
