@@ -704,6 +704,160 @@ app.get("/debug-alloc", async (_req, res) => {
   }
 });
 
+// --- Debug: test attributable collections calc tool ---
+app.get("/debug-calc", async (req, res) => {
+  try {
+    const { fetchAllPages, downloadReport } = require("./clio/pagination");
+
+    const startDate = (req.query.start as string) || "2026-02-01";
+    const endDate = (req.query.end as string) || "2026-02-28";
+
+    // 1. Find Gus, Courtney, May
+    const allUsers = await fetchAllPages("/users", { fields: "id,name,enabled" });
+    const users = allUsers.map((u: any) => ({ id: u.id, name: u.name }));
+    const gus = users.find((u: any) => u.name.toLowerCase().includes("gus"));
+    const courtney = users.find((u: any) => u.name.toLowerCase().includes("courtney"));
+    const may = users.find((u: any) => u.name.toLowerCase().includes("may"));
+
+    if (!gus && !courtney) {
+      res.json({ error: "Could not find Gus or Courtney", users: users.map((u: any) => u.name) });
+      return;
+    }
+
+    // 2. Get Fee Allocation CSV
+    const reports = await fetchAllPages("/reports", {
+      fields: "id,name,state,kind,format", order: "name(asc)",
+    });
+    const feeReports = reports.filter((r: any) =>
+      r.kind === "fee_allocation" && r.state === "completed" && r.format === "csv"
+    );
+    if (feeReports.length === 0) {
+      res.json({ error: "No Fee Allocation Report found" });
+      return;
+    }
+    const latest = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+
+    // Parse CSV
+    const csv = await downloadReport(latest.id);
+    const lines = csv.split("\n");
+    const parseLine = (line: string) => {
+      const fields: string[] = [];
+      let current = "", inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') { if (inQuotes && line[i+1] === '"') { current += '"'; i++; } else inQuotes = !inQuotes; }
+        else if (ch === "," && !inQuotes) { fields.push(current.trim()); current = ""; }
+        else current += ch;
+      }
+      fields.push(current.trim());
+      return fields;
+    };
+    const headers = parseLine(lines[0]);
+    const csvRows: Record<string, string>[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const values = parseLine(line);
+      const row: Record<string, string> = {};
+      for (let j = 0; j < headers.length; j++) row[headers[j]] = values[j] ?? "";
+      csvRows.push(row);
+    }
+
+    const targetAttorneys = [gus, courtney].filter(Boolean);
+
+    // 3. Find matters for each attorney
+    const openMatters = await fetchAllPages("/matters", {
+      fields: "id,display_number,description,status,responsible_attorney{id,name}", status: "open",
+    });
+    const closedMatters = await fetchAllPages("/matters", {
+      fields: "id,display_number,description,status,responsible_attorney{id,name}", status: "closed",
+    });
+    const allMatters = [...openMatters, ...closedMatters];
+
+    const results: any[] = [];
+    for (const atty of targetAttorneys) {
+      const matters = allMatters.filter((m: any) => m.responsible_attorney?.id === atty.id);
+      const matterIds = new Set(matters.map((m: any) => m.id));
+      const attyNameLower = atty.name.toLowerCase();
+
+      // CSV collections
+      const attyRows = csvRows.filter((r) => {
+        const ra = (r["Responsible Attorney"] ?? "").toLowerCase();
+        return ra.includes(attyNameLower) || attyNameLower.includes(ra);
+      });
+      const totalCollections = attyRows.reduce(
+        (sum: number, r) => sum + parseFloat(r["Total Funds Collected"] || "0"), 0
+      );
+
+      // May's credit
+      let mayCredit = 0;
+      const mayCreditDetails: any[] = [];
+      if (may && matterIds.size > 0) {
+        const mayEntries = await fetchAllPages("/activities", {
+          type: "TimeEntry", user_id: may.id,
+          fields: "id,date,quantity,price,matter{id,display_number}",
+          created_since: `${startDate}T00:00:00+00:00`,
+        });
+        const relevant = mayEntries.filter((e: any) =>
+          e.date >= startDate && e.date <= endDate && e.matter?.id && matterIds.has(e.matter.id)
+        );
+        const byMatter: Record<number, any[]> = {};
+        for (const e of relevant) {
+          const mid = e.matter.id;
+          if (!byMatter[mid]) byMatter[mid] = [];
+          byMatter[mid].push(e);
+        }
+        for (const [midStr, entries] of Object.entries(byMatter)) {
+          entries.sort((a: any, b: any) => a.date.localeCompare(b.date));
+          let hoursUsed = 0, creditValue = 0;
+          const totalHours = entries.reduce((s: number, e: any) => s + e.quantity / 3600, 0);
+          for (const e of entries) {
+            const hours = e.quantity / 3600;
+            const rate = e.price || 0;
+            const remaining = 10 - hoursUsed;
+            if (remaining <= 0) break;
+            const credited = Math.min(hours, remaining);
+            creditValue += credited * rate;
+            hoursUsed += credited;
+          }
+          if (hoursUsed > 0) {
+            const matter = matters.find((m: any) => m.id === parseInt(midStr));
+            mayCreditDetails.push({
+              matter_id: parseInt(midStr),
+              matter_number: matter?.display_number ?? midStr,
+              total_hours: Math.round(totalHours * 100) / 100,
+              credited_hours: Math.round(hoursUsed * 100) / 100,
+              credit_value: Math.round(creditValue * 100) / 100,
+            });
+            mayCredit += creditValue;
+          }
+        }
+      }
+
+      results.push({
+        attorney: atty.name,
+        attorney_id: atty.id,
+        matter_count: matters.length,
+        total_collections: Math.round(totalCollections * 100) / 100,
+        may_credit_total: Math.round(mayCredit * 100) / 100,
+        attributable_total: Math.round((totalCollections + mayCredit) * 100) / 100,
+        csv_rows: attyRows.length,
+        may_credit_details: mayCreditDetails,
+      });
+    }
+
+    res.json({
+      period: { start: startDate, end: endDate },
+      found_users: { gus, courtney, may },
+      csv_headers: headers,
+      csv_total_rows: csvRows.length,
+      results,
+    });
+  } catch (err: any) {
+    res.json({ error: err.message, status: err.response?.status, clio_error: err.response?.data });
+  }
+});
+
 // --- OAuth Bootstrap ---
 app.get("/oauth/start", (_req, res) => {
   const url = getAuthorizationUrl();
