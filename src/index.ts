@@ -411,6 +411,7 @@ app.get("/debug-reports3", async (_req, res) => {
     try {
       const reports = await fetchAllPages("/reports", {
         fields: "id,name",
+        order: "name(asc)",
       });
       results.all_reports = { count: reports.length, reports: reports.map((r: any) => ({ id: r.id, name: r.name })) };
     } catch (e: any) {
@@ -421,6 +422,7 @@ app.get("/debug-reports3", async (_req, res) => {
     try {
       const presets = await fetchAllPages("/report_presets", {
         fields: "id,name",
+        order: "name(asc)",
       });
       results.all_presets = { count: presets.length, presets: presets.map((r: any) => ({ id: r.id, name: r.name })) };
     } catch (e: any) {
