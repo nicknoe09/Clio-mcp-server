@@ -442,6 +442,34 @@ app.get("/debug-reports3", async (_req, res) => {
       }
     }
 
+    // Try to get all fields for the fee allocation report
+    try {
+      const detail = await rawGetSingle("/reports/166221530", {
+        fields: "id,name,state,kind,format,source,url,download_url,file_url,content_url",
+      });
+      results.fee_alloc_fields = { ok: true, data: detail.data };
+    } catch (e: any) {
+      results.fee_alloc_fields = { ok: false, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // Try raw download of the report
+    try {
+      const detail = await rawGetSingle("/reports/166221530", {
+        fields: "id,name,state,kind,format",
+      });
+      results.fee_alloc_detail = { ok: true, data: detail.data };
+    } catch (e: any) {
+      results.fee_alloc_detail = { ok: false, error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // Try the .csv extension
+    try {
+      const csvData = await rawGetSingle("/reports/166221530.csv", {});
+      results.fee_alloc_csv = { ok: true, preview: typeof csvData === "string" ? csvData.slice(0, 500) : JSON.stringify(csvData).slice(0, 500) };
+    } catch (e: any) {
+      results.fee_alloc_csv = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+    }
+
     res.json(results);
   } catch (err: any) {
     res.json({ error: err.message });
