@@ -338,6 +338,38 @@ app.get("/debug-alloc-fields", async (_req, res) => {
   }
 });
 
+// --- Debug: find all allocation parent types ---
+app.get("/debug-alloc-types", async (_req, res) => {
+  try {
+    const { fetchAllPages } = require("./clio/pagination");
+    // Get Feb 2026 allocations with parent type
+    const allocs = await fetchAllPages("/allocations", {
+      fields: "id,date,amount,description,parent{id,type},bill{id,number},matter{id}",
+      created_since: "2026-02-01T00:00:00+00:00",
+    });
+    const febAllocs = allocs.filter((a: any) => a.date >= "2026-02-01" && a.date <= "2026-02-28");
+
+    // Group by parent type
+    const byType: Record<string, { count: number; total: number; samples: any[] }> = {};
+    for (const a of febAllocs) {
+      const ptype = a.parent?.type ?? "unknown";
+      if (!byType[ptype]) byType[ptype] = { count: 0, total: 0, samples: [] };
+      byType[ptype].count++;
+      byType[ptype].total += a.amount || 0;
+      if (byType[ptype].samples.length < 3) byType[ptype].samples.push(a);
+    }
+
+    // Round totals
+    for (const t of Object.values(byType)) {
+      t.total = Math.round(t.total * 100) / 100;
+    }
+
+    res.json({ total_feb_allocations: febAllocs.length, by_parent_type: byType });
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
+
 // --- Debug: probe reports + line_items structure ---
 app.get("/debug-reports2", async (_req, res) => {
   try {
