@@ -1,9 +1,84 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, downloadReport } from "../clio/pagination";
 
 const TIME_FIELDS =
   "id,date,quantity,price,total,note,billed,matter{id,display_number,description},user{id,name}";
+
+/**
+ * Parse CSV content into an array of objects using header row as keys.
+ * Handles quoted fields with commas inside.
+ */
+function parseCSV(csv: string): Record<string, string>[] {
+  const lines = csv.split("\n");
+  if (lines.length < 2) return [];
+
+  // Parse a CSV line respecting quoted fields
+  function parseLine(line: string): string[] {
+    const fields: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === "," && !inQuotes) {
+        fields.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    fields.push(current.trim());
+    return fields;
+  }
+
+  const headers = parseLine(lines[0]);
+  const rows: Record<string, string>[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const values = parseLine(line);
+    const row: Record<string, string> = {};
+    for (let j = 0; j < headers.length; j++) {
+      row[headers[j]] = values[j] ?? "";
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * Find the most recent Fee Allocation Report in Clio and download + parse it.
+ */
+async function getFeeAllocationCSV(): Promise<Record<string, string>[]> {
+  // Find all reports, look for fee allocation ones
+  const reports = await fetchAllPages<any>("/reports", {
+    fields: "id,name,state,kind,format",
+    order: "name(asc)",
+  });
+
+  // Filter to completed fee_allocation CSV reports
+  const feeReports = reports.filter((r: any) =>
+    r.kind === "fee_allocation" && r.state === "completed" && r.format === "csv"
+  );
+
+  if (feeReports.length === 0) {
+    throw new Error("No completed Fee Allocation Report found in Clio. Please generate one from Clio's Reports UI.");
+  }
+
+  // Use the most recent one (highest ID)
+  const latest = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+
+  // Download and parse
+  const csv = await downloadReport(latest.id);
+  return parseCSV(csv);
+}
 
 /**
  * Count working days (Mon-Fri) between two dates inclusive.
@@ -652,116 +727,89 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_fee_allocation
   server.tool(
     "get_fee_allocation",
-    "Fee allocation by timekeeper. Gets payments via allocations, then fetches billed activities per-matter to compute exact per-user dollar proportions. Filters by bill payment date.",
+    "Fee allocation by timekeeper using Clio's own Fee Allocation Report (exact numbers, same as Rachel's reports). Downloads the latest auto-generated report CSV and aggregates by timekeeper. Filter by date range and optionally by user.",
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
-      user_id: z.coerce.number().optional().describe("Filter to a specific timekeeper"),
+      user_id: z.coerce.number().optional().describe("Filter to a specific timekeeper by name match"),
+      user_name: z.string().optional().describe("Filter by timekeeper name (partial match)"),
     },
     async (params) => {
       try {
-        // Step 1: Get allocations (actual payments only) in the date range
-        const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,parent{id,type},bill{id,number},matter{id,display_number}",
-          created_since: `${params.start_date}T00:00:00+00:00`,
+        const rows = await getFeeAllocationCSV();
+
+        // Filter by issue date range (the report has Issue Date column)
+        const filtered = rows.filter((r) => {
+          const issueDate = r["Issue Date"];
+          if (!issueDate) return false;
+          // Convert MM/DD/YYYY to YYYY-MM-DD for comparison
+          const parts = issueDate.split("/");
+          if (parts.length !== 3) return false;
+          const isoDate = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+          return isoDate >= params.start_date && isoDate <= params.end_date;
         });
-        const periodAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date
-          && a.amount > 0
-          && a.parent?.type === "Payment"
-        );
 
-        // Build bill_id → payment amount and collect unique matter IDs
-        const billPayments: Record<number, { number: string; total_paid: number; matter_id: number }> = {};
-        const matterIds = new Set<number>();
-        for (const a of periodAllocations) {
-          const bid = a.bill?.id;
-          const mid = a.matter?.id;
-          if (!bid) continue;
-          if (!billPayments[bid]) {
-            billPayments[bid] = { number: a.bill?.number ?? "N/A", total_paid: 0, matter_id: mid ?? 0 };
+        // Aggregate by user
+        const userTotals: Record<string, {
+          billed_hours: number;
+          billed_time: number;
+          time_collected: number;
+          time_outstanding: number;
+          expense_collected: number;
+          expense_outstanding: number;
+          total_collected: number;
+          total_outstanding: number;
+          invoice_count: number;
+        }> = {};
+
+        for (const r of filtered) {
+          const user = r["User"] ?? "Unknown";
+          if (params.user_name && !user.toLowerCase().includes(params.user_name.toLowerCase())) continue;
+
+          if (!userTotals[user]) {
+            userTotals[user] = {
+              billed_hours: 0, billed_time: 0,
+              time_collected: 0, time_outstanding: 0,
+              expense_collected: 0, expense_outstanding: 0,
+              total_collected: 0, total_outstanding: 0,
+              invoice_count: 0,
+            };
           }
-          billPayments[bid].total_paid += a.amount;
-          if (mid) matterIds.add(mid);
+          const u = userTotals[user];
+          u.billed_hours += parseFloat(r["Billed Hours"] || "0");
+          u.billed_time += parseFloat(r["Billed Time"] || "0");
+          u.time_collected += parseFloat(r["Billed Time Collected"] || "0");
+          u.time_outstanding += parseFloat(r["Billed Time Outstanding"] || "0");
+          u.expense_collected += parseFloat(r["Expense Amount Collected"] || "0");
+          u.expense_outstanding += parseFloat(r["Expense Amount Outstanding"] || "0");
+          u.total_collected += parseFloat(r["Total Funds Collected"] || "0");
+          u.total_outstanding += parseFloat(r["Total Funds Outstanding"] || "0");
+          u.invoice_count++;
         }
 
-        // Step 2: Fetch billed activities per-matter (parallel batches of 5)
-        // This is much faster than per-bill line_items queries
-        const matterIdList = Array.from(matterIds);
-        const allActivities: any[] = [];
-        const BATCH = 5;
-        for (let i = 0; i < matterIdList.length; i += BATCH) {
-          const batch = matterIdList.slice(i, i + BATCH);
-          const batchResults = await Promise.all(
-            batch.map(mid =>
-              fetchAllPages<any>("/activities", {
-                type: "TimeEntry",
-                billed: true,
-                matter_id: mid,
-                fields: "id,quantity,price,total,bill{id},user{id,name},matter{id}",
-              }).catch(() => [])
-            )
-          );
-          for (const items of batchResults) allActivities.push(...items);
-        }
+        const results = Object.entries(userTotals).map(([name, u]) => ({
+          name,
+          billed_hours: Math.round(u.billed_hours * 100) / 100,
+          billed_time_value: Math.round(u.billed_time * 100) / 100,
+          time_collected: Math.round(u.time_collected * 100) / 100,
+          time_outstanding: Math.round(u.time_outstanding * 100) / 100,
+          expense_collected: Math.round(u.expense_collected * 100) / 100,
+          total_collected: Math.round(u.total_collected * 100) / 100,
+          total_outstanding: Math.round(u.total_outstanding * 100) / 100,
+          invoices: u.invoice_count,
+        })).sort((a, b) => b.total_collected - a.total_collected);
 
-        // Step 3: Group billed amounts by bill → user
-        const billUserTotals: Record<number, { billTotal: number; byUser: Record<number, { name: string; total: number }> }> = {};
-        for (const e of allActivities) {
-          const bid = e.bill?.id;
-          const uid = e.user?.id;
-          if (!bid || !uid) continue;
-          // Only include bills that had payments in our period
-          if (!billPayments[bid]) continue;
-
-          const value = e.total || ((e.quantity / 3600) * (e.price || 0));
-
-          if (!billUserTotals[bid]) billUserTotals[bid] = { billTotal: 0, byUser: {} };
-          billUserTotals[bid].billTotal += value;
-          if (!billUserTotals[bid].byUser[uid]) {
-            billUserTotals[bid].byUser[uid] = { name: e.user?.name ?? "Unknown", total: 0 };
-          }
-          billUserTotals[bid].byUser[uid].total += value;
-        }
-
-        // Step 4: Pro-rate each payment across timekeepers
-        const userResults: Record<number, { name: string; total_allocated: number; bill_count: number }> = {};
-
-        for (const [bidStr, bp] of Object.entries(billPayments)) {
-          const bid = parseInt(bidStr, 10);
-          const bt = billUserTotals[bid];
-          if (!bt || bt.billTotal === 0) continue;
-
-          for (const [uidStr, u] of Object.entries(bt.byUser)) {
-            const uid = parseInt(uidStr, 10);
-            const proportion = u.total / bt.billTotal;
-            const allocated = bp.total_paid * proportion;
-
-            if (!userResults[uid]) userResults[uid] = { name: u.name, total_allocated: 0, bill_count: 0 };
-            userResults[uid].total_allocated += allocated;
-            userResults[uid].bill_count++;
-          }
-        }
-
-        let results = Object.entries(userResults).map(([uid, u]) => ({
-          user_id: parseInt(uid, 10),
-          name: u.name,
-          total_allocated: Math.round(u.total_allocated * 100) / 100,
-          bills_paid: u.bill_count,
-        }));
-
-        if (params.user_id) results = results.filter((r) => r.user_id === params.user_id);
-        results.sort((a, b) => b.total_allocated - a.total_allocated);
-        const firmTotal = Math.round(results.reduce((s, r) => s + r.total_allocated, 0) * 100) / 100;
+        const firmTotal = Math.round(results.reduce((s, r) => s + r.total_collected, 0) * 100) / 100;
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
+              source: "Clio Fee Allocation Report (auto-generated)",
               period: { start: params.start_date, end: params.end_date },
               total_collected: firmTotal,
-              bills_with_payments: Object.keys(billPayments).length,
-              matters_queried: matterIdList.length,
+              rows_in_report: rows.length,
+              rows_in_period: filtered.length,
               timekeeper_count: results.length,
               timekeepers: results,
             }, null, 2),
@@ -787,7 +835,7 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_responsible_collections
   server.tool(
     "get_responsible_collections",
-    "Collections rolled up to responsible attorneys using line_items for exact per-timekeeper amounts. Nick Noe gets credit for Tzipora + Kaz. Kenny Sumner gets Anna + Jonathan. Paul Romano gets Angela + Nick Fernelius. May Huynh flows to the responsible attorney on each matter.",
+    "Collections rolled up to responsible attorneys using Clio's Fee Allocation Report. Groups each timekeeper's collected amounts under the responsible attorney on their matter. Exact numbers from Clio's own report.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
@@ -799,68 +847,55 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const RESPONSIBILITY_MAP: Record<number, number> = {
-          359711375: 348755029, // Tzipora Simmons → Nick Noe
-          358550509: 348755029, // Kaz Gonzalez → Nick Noe
-          358108805: 344134017, // Anna Lozano → Kenny Sumner
-          360091325: 344134017, // Jonathan Barbee → Kenny Sumner
-          358528744: 344117381, // Angela Alanis → Paul Romano
-          359380639: 344117381, // Nick Fernelius → Paul Romano
-        };
-        const MAY_HUYNH_ID = 359576660;
+        const rows = await getFeeAllocationCSV();
 
-        const ATTORNEY_NAMES: Record<number, string> = {
-          348755029: "Nicholas Noe",
-          344134017: "Kenny Sumner",
-          344117381: "Paul Romano",
-          359865560: "Courteney Daniel",
-          360049685: "Gus Vlahadamis",
-          359138569: "Christopher Winiecki",
-          359576660: "May Huynh",
-        };
-
-        // Step 1: Get allocations with matter info (actual payment records only, exclude CreditMemos)
-        const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,parent{id,type},matter{id,responsible_attorney}",
-          created_since: `${params.start_date}T00:00:00+00:00`,
+        // Filter by issue date range
+        const filtered = rows.filter((r) => {
+          const issueDate = r["Issue Date"];
+          if (!issueDate) return false;
+          const parts = issueDate.split("/");
+          if (parts.length !== 3) return false;
+          const isoDate = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+          return isoDate >= params.start_date && isoDate <= params.end_date;
         });
-        const periodAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date
-          && a.amount > 0
-          && a.parent?.type === "Payment" // Exclude CreditMemos and other non-payment types
-        );
 
-        // Step 2: Roll up directly — each allocation has matter → responsible_attorney
-        function getPeriodKey(dateStr: string): string {
-          return params.breakdown === "monthly" ? dateStr.slice(0, 7) : "total";
+        // Helper to get period key
+        function getPeriodKey(issueDate: string): string {
+          if (params.breakdown !== "monthly") return "total";
+          const parts = issueDate.split("/");
+          return `${parts[2]}-${parts[0].padStart(2, "0")}`;
         }
 
-        const rollup: Record<number, Record<string, number>> = {};
+        // Roll up by responsible attorney
+        const rollup: Record<string, {
+          periods: Record<string, number>;
+          timekeepers: Record<string, number>;
+        }> = {};
 
-        function addToRollup(responsibleId: number, period: string, amount: number) {
-          if (!rollup[responsibleId]) rollup[responsibleId] = {};
-          rollup[responsibleId][period] = (rollup[responsibleId][period] || 0) + amount;
+        for (const r of filtered) {
+          const responsible = r["Responsible Attorney"] ?? "Unknown";
+          const user = r["User"] ?? "Unknown";
+          const collected = parseFloat(r["Total Funds Collected"] || "0");
+          const period = getPeriodKey(r["Issue Date"]);
+
+          if (!rollup[responsible]) rollup[responsible] = { periods: {}, timekeepers: {} };
+          rollup[responsible].periods[period] = (rollup[responsible].periods[period] || 0) + collected;
+          rollup[responsible].timekeepers[user] = (rollup[responsible].timekeepers[user] || 0) + collected;
         }
 
-        for (const a of periodAllocations) {
-          const responsibleId = a.matter?.responsible_attorney?.id;
-          if (!responsibleId) continue;
-          const period = getPeriodKey(a.date);
-          addToRollup(responsibleId, period, a.amount);
-        }
-
-        const results = Object.entries(rollup).map(([ridStr, periods]) => {
-          const rid = parseInt(ridStr, 10);
-          const totalCollections = Object.values(periods).reduce((s, v) => s + v, 0);
+        const results = Object.entries(rollup).map(([name, data]) => {
+          const totalCollections = Object.values(data.periods).reduce((s, v) => s + v, 0);
 
           const result: any = {
-            responsible_attorney_id: rid,
-            name: ATTORNEY_NAMES[rid] || `User ${rid}`,
+            responsible_attorney: name,
             total_responsible_collections: Math.round(totalCollections * 100) / 100,
+            timekeepers: Object.entries(data.timekeepers)
+              .map(([tk, amt]) => ({ name: tk, collected: Math.round(amt * 100) / 100 }))
+              .sort((a, b) => b.collected - a.collected),
           };
 
           if (params.breakdown === "monthly") {
-            result.monthly = Object.entries(periods)
+            result.monthly = Object.entries(data.periods)
               .sort(([a], [b]) => a.localeCompare(b))
               .map(([period, amount]) => ({
                 period,
@@ -877,9 +912,10 @@ export function registerPerformanceTools(server: McpServer): void {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
+              source: "Clio Fee Allocation Report (auto-generated)",
               period: { start: params.start_date, end: params.end_date },
               firm_total_collections: firmTotal,
-              allocations_in_period: periodAllocations.length,
+              rows_in_period: filtered.length,
               responsible_attorneys: results,
             }, null, 2),
           }],

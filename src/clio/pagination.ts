@@ -345,3 +345,63 @@ export async function rawDeleteSingle(url: string): Promise<any> {
     }
   });
 }
+
+/**
+ * Download a Clio report by following the 303 redirect to S3.
+ * Returns the raw file content (CSV, HTML, PDF as string).
+ */
+export async function downloadReport(reportId: number): Promise<string> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const downloadUrl = `${baseUrl}/reports/${reportId}/download`;
+
+  return withBackoff(async () => {
+    return new Promise<string>((resolve, reject) => {
+      const parsed = new URL(downloadUrl);
+      const options = {
+        hostname: parsed.hostname,
+        port: 443,
+        path: parsed.pathname,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${getAccessToken()}`,
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        if (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301) {
+          const redirectUrl = res.headers.location;
+          if (!redirectUrl) return reject(new Error("No redirect URL in 303 response"));
+
+          // Follow redirect to S3
+          https.get(redirectUrl, (res2) => {
+            let body = "";
+            res2.on("data", (chunk) => (body += chunk));
+            res2.on("end", () => {
+              if (res2.statusCode && res2.statusCode >= 200 && res2.statusCode < 300) {
+                resolve(body);
+              } else {
+                reject(new Error(`S3 download failed with status ${res2.statusCode}`));
+              }
+            });
+          }).on("error", reject);
+        } else if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          // Direct response (unlikely but handle it)
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => resolve(body));
+        } else {
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => {
+            const err: any = new Error(`Report download failed with status ${res.statusCode}`);
+            err.response = { status: res.statusCode, data: body.slice(0, 500) };
+            reject(err);
+          });
+        }
+      });
+
+      req.on("error", reject);
+      req.end();
+    });
+  });
+}
