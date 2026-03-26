@@ -173,14 +173,16 @@ export function registerCalcTools(server: McpServer): void {
           });
 
           // Separate attorney time vs staff time
-          // Attorney time = rows where User matches the of counsel attorney
-          // Staff time = rows where User is someone else (firm staff on their matters)
+          // Attorney time = rows where User is ANY V&D principal (Gus or Courteney)
+          // Staff time = rows where User is a firm employee (everyone else)
+          const vdLastNames = targetAttorneys.map((a) => (a.name.toLowerCase().split(" ").pop() ?? ""));
           const attorneyTimeRows: Record<string, string>[] = [];
           const staffTimeRows: Record<string, string>[] = [];
 
           for (const r of attyRows) {
             const user = (r["User"] ?? "").toLowerCase();
-            if (user.includes(attyLastName)) {
+            const isVDPrincipal = vdLastNames.some((ln) => user.includes(ln));
+            if (isVDPrincipal) {
               attorneyTimeRows.push(r);
             } else {
               staffTimeRows.push(r);
