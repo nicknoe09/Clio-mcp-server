@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
+import https from "https";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { ENV } from "./utils/env";
@@ -504,8 +505,7 @@ app.get("/debug-reports3", async (_req, res) => {
           if (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301) {
             const redirectUrl = res.headers.location;
             // Follow the redirect to get actual CSV
-            const httpsLib = require("https");
-            httpsLib.get(redirectUrl, (res2: any) => {
+            https.get(redirectUrl, (res2: any) => {
               let body = "";
               res2.on("data", (chunk: any) => (body += chunk));
               res2.on("end", () => resolve({ redirectUrl, status: res2.statusCode, preview: body.slice(0, 2000) }));
@@ -525,7 +525,7 @@ app.get("/debug-reports3", async (_req, res) => {
     }
 
     // Try raw GET with Accept: text/csv header via custom rawGet
-    const https = require("https");
+    // https already imported at module level
     try {
       const csvContent: string = await new Promise((resolve, reject) => {
         const options = {
