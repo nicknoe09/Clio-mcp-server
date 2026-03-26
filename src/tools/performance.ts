@@ -660,13 +660,15 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        // Step 1: Get allocations (actual payment records) in the date range
+        // Step 1: Get allocations (actual payment records only, exclude CreditMemos)
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,bill{id,number}",
+          fields: "id,date,amount,parent{id,type},bill{id,number}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const periodAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+          a.date && a.date >= params.start_date && a.date <= params.end_date
+          && a.amount > 0
+          && a.parent?.type === "Payment" // Exclude CreditMemos and other non-payment types
         );
 
         // Build bill_id → total payment amount map
@@ -822,13 +824,15 @@ export function registerPerformanceTools(server: McpServer): void {
           359576660: "May Huynh",
         };
 
-        // Step 1: Get allocations with matter info (actual payment records)
+        // Step 1: Get allocations with matter info (actual payment records only, exclude CreditMemos)
         const allAllocations = await fetchAllPages<any>("/allocations", {
-          fields: "id,date,amount,matter{id,responsible_attorney}",
+          fields: "id,date,amount,parent{id,type},matter{id,responsible_attorney}",
           created_since: `${params.start_date}T00:00:00+00:00`,
         });
         const periodAllocations = allAllocations.filter((a: any) =>
-          a.date && a.date >= params.start_date && a.date <= params.end_date && a.amount > 0
+          a.date && a.date >= params.start_date && a.date <= params.end_date
+          && a.amount > 0
+          && a.parent?.type === "Payment" // Exclude CreditMemos and other non-payment types
         );
 
         // Step 2: Roll up directly — each allocation has matter → responsible_attorney
