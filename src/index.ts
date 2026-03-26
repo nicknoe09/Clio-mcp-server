@@ -375,7 +375,7 @@ app.get("/debug-alloc-trust", async (_req, res) => {
   try {
     const { fetchAllPages } = require("./clio/pagination");
     const allocs = await fetchAllPages("/allocations", {
-      fields: "id,date,amount,description,parent{id,type,etag},bill{id,number},matter{id,display_number}",
+      fields: "id,date,amount,description,parent{id,type},bill{id,number},matter{id,display_number}",
       created_since: "2026-02-01T00:00:00+00:00",
     });
     const febPayments = allocs.filter((a: any) =>
