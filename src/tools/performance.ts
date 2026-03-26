@@ -880,7 +880,7 @@ export function registerPerformanceTools(server: McpServer): void {
             text: JSON.stringify({
               period: { start: params.start_date, end: params.end_date },
               firm_total_collections: firmTotal,
-              bills_with_payments: billIds.length,
+              allocations_in_period: periodAllocations.length,
               responsible_attorneys: results,
             }, null, 2),
           }],
