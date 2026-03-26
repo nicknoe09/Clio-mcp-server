@@ -166,46 +166,32 @@ export function registerMatterTools(server: McpServer): void {
         cutoffDate.setDate(cutoffDate.getDate() - params.days_inactive);
         const cutoffStr = cutoffDate.toISOString().split("T")[0];
 
-        // Step 1: Fetch open matters for this attorney
+        // Step 1: Fetch open matters for this attorney (single paginated call)
         const matters = await fetchAllPages<any>("/matters", {
           fields: MATTER_FIELDS,
           status: "open",
           responsible_attorney_id: params.responsible_attorney_id,
         });
 
-        // Step 2: For each matter, check for recent activity in parallel batches
-        const BATCH = 5;
-        const matterActivity = new Map<number, string | null>();
+        // Step 2: Fetch recent activities (single paginated call, capped)
+        // Only need matter IDs to build the "active" set
+        const recentEntries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          fields: "id,date,matter{id}",
+          created_since: `${cutoffStr}T00:00:00+00:00`,
+        }, 4000);
 
-        for (let i = 0; i < matters.length; i += BATCH) {
-          const batch = matters.slice(i, i + BATCH);
-          const results = await Promise.all(
-            batch.map(async (m: any) => {
-              try {
-                // Fetch just 1 recent entry per matter to check activity
-                const entries = await fetchAllPages<any>("/activities", {
-                  type: "TimeEntry",
-                  matter_id: m.id,
-                  fields: "id,date",
-                  created_since: `${cutoffStr}T00:00:00+00:00`,
-                }, 1);
-                const latestDate = entries.length > 0 ? entries[0].date : null;
-                return { id: m.id, lastActivity: latestDate };
-              } catch {
-                return { id: m.id, lastActivity: null };
-              }
-            })
-          );
-          for (const r of results) matterActivity.set(r.id, r.lastActivity);
+        // Build set of matter IDs with recent activity
+        const activeMatters = new Set<number>();
+        for (const e of recentEntries) {
+          if (e.matter?.id) activeMatters.add(e.matter.id);
         }
 
         // Step 3: Filter to stale matters
         const staleMatterResults: any[] = [];
         for (const m of matters) {
           if (staleMatterResults.length >= params.limit) break;
-          const lastActivity = matterActivity.get(m.id);
-          // If there's a recent entry after cutoff, it's active
-          if (lastActivity && lastActivity >= cutoffStr) continue;
+          if (activeMatters.has(m.id)) continue;
 
           staleMatterResults.push({
             id: m.id,
@@ -214,10 +200,7 @@ export function registerMatterTools(server: McpServer): void {
             client: m.client,
             responsible_attorney: m.responsible_attorney,
             open_date: m.open_date,
-            last_activity_date: lastActivity ?? null,
-            days_inactive: lastActivity
-              ? Math.floor((Date.now() - new Date(lastActivity).getTime()) / 86400000)
-              : "30+",
+            days_inactive: params.days_inactive + "+",
           });
         }
 
