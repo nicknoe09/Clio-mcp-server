@@ -401,6 +401,51 @@ app.get("/debug-alloc-trust", async (_req, res) => {
   }
 });
 
+// --- Debug: list all Clio reports and try to run one ---
+app.get("/debug-reports3", async (_req, res) => {
+  try {
+    const { fetchAllPages, rawGetSingle } = require("./clio/pagination");
+    const results: Record<string, any> = {};
+
+    // List all reports with their fields
+    try {
+      const reports = await fetchAllPages("/reports", {
+        fields: "id,name",
+      });
+      results.all_reports = { count: reports.length, reports: reports.map((r: any) => ({ id: r.id, name: r.name })) };
+    } catch (e: any) {
+      results.all_reports = { error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // List report presets
+    try {
+      const presets = await fetchAllPages("/report_presets", {
+        fields: "id,name",
+      });
+      results.all_presets = { count: presets.length, presets: presets.map((r: any) => ({ id: r.id, name: r.name })) };
+    } catch (e: any) {
+      results.all_presets = { error: e.response?.data?.error?.message ?? e.message };
+    }
+
+    // Try to get a single report detail
+    if (results.all_reports?.reports?.[0]) {
+      const firstId = results.all_reports.reports[0].id;
+      try {
+        const detail = await rawGetSingle(`/reports/${firstId}`, {
+          fields: "id,name,state,kind,format",
+        });
+        results.report_detail = { ok: true, data: detail.data };
+      } catch (e: any) {
+        results.report_detail = { ok: false, error: e.response?.data?.error?.message ?? e.message };
+      }
+    }
+
+    res.json(results);
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
+
 // --- Debug: probe reports + line_items structure ---
 app.get("/debug-reports2", async (_req, res) => {
   try {
