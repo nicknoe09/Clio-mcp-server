@@ -311,6 +311,33 @@ app.get("/debug-reports", async (_req, res) => {
   }
 });
 
+// --- Debug: probe allocation fields ---
+app.get("/debug-alloc-fields", async (_req, res) => {
+  try {
+    const { rawGetSingle } = require("./clio/pagination");
+    const results: Record<string, any> = {};
+
+    const probes = [
+      { name: "alloc_all_fields", ep: "/allocations", p: { fields: "id,date,amount,description,type,category,kind,parent,bill{id,number,state},matter{id},contact{id,name}", limit: 5 } },
+      { name: "alloc_with_parent_type", ep: "/allocations", p: { fields: "id,date,amount,parent{id,type}", limit: 5 } },
+      { name: "alloc_feb_sample", ep: "/allocations", p: { fields: "id,date,amount,description,bill{id,number}", created_since: "2026-02-01T00:00:00+00:00", limit: 10 } },
+    ];
+
+    for (const { name, ep, p } of probes) {
+      try {
+        const r = await rawGetSingle(ep, p);
+        results[name] = { ok: true, count: r.meta?.records, sample: r.data };
+      } catch (e: any) {
+        results[name] = { ok: false, status: e.response?.status, error: e.response?.data?.error?.message ?? e.message };
+      }
+    }
+
+    res.json(results);
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
+
 // --- Debug: probe reports + line_items structure ---
 app.get("/debug-reports2", async (_req, res) => {
   try {
