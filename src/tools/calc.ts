@@ -49,9 +49,12 @@ function parseCSV(csv: string): Record<string, string>[] {
 }
 
 /**
- * Find the most recent Fee Allocation Report in Clio and download + parse it.
+ * Download and parse a Fee Allocation Report from Clio.
+ * If reportId is provided, uses that specific report.
+ * Otherwise uses the most recent one (highest ID).
+ * Returns { rows, report } where report is the selected report's metadata.
  */
-async function getFeeAllocationCSV(): Promise<Record<string, string>[]> {
+async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<string, string>[]; report: any }> {
   const reports = await fetchAllPages<any>("/reports", {
     fields: "id,name,state,kind,format",
     order: "name(asc)",
@@ -68,9 +71,16 @@ async function getFeeAllocationCSV(): Promise<Record<string, string>[]> {
     );
   }
 
-  const latest = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
-  const csv = await downloadReport(latest.id);
-  return parseCSV(csv);
+  let target;
+  if (reportId) {
+    target = feeReports.find((r: any) => r.id === reportId);
+    if (!target) throw new Error(`Report ID ${reportId} not found among ${feeReports.length} fee allocation reports. Use list_fee_allocation_reports to see available reports.`);
+  } else {
+    target = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+  }
+
+  const csv = await downloadReport(target.id);
+  return { rows: parseCSV(csv), report: target };
 }
 
 function round2(n: number): number {
@@ -139,10 +149,11 @@ function tierLabel(ytd: number): string {
 export function registerCalcTools(server: McpServer): void {
   server.tool(
     "get_attributable_collections",
-    "V&D Of Counsel compensation calculator per the Services Agreement. Gus and Courteney are treated as a JOINT UNIT for tier thresholds ($250K/$500K). Applies tiered attorney splits (82.5%/80%/77.5%), staff splits (35% V&D after 10hr/month allowance per of counsel). Uses Clio Fee Allocation Report. Always calculates from Jan 1 for accurate YTD tier placement.",
+    "V&D Of Counsel compensation calculator per the Services Agreement. Gus and Courteney are treated as a JOINT UNIT for tier thresholds ($250K/$500K). Applies tiered attorney splits (82.5%/80%/77.5%), staff splits (35% V&D after 10hr/month allowance per of counsel). Uses Clio Fee Allocation Report. Always calculates from Jan 1 for accurate YTD tier placement. Optionally specify report_id from list_fee_allocation_reports to use a specific report instead of the latest.",
     {
       start_date: z.string().describe("Start date for display period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for display period (YYYY-MM-DD)"),
+      report_id: z.coerce.number().optional().describe("Specific Clio report ID to use (from list_fee_allocation_reports). If omitted, uses the latest report."),
     },
     async (params) => {
       try {
@@ -171,7 +182,7 @@ export function registerCalcTools(server: McpServer): void {
         const vdLastNames = vdAttorneys.map((a) => (a.name.toLowerCase().split(" ").pop() ?? ""));
 
         // 2. Get Fee Allocation CSV
-        const csvRows = await getFeeAllocationCSV();
+        const { rows: csvRows, report: usedReport } = await getFeeAllocationCSV(params.report_id);
 
         // 3. Gather ALL V&D rows (where responsible attorney is Gus or Courteney)
         const vdRows: Record<string, string>[] = [];
@@ -374,6 +385,7 @@ export function registerCalcTools(server: McpServer): void {
             type: "text" as const,
             text: JSON.stringify({
               source: "Clio Fee Allocation Report + V&D Services Agreement",
+              report: { id: usedReport.id, name: usedReport.name },
               display_period: { start: params.start_date, end: params.end_date },
               ytd_calculated_from: `${year}-01-01`,
               note: "Gus + Courteney collections are POOLED for tier thresholds",

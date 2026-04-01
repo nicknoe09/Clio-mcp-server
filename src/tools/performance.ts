@@ -54,30 +54,42 @@ function parseCSV(csv: string): Record<string, string>[] {
 }
 
 /**
- * Find the most recent Fee Allocation Report in Clio and download + parse it.
+ * List all completed Fee Allocation Reports in Clio.
  */
-async function getFeeAllocationCSV(): Promise<Record<string, string>[]> {
-  // Find all reports, look for fee allocation ones
+async function listFeeAllocationReports(): Promise<any[]> {
   const reports = await fetchAllPages<any>("/reports", {
     fields: "id,name,state,kind,format",
     order: "name(asc)",
   });
 
-  // Filter to completed fee_allocation CSV reports
-  const feeReports = reports.filter((r: any) =>
+  return reports.filter((r: any) =>
     r.kind === "fee_allocation" && r.state === "completed" && r.format === "csv"
   );
+}
+
+/**
+ * Download and parse a Fee Allocation Report from Clio.
+ * If reportId is provided, uses that specific report.
+ * Otherwise uses the most recent one (highest ID).
+ * Returns { rows, report } where report is the selected report's metadata.
+ */
+async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<string, string>[]; report: any }> {
+  const feeReports = await listFeeAllocationReports();
 
   if (feeReports.length === 0) {
     throw new Error("No completed Fee Allocation Report found in Clio. Please generate one from Clio's Reports UI.");
   }
 
-  // Use the most recent one (highest ID)
-  const latest = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+  let target;
+  if (reportId) {
+    target = feeReports.find((r: any) => r.id === reportId);
+    if (!target) throw new Error(`Report ID ${reportId} not found among ${feeReports.length} fee allocation reports. Use list_fee_allocation_reports to see available reports.`);
+  } else {
+    target = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+  }
 
-  // Download and parse
-  const csv = await downloadReport(latest.id);
-  return parseCSV(csv);
+  const csv = await downloadReport(target.id);
+  return { rows: parseCSV(csv), report: target };
 }
 
 /**
@@ -724,19 +736,48 @@ export function registerPerformanceTools(server: McpServer): void {
     }
   );
 
+  // list_fee_allocation_reports
+  server.tool(
+    "list_fee_allocation_reports",
+    "List all completed Fee Allocation Reports in Clio with their IDs and names. Use report IDs with get_fee_allocation, get_responsible_collections, or get_attributable_collections to access a specific report instead of the latest.",
+    {},
+    async () => {
+      try {
+        const reports = await listFeeAllocationReports();
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              count: reports.length,
+              reports: reports
+                .sort((a: any, b: any) => b.id - a.id)
+                .map((r: any) => ({ id: r.id, name: r.name, state: r.state, format: r.format })),
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // get_fee_allocation
   server.tool(
     "get_fee_allocation",
-    "Fee allocation by timekeeper using Clio's own Fee Allocation Report (exact numbers, same as Rachel's reports). Downloads the latest auto-generated report CSV and aggregates by timekeeper. Filter by date range and optionally by user.",
+    "Fee allocation by timekeeper using Clio's own Fee Allocation Report (exact numbers, same as Rachel's reports). Downloads the latest auto-generated report CSV and aggregates by timekeeper. Filter by date range and optionally by user. Optionally specify report_id from list_fee_allocation_reports to use a specific report instead of the latest.",
     {
       start_date: z.string().describe("Start date for collections period (YYYY-MM-DD)"),
       end_date: z.string().describe("End date for collections period (YYYY-MM-DD)"),
       user_id: z.coerce.number().optional().describe("Filter to a specific timekeeper by name match"),
       user_name: z.string().optional().describe("Filter by timekeeper name (partial match)"),
+      report_id: z.coerce.number().optional().describe("Specific Clio report ID to use (from list_fee_allocation_reports). If omitted, uses the latest report."),
     },
     async (params) => {
       try {
-        const rows = await getFeeAllocationCSV();
+        const { rows, report } = await getFeeAllocationCSV(params.report_id);
 
         // The report is already pre-filtered by Clio to the configured date range
         // (bill payment date). Use ALL rows — no additional date filtering needed.
@@ -802,6 +843,7 @@ export function registerPerformanceTools(server: McpServer): void {
             type: "text" as const,
             text: JSON.stringify({
               source: "Clio Fee Allocation Report (auto-generated)",
+              report: { id: report.id, name: report.name },
               period: { start: params.start_date, end: params.end_date },
               total_collected: firmTotal,
               rows_in_report: rows.length,
@@ -831,10 +873,11 @@ export function registerPerformanceTools(server: McpServer): void {
   // get_responsible_collections
   server.tool(
     "get_responsible_collections",
-    "Collections rolled up to responsible attorneys using Clio's Fee Allocation Report. Groups each timekeeper's collected amounts under the responsible attorney on their matter. Exact numbers from Clio's own report.",
+    "Collections rolled up to responsible attorneys using Clio's Fee Allocation Report. Groups each timekeeper's collected amounts under the responsible attorney on their matter. Exact numbers from Clio's own report. Optionally specify report_id from list_fee_allocation_reports to use a specific report instead of the latest.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
+      report_id: z.coerce.number().optional().describe("Specific Clio report ID to use (from list_fee_allocation_reports). If omitted, uses the latest report."),
       breakdown: z
         .enum(["none", "monthly"])
         .optional()
@@ -843,7 +886,7 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const rows = await getFeeAllocationCSV();
+        const { rows, report } = await getFeeAllocationCSV(params.report_id);
 
         // The report is already pre-filtered by Clio to the configured date range.
         // Use ALL rows — no additional date filtering needed.
@@ -903,6 +946,7 @@ export function registerPerformanceTools(server: McpServer): void {
             type: "text" as const,
             text: JSON.stringify({
               source: "Clio Fee Allocation Report (auto-generated)",
+              report: { id: report.id, name: report.name },
               period: { start: params.start_date, end: params.end_date },
               firm_total_collections: firmTotal,
               rows_in_period: filtered.length,
