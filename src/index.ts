@@ -20,6 +20,7 @@ import { registerScorecardTools } from "./tools/scorecard";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerCalcTools } from "./tools/calc";
 import { registerDocumentTools } from "./tools/documents";
+import { registerAuditTools } from "./tools/audit";
 
 const app = express();
 
@@ -73,6 +74,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerCalcTools OK");
     registerDocumentTools(server);
     console.log("[MCP] registerDocumentTools OK");
+    registerAuditTools(server);
+    console.log("[MCP] registerAuditTools OK");
 
     console.log("[MCP] All tools registered successfully");
     return server;
