@@ -19,6 +19,7 @@ import { registerReconcileTools } from "./tools/reconcile";
 import { registerScorecardTools } from "./tools/scorecard";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerCalcTools } from "./tools/calc";
+import { registerDocumentTools } from "./tools/documents";
 
 const app = express();
 
@@ -70,8 +71,10 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerCalendarTools OK");
     registerCalcTools(server);
     console.log("[MCP] registerCalcTools OK");
+    registerDocumentTools(server);
+    console.log("[MCP] registerDocumentTools OK");
 
-    console.log("[MCP] All 24 tools registered successfully");
+    console.log("[MCP] All tools registered successfully");
     return server;
   } catch (err: any) {
     console.error("[MCP] FATAL: tool registration failed");

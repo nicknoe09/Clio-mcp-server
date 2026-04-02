@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawGetBinarySingle } from "../clio/pagination";
+import JSZip from "jszip";
 
 const BILL_FIELDS =
   "id,number,issued_at,due_at,balance,total,state,matters";
@@ -95,6 +96,216 @@ export function registerBillTools(server: McpServer): void {
               }),
             },
           ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============================================================
+  //  download_bill_pdf — Download a single bill as PDF
+  // ============================================================
+  server.tool(
+    "download_bill_pdf",
+    "Download a single bill as a PDF file. Returns base64-encoded PDF for download. Requires the bill ID (use get_bills to find IDs). Draft bills may not have PDFs available.",
+    {
+      bill_id: z.coerce.number().describe("Clio bill ID"),
+    },
+    async (params) => {
+      try {
+        // Fetch bill metadata for filename and state check
+        const billData = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: "id,number,state,issued_at",
+        });
+        const bill = billData.data;
+
+        if (!bill) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Bill ${params.bill_id} not found` }) }],
+            isError: true,
+          };
+        }
+
+        if (bill.state === "draft") {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Bill ${bill.number || params.bill_id} is a draft — PDFs are only available for issued bills. Issue the bill in Clio first.` }) }],
+            isError: true,
+          };
+        }
+
+        // Download the PDF — try .pdf suffix first, fall back to Accept header
+        let result: { buffer: Buffer; contentType: string };
+        try {
+          result = await rawGetBinarySingle(`/bills/${params.bill_id}.pdf`);
+        } catch (suffixErr: any) {
+          // If .pdf suffix doesn't work, try Accept header approach
+          if (suffixErr.response?.status === 404 || suffixErr.response?.status === 406) {
+            result = await rawGetBinarySingle(
+              `/bills/${params.bill_id}`,
+              {},
+              { "Accept": "application/pdf" }
+            );
+          } else {
+            throw suffixErr;
+          }
+        }
+
+        // Verify we actually got a PDF
+        if (!result.contentType.includes("pdf") && !result.buffer.slice(0, 5).toString().startsWith("%PDF")) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Clio returned content-type "${result.contentType}" instead of PDF. The API may not support PDF download for this bill.` }) }],
+            isError: true,
+          };
+        }
+
+        const base64 = result.buffer.toString("base64");
+        const filename = `Bill-${bill.number || params.bill_id}.pdf`;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              filename,
+              format: "pdf",
+              size_kb: Math.round(result.buffer.length / 1024),
+              base64,
+            }),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============================================================
+  //  download_bills_pdf — Bulk download bills as a zip of PDFs
+  // ============================================================
+  server.tool(
+    "download_bills_pdf",
+    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range, then downloads each PDF and bundles them. Draft bills are skipped (no PDF available). Returns base64-encoded zip for download.",
+    {
+      state: z
+        .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
+        .optional()
+        .default("all")
+        .describe("Filter by bill state"),
+      matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
+      client_id: z.coerce.number().optional().describe("Filter by client ID"),
+      issued_after: z.string().optional().describe("Issued after date (YYYY-MM-DD)"),
+      issued_before: z.string().optional().describe("Issued before date (YYYY-MM-DD)"),
+    },
+    async (params) => {
+      try {
+        // Fetch matching bills
+        const queryParams: Record<string, any> = {
+          fields: "id,number,state,issued_at",
+        };
+        if (params.matter_id) queryParams.matter_id = params.matter_id;
+        if (params.client_id) queryParams.client_id = params.client_id;
+        if (params.state !== "all") queryParams.state = params.state;
+        if (params.issued_after) queryParams.issued_after = params.issued_after;
+        if (params.issued_before) queryParams.issued_before = params.issued_before;
+
+        const bills = await fetchAllPages<any>("/bills", queryParams);
+
+        if (bills.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: "No bills matched the provided filters." }) }],
+            isError: true,
+          };
+        }
+
+        // Separate downloadable bills from drafts
+        const drafts = bills.filter((b: any) => b.state === "draft");
+        const downloadable = bills.filter((b: any) => b.state !== "draft");
+
+        if (downloadable.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `All ${drafts.length} matching bill(s) are drafts — PDFs are only available for issued bills.` }) }],
+            isError: true,
+          };
+        }
+
+        // Download each PDF sequentially (respects rate limits)
+        const zip = new JSZip();
+        let downloaded = 0;
+        let failed = 0;
+        const errors: string[] = [];
+
+        for (const bill of downloadable) {
+          try {
+            let result: { buffer: Buffer; contentType: string };
+            try {
+              result = await rawGetBinarySingle(`/bills/${bill.id}.pdf`);
+            } catch (suffixErr: any) {
+              if (suffixErr.response?.status === 404 || suffixErr.response?.status === 406) {
+                result = await rawGetBinarySingle(
+                  `/bills/${bill.id}`,
+                  {},
+                  { "Accept": "application/pdf" }
+                );
+              } else {
+                throw suffixErr;
+              }
+            }
+
+            const filename = `Bill-${bill.number || bill.id}.pdf`;
+            zip.file(filename, result.buffer);
+            downloaded++;
+
+            // Courtesy delay between downloads to avoid slamming the API
+            if (downloaded < downloadable.length) {
+              await new Promise((r) => setTimeout(r, 200));
+            }
+          } catch (dlErr: any) {
+            failed++;
+            errors.push(`Bill ${bill.number || bill.id}: ${dlErr.message}`);
+          }
+        }
+
+        if (downloaded === 0) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Failed to download all ${downloadable.length} bill PDFs. Errors: ${errors.join("; ")}` }) }],
+            isError: true,
+          };
+        }
+
+        const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+        const base64 = zipBuffer.toString("base64");
+
+        const filterDesc = [
+          params.state !== "all" ? params.state : null,
+          params.matter_id ? `matter-${params.matter_id}` : null,
+          params.client_id ? `client-${params.client_id}` : null,
+        ].filter(Boolean).join("_") || "filtered";
+
+        const filename = `Bills-${filterDesc}.zip`;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              filename,
+              format: "zip",
+              size_kb: Math.round(zipBuffer.length / 1024),
+              base64,
+              summary: {
+                total_matched: bills.length,
+                downloaded,
+                skipped_drafts: drafts.length,
+                failed,
+                errors: errors.length > 0 ? errors : undefined,
+              },
+            }),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }],
           isError: true,
         };
       }

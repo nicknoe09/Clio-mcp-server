@@ -142,6 +142,109 @@ export async function rawGetSingle(
 }
 
 /**
+ * Make a raw HTTPS GET request that returns binary data as a Buffer.
+ * Follows 303/302/301 redirects (Clio redirects file downloads to S3).
+ * Strips Authorization header on redirect since S3 doesn't need it.
+ */
+function rawGetBinary(
+  fullUrl: string,
+  extraHeaders?: Record<string, string>
+): Promise<{ buffer: Buffer; contentType: string; statusCode: number }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(fullUrl);
+    const path = fullUrl.slice(fullUrl.indexOf(parsed.pathname));
+
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${getAccessToken()}`,
+        ...extraHeaders,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      // Follow redirects (Clio sends 303 to S3 signed URLs for file downloads)
+      if (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301) {
+        const redirectUrl = res.headers.location;
+        if (!redirectUrl) return reject(new Error("No redirect URL in response"));
+
+        // Follow redirect — no Authorization header needed for S3
+        https.get(redirectUrl, (res2) => {
+          const chunks: Buffer[] = [];
+          res2.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res2.on("end", () => {
+            const buffer = Buffer.concat(chunks);
+            if (res2.statusCode && res2.statusCode >= 200 && res2.statusCode < 300) {
+              resolve({
+                buffer,
+                contentType: res2.headers["content-type"] || "application/octet-stream",
+                statusCode: res2.statusCode,
+              });
+            } else {
+              const err: any = new Error(`Download failed with status ${res2.statusCode}`);
+              err.response = { status: res2.statusCode, data: buffer.toString("utf8").slice(0, 500) };
+              reject(err);
+            }
+          });
+        }).on("error", reject);
+      } else if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        // Direct binary response
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          resolve({
+            buffer: Buffer.concat(chunks),
+            contentType: res.headers["content-type"] || "application/octet-stream",
+            statusCode: res.statusCode!,
+          });
+        });
+      } else {
+        // Error response — collect as string for the error message
+        let body = "";
+        res.on("data", (chunk) => (body += chunk));
+        res.on("end", () => {
+          const err: any = new Error(`Request failed with status code ${res.statusCode}`);
+          err.response = { status: res.statusCode, data: body.slice(0, 500), headers: res.headers };
+          reject(err);
+        });
+      }
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * Fetch a single binary resource from Clio (e.g. bill PDF).
+ * Handles auth refresh on 401 and rate-limit backoff.
+ */
+export async function rawGetBinarySingle(
+  url: string,
+  params: Record<string, any> = {},
+  extraHeaders?: Record<string, string>
+): Promise<{ buffer: Buffer; contentType: string }> {
+  const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
+  const qs = buildQueryString(params);
+  const fullUrl = qs ? `${baseUrl}${url}?${qs}` : `${baseUrl}${url}`;
+
+  return withBackoff(async () => {
+    try {
+      return await rawGetBinary(fullUrl, extraHeaders);
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        await refreshAccessToken();
+        return await rawGetBinary(fullUrl, extraHeaders);
+      }
+      throw err;
+    }
+  });
+}
+
+/**
  * Make a raw HTTPS POST request, bypassing axios entirely.
  */
 function rawPost(fullUrl: string, body: any): Promise<any> {
