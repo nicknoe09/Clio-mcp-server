@@ -13,14 +13,59 @@ const HC_COURT_IDS = new Set([
 ]);
 
 // HC rate caps by experience bracket (years → max hourly rate)
-const HC_RATE_CAPS: { label: string; max: number }[] = [
-  { label: "0-2 yrs",  max: 250 },
-  { label: "3-5 yrs",  max: 300 },
-  { label: "6-10 yrs", max: 400 },
-  { label: "11-20 yrs", max: 500 },
-  { label: "20+ yrs",  max: 600 },
+const HC_RATE_BRACKETS: { minYrs: number; maxYrs: number; label: string; max: number }[] = [
+  { minYrs: 0,  maxYrs: 2,  label: "0-2 yrs",   max: 250 },
+  { minYrs: 3,  maxYrs: 5,  label: "3-5 yrs",   max: 300 },
+  { minYrs: 6,  maxYrs: 10, label: "6-10 yrs",  max: 400 },
+  { minYrs: 11, maxYrs: 20, label: "11-20 yrs",  max: 500 },
+  { minYrs: 21, maxYrs: 99, label: "20+ yrs",   max: 600 },
 ];
 const HC_PARALEGAL_MAX = 175;
+
+// Timekeeper roster — license dates drive dynamic HC rate cap calculation
+type TimekeeperInfo = {
+  name: string;
+  role: "attorney" | "paralegal" | "clerk";
+  licensedDate: string | null; // ISO date or null for non-attorneys
+};
+
+const TIMEKEEPER_ROSTER: Record<number, TimekeeperInfo> = {
+  344117381: { name: "Paul Romano",        role: "attorney",  licensedDate: "2002-01-01" },
+  344134017: { name: "Kenny Sumner",       role: "attorney",  licensedDate: "2006-01-01" },
+  348755029: { name: "Nicholas Noe",       role: "attorney",  licensedDate: "2017-11-01" },
+  359380639: { name: "Nicholas Fernelius", role: "attorney",  licensedDate: "2020-10-30" },
+  359711375: { name: "Tzipora Simmons",    role: "attorney",  licensedDate: "2016-01-01" },
+  359576660: { name: "May Huynh",          role: "attorney",  licensedDate: "2026-01-01" },
+  358528744: { name: "Angela Alanis",      role: "paralegal", licensedDate: null },
+  358108805: { name: "Anna Lozano",        role: "paralegal", licensedDate: null },
+  358550509: { name: "Kaz Gonzalez",       role: "paralegal", licensedDate: null },
+  360091325: { name: "Jonathan Barbee",    role: "clerk",     licensedDate: null },
+};
+
+function getHCRateCap(userId: number): { max: number; label: string } | null {
+  const tk = TIMEKEEPER_ROSTER[userId];
+  if (!tk) return null; // Unknown timekeeper — can't determine cap
+
+  if (tk.role === "paralegal" || tk.role === "clerk") {
+    return { max: HC_PARALEGAL_MAX, label: `${tk.role} ($${HC_PARALEGAL_MAX}/hr max)` };
+  }
+
+  if (!tk.licensedDate) return null;
+
+  const licensed = new Date(tk.licensedDate);
+  const now = new Date();
+  const yearsExp = (now.getTime() - licensed.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
+  const yrs = Math.floor(yearsExp);
+
+  for (const bracket of HC_RATE_BRACKETS) {
+    if (yrs >= bracket.minYrs && yrs <= bracket.maxYrs) {
+      return { max: bracket.max, label: `${bracket.label} (${yrs} yrs exp → $${bracket.max}/hr max)` };
+    }
+  }
+
+  // Fallback for 20+
+  return { max: 600, label: `20+ yrs (${yrs} yrs exp → $600/hr max)` };
+}
 
 // --- Programmatic flag detection ---
 
@@ -72,9 +117,23 @@ function detectFlags(
   note: string,
   rate: number,
   hours: number,
-  isHC: boolean
+  isHC: boolean,
+  userId?: number
 ): Flag[] {
   const flags: Flag[] = [];
+
+  // Rate cap check (HC only)
+  if (isHC && userId) {
+    const cap = getHCRateCap(userId);
+    if (cap && rate > cap.max) {
+      flags.push({
+        code: "RATE_EXCEEDS_CAP",
+        severity: "reduce",
+        message: `Rate $${rate}/hr exceeds HC cap for ${cap.label}. Reduce to $${cap.max}/hr.`,
+      });
+    }
+  }
+
   if (!note || note.trim().length === 0) {
     flags.push({ code: "NO_DESC", severity: "strike", message: "No description provided" });
     return flags;
@@ -307,7 +366,7 @@ export function registerAuditTools(server: McpServer): void {
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
 
-            const flags = detectFlags(note, rate, hours, isHC);
+            const flags = detectFlags(note, rate, hours, isHC, li.user?.id);
 
             allEntries.push({
               line_item_id: li.id,
@@ -518,7 +577,7 @@ export function registerAuditTools(server: McpServer): void {
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
 
-            const flags = detectFlags(note, rate, hours, isHC);
+            const flags = detectFlags(note, rate, hours, isHC, li.user?.id);
 
             allEntries.push({
               line_item_id: li.id,
