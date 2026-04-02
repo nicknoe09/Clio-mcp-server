@@ -578,10 +578,10 @@ export function registerAuditTools(server: McpServer): void {
         ws1.getRow(1).font = { bold: true };
 
         const severityColor: Record<string, string> = {
-          strike: "FFFF0000",
-          reduce: "FFFF8C00",
-          review: "FFFFCC00",
-          rephrase: "FF87CEEB",
+          strike: "40FF0000",   // red, semi-transparent
+          reduce: "40FF8C00",   // orange
+          review: "40FFCC00",   // yellow
+          rephrase: "4087CEEB", // blue
         };
 
         for (const e of allEntries) {
@@ -613,7 +613,7 @@ export function registerAuditTools(server: McpServer): void {
               cell.fill = {
                 type: "pattern",
                 pattern: "solid",
-                fgColor: { argb: severityColor[worstSeverity] + "33" },
+                fgColor: { argb: severityColor[worstSeverity] },
               };
             });
           }
@@ -666,7 +666,21 @@ export function registerAuditTools(server: McpServer): void {
 
         // Sheet 3: Flagged Only
         const ws3 = wb.addWorksheet("Flagged Only");
-        ws3.columns = ws1.columns.map(c => ({ ...c }));
+        ws3.columns = [
+          { header: "Bill #", key: "bill", width: 10 },
+          { header: "Matter", key: "matter", width: 45 },
+          { header: "Practice Area", key: "pa", width: 18 },
+          { header: "Standard", key: "standard", width: 10 },
+          { header: "Date", key: "date", width: 12 },
+          { header: "Timekeeper", key: "tk", width: 22 },
+          { header: "Hours", key: "hours", width: 8 },
+          { header: "Rate", key: "rate", width: 10 },
+          { header: "Amount", key: "amount", width: 12 },
+          { header: "Description", key: "note", width: 60 },
+          { header: "Flags", key: "flags", width: 15 },
+          { header: "Severity", key: "severity", width: 12 },
+          { header: "Flag Details", key: "details", width: 50 },
+        ];
         ws3.getRow(1).font = { bold: true };
 
         for (const e of flaggedEntries) {
@@ -696,7 +710,7 @@ export function registerAuditTools(server: McpServer): void {
               cell.fill = {
                 type: "pattern",
                 pattern: "solid",
-                fgColor: { argb: severityColor[worstSeverity] + "33" },
+                fgColor: { argb: severityColor[worstSeverity] },
               };
             });
           }
