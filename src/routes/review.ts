@@ -228,8 +228,7 @@ router.get("/review", async (req: Request, res: Response) => {
         }
       }
 
-      // Filter by date range
-      entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+      // No date filter for draft bills — show all entries on current drafts
     } else {
       // All time entries for user in date range
       const queryParams: Record<string, any> = {
@@ -989,19 +988,19 @@ function buildLandingHTML(): string {
     </select>
 
     <label for="scope">Scope</label>
-    <select id="scope">
+    <select id="scope" onchange="toggleDates()">
       <option value="all">All time entries in date range</option>
       <option value="draft_bills">Only entries on draft bills</option>
     </select>
 
-    <div class="date-row">
+    <div class="date-row" id="dateRow">
       <div>
         <label for="start">Start Date</label>
-        <input type="date" id="start" value="${twoWeeksAgo}" required>
+        <input type="date" id="start" value="${twoWeeksAgo}">
       </div>
       <div>
         <label for="end">End Date</label>
-        <input type="date" id="end" value="${today}" required>
+        <input type="date" id="end" value="${today}">
       </div>
     </div>
 
@@ -1010,15 +1009,22 @@ function buildLandingHTML(): string {
   <div class="loading" id="loading">Loading entries and generating suggestions... this may take a moment.</div>
 </div>
 <script>
+function toggleDates() {
+  const scope = document.getElementById('scope').value;
+  document.getElementById('dateRow').style.display = scope === 'draft_bills' ? 'none' : 'flex';
+}
+
 function go(e) {
   e.preventDefault();
   const uid = document.getElementById('user').value;
-  const start = document.getElementById('start').value;
-  const end = document.getElementById('end').value;
   const scope = document.getElementById('scope').value;
   if (!uid) return;
   document.getElementById('loading').classList.add('show');
-  window.location.href = '/review?user_id=' + uid + '&start=' + start + '&end=' + end + '&scope=' + scope;
+  let url = '/review?user_id=' + uid + '&scope=' + scope;
+  if (scope !== 'draft_bills') {
+    url += '&start=' + document.getElementById('start').value + '&end=' + document.getElementById('end').value;
+  }
+  window.location.href = url;
 }
 </script>
 </body>
