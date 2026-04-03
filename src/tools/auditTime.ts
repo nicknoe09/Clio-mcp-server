@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 import { detectFlags, detectDuplicates, detectBillingSpikes, HC_COURT_IDS, Flag } from "./audit";
 
 export function registerAuditTimeTools(server: McpServer): void {
@@ -34,32 +34,38 @@ export async function auditTimeEntries(
   startDate: string,
   endDate: string
 ): Promise<AuditResult> {
-  // 1. Fetch time entries
+  // 1. Fetch time entries (simple fields — activities endpoint doesn't support deep nesting)
   const queryParams: Record<string, any> = {
     type: "TimeEntry",
-    fields: "id,date,quantity,price,note,matter{id,display_number,description,practice_area{name},custom_field_values{id,field_name,value}},user{id,name}",
+    fields: "id,date,quantity,price,note,matter{id,display_number,description},user{id,name}",
     user_id: userId,
     created_since: `${startDate}T00:00:00+00:00`,
   };
   let entries = await fetchAllPages<any>("/activities", queryParams);
   entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
 
-  // 2. Build matter HC classification cache
+  // 2. Build matter HC classification cache — fetch matter details separately
   const matterHC = new Map<number, { isHC: boolean; description: string }>();
+  const matterIds = new Set(entries.map((e: any) => e.matter?.id).filter(Boolean));
 
-  for (const e of entries) {
-    const mid = e.matter?.id;
-    if (!mid || matterHC.has(mid)) continue;
+  for (const mid of matterIds) {
+    try {
+      const matterDetail = await rawGetSingle(`/matters/${mid}`, {
+        fields: "id,description,custom_field_values{id,field_name,value}",
+      });
+      const cfvs = matterDetail.data?.custom_field_values || [];
+      const courtField = cfvs.find((c: any) => c.field_name === "Court");
+      const courtId = courtField?.value || null;
+      const isHC = courtId ? HC_COURT_IDS.has(courtId) : false;
 
-    const cfvs = e.matter?.custom_field_values || [];
-    const courtField = cfvs.find((c: any) => c.field_name === "Court");
-    const courtId = courtField?.value || null;
-    const isHC = courtId ? HC_COURT_IDS.has(courtId) : false;
-
-    matterHC.set(mid, {
-      isHC,
-      description: e.matter?.description || "",
-    });
+      matterHC.set(mid, {
+        isHC,
+        description: matterDetail.data?.description || "",
+      });
+    } catch {
+      // If we can't fetch matter details, assume non-HC
+      matterHC.set(mid, { isHC: false, description: "" });
+    }
   }
 
   // 3. Run detection on each entry
