@@ -76,6 +76,8 @@ type Flag = {
   code: string;
   severity: "strike" | "reduce" | "review" | "rephrase";
   message: string;
+  suggested_action?: string;        // e.g. "REMOVE ENTRY", "REDUCE RATE TO $250", etc.
+  suggested_description?: string;   // copy-pasteable revised description, if applicable
 };
 
 const CLERICAL_PATTERNS = [
@@ -134,29 +136,49 @@ function detectFlags(
         code: "RATE_EXCEEDS_CAP",
         severity: "reduce",
         message: `Rate $${rate}/hr exceeds HC cap for ${cap.label}. Reduce to $${cap.max}/hr.`,
+        suggested_action: `REDUCE RATE TO $${cap.max}/hr`,
       });
     }
   }
 
   if (!note || note.trim().length === 0) {
-    flags.push({ code: "NO_DESC", severity: "strike", message: "No description provided" });
+    flags.push({ code: "NO_DESC", severity: "strike", message: "No description provided", suggested_action: "REMOVE ENTRY or add a detailed description" });
     return flags;
   }
 
   const trimmed = note.trim();
 
-  // Block billing
+  // Block billing — split semicolon-delimited tasks into individual suggested entries
   const semicolons = (trimmed.match(/;/g) || []).length;
   const sentences = trimmed.split(/\.\s+[A-Z]/).length;
   if (semicolons >= 2 || sentences >= 3) {
-    flags.push({ code: "BLOCK_BILL", severity: "reduce", message: `Block billing detected (${semicolons} semicolons, ~${sentences} tasks). HC standard: 15-40% reduction.` });
+    const tasks = trimmed.split(/;\s*/).filter(t => t.length > 0);
+    const splitSuggestions = tasks.map((t, i) => `Entry ${i + 1}: ${t.trim().replace(/\.$/, "")}`).join("\n");
+    flags.push({
+      code: "BLOCK_BILL",
+      severity: "reduce",
+      message: `Block billing detected (${semicolons} semicolons, ~${sentences} tasks). HC standard: 15-40% reduction.`,
+      suggested_action: `SPLIT into ${tasks.length} separate time entries`,
+      suggested_description: splitSuggestions,
+    });
   } else if (BLOCK_BILLING_INDICATORS.some(p => p.test(trimmed)) && (semicolons >= 1 || sentences >= 2)) {
-    flags.push({ code: "BLOCK_BILL_MILD", severity: "review", message: "Possible block billing — multiple tasks in one entry" });
+    flags.push({
+      code: "BLOCK_BILL_MILD",
+      severity: "review",
+      message: "Possible block billing — multiple tasks in one entry",
+      suggested_action: "Consider splitting into separate entries or clarifying single-task nature",
+    });
   }
 
   // Vague entries
   if (trimmed.length < 15 || VAGUE_PATTERNS.some(p => p.test(trimmed))) {
-    flags.push({ code: "VAGUE", severity: "reduce", message: "Vague entry — lacks who/what/why specificity" });
+    flags.push({
+      code: "VAGUE",
+      severity: "reduce",
+      message: "Vague entry — lacks who/what/why specificity",
+      suggested_action: "REVISE description to include specific task, document, or person involved",
+      suggested_description: `[Specify action: e.g. 'Reviewed and analyzed [document name] regarding [specific issue]' or 'Telephone conference with [person] regarding [topic]']`,
+    });
   }
 
   // Clerical work
@@ -164,57 +186,118 @@ function detectFlags(
   const isEfiling = EFILING_PATTERN.test(trimmed);
 
   if (isClerical && !isEfiling) {
-    flags.push({ code: "CLERICAL", severity: isHC ? "strike" : "strike", message: "Clerical/administrative work — non-compensable" });
+    flags.push({
+      code: "CLERICAL",
+      severity: "strike",
+      message: "Clerical/administrative work — non-compensable",
+      suggested_action: "REMOVE ENTRY — clerical tasks are non-compensable",
+    });
   } else if (isEfiling && isHC) {
-    flags.push({ code: "EFILING_HC", severity: "strike", message: "E-filing is non-compensable under HC standards" });
+    flags.push({
+      code: "EFILING_HC",
+      severity: "strike",
+      message: "E-filing is non-compensable under HC standards",
+      suggested_action: "REMOVE ENTRY — e-filing is non-compensable under HC standards",
+    });
   }
-  // E-filing is OK under general hygiene — no flag
 
   // Fee petition prep (HC: strike; general: review)
   if (FEE_PETITION_PATTERN.test(trimmed)) {
-    flags.push({ code: "FEE_PETITION", severity: isHC ? "strike" : "review", message: isHC ? "Fee petition preparation — not recoverable under HC standards" : "Fee petition preparation — consider whether recoverable" });
+    flags.push({
+      code: "FEE_PETITION",
+      severity: isHC ? "strike" : "review",
+      message: isHC ? "Fee petition preparation — not recoverable under HC standards" : "Fee petition preparation — consider whether recoverable",
+      suggested_action: isHC ? "REMOVE ENTRY — fee petition prep is not recoverable under HC standards" : "Review whether fee petition time is recoverable in this matter",
+    });
   }
 
   // Court staff communication (HC only)
   if (isHC && COURT_STAFF_PATTERN.test(trimmed)) {
-    flags.push({ code: "COURT_STAFF", severity: "strike", message: "Court staff communication — not billable under HC standards (except narrow correction scenarios)" });
+    flags.push({
+      code: "COURT_STAFF",
+      severity: "strike",
+      message: "Court staff communication — not billable under HC standards (except narrow correction scenarios)",
+      suggested_action: "REMOVE ENTRY — court staff communication is non-billable (unless correcting a court error)",
+    });
   }
 
   // Travel (HC only — not reimbursable within Harris County)
   if (isHC && TRAVEL_PATTERN.test(trimmed)) {
-    flags.push({ code: "TRAVEL_HC", severity: "strike", message: "Travel — not reimbursable within Harris County" });
+    flags.push({
+      code: "TRAVEL_HC",
+      severity: "strike",
+      message: "Travel — not reimbursable within Harris County",
+      suggested_action: "REMOVE ENTRY — travel within Harris County is not reimbursable",
+    });
   }
 
   // Research — HC: only if novel; general: OK but suggest rephrasing
   if (RESEARCH_PATTERN.test(trimmed)) {
     if (isHC) {
-      flags.push({ code: "RESEARCH_HC", severity: "review", message: "Research — only compensable if novel issue under HC standards. Verify novelty." });
+      flags.push({
+        code: "RESEARCH_HC",
+        severity: "review",
+        message: "Research — only compensable if novel issue under HC standards. Verify novelty.",
+        suggested_action: "REVISE to specify the novel legal issue researched, or REMOVE if routine",
+        suggested_description: `Researched novel legal issue regarding [specify issue, e.g. 'applicability of § ___ to ward's mineral interests'] — no controlling authority in this jurisdiction`,
+      });
     } else {
-      flags.push({ code: "RESEARCH_REPHRASE", severity: "rephrase", message: "Research — consider rephrasing to specify the issue researched" });
+      flags.push({
+        code: "RESEARCH_REPHRASE",
+        severity: "rephrase",
+        message: "Research — consider rephrasing to specify the issue researched",
+        suggested_description: `Researched [specify legal issue] regarding [specify context, e.g. 'applicability of ___ to client's ___']`,
+      });
     }
   }
 
   // Internal conferencing
   if (CONFERENCE_PATTERN.test(trimmed)) {
     if (!CONFERENCE_LEGAL_KEYWORDS.test(trimmed)) {
-      flags.push({ code: "CONFERENCE_VAGUE", severity: "review", message: "Internal conference — description doesn't reference legal strategy or substance. Rephrase or justify." });
+      flags.push({
+        code: "CONFERENCE_VAGUE",
+        severity: "review",
+        message: "Internal conference — description doesn't reference legal strategy or substance. Rephrase or justify.",
+        suggested_action: "REVISE to include the legal substance discussed",
+        suggested_description: `Conference with [attorney/staff name] regarding [legal strategy/case issue, e.g. 'strategy for upcoming hearing on motion to ___']`,
+      });
     }
   }
 
   // Excessive time
   if (hours >= 4.0 && /\b(hearing|appearance|court)\b/i.test(trimmed)) {
-    flags.push({ code: "EXCESS_HEARING", severity: "review", message: `${hours} hrs for hearing/appearance — HC guideline: simple hearings < 3-4 hrs total` });
+    flags.push({
+      code: "EXCESS_HEARING",
+      severity: "review",
+      message: `${hours} hrs for hearing/appearance — HC guideline: simple hearings < 3-4 hrs total`,
+      suggested_action: `REDUCE HOURS — consider reducing to 3.0-3.5 hrs or add justification for extended hearing`,
+    });
   }
   if (hours >= 2.0 && /\b(pleading|motion|order)\b/i.test(trimmed) && /\b(routine|standard|simple)\b/i.test(trimmed)) {
-    flags.push({ code: "EXCESS_ROUTINE", severity: "review", message: `${hours} hrs for routine pleading — HC guideline: 1-2 hrs` });
+    flags.push({
+      code: "EXCESS_ROUTINE",
+      severity: "review",
+      message: `${hours} hrs for routine pleading — HC guideline: 1-2 hrs`,
+      suggested_action: `REDUCE HOURS to 1.0-2.0 hrs, or remove 'routine/standard/simple' if work was complex`,
+    });
   }
   if (hours >= 0.3 && /^(call|email|voicemail|text|message)\b/i.test(trimmed) && trimmed.length < 60) {
-    flags.push({ code: "EXCESS_COMMS", severity: "review", message: `${hours} hrs for brief communication — review for reasonableness` });
+    flags.push({
+      code: "EXCESS_COMMS",
+      severity: "review",
+      message: `${hours} hrs for brief communication — review for reasonableness`,
+      suggested_action: `REDUCE HOURS to 0.1-0.2 hrs, or expand description to justify time`,
+    });
   }
 
   // Round-number billing (pattern, not auto-reduce)
   if (hours > 0 && hours === Math.floor(hours) && hours >= 2) {
-    flags.push({ code: "ROUND_NUMBER", severity: "review", message: `Exact ${hours}.0 hrs — round-number billing pattern` });
+    flags.push({
+      code: "ROUND_NUMBER",
+      severity: "review",
+      message: `Exact ${hours}.0 hrs — round-number billing pattern`,
+      suggested_action: "Adjust to actual time (e.g. 1.8 or 2.2) if entry was rounded",
+    });
   }
 
   return flags;
@@ -635,7 +718,7 @@ export function registerAuditTools(server: McpServer): void {
           return s;
         }
 
-        const csvHeaders = ["Bill #","Matter","Practice Area","Standard","Date","Timekeeper","Hours","Rate","Amount","Description","Flags","Severity","Flag Details"];
+        const csvHeaders = ["Bill #","Matter","Practice Area","Standard","Date","Timekeeper","Hours","Rate","Amount","Description","Flags","Severity","Flag Details","Suggested Action","Suggested Revised Description"];
         const csvRows: string[] = [csvHeaders.join(",")];
 
         for (const e of allEntries) {
@@ -645,6 +728,16 @@ export function registerAuditTools(server: McpServer): void {
               : e.flags.some((f: Flag) => f.severity === "review") ? "review"
               : "rephrase")
             : "";
+
+          const suggestedActions = e.flags
+            .filter((f: Flag) => f.suggested_action)
+            .map((f: Flag) => f.suggested_action)
+            .join("; ");
+
+          const suggestedDescriptions = e.flags
+            .filter((f: Flag) => f.suggested_description)
+            .map((f: Flag) => f.suggested_description)
+            .join("\n");
 
           csvRows.push([
             csvEscape(e.bill_number),
@@ -660,6 +753,8 @@ export function registerAuditTools(server: McpServer): void {
             csvEscape(e.flags.map((f: Flag) => f.code).join(", ")),
             csvEscape(worstSeverity),
             csvEscape(e.flags.map((f: Flag) => f.message).join("; ")),
+            csvEscape(suggestedActions),
+            csvEscape(suggestedDescriptions),
           ].join(","));
         }
 
@@ -705,7 +800,9 @@ export function registerAuditTools(server: McpServer): void {
                 "- Row color by worst severity: strike=#FFD9D9 (red), reduce=#FFE8CC (orange), review=#FFF5CC (yellow), rephrase=#D9E8FF (blue), clean rows=#FFFFFF (white).",
                 "- 'Rate' and 'Amount' columns: currency format ($#,##0.00).",
                 "- 'Hours' column: number format with 2 decimal places.",
-                "- Column widths: auto-fit or use sensible defaults (Bill#=10, Matter=40, Date=12, Timekeeper=22, Hours=8, Rate=10, Amount=12, Description=55, Flags=20, Severity=12, Flag Details=50).",
+                "- 'Suggested Action' column: contains the recommended action (e.g. REMOVE ENTRY, REDUCE RATE, SPLIT entries, REVISE description).",
+                "- 'Suggested Revised Description' column: contains copy-pasteable revised time entry descriptions that the user can paste directly into Clio while editing time entries. This is the most important column for flagged entries.",
+                "- Column widths: auto-fit or use sensible defaults (Bill#=10, Matter=40, Date=12, Timekeeper=22, Hours=8, Rate=10, Amount=12, Description=55, Flags=20, Severity=12, Flag Details=50, Suggested Action=30, Suggested Revised Description=60).",
                 "- Freeze the top row (header) so it stays visible when scrolling.",
                 "",
                 "Sheet 3 — 'Summary' formatting:",
