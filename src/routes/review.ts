@@ -174,6 +174,7 @@ router.get("/review", async (req: Request, res: Response) => {
   const userId = req.query.user_id as string;
   const start = req.query.start as string;
   const end = req.query.end as string;
+  const scope = (req.query.scope as string) || "all"; // "all" | "draft_bills"
 
   if (!userId) {
     res.setHeader("Content-Type", "text/html");
@@ -185,15 +186,61 @@ router.get("/review", async (req: Request, res: Response) => {
   const endDate = end || new Date().toISOString().split("T")[0];
 
   try {
-    // 1. Fetch time entries from Clio
-    const queryParams: Record<string, any> = {
-      type: "TimeEntry",
-      fields: "id,date,quantity,price,note,matter{id,display_number,description},user{id,name}",
-      user_id: userId,
-      created_since: `${startDate}T00:00:00+00:00`,
-    };
-    let entries = await fetchAllPages<any>("/activities", queryParams);
-    entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+    let entries: any[];
+
+    if (scope === "draft_bills") {
+      // Fetch draft bills, then pull line items to get activity IDs for this user
+      const draftBills = await fetchAllPages<any>("/bills", {
+        fields: "id,number,state,matters{id,display_number,description}",
+        state: "draft",
+      });
+
+      entries = [];
+      for (const bill of draftBills) {
+        const lineItems = await fetchAllPages<any>("/line_items", {
+          fields: "id,date,quantity,price,description,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
+          bill_id: bill.id,
+        });
+
+        for (const li of lineItems) {
+          if (li.activity?.type !== "TimeEntry") continue;
+          if (String(li.user?.id) !== String(userId)) continue;
+
+          const matter = li.matter || bill.matters?.[0] || {};
+          entries.push({
+            id: li.activity.id,
+            date: li.date,
+            quantity: li.quantity,
+            price: li.price,
+            note: li.activity?.note || li.description || "",
+            matter: {
+              id: matter.id,
+              display_number: matter.display_number,
+              description: matter.description,
+            },
+            user: li.user,
+          });
+        }
+
+        // Courtesy delay
+        if (draftBills.indexOf(bill) < draftBills.length - 1) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+      }
+
+      // Filter by date range
+      entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+    } else {
+      // All time entries for user in date range
+      const queryParams: Record<string, any> = {
+        type: "TimeEntry",
+        fields: "id,date,quantity,price,note,matter{id,display_number,description},user{id,name}",
+        user_id: userId,
+        created_since: `${startDate}T00:00:00+00:00`,
+      };
+      entries = await fetchAllPages<any>("/activities", queryParams);
+      entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+    }
 
     // 2. Generate suggestions for each entry
     const rows: PendingRow[] = [];
@@ -227,7 +274,8 @@ router.get("/review", async (req: Request, res: Response) => {
     // 4. Serve HTML
     res.setHeader("Content-Type", "text/html");
     const userName = findUserById(Number(userId))?.name || `User ${userId}`;
-    res.send(buildHTML(rows, startDate, endDate, userName));
+    const scopeLabel = scope === "draft_bills" ? "Draft Bills Only" : "All Entries";
+    res.send(buildHTML(rows, startDate, endDate, userName, scopeLabel));
   } catch (err: any) {
     res.status(500).send(`Error: ${err.message}`);
   }
@@ -298,7 +346,7 @@ export { readCSV, writeCSV, PendingRow, CSV_PATH };
 // ---------------------------------------------------------------------------
 //  HTML builder
 // ---------------------------------------------------------------------------
-function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userName: string): string {
+function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userName: string, scopeLabel: string): string {
   const rowsJSON = JSON.stringify(rows).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 
   return `<!DOCTYPE html>
@@ -662,7 +710,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 
 <div class="header">
   <h1>Time Entry Review</h1>
-  <div class="subtitle">${userName} &middot; ${startDate} to ${endDate} &middot; ${rows.length} entries</div>
+  <div class="subtitle">${userName} &middot; ${startDate} to ${endDate} &middot; ${rows.length} entries &middot; ${scopeLabel}</div>
   <div class="progress-wrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-text" id="progressText">0 of ${rows.length}</div>
@@ -940,6 +988,12 @@ function buildLandingHTML(): string {
       ${userOptions}
     </select>
 
+    <label for="scope">Scope</label>
+    <select id="scope">
+      <option value="all">All time entries in date range</option>
+      <option value="draft_bills">Only entries on draft bills</option>
+    </select>
+
     <div class="date-row">
       <div>
         <label for="start">Start Date</label>
@@ -961,9 +1015,10 @@ function go(e) {
   const uid = document.getElementById('user').value;
   const start = document.getElementById('start').value;
   const end = document.getElementById('end').value;
+  const scope = document.getElementById('scope').value;
   if (!uid) return;
   document.getElementById('loading').classList.add('show');
-  window.location.href = '/review?user_id=' + uid + '&start=' + start + '&end=' + end;
+  window.location.href = '/review?user_id=' + uid + '&start=' + start + '&end=' + end + '&scope=' + scope;
 }
 </script>
 </body>
