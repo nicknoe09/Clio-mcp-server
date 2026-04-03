@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle } from "../clio/pagination";
+import { getActiveUsers, findUserById } from "../utils/userRoster";
 
 const router = Router();
 const CSV_PATH = path.join(process.cwd(), "pending.csv");
@@ -175,7 +176,8 @@ router.get("/review", async (req: Request, res: Response) => {
   const end = req.query.end as string;
 
   if (!userId) {
-    res.status(400).send("Missing required query param: user_id");
+    res.setHeader("Content-Type", "text/html");
+    res.send(buildLandingHTML());
     return;
   }
 
@@ -224,7 +226,8 @@ router.get("/review", async (req: Request, res: Response) => {
 
     // 4. Serve HTML
     res.setHeader("Content-Type", "text/html");
-    res.send(buildHTML(rows, startDate, endDate));
+    const userName = findUserById(Number(userId))?.name || `User ${userId}`;
+    res.send(buildHTML(rows, startDate, endDate, userName));
   } catch (err: any) {
     res.status(500).send(`Error: ${err.message}`);
   }
@@ -295,7 +298,7 @@ export { readCSV, writeCSV, PendingRow, CSV_PATH };
 // ---------------------------------------------------------------------------
 //  HTML builder
 // ---------------------------------------------------------------------------
-function buildHTML(rows: PendingRow[], startDate: string, endDate: string): string {
+function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userName: string): string {
   const rowsJSON = JSON.stringify(rows).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 
   return `<!DOCTYPE html>
@@ -659,7 +662,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string): stri
 
 <div class="header">
   <h1>Time Entry Review</h1>
-  <div class="subtitle">${startDate} to ${endDate} &middot; ${rows.length} entries</div>
+  <div class="subtitle">${userName} &middot; ${startDate} to ${endDate} &middot; ${rows.length} entries</div>
   <div class="progress-wrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-text" id="progressText">0 of ${rows.length}</div>
@@ -835,6 +838,133 @@ async function applyAll() {
 
 render();
 updateProgress();
+</script>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+//  Landing page — user picker
+// ---------------------------------------------------------------------------
+function buildLandingHTML(): string {
+  const users = getActiveUsers();
+  const today = new Date().toISOString().split("T")[0];
+  const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+  const userOptions = users
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((u) => `<option value="${u.id}">${u.name} (${u.role})</option>`)
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Time Entry Review</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .panel {
+    background: #1a1d2e;
+    border: 1px solid #2d3348;
+    border-radius: 16px;
+    padding: 40px;
+    width: 100%;
+    max-width: 440px;
+  }
+  h1 { font-size: 22px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: #94a3b8; margin-bottom: 28px; }
+  label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #94a3b8;
+    margin-bottom: 6px;
+  }
+  select, input[type="date"] {
+    width: 100%;
+    padding: 10px 14px;
+    background: #111322;
+    border: 1px solid #2d3348;
+    border-radius: 8px;
+    color: #e2e8f0;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    margin-bottom: 20px;
+    outline: none;
+  }
+  select:focus, input[type="date"]:focus { border-color: #6366f1; }
+  .date-row { display: flex; gap: 12px; }
+  .date-row > div { flex: 1; }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    margin-top: 8px;
+    transition: all 0.2s;
+  }
+  .btn:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); transform: translateY(-1px); }
+  .loading { display: none; text-align: center; color: #94a3b8; font-size: 13px; margin-top: 16px; }
+  .loading.show { display: block; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>Time Entry Review</h1>
+  <div class="sub">Select a team member and date range to review their time entries with AI-suggested revisions.</div>
+
+  <form id="reviewForm" onsubmit="go(event)">
+    <label for="user">Team Member</label>
+    <select id="user" required>
+      <option value="">Select a person...</option>
+      ${userOptions}
+    </select>
+
+    <div class="date-row">
+      <div>
+        <label for="start">Start Date</label>
+        <input type="date" id="start" value="${twoWeeksAgo}" required>
+      </div>
+      <div>
+        <label for="end">End Date</label>
+        <input type="date" id="end" value="${today}" required>
+      </div>
+    </div>
+
+    <button type="submit" class="btn">Review Entries</button>
+  </form>
+  <div class="loading" id="loading">Loading entries and generating suggestions... this may take a moment.</div>
+</div>
+<script>
+function go(e) {
+  e.preventDefault();
+  const uid = document.getElementById('user').value;
+  const start = document.getElementById('start').value;
+  const end = document.getElementById('end').value;
+  if (!uid) return;
+  document.getElementById('loading').classList.add('show');
+  window.location.href = '/review?user_id=' + uid + '&start=' + start + '&end=' + end;
+}
 </script>
 </body>
 </html>`;
