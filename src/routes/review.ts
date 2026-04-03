@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import fs from "fs";
 import path from "path";
 import https from "https";
-import { fetchAllPages, rawGetSingle, rawPatchSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
 import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
 import { detectFlags, HC_COURT_IDS, Flag } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
@@ -401,11 +401,20 @@ router.get("/review", async (req: Request, res: Response) => {
         suggested_note: suggested,
         selected_note: "",
         status: "pending",
-        flags_json: JSON.stringify(e.flags.map(f => ({
-          code: f.code,
-          severity: f.severity,
-          message: f.message,
-        }))),
+        flags_json: JSON.stringify(e.flags.map(f => {
+          const obj: any = { code: f.code, severity: f.severity, message: f.message };
+          // For BLOCK_BILL, include split tasks for the UI
+          if (f.code === "BLOCK_BILL" && f.suggested_description) {
+            const taskLines = f.suggested_description.split("\n").filter(l => l.trim());
+            const taskCount = taskLines.length || 1;
+            const perTaskHours = Math.round((e.hours / taskCount) * 100) / 100;
+            obj.split_tasks = taskLines.map((line: string) => ({
+              description: line.replace(/^Entry \d+:\s*/, ""),
+              hours: perTaskHours,
+            }));
+          }
+          return obj;
+        })),
       });
     }
 
@@ -457,6 +466,90 @@ router.post("/pending", (req: Request, res: Response) => {
   row.selected_note = selected_note || "";
   writeCSV(rows);
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+//  POST /pending/split — split a block-billed entry into multiple entries
+// ---------------------------------------------------------------------------
+router.post("/pending/split", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_id, tasks } = req.body || {};
+  // tasks: [{ description: string, hours: number }]
+
+  if (!activity_id || !tasks || !Array.isArray(tasks) || tasks.length === 0) {
+    res.status(400).json({ ok: false, error: "activity_id and tasks[] required" });
+    return;
+  }
+
+  try {
+    // 1. Read the original activity to get matter, date, user, rate
+    const original = await rawGetSingle(`/activities/${activity_id}`, {
+      fields: "id,date,quantity,price,note,matter{id},user{id}",
+    });
+    const act = original.data;
+    const matterId = act.matter?.id;
+    const userId = act.user?.id;
+    const date = act.date;
+    const rate = act.price || 0;
+
+    if (!matterId || !userId) {
+      res.status(400).json({ ok: false, error: "Could not read matter or user from original entry" });
+      return;
+    }
+
+    // 2. Create new entries for each task
+    const created: any[] = [];
+    for (const task of tasks) {
+      const quantitySeconds = Math.round((task.hours || 0) * 3600);
+      const result = await rawPostSingle("/activities", {
+        data: {
+          type: "TimeEntry",
+          date,
+          note: task.description,
+          quantity: quantitySeconds,
+          price: rate,
+          matter: { id: matterId },
+          user: { id: userId },
+        },
+      });
+      created.push({
+        id: result.data?.id,
+        description: task.description,
+        hours: task.hours,
+      });
+    }
+
+    // 3. Zero out the original entry
+    await rawPatchSingle(`/activities/${activity_id}`, {
+      data: {
+        quantity: 0,
+        note: `[SPLIT into ${created.length} entries] ${act.note || ""}`,
+      },
+    });
+
+    // 4. Update CSV status
+    const rows = readCSV();
+    const row = rows.find((r) => r.activity_id === String(activity_id));
+    if (row) {
+      row.status = "accepted";
+      row.selected_note = `Split into ${created.length} entries`;
+      writeCSV(rows);
+    }
+
+    res.json({
+      ok: true,
+      original_zeroed: activity_id,
+      created,
+    });
+  } catch (err: any) {
+    console.error("[Review] Split error:", err.message, err.response?.status, err.response?.data);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      clio_status: err.response?.status,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -975,9 +1068,12 @@ function render() {
             <button class="btn btn-cancel btn-sm" onclick="cancelEdit('\${e.activity_id}')">Cancel</button>
             <button class="btn btn-save btn-sm" onclick="saveEdit('\${e.activity_id}')">Save Edit</button>
           </div>
-        </div>
-        <div class="actions" id="actions-\${e.activity_id}">
-          <button class="btn btn-accept" onclick="accept('\${e.activity_id}')">\\u2713 Accept</button>
+        </div>\${buildSplitUI(e, flags)}
+        <div class="actions" id="actions-\${e.activity_id}">\${
+          hasBlockBill(flags)
+            ? '<button class="btn btn-accept" onclick="showSplit(\\'' + e.activity_id + '\\')">\\u2702 Split Entries</button>'
+            : '<button class="btn btn-accept" onclick="accept(\\'' + e.activity_id + '\\')">\\u2713 Accept</button>'
+        }
           <button class="btn btn-edit" onclick="startEdit('\${e.activity_id}')">\\u270E Edit</button>
           <button class="btn btn-skip" onclick="skip('\${e.activity_id}')">\\u2717 Skip</button>
         </div>
@@ -991,6 +1087,83 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function hasBlockBill(flags) {
+  return flags.some(f => f.code === 'BLOCK_BILL' && f.split_tasks && f.split_tasks.length > 0);
+}
+
+function buildSplitUI(e, flags) {
+  const bb = flags.find(f => f.code === 'BLOCK_BILL' && f.split_tasks);
+  if (!bb) return '';
+  const tasks = bb.split_tasks;
+  const rows = tasks.map((t, i) =>
+    '<div class="split-row" style="display:flex;gap:8px;margin-bottom:8px;align-items:start">' +
+      '<input type="number" step="0.1" min="0" value="' + t.hours + '" ' +
+        'id="split-hrs-' + e.activity_id + '-' + i + '" ' +
+        'style="width:70px;padding:8px;background:#f8f7f5;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px;color:#1a1a1a">' +
+      '<span style="padding-top:8px;color:#7a7568;font-size:12px">hrs</span>' +
+      '<textarea id="split-desc-' + e.activity_id + '-' + i + '" ' +
+        'style="flex:1;padding:8px;min-height:50px;background:#f8f7f5;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px;color:#1a1a1a;resize:vertical">' +
+        esc(t.description) + '</textarea>' +
+    '</div>'
+  ).join('');
+
+  return '<div class="split-area" id="split-' + e.activity_id + '" style="display:none;margin-top:12px;padding:16px;background:#f8f7f5;border:1px solid #d4d0c8;border-radius:2px">' +
+    '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#1b2a3d;margin-bottom:10px">Split into ' + tasks.length + ' entries (total: ' + e.hours + ' hrs)</div>' +
+    rows +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
+      '<button class="btn btn-cancel btn-sm" onclick="hideSplit(\\'' + e.activity_id + '\\')">Cancel</button>' +
+      '<button class="btn btn-accept btn-sm" onclick="applySplit(\\'' + e.activity_id + '\\',' + tasks.length + ')">Apply Split</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function showSplit(id) {
+  document.getElementById('split-' + id).style.display = 'block';
+  document.getElementById('actions-' + id).style.display = 'none';
+}
+
+function hideSplit(id) {
+  document.getElementById('split-' + id).style.display = 'none';
+  document.getElementById('actions-' + id).style.display = 'flex';
+}
+
+async function applySplit(id, taskCount) {
+  const tasks = [];
+  for (let i = 0; i < taskCount; i++) {
+    const hrs = parseFloat(document.getElementById('split-hrs-' + id + '-' + i).value) || 0;
+    const desc = document.getElementById('split-desc-' + id + '-' + i).value.trim();
+    if (desc) tasks.push({ description: desc, hours: hrs });
+  }
+  if (tasks.length === 0) return;
+
+  // Disable buttons
+  const splitArea = document.getElementById('split-' + id);
+  splitArea.querySelectorAll('button').forEach(b => b.disabled = true);
+  splitArea.querySelector('.btn-accept').textContent = 'Splitting...';
+
+  try {
+    const res = await fetch('/pending/split', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, tasks }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      state[id] = { status: 'accepted', selected_note: 'Split into ' + data.created.length + ' entries' };
+      render();
+      updateProgress();
+    } else {
+      alert('Split failed: ' + (data.error || 'Unknown error'));
+      splitArea.querySelectorAll('button').forEach(b => b.disabled = false);
+      splitArea.querySelector('.btn-accept').textContent = 'Apply Split';
+    }
+  } catch (err) {
+    alert('Split error: ' + err.message);
+    splitArea.querySelectorAll('button').forEach(b => b.disabled = false);
+    splitArea.querySelector('.btn-accept').textContent = 'Apply Split';
+  }
 }
 
 function updateProgress() {
