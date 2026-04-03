@@ -204,53 +204,56 @@ Return ONLY the revised description text, nothing else.`;
 //  Audit draft bill entries for a specific user
 // ---------------------------------------------------------------------------
 async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
-  // Fetch draft bills with simple fields (matching working audit tool pattern)
+  // First, get all matters where this user has billed time (as responsible attorney)
+  const matters = await fetchAllPages<any>("/matters", {
+    fields: "id,display_number,description,responsible_attorney{id},custom_field_values{id,field_name,value}",
+    responsible_attorney_id: userId,
+    status: "open",
+  });
+
+  const matterMap = new Map<number, { display_number: string; description: string; isHC: boolean }>();
+  for (const m of matters) {
+    const cfvs = m.custom_field_values || [];
+    const courtField = cfvs.find((c: any) => c.field_name === "Court");
+    const courtId = courtField?.value || null;
+    matterMap.set(m.id, {
+      display_number: m.display_number || "",
+      description: m.description || "",
+      isHC: courtId ? HC_COURT_IDS.has(courtId) : false,
+    });
+  }
+
+  if (matterMap.size === 0) return [];
+
+  // Get all draft bills
   const draftBills = await fetchAllPages<any>("/bills", {
-    fields: "id,number,state,total,matters",
+    fields: "id,number,state,total,balance,matters",
     state: "draft",
   });
 
-  // Collect all matter IDs from draft bills and fetch their details
-  const matterIds = new Set<number>();
-  for (const bill of draftBills) {
-    const mid = bill.matters?.[0]?.id;
-    if (mid) matterIds.add(mid);
-  }
+  // Filter to bills that belong to this attorney's matters
+  const matterIds = new Set(matterMap.keys());
+  const relevantBills = draftBills.filter((b: any) => {
+    const billMatter = b.matters?.[0];
+    return billMatter && matterIds.has(billMatter.id);
+  });
 
-  const matterMap = new Map<number, { description: string; isHC: boolean }>();
-  for (const mid of matterIds) {
-    try {
-      const m = await rawGetSingle(`/matters/${mid}`, {
-        fields: "id,display_number,description,custom_field_values{id,field_name,value}",
-      });
-      const cfvs = m.data?.custom_field_values || [];
-      const courtField = cfvs.find((c: any) => c.field_name === "Court");
-      const courtId = courtField?.value || null;
-      matterMap.set(mid, {
-        description: m.data?.description || "",
-        isHC: courtId ? HC_COURT_IDS.has(courtId) : false,
-      });
-    } catch {
-      matterMap.set(mid, { description: "", isHC: false });
-    }
-  }
+  console.log(`[Review] Draft bills: ${draftBills.length} total, ${relevantBills.length} for user ${userId} (${matterMap.size} matters)`);
 
   const allEntries: AuditEntry[] = [];
 
-  for (const bill of draftBills) {
+  for (const bill of relevantBills) {
     const lineItems = await fetchAllPages<any>("/line_items", {
-      fields: "id,total,type,date,description,quantity,price,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
+      fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
       bill_id: bill.id,
     });
 
+    const matterId = bill.matters?.[0]?.id;
+    const matterInfo = matterId ? matterMap.get(matterId) : null;
+    const isHC = matterInfo?.isHC || false;
+
     for (const li of lineItems) {
       if (li.activity?.type !== "TimeEntry") continue;
-      if (li.user?.id !== userId) continue;
-
-      const matter = li.matter || bill.matters?.[0] || {};
-      const mid = matter.id;
-      const matterInfo = mid ? matterMap.get(mid) : null;
-      const isHC = matterInfo?.isHC || false;
 
       let hours = li.quantity ? li.quantity / 3600 : 0;
       const rate = li.price || 0;
@@ -258,35 +261,42 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
       if (hours === 0 && rate > 0 && li.total) {
         hours = li.total / rate;
       }
+
+      // Debug first entry
+      if (allEntries.length === 0) {
+        console.log(`[Review] First line item sample:`, JSON.stringify({ quantity: li.quantity, price: li.price, total: li.total, type: li.type, hours }));
+      }
+
       const note = li.activity?.note || li.description || "";
 
-      const flags = detectFlags(note, rate, hours, isHC, userId, matterInfo?.description || matter.description || "");
+      const flags = detectFlags(note, rate, hours, isHC, li.user?.id, matterInfo?.description || "");
 
-      const matterName = matter.display_number
-        ? `${matter.display_number} — ${matter.description || ""}`
-        : "Unknown Matter";
+      const matterName = matterInfo
+        ? `${matterInfo.display_number} — ${matterInfo.description}`
+        : (li.matter?.display_number || "Unknown Matter");
 
       allEntries.push({
         activity_id: li.activity.id,
-        matter_id: mid || 0,
+        matter_id: matterId || 0,
         matter_name: matterName,
         is_hc: isHC,
         date: li.date,
         timekeeper: li.user?.name || "Unknown",
-        user_id: userId,
+        user_id: li.user?.id,
         hours: Math.round(hours * 100) / 100,
         rate,
-        amount: Math.round(hours * rate * 100) / 100,
+        amount: Math.round((li.total || 0) * 100) / 100,
         note,
         flags,
       });
     }
 
-    if (draftBills.indexOf(bill) < draftBills.length - 1) {
+    if (relevantBills.indexOf(bill) < relevantBills.length - 1) {
       await new Promise(r => setTimeout(r, 100));
     }
   }
 
+  console.log(`[Review] Total entries for user ${userId}: ${allEntries.length}`);
   return allEntries;
 }
 
