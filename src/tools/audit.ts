@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
-import ExcelJS from "exceljs";
+
 
 // Harris County Probate Court picklist IDs
 const HC_COURT_IDS = new Set([
@@ -495,7 +495,7 @@ export function registerAuditTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bill_audit",
-    "Generate a downloadable Excel audit report of draft bill time entries for a responsible attorney. Includes all entries with flag annotations, severity ratings, and a summary sheet. Same data as audit_draft_bills but in spreadsheet format.",
+    "Generate a CSV audit report of draft bill time entries for a responsible attorney. Includes all entries with flag annotations, severity ratings, and a summary. Same data as audit_draft_bills but in CSV format.",
     {
       responsible_attorney_id: z.coerce.number().describe("Clio user ID of the responsible attorney"),
       practice_area: z.string().optional().describe("Optional: filter to a specific practice area (e.g. 'Guardianship', 'Probate')"),
@@ -619,35 +619,24 @@ export function registerAuditTools(server: McpServer): void {
           }
         }
 
-        // --- Build Excel ---
-        const wb = new ExcelJS.Workbook();
+        // --- Build CSV ---
         const attorneyName = [...matterMap.values()][0]?.responsible_attorney || "Unknown";
+        const flaggedEntries = allEntries.filter(e => e.flags.length > 0);
+        const totalHours = allEntries.reduce((s, e) => s + e.hours, 0);
+        const totalAmount = allEntries.reduce((s, e) => s + e.amount, 0);
+        const flaggedHours = flaggedEntries.reduce((s, e) => s + e.hours, 0);
+        const flaggedAmount = flaggedEntries.reduce((s, e) => s + e.amount, 0);
 
-        // Sheet 1: All Entries
-        const ws1 = wb.addWorksheet("All Entries");
-        ws1.columns = [
-          { header: "Bill #", key: "bill", width: 10 },
-          { header: "Matter", key: "matter", width: 45 },
-          { header: "Practice Area", key: "pa", width: 18 },
-          { header: "Standard", key: "standard", width: 10 },
-          { header: "Date", key: "date", width: 12 },
-          { header: "Timekeeper", key: "tk", width: 22 },
-          { header: "Hours", key: "hours", width: 8 },
-          { header: "Rate", key: "rate", width: 10 },
-          { header: "Amount", key: "amount", width: 12 },
-          { header: "Description", key: "note", width: 60 },
-          { header: "Flags", key: "flags", width: 15 },
-          { header: "Severity", key: "severity", width: 12 },
-          { header: "Flag Details", key: "details", width: 50 },
-        ];
-        ws1.getRow(1).font = { bold: true };
+        function csvEscape(val: any): string {
+          const s = String(val ?? "");
+          if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+            return '"' + s.replace(/"/g, '""') + '"';
+          }
+          return s;
+        }
 
-        const severityColor: Record<string, string> = {
-          strike: "40FF0000",   // red, semi-transparent
-          reduce: "40FF8C00",   // orange
-          review: "40FFCC00",   // yellow
-          rephrase: "4087CEEB", // blue
-        };
+        const csvHeaders = ["Bill #","Matter","Practice Area","Standard","Date","Timekeeper","Hours","Rate","Amount","Description","Flags","Severity","Flag Details"];
+        const csvRows: string[] = [csvHeaders.join(",")];
 
         for (const e of allEntries) {
           const worstSeverity = e.flags.length > 0
@@ -657,154 +646,52 @@ export function registerAuditTools(server: McpServer): void {
               : "rephrase")
             : "";
 
-          const row = ws1.addRow({
-            bill: e.bill_number,
-            matter: e.matter_number,
-            pa: e.practice_area,
-            standard: e.is_hc ? "HC" : "General",
-            date: e.date,
-            tk: e.timekeeper,
-            hours: e.hours,
-            rate: e.rate,
-            amount: e.amount,
-            note: e.note?.slice(0, 300),
-            flags: e.flags.map((f: Flag) => f.code).join(", "),
-            severity: worstSeverity,
-            details: e.flags.map((f: Flag) => f.message).join("; "),
-          });
-
-          if (worstSeverity && severityColor[worstSeverity]) {
-            row.eachCell((cell) => {
-              cell.fill = {
-                type: "pattern",
-                pattern: "solid",
-                fgColor: { argb: severityColor[worstSeverity] },
-              };
-            });
-          }
+          csvRows.push([
+            csvEscape(e.bill_number),
+            csvEscape(e.matter_number),
+            csvEscape(e.practice_area),
+            csvEscape(e.is_hc ? "HC" : "General"),
+            csvEscape(e.date),
+            csvEscape(e.timekeeper),
+            csvEscape(e.hours),
+            csvEscape(e.rate),
+            csvEscape(e.amount),
+            csvEscape(e.note?.slice(0, 300)),
+            csvEscape(e.flags.map((f: Flag) => f.code).join(", ")),
+            csvEscape(worstSeverity),
+            csvEscape(e.flags.map((f: Flag) => f.message).join("; ")),
+          ].join(","));
         }
 
-        ws1.getColumn("rate").numFmt = '"$"#,##0.00';
-        ws1.getColumn("amount").numFmt = '"$"#,##0.00';
+        const csvContent = csvRows.join("\n");
 
-        // Sheet 2: Summary
-        const ws2 = wb.addWorksheet("Summary");
-        const flaggedEntries = allEntries.filter(e => e.flags.length > 0);
-        const totalHours = allEntries.reduce((s, e) => s + e.hours, 0);
-        const totalAmount = allEntries.reduce((s, e) => s + e.amount, 0);
-        const flaggedHours = flaggedEntries.reduce((s, e) => s + e.hours, 0);
-        const flaggedAmount = flaggedEntries.reduce((s, e) => s + e.amount, 0);
-
-        ws2.getColumn(1).width = 30;
-        ws2.getColumn(2).width = 20;
-
-        ws2.addRow(["Draft Bill Audit Report", ""]).font = { bold: true, size: 14 };
-        ws2.addRow([`Attorney: ${attorneyName}`, ""]);
-        ws2.addRow([`Generated: ${new Date().toISOString().split("T")[0]}`, ""]);
-        ws2.addRow([]);
-        ws2.addRow(["Metric", "Value"]).font = { bold: true };
-        ws2.addRow(["Matters Reviewed", matterMap.size]);
-        ws2.addRow(["HC Standard Matters", [...matterMap.values()].filter(m => m.is_hc).length]);
-        ws2.addRow(["General Hygiene Matters", [...matterMap.values()].filter(m => !m.is_hc).length]);
-        ws2.addRow(["Draft Bills", relevantBills.length]);
-        ws2.addRow(["Total Entries", allEntries.length]);
-        ws2.addRow(["Total Hours", Math.round(totalHours * 100) / 100]);
-        ws2.addRow(["Total Amount", Math.round(totalAmount * 100) / 100]);
-        ws2.addRow([]);
-        ws2.addRow(["Flagged Entries", flaggedEntries.length]);
-        ws2.addRow(["Flagged Hours", Math.round(flaggedHours * 100) / 100]);
-        ws2.addRow(["Flagged Amount", Math.round(flaggedAmount * 100) / 100]);
-        ws2.addRow(["Flag Rate", `${allEntries.length > 0 ? Math.round((flaggedEntries.length / allEntries.length) * 100) : 0}%`]);
-
-        ws2.addRow([]);
-        ws2.addRow(["Severity Breakdown", ""]).font = { bold: true };
         const severityCounts: Record<string, number> = { strike: 0, reduce: 0, review: 0, rephrase: 0 };
         for (const e of flaggedEntries) {
           for (const f of e.flags) {
             severityCounts[f.severity] = (severityCounts[f.severity] || 0) + 1;
           }
         }
-        ws2.addRow(["Strike (non-compensable)", severityCounts.strike]);
-        ws2.addRow(["Reduce", severityCounts.reduce]);
-        ws2.addRow(["Review needed", severityCounts.review]);
-        ws2.addRow(["Rephrase", severityCounts.rephrase]);
-
-        // Sheet 3: Flagged Only
-        const ws3 = wb.addWorksheet("Flagged Only");
-        ws3.columns = [
-          { header: "Bill #", key: "bill", width: 10 },
-          { header: "Matter", key: "matter", width: 45 },
-          { header: "Practice Area", key: "pa", width: 18 },
-          { header: "Standard", key: "standard", width: 10 },
-          { header: "Date", key: "date", width: 12 },
-          { header: "Timekeeper", key: "tk", width: 22 },
-          { header: "Hours", key: "hours", width: 8 },
-          { header: "Rate", key: "rate", width: 10 },
-          { header: "Amount", key: "amount", width: 12 },
-          { header: "Description", key: "note", width: 60 },
-          { header: "Flags", key: "flags", width: 15 },
-          { header: "Severity", key: "severity", width: 12 },
-          { header: "Flag Details", key: "details", width: 50 },
-        ];
-        ws3.getRow(1).font = { bold: true };
-
-        for (const e of flaggedEntries) {
-          const worstSeverity = e.flags.some((f: Flag) => f.severity === "strike") ? "strike"
-            : e.flags.some((f: Flag) => f.severity === "reduce") ? "reduce"
-            : e.flags.some((f: Flag) => f.severity === "review") ? "review"
-            : "rephrase";
-
-          const row = ws3.addRow({
-            bill: e.bill_number,
-            matter: e.matter_number,
-            pa: e.practice_area,
-            standard: e.is_hc ? "HC" : "General",
-            date: e.date,
-            tk: e.timekeeper,
-            hours: e.hours,
-            rate: e.rate,
-            amount: e.amount,
-            note: e.note?.slice(0, 300),
-            flags: e.flags.map((f: Flag) => f.code).join(", "),
-            severity: worstSeverity,
-            details: e.flags.map((f: Flag) => f.message).join("; "),
-          });
-
-          if (severityColor[worstSeverity]) {
-            row.eachCell((cell) => {
-              cell.fill = {
-                type: "pattern",
-                pattern: "solid",
-                fgColor: { argb: severityColor[worstSeverity] },
-              };
-            });
-          }
-        }
-
-        ws3.getColumn("rate").numFmt = '"$"#,##0.00';
-        ws3.getColumn("amount").numFmt = '"$"#,##0.00';
-
-        const buffer = await wb.xlsx.writeBuffer() as Buffer;
-        const base64 = Buffer.from(buffer).toString("base64");
-        const filename = `Bill Audit - ${attorneyName} - ${new Date().toISOString().split("T")[0]}.xlsx`;
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
-              filename,
-              format: "xlsx",
-              size_kb: Math.round(buffer.byteLength / 1024),
-              base64,
+              format: "csv",
               summary: {
                 attorney: attorneyName,
                 matters: matterMap.size,
+                hc_matters: [...matterMap.values()].filter(m => m.is_hc).length,
                 draft_bills: relevantBills.length,
                 total_entries: allEntries.length,
-                flagged_entries: flaggedEntries.length,
+                total_hours: Math.round(totalHours * 100) / 100,
                 total_amount: Math.round(totalAmount * 100) / 100,
+                flagged_entries: flaggedEntries.length,
+                flagged_hours: Math.round(flaggedHours * 100) / 100,
                 flagged_amount: Math.round(flaggedAmount * 100) / 100,
+                flag_rate: `${allEntries.length > 0 ? Math.round((flaggedEntries.length / allEntries.length) * 100) : 0}%`,
+                severity_breakdown: severityCounts,
               },
+              csv: csvContent,
             }),
           }],
         };
