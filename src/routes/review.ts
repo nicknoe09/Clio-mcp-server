@@ -204,10 +204,36 @@ Return ONLY the revised description text, nothing else.`;
 //  Audit draft bill entries for a specific user
 // ---------------------------------------------------------------------------
 async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
+  // Fetch draft bills with simple fields (matching working audit tool pattern)
   const draftBills = await fetchAllPages<any>("/bills", {
-    fields: "id,number,state,matters{id,display_number,description,custom_field_values{id,field_name,value}}",
+    fields: "id,number,state,total,matters",
     state: "draft",
   });
+
+  // Collect all matter IDs from draft bills and fetch their details
+  const matterIds = new Set<number>();
+  for (const bill of draftBills) {
+    const mid = bill.matters?.[0]?.id;
+    if (mid) matterIds.add(mid);
+  }
+
+  const matterMap = new Map<number, { description: string; isHC: boolean }>();
+  for (const mid of matterIds) {
+    try {
+      const m = await rawGetSingle(`/matters/${mid}`, {
+        fields: "id,display_number,description,custom_field_values{id,field_name,value}",
+      });
+      const cfvs = m.data?.custom_field_values || [];
+      const courtField = cfvs.find((c: any) => c.field_name === "Court");
+      const courtId = courtField?.value || null;
+      matterMap.set(mid, {
+        description: m.data?.description || "",
+        isHC: courtId ? HC_COURT_IDS.has(courtId) : false,
+      });
+    } catch {
+      matterMap.set(mid, { description: "", isHC: false });
+    }
+  }
 
   const allEntries: AuditEntry[] = [];
 
@@ -222,16 +248,15 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
       if (li.user?.id !== userId) continue;
 
       const matter = li.matter || bill.matters?.[0] || {};
-      const cfvs = matter.custom_field_values || bill.matters?.[0]?.custom_field_values || [];
-      const courtField = cfvs.find((c: any) => c.field_name === "Court");
-      const courtId = courtField?.value || null;
-      const isHC = courtId ? HC_COURT_IDS.has(courtId) : false;
+      const mid = matter.id;
+      const matterInfo = mid ? matterMap.get(mid) : null;
+      const isHC = matterInfo?.isHC || false;
 
       const hours = li.quantity ? li.quantity / 3600 : 0;
       const rate = li.price || 0;
       const note = li.activity?.note || li.description || "";
 
-      const flags = detectFlags(note, rate, hours, isHC, userId, matter.description || "");
+      const flags = detectFlags(note, rate, hours, isHC, userId, matterInfo?.description || matter.description || "");
 
       const matterName = matter.display_number
         ? `${matter.display_number} — ${matter.description || ""}`
@@ -239,7 +264,7 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
 
       allEntries.push({
         activity_id: li.activity.id,
-        matter_id: matter.id || 0,
+        matter_id: mid || 0,
         matter_name: matterName,
         is_hc: isHC,
         date: li.date,
@@ -367,7 +392,8 @@ router.get("/review", async (req: Request, res: Response) => {
     const scopeLabel = scope === "draft_bills" ? "Draft Bills Only" : "All Entries";
     res.send(buildHTML(rows, startDate, endDate, userName, scopeLabel));
   } catch (err: any) {
-    res.status(500).send(`Error: ${err.message}`);
+    console.error("[Review] Error:", err.message, err.response?.status, err.response?.data);
+    res.status(500).send(`Error: ${err.message}${err.response?.status ? ` (Clio status: ${err.response.status})` : ''}`);
   }
 });
 
