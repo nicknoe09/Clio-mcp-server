@@ -3,6 +3,8 @@ import fs from "fs";
 import path from "path";
 import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle } from "../clio/pagination";
+import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
+import { detectFlags, HC_COURT_IDS, Flag } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
 
 const router = Router();
@@ -24,6 +26,7 @@ interface PendingRow {
   suggested_note: string;
   selected_note: string;
   status: string; // pending | accepted | edited | skipped
+  flags_json?: string; // JSON-encoded flags for the UI (not persisted to CSV)
 }
 
 function csvEscape(val: string): string {
@@ -198,6 +201,67 @@ Return ONLY the revised description text, nothing else.`;
 }
 
 // ---------------------------------------------------------------------------
+//  Audit draft bill entries for a specific user
+// ---------------------------------------------------------------------------
+async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
+  const draftBills = await fetchAllPages<any>("/bills", {
+    fields: "id,number,state,matters{id,display_number,description,custom_field_values{id,field_name,value}}",
+    state: "draft",
+  });
+
+  const allEntries: AuditEntry[] = [];
+
+  for (const bill of draftBills) {
+    const lineItems = await fetchAllPages<any>("/line_items", {
+      fields: "id,total,type,date,description,quantity,price,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
+      bill_id: bill.id,
+    });
+
+    for (const li of lineItems) {
+      if (li.activity?.type !== "TimeEntry") continue;
+      if (li.user?.id !== userId) continue;
+
+      const matter = li.matter || bill.matters?.[0] || {};
+      const cfvs = matter.custom_field_values || bill.matters?.[0]?.custom_field_values || [];
+      const courtField = cfvs.find((c: any) => c.field_name === "Court");
+      const courtId = courtField?.value || null;
+      const isHC = courtId ? HC_COURT_IDS.has(courtId) : false;
+
+      const hours = li.quantity ? li.quantity / 3600 : 0;
+      const rate = li.price || 0;
+      const note = li.activity?.note || li.description || "";
+
+      const flags = detectFlags(note, rate, hours, isHC, userId, matter.description || "");
+
+      const matterName = matter.display_number
+        ? `${matter.display_number} — ${matter.description || ""}`
+        : "Unknown Matter";
+
+      allEntries.push({
+        activity_id: li.activity.id,
+        matter_id: matter.id || 0,
+        matter_name: matterName,
+        is_hc: isHC,
+        date: li.date,
+        timekeeper: li.user?.name || "Unknown",
+        user_id: userId,
+        hours: Math.round(hours * 100) / 100,
+        rate,
+        amount: Math.round(hours * rate * 100) / 100,
+        note,
+        flags,
+      });
+    }
+
+    if (draftBills.indexOf(bill) < draftBills.length - 1) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  return allEntries;
+}
+
+// ---------------------------------------------------------------------------
 //  Auth — simple password gate via cookie
 // ---------------------------------------------------------------------------
 function isAuthenticated(req: Request): boolean {
@@ -244,84 +308,53 @@ router.get("/review", async (req: Request, res: Response) => {
   const endDate = end || new Date().toISOString().split("T")[0];
 
   try {
-    let entries: any[];
+    let auditEntries: AuditEntry[];
 
     if (scope === "draft_bills") {
-      // Fetch draft bills, then pull line items to get activity IDs for this user
-      const draftBills = await fetchAllPages<any>("/bills", {
-        fields: "id,number,state,matters{id,display_number,description}",
-        state: "draft",
-      });
-
-      entries = [];
-      for (const bill of draftBills) {
-        const lineItems = await fetchAllPages<any>("/line_items", {
-          fields: "id,total,type,date,description,quantity,price,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
-          bill_id: bill.id,
-        });
-
-        for (const li of lineItems) {
-          if (li.activity?.type !== "TimeEntry") continue;
-          if (String(li.user?.id) !== String(userId)) continue;
-
-          const matter = li.matter || bill.matters?.[0] || {};
-          entries.push({
-            id: li.activity.id,
-            date: li.date,
-            quantity: li.quantity || 0,
-            price: li.price || 0,
-            note: li.activity?.note || li.description || "",
-            matter: {
-              id: matter.id,
-              display_number: matter.display_number,
-              description: matter.description,
-            },
-            user: li.user,
-          });
-        }
-
-        // Courtesy delay
-        if (draftBills.indexOf(bill) < draftBills.length - 1) {
-          await new Promise(r => setTimeout(r, 100));
-        }
-      }
-
-      // No date filter for draft bills — show all entries on current drafts
+      auditEntries = await auditDraftBillEntries(Number(userId));
     } else {
-      // All time entries for user in date range
-      const queryParams: Record<string, any> = {
-        type: "TimeEntry",
-        fields: "id,date,quantity,price,note,matter{id,display_number,description},user{id,name}",
-        user_id: userId,
-        created_since: `${startDate}T00:00:00+00:00`,
-      };
-      entries = await fetchAllPages<any>("/activities", queryParams);
-      entries = entries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+      const result = await auditTimeEntries(Number(userId), startDate, endDate);
+      auditEntries = result.entries;
     }
 
-    // 2. Generate suggestions for each entry
+    // Convert audit entries to pending rows
     const rows: PendingRow[] = [];
-    for (const e of entries) {
-      const matterName = e.matter
-        ? `${e.matter.display_number} — ${e.matter.description || ""}`
-        : "Unknown Matter";
-      const hours = e.quantity ? (e.quantity / 3600).toFixed(2) : "0.00";
-      const rate = (e.price || 0).toFixed(2);
-      const currentNote = e.note || "";
+    for (const e of auditEntries) {
+      // Build suggested note from flags
+      const suggestedDescriptions = e.flags
+        .filter(f => f.suggested_description)
+        .map(f => f.suggested_description);
+      const suggestedActions = e.flags
+        .filter(f => f.suggested_action)
+        .map(f => f.suggested_action);
 
-      const suggested = await suggestNote(matterName, e.date, hours, currentNote);
+      let suggested = "";
+      if (suggestedDescriptions.length > 0) {
+        suggested = suggestedDescriptions[0]!;
+      } else if (suggestedActions.length > 0) {
+        suggested = suggestedActions.join("; ");
+      } else if (e.flags.length > 0) {
+        suggested = e.flags.map(f => f.message).join("; ");
+      } else {
+        suggested = e.note; // clean entry — no changes needed
+      }
 
       rows.push({
-        activity_id: String(e.id),
-        matter_id: String(e.matter?.id || ""),
-        matter_name: matterName,
+        activity_id: String(e.activity_id),
+        matter_id: String(e.matter_id),
+        matter_name: e.matter_name,
         date: e.date,
-        hours,
-        rate,
-        current_note: currentNote,
+        hours: e.hours.toFixed(2),
+        rate: e.rate.toFixed(2),
+        current_note: e.note,
         suggested_note: suggested,
         selected_note: "",
         status: "pending",
+        flags_json: JSON.stringify(e.flags.map(f => ({
+          code: f.code,
+          severity: f.severity,
+          message: f.message,
+        }))),
       });
     }
 
@@ -530,6 +563,24 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   }
 
   .meta-row span { display: flex; align-items: center; gap: 4px; }
+
+  .flag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 12px 0 8px;
+  }
+
+  .flag-tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: default;
+  }
 
   .status-badge {
     font-size: 11px;
@@ -807,6 +858,17 @@ function render() {
   container.innerHTML = entries.map((e, i) => {
     const s = state[e.activity_id];
     const isDone = s.status !== 'pending';
+    const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+    const flagTags = flags.map(f => {
+      const colors = {
+        strike: 'background:#991b1b;color:#fecaca',
+        reduce: 'background:#92400e;color:#fde68a',
+        review: 'background:#854d0e;color:#fef08a',
+        rephrase: 'background:#1e3a5f;color:#7dd3fc',
+      };
+      const style = colors[f.severity] || 'background:#374151;color:#9ca3af';
+      return '<span class="flag-tag" style="' + style + '" title="' + esc(f.message) + '">' + esc(f.code) + '</span>';
+    }).join(' ');
     return \`
     <div class="card \${isDone ? 'done' : ''}" id="card-\${e.activity_id}">
       <div class="card-header">
@@ -824,13 +886,13 @@ function render() {
           s.status === 'skipped' ? 'Skipped' : ''
         }</span>
       </div>
-      <div class="card-body">
+      <div class="card-body">\${flags.length > 0 ? '<div class="flag-row">' + flagTags + '</div>' : '<div class="flag-row"><span class="flag-tag" style="background:#064e3b;color:#6ee7b7">CLEAN</span></div>'}
         <div class="note-section">
           <div class="note-label current">Current</div>
           <div class="note-box current">\${esc(e.current_note) || '<em style="opacity:0.5">No description</em>'}</div>
         </div>
         <div class="note-section">
-          <div class="note-label suggested">Suggested</div>
+          <div class="note-label suggested">\${flags.length > 0 ? 'Suggested Revision' : 'No Changes Needed'}</div>
           <div class="note-box suggested">\${esc(e.suggested_note)}</div>
         </div>
         <div class="edit-area" id="edit-\${e.activity_id}">

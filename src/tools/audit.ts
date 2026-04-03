@@ -4,7 +4,7 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 
 
 // Harris County Probate Court picklist IDs
-const HC_COURT_IDS = new Set([
+export const HC_COURT_IDS = new Set([
   2225269,  // Harris County Probate Court 1
   2225284,  // Harris County Probate Court 2
   2225299,  // Harris County Probate Court 3
@@ -72,7 +72,7 @@ function getHCRateCap(userId: number): { max: number; label: string } | null {
 
 // --- Programmatic flag detection ---
 
-type Flag = {
+export type Flag = {
   code: string;
   severity: "strike" | "reduce" | "review" | "rephrase";
   message: string;
@@ -118,7 +118,7 @@ const FEE_PETITION_PATTERN = /\b(fee (application|petition|statement|affidavit)|
 const COURT_STAFF_PATTERN = /\b(call(?:ed)?\s+(clerk|coordinator|court staff)|email(?:ed)?\s+(clerk|coordinator))\b/i;
 const TRAVEL_PATTERN = /\b(travel(?:ed|ing)?|drove|driving|commut)/i;
 
-function detectFlags(
+export function detectFlags(
   note: string,
   rate: number,
   hours: number,
@@ -303,7 +303,7 @@ function detectFlags(
   return flags;
 }
 
-function detectDuplicates(entries: any[]): Map<number, string> {
+export function detectDuplicates(entries: any[]): Map<number, string> {
   const dupeFlags = new Map<number, string>();
   const seen = new Map<string, number[]>();
 
@@ -324,7 +324,7 @@ function detectDuplicates(entries: any[]): Map<number, string> {
   return dupeFlags;
 }
 
-function detectBillingSpikes(entries: any[]): Map<number, string> {
+export function detectBillingSpikes(entries: any[]): Map<number, string> {
   const spikeFlags = new Map<number, string>();
   // Group by user + week
   const weeklyHours = new Map<string, { total: number; ids: number[] }>();

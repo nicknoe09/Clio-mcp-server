@@ -21,6 +21,7 @@ import { registerCalendarTools } from "./tools/calendar";
 import { registerCalcTools } from "./tools/calc";
 import { registerDocumentTools } from "./tools/documents";
 import { registerAuditTools } from "./tools/audit";
+import { registerAuditTimeTools } from "./tools/auditTime";
 import { registerReviewTools } from "./tools/review";
 import reviewRouter from "./routes/review";
 
@@ -78,6 +79,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerDocumentTools OK");
     registerAuditTools(server);
     console.log("[MCP] registerAuditTools OK");
+    registerAuditTimeTools(server);
+    console.log("[MCP] registerAuditTimeTools OK");
     registerReviewTools(server);
     console.log("[MCP] registerReviewTools OK");
 
