@@ -226,7 +226,7 @@ router.get("/review", async (req: Request, res: Response) => {
       entries = [];
       for (const bill of draftBills) {
         const lineItems = await fetchAllPages<any>("/line_items", {
-          fields: "id,date,quantity,price,description,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
+          fields: "id,date,total,quantity,price,description,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note,quantity,price}",
           bill_id: bill.id,
         });
 
@@ -235,11 +235,14 @@ router.get("/review", async (req: Request, res: Response) => {
           if (String(li.user?.id) !== String(userId)) continue;
 
           const matter = li.matter || bill.matters?.[0] || {};
+          // quantity may be on the line item or the activity — both are in seconds
+          const qty = li.quantity || li.activity?.quantity || 0;
+          const price = li.price || li.activity?.price || 0;
           entries.push({
             id: li.activity.id,
             date: li.date,
-            quantity: li.quantity,
-            price: li.price,
+            quantity: qty,
+            price: price,
             note: li.activity?.note || li.description || "",
             matter: {
               id: matter.id,
@@ -275,7 +278,7 @@ router.get("/review", async (req: Request, res: Response) => {
       const matterName = e.matter
         ? `${e.matter.display_number} — ${e.matter.description || ""}`
         : "Unknown Matter";
-      const hours = (e.quantity / 3600).toFixed(2);
+      const hours = e.quantity ? (e.quantity / 3600).toFixed(2) : "0.00";
       const rate = (e.price || 0).toFixed(2);
       const currentNote = e.note || "";
 
