@@ -21,6 +21,8 @@ import { registerCalendarTools } from "./tools/calendar";
 import { registerCalcTools } from "./tools/calc";
 import { registerDocumentTools } from "./tools/documents";
 import { registerAuditTools } from "./tools/audit";
+import { registerReviewTools } from "./tools/review";
+import reviewRouter from "./routes/review";
 
 const app = express();
 
@@ -76,6 +78,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerDocumentTools OK");
     registerAuditTools(server);
     console.log("[MCP] registerAuditTools OK");
+    registerReviewTools(server);
+    console.log("[MCP] registerReviewTools OK");
 
     console.log("[MCP] All tools registered successfully");
     return server;
@@ -116,6 +120,9 @@ app.post("/messages", async (req, res) => {
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "clio-mcp", version: "1.1.0", build: "all-tools" });
 });
+
+// --- Review UI Routes ---
+app.use(reviewRouter);
 
 // --- Debug: show query string construction ---
 app.get("/debug-fields", (_req, res) => {
