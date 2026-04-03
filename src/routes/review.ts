@@ -22,6 +22,7 @@ interface PendingRow {
   date: string;
   hours: string;
   rate: string;
+  timekeeper: string;
   current_note: string;
   suggested_note: string;
   selected_note: string;
@@ -244,7 +245,7 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
 
   for (const bill of relevantBills) {
     const lineItems = await fetchAllPages<any>("/line_items", {
-      fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+      fields: "id,total,type,date,description,quantity,price,secondary_quantity,secondary_total,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note,quantity,price}",
       bill_id: bill.id,
     });
 
@@ -255,16 +256,28 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
     for (const li of lineItems) {
       if (li.activity?.type !== "TimeEntry") continue;
 
-      let hours = li.quantity ? li.quantity / 3600 : 0;
-      const rate = li.price || 0;
-      // Fallback: derive hours from total/rate if quantity is missing
+      // Try multiple sources for hours: li.quantity, activity.quantity, or derive from total/rate
+      const rawQty = li.quantity || li.activity?.quantity || li.secondary_quantity || 0;
+      let hours = rawQty ? rawQty / 3600 : 0;
+      const rate = li.price || li.activity?.price || 0;
       if (hours === 0 && rate > 0 && li.total) {
         hours = li.total / rate;
       }
 
-      // Debug first entry
-      if (allEntries.length === 0) {
-        console.log(`[Review] First line item sample:`, JSON.stringify({ quantity: li.quantity, price: li.price, total: li.total, type: li.type, hours }));
+      // Debug first few entries
+      if (allEntries.length < 3) {
+        console.log(`[Review] Line item #${allEntries.length}:`, JSON.stringify({
+          li_quantity: li.quantity,
+          li_price: li.price,
+          li_total: li.total,
+          li_secondary_quantity: li.secondary_quantity,
+          li_secondary_total: li.secondary_total,
+          li_type: li.type,
+          activity_quantity: li.activity?.quantity,
+          activity_price: li.activity?.price,
+          computed_hours: hours,
+          computed_rate: rate,
+        }));
       }
 
       const note = li.activity?.note || li.description || "";
@@ -387,6 +400,7 @@ router.get("/review", async (req: Request, res: Response) => {
         date: e.date,
         hours: e.hours.toFixed(2),
         rate: e.rate.toFixed(2),
+        timekeeper: e.timekeeper,
         current_note: e.note,
         suggested_note: suggested,
         selected_note: "",
@@ -927,6 +941,7 @@ function render() {
         <div>
           <div class="matter-name">\${esc(e.matter_name)}</div>
           <div class="meta-row">
+            <span><strong>\${esc(e.timekeeper)}</strong></span>
             <span>\${e.date}</span>
             <span>\${e.hours} hrs</span>
             <span>$\${e.rate}/hr</span>
