@@ -245,7 +245,7 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
 
   for (const bill of relevantBills) {
     const lineItems = await fetchAllPages<any>("/line_items", {
-      fields: "id,total,type,date,description,quantity,price,secondary_quantity,secondary_total,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note,quantity,price}",
+      fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
       bill_id: bill.id,
     });
 
@@ -256,28 +256,27 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
     for (const li of lineItems) {
       if (li.activity?.type !== "TimeEntry") continue;
 
-      // Try multiple sources for hours: li.quantity, activity.quantity, or derive from total/rate
-      const rawQty = li.quantity || li.activity?.quantity || li.secondary_quantity || 0;
-      let hours = rawQty ? rawQty / 3600 : 0;
-      const rate = li.price || li.activity?.price || 0;
-      if (hours === 0 && rate > 0 && li.total) {
-        hours = li.total / rate;
+      // li.quantity is in seconds on line items (same as audit tool)
+      let hours = li.quantity ? li.quantity / 3600 : 0;
+      const rate = li.price || 0;
+
+      // If quantity is still 0, fetch the activity directly for its quantity
+      if (hours === 0 && li.activity?.id) {
+        try {
+          const act = await rawGetSingle(`/activities/${li.activity.id}`, {
+            fields: "id,quantity,price",
+          });
+          const actQty = act.data?.quantity || 0;
+          if (actQty) hours = actQty / 3600;
+        } catch {
+          // Fall back to total/rate
+          if (rate > 0 && li.total) hours = li.total / rate;
+        }
       }
 
-      // Debug first few entries
+      // Debug first 3 entries
       if (allEntries.length < 3) {
-        console.log(`[Review] Line item #${allEntries.length}:`, JSON.stringify({
-          li_quantity: li.quantity,
-          li_price: li.price,
-          li_total: li.total,
-          li_secondary_quantity: li.secondary_quantity,
-          li_secondary_total: li.secondary_total,
-          li_type: li.type,
-          activity_quantity: li.activity?.quantity,
-          activity_price: li.activity?.price,
-          computed_hours: hours,
-          computed_rate: rate,
-        }));
+        console.log(`[Review] Entry #${allEntries.length}: li.quantity=${li.quantity}, li.price=${li.price}, li.total=${li.total}, hours=${hours}`);
       }
 
       const note = li.activity?.note || li.description || "";
