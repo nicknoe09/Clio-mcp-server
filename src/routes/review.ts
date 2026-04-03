@@ -703,12 +703,77 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
     text-align: right;
   }
 
-  .filter-bar {
+  .toolbar {
     max-width: 820px;
     margin: 12px auto 0;
-    padding: 10px 20px;
+    padding: 12px 20px;
+    background: #fff;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+
+  .toolbar-row {
     display: flex;
     align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .toolbar-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #7a7568;
+    white-space: nowrap;
+  }
+
+  .toolbar-select {
+    padding: 5px 8px;
+    background: #f8f7f5;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    font-family: 'Lora', Georgia, serif;
+    font-size: 12px;
+    color: #1a1a1a;
+  }
+
+  kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    font-family: 'Lora', Georgia, serif;
+    font-size: 11px;
+    background: #f8f7f5;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    color: #1b2a3d;
+  }
+
+  .group-header {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: #1b2a3d;
+    padding: 16px 0 8px;
+    border-bottom: 2px solid #c9a84c;
+    margin-bottom: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .group-header:hover { color: #c9a84c; }
+
+  .group-header .toggle { font-size: 14px; color: #7a7568; margin-right: 8px; }
+
+  .duplicate-highlight {
+    border-left: 3px solid #991b1b !important;
   }
 
   .container {
@@ -1035,17 +1100,53 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
   </div>
 </div>
 
-<div class="filter-bar" id="filterBar">
-  <label for="tkFilter" style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#7a7568;margin-right:8px">Timekeeper:</label>
-  <select id="tkFilter" onchange="render();updateProgress()" style="padding:6px 10px;background:#fff;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px;color:#1a1a1a">
-    <option value="">All</option>
-  </select>
+<div class="toolbar">
+  <div class="toolbar-row">
+    <div class="toolbar-group">
+      <label class="toolbar-label">Timekeeper</label>
+      <select id="tkFilter" onchange="render();updateProgress()" class="toolbar-select">
+        <option value="">All</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <label class="toolbar-label">Flag Type</label>
+      <select id="flagFilter" onchange="render();updateProgress()" class="toolbar-select">
+        <option value="">All Flags</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <label class="toolbar-label">Sort</label>
+      <select id="sortMode" onchange="render()" class="toolbar-select">
+        <option value="default">Bill Order</option>
+        <option value="severity">Severity (worst first)</option>
+        <option value="amount">Amount (highest first)</option>
+        <option value="timekeeper">Timekeeper</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <label class="toolbar-label">Group</label>
+      <select id="groupMode" onchange="render()" class="toolbar-select">
+        <option value="none">No Grouping</option>
+        <option value="matter">By Matter</option>
+        <option value="timekeeper">By Timekeeper</option>
+      </select>
+    </div>
+  </div>
+  <div class="toolbar-row" style="margin-top:8px">
+    <button class="btn btn-sm" style="background:#991b1b;color:#fecaca" onclick="bulkSkipStrikes()">Skip All Strikes</button>
+    <button class="btn btn-sm" style="background:#e8e5df;color:#7a7568" onclick="bulkResetAll()">Reset All</button>
+    <div style="flex:1"></div>
+    <div class="toolbar-label" style="margin:0">Keyboard: <kbd>A</kbd> accept &middot; <kbd>S</kbd> skip &middot; <kbd>E</kbd> edit &middot; <kbd>U</kbd> undo</div>
+  </div>
 </div>
 
 <div class="container" id="cards"></div>
 
 <div class="apply-bar">
-  <div class="apply-stats" id="applyStats">No entries reviewed yet</div>
+  <div>
+    <div class="apply-stats" id="applyStats">No entries reviewed yet</div>
+    <div class="apply-stats" id="savingsStats" style="margin-top:2px"></div>
+  </div>
   <button class="btn btn-apply" id="applyBtn" disabled onclick="applyAll()">Apply All Changes</button>
 </div>
 
@@ -1063,7 +1164,21 @@ const entries = ${rowsJSON};
 const state = {};
 entries.forEach(e => { state[e.activity_id] = { status: 'pending', selected_note: '' }; });
 
-// Populate timekeeper filter
+// --- Detect duplicates ---
+const dupeSet = new Set();
+(function() {
+  const seen = {};
+  entries.forEach(e => {
+    const key = e.date + '|' + (e.timekeeper||'') + '|' + (e.current_note||'').trim().toLowerCase();
+    if (!seen[key]) seen[key] = [];
+    seen[key].push(e.activity_id);
+  });
+  Object.values(seen).forEach(ids => {
+    if (ids.length > 1) ids.forEach(id => dupeSet.add(id));
+  });
+})();
+
+// --- Populate filter dropdowns ---
 const timekeepers = [...new Set(entries.map(e => e.timekeeper).filter(Boolean))].sort();
 const tkSelect = document.getElementById('tkFilter');
 timekeepers.forEach(tk => {
@@ -1073,23 +1188,96 @@ timekeepers.forEach(tk => {
   tkSelect.appendChild(opt);
 });
 
-let currentFilter = '';
+const allFlags = new Set();
+entries.forEach(e => {
+  const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+  flags.forEach(f => allFlags.add(f.code));
+});
+const flagSelect = document.getElementById('flagFilter');
+[...allFlags].sort().forEach(code => {
+  const opt = document.createElement('option');
+  opt.value = code;
+  opt.textContent = code;
+  flagSelect.appendChild(opt);
+});
+
+// --- Severity ranking ---
+const sevRank = { strike: 0, reduce: 1, review: 2, rephrase: 3 };
+
+function getWorstSeverity(e) {
+  const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+  let worst = 4;
+  flags.forEach(f => { if (sevRank[f.severity] !== undefined && sevRank[f.severity] < worst) worst = sevRank[f.severity]; });
+  return worst;
+}
 
 function getFilteredEntries() {
-  currentFilter = document.getElementById('tkFilter').value;
-  if (!currentFilter) return entries;
-  return entries.filter(e => e.timekeeper === currentFilter);
+  const tkVal = document.getElementById('tkFilter').value;
+  const flagVal = document.getElementById('flagFilter').value;
+  let filtered = entries;
+  if (tkVal) filtered = filtered.filter(e => e.timekeeper === tkVal);
+  if (flagVal) filtered = filtered.filter(e => {
+    const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+    return flags.some(f => f.code === flagVal);
+  });
+
+  // Sort
+  const sortMode = document.getElementById('sortMode').value;
+  if (sortMode === 'severity') {
+    filtered = [...filtered].sort((a, b) => getWorstSeverity(a) - getWorstSeverity(b));
+  } else if (sortMode === 'amount') {
+    filtered = [...filtered].sort((a, b) => parseFloat(b.hours) * parseFloat(b.rate) - parseFloat(a.hours) * parseFloat(a.rate));
+  } else if (sortMode === 'timekeeper') {
+    filtered = [...filtered].sort((a, b) => (a.timekeeper || '').localeCompare(b.timekeeper || ''));
+  }
+
+  return filtered;
 }
 
 function render() {
   const filtered = getFilteredEntries();
+  const groupMode = document.getElementById('groupMode').value;
   const container = document.getElementById('cards');
+
   if (filtered.length === 0) {
-    container.innerHTML = '<div class="empty-state"><h2>No time entries found</h2><p>No entries matched the date range.</p></div>';
+    container.innerHTML = '<div class="empty-state"><h2>No matching entries</h2><p>Try adjusting filters.</p></div>';
     return;
   }
 
-  container.innerHTML = filtered.map((e, i) => {
+  // Group entries
+  let html = '';
+  if (groupMode !== 'none') {
+    const groups = {};
+    filtered.forEach(e => {
+      const key = groupMode === 'matter' ? e.matter_name : e.timekeeper;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(e);
+    });
+    Object.keys(groups).sort().forEach(key => {
+      const groupEntries = groups[key];
+      const groupId = 'grp-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+      html += '<div class="group-header" onclick="toggleGroup(\\'' + groupId + '\\')">';
+      html += '<span class="toggle" id="tog-' + groupId + '">\\u25BC</span> ' + esc(key);
+      html += ' <span style="font-size:12px;color:#7a7568;font-weight:400">(' + groupEntries.length + ')</span>';
+      html += '</div>';
+      html += '<div id="' + groupId + '">';
+      html += groupEntries.map((e, i) => renderCard(e)).join('');
+      html += '</div>';
+    });
+  } else {
+    html = filtered.map((e, i) => renderCard(e)).join('');
+  }
+  container.innerHTML = html;
+}
+
+function toggleGroup(id) {
+  const el = document.getElementById(id);
+  const tog = document.getElementById('tog-' + id);
+  if (el.style.display === 'none') { el.style.display = 'block'; tog.textContent = '\\u25BC'; }
+  else { el.style.display = 'none'; tog.textContent = '\\u25B6'; }
+}
+
+function renderCard(e) {
     const s = state[e.activity_id];
     const isDone = s.status !== 'pending';
     const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
@@ -1103,8 +1291,9 @@ function render() {
       const style = colors[f.severity] || 'background:#374151;color:#9ca3af';
       return '<span class="flag-tag" style="' + style + '" title="' + esc(f.message) + '">' + esc(f.code) + '</span>';
     }).join(' ');
+    const isDupe = dupeSet.has(e.activity_id);
     return \`
-    <div class="card \${isDone ? 'done' : ''}" id="card-\${e.activity_id}">
+    <div class="card \${isDone ? 'done' : ''} \${isDupe ? 'duplicate-highlight' : ''}" id="card-\${e.activity_id}">\${isDupe ? '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#991b1b;padding:6px 20px 0;background:#f8f7f5">\\u26A0 Possible Duplicate</div>' : ''}
       <div class="card-header">
         <div>
           <div class="matter-name">\${esc(e.matter_name)}</div>
@@ -1149,7 +1338,6 @@ function render() {
         </div>
       </div>
     </div>\`;
-  }).join('');
 }
 
 function esc(s) {
@@ -1254,6 +1442,21 @@ function updateProgress() {
   document.getElementById('applyStats').innerHTML = parts.length ? parts.join(' &middot; ') : 'No entries reviewed yet';
 
   document.getElementById('applyBtn').disabled = (accepted + edited) === 0;
+
+  // Savings counter — estimate based on skipped entries (removed) and accepted rate fixes
+  let savings = 0;
+  entries.forEach(e => {
+    const s = state[e.activity_id];
+    if (s.status === 'skipped') {
+      savings += parseFloat(e.hours) * parseFloat(e.rate);
+    }
+  });
+  const savingsEl = document.getElementById('savingsStats');
+  if (savings > 0) {
+    savingsEl.innerHTML = 'Estimated savings: <strong>$' + savings.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',') + '</strong>';
+  } else {
+    savingsEl.innerHTML = '';
+  }
 }
 
 async function postUpdate(activityId, selectedNote, status) {
@@ -1309,12 +1512,37 @@ async function applyAll() {
     const data = await res.json();
     overlay.classList.remove('show');
 
+    // Calculate before/after summary
+    const totalBefore = entries.reduce((s, e) => s + parseFloat(e.hours) * parseFloat(e.rate), 0);
+    let removed = 0;
+    entries.forEach(e => {
+      if (state[e.activity_id].status === 'skipped') removed += parseFloat(e.hours) * parseFloat(e.rate);
+    });
+    const totalAfter = totalBefore - removed;
+    const pctReduction = totalBefore > 0 ? ((removed / totalBefore) * 100).toFixed(1) : '0.0';
+    const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+
+    const accepted = Object.values(state).filter(s => s.status === 'accepted').length;
+    const edited = Object.values(state).filter(s => s.status === 'edited').length;
+    const skippedCount = Object.values(state).filter(s => s.status === 'skipped').length;
+
     const rc = document.getElementById('resultCard');
+    rc.style.maxWidth = '500px';
     rc.innerHTML = \`
-      <h2>\${data.errors && data.errors.length ? '\u26A0\uFE0F Completed with errors' : '\u2705 All changes applied!'}</h2>
-      <p>\${data.patched || 0} entries updated in Clio<br>\${data.skipped || 0} entries skipped\${data.errors && data.errors.length ? '<br>' + data.errors.length + ' errors' : ''}</p>
-      <div style="display:flex;gap:8px;justify-content:center;margin-top:20px">
-        <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download Comparison CSV</button>
+      <h2>\${data.errors && data.errors.length ? '\\u26A0\\uFE0F Completed with errors' : '\\u2705 Changes Applied'}</h2>
+      <div style="text-align:left;margin:16px 0;font-size:13px;line-height:2;color:#1a1a1a">
+        <div style="display:flex;justify-content:space-between"><span>Entries updated:</span><strong>\${data.patched || 0}</strong></div>
+        <div style="display:flex;justify-content:space-between"><span>Entries skipped/removed:</span><strong>\${data.skipped || 0}</strong></div>
+        <div style="display:flex;justify-content:space-between"><span>Descriptions revised:</span><strong>\${accepted + edited}</strong></div>
+        \${data.errors && data.errors.length ? '<div style="color:#991b1b">' + data.errors.length + ' errors</div>' : ''}
+        <hr style="border:none;border-top:1px solid #d4d0c8;margin:8px 0">
+        <div style="display:flex;justify-content:space-between"><span>Total billed (before):</span><strong>\${fmtD(totalBefore)}</strong></div>
+        <div style="display:flex;justify-content:space-between"><span>Entries removed:</span><strong style="color:#991b1b">-\${fmtD(removed)}</strong></div>
+        <div style="display:flex;justify-content:space-between"><span>Total billed (after):</span><strong style="color:#064e3b">\${fmtD(totalAfter)}</strong></div>
+        <div style="display:flex;justify-content:space-between"><span>Reduction:</span><strong>\${pctReduction}%</strong></div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:16px">
+        <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download CSV</button>
         <button class="btn btn-apply" onclick="location.reload()">Done</button>
       </div>
     \`;
@@ -1403,6 +1631,63 @@ function csvEscJS(val) {
   }
   return s;
 }
+
+// --- Bulk actions ---
+function bulkSkipStrikes() {
+  entries.forEach(e => {
+    if (state[e.activity_id].status !== 'pending') return;
+    const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+    const isStrike = flags.some(f => f.severity === 'strike');
+    if (isStrike) {
+      state[e.activity_id] = { status: 'skipped', selected_note: '' };
+      postUpdate(e.activity_id, '', 'skipped');
+    }
+  });
+  render();
+  updateProgress();
+}
+
+function bulkResetAll() {
+  entries.forEach(e => {
+    state[e.activity_id] = { status: 'pending', selected_note: '' };
+    postUpdate(e.activity_id, '', 'pending');
+  });
+  render();
+  updateProgress();
+}
+
+// --- Keyboard shortcuts ---
+let focusedIdx = 0;
+
+document.addEventListener('keydown', function(evt) {
+  // Don't capture if typing in an input/textarea
+  if (evt.target.tagName === 'INPUT' || evt.target.tagName === 'TEXTAREA' || evt.target.tagName === 'SELECT') return;
+
+  const filtered = getFilteredEntries();
+  const pendingFiltered = filtered.filter(e => state[e.activity_id].status === 'pending');
+  if (pendingFiltered.length === 0) return;
+
+  // Find first pending entry
+  const current = pendingFiltered[0];
+  if (!current) return;
+  const id = current.activity_id;
+
+  if (evt.key === 'a' || evt.key === 'A') {
+    const flags = current.flags_json ? JSON.parse(current.flags_json) : [];
+    if (hasBlockBill(flags)) { showSplit(id); } else { accept(id); }
+  } else if (evt.key === 's' || evt.key === 'S') {
+    skip(id);
+  } else if (evt.key === 'e' || evt.key === 'E') {
+    startEdit(id);
+  } else if (evt.key === 'u' || evt.key === 'U') {
+    // Undo last action
+    const lastActioned = [...filtered].reverse().find(e => state[e.activity_id].status !== 'pending');
+    if (lastActioned) undo(lastActioned.activity_id);
+  }
+});
+
+// --- Savings counter in updateProgress ---
+const origUpdateProgress = updateProgress;
 
 render();
 updateProgress();
