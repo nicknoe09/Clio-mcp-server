@@ -169,15 +169,29 @@ Return ONLY the revised description text, nothing else.`;
         res.on("end", () => {
           try {
             const parsed = JSON.parse(data);
-            const text = parsed.content?.[0]?.text || currentNote || "";
+            if (parsed.error) {
+              console.error("[Review] Anthropic API error:", parsed.error);
+              resolve(`[AI error: ${parsed.error.message || "unknown"}] ${currentNote}`);
+              return;
+            }
+            const text = parsed.content?.[0]?.text;
+            if (!text) {
+              console.error("[Review] No text in Anthropic response:", JSON.stringify(parsed).slice(0, 300));
+              resolve(`[No suggestion generated] ${currentNote}`);
+              return;
+            }
             resolve(text.trim());
-          } catch {
-            resolve(currentNote || "(suggestion generation failed)");
+          } catch (e) {
+            console.error("[Review] Failed to parse Anthropic response:", data.slice(0, 300));
+            resolve(`[Parse error] ${currentNote}`);
           }
         });
       }
     );
-    req.on("error", () => resolve(currentNote || "(suggestion generation failed)"));
+    req.on("error", (e) => {
+      console.error("[Review] Anthropic request error:", e.message);
+      resolve(`[Request error: ${e.message}] ${currentNote}`);
+    });
     req.write(body);
     req.end();
   });
