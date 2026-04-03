@@ -252,8 +252,12 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
       const matterInfo = mid ? matterMap.get(mid) : null;
       const isHC = matterInfo?.isHC || false;
 
-      const hours = li.quantity ? li.quantity / 3600 : 0;
+      let hours = li.quantity ? li.quantity / 3600 : 0;
       const rate = li.price || 0;
+      // Fallback: derive hours from total/rate if quantity is missing
+      if (hours === 0 && rate > 0 && li.total) {
+        hours = li.total / rate;
+      }
       const note = li.activity?.note || li.description || "";
 
       const flags = detectFlags(note, rate, hours, isHC, userId, matterInfo?.description || matter.description || "");
@@ -342,9 +346,11 @@ router.get("/review", async (req: Request, res: Response) => {
       auditEntries = result.entries;
     }
 
-    // Convert audit entries to pending rows
+    // Convert flagged audit entries to pending rows (skip clean entries)
     const rows: PendingRow[] = [];
-    for (const e of auditEntries) {
+    const totalEntries = auditEntries.length;
+    const flaggedEntries = auditEntries.filter(e => e.flags.length > 0);
+    for (const e of flaggedEntries) {
       // Build suggested note from flags
       const suggestedDescriptions = e.flags
         .filter(f => f.suggested_description)
@@ -390,7 +396,8 @@ router.get("/review", async (req: Request, res: Response) => {
     res.setHeader("Content-Type", "text/html");
     const userName = findUserById(Number(userId))?.name || `User ${userId}`;
     const scopeLabel = scope === "draft_bills" ? "Draft Bills Only" : "All Entries";
-    res.send(buildHTML(rows, startDate, endDate, userName, scopeLabel));
+    const subtitle = `${userName} &middot; ${scopeLabel} &middot; ${rows.length} flagged of ${totalEntries} entries`;
+    res.send(buildHTML(rows, startDate, endDate, subtitle));
   } catch (err: any) {
     console.error("[Review] Error:", err.message, err.response?.status, err.response?.data);
     res.status(500).send(`Error: ${err.message}${err.response?.status ? ` (Clio status: ${err.response.status})` : ''}`);
@@ -464,7 +471,7 @@ export { readCSV, writeCSV, PendingRow, CSV_PATH };
 // ---------------------------------------------------------------------------
 //  HTML builder
 // ---------------------------------------------------------------------------
-function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userName: string, scopeLabel: string): string {
+function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subtitle: string): string {
   const rowsJSON = JSON.stringify(rows).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 
   return `<!DOCTYPE html>
@@ -855,7 +862,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 
 <div class="header">
   <h1>Time Entry Review</h1>
-  <div class="subtitle">${userName} &middot; ${startDate} to ${endDate} &middot; ${rows.length} entries &middot; ${scopeLabel}</div>
+  <div class="subtitle">${subtitle}</div>
   <div class="progress-wrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-text" id="progressText">0 of ${rows.length}</div>
