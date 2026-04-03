@@ -162,11 +162,20 @@ export function detectFlags(
       suggested_description: splitSuggestions,
     });
   } else if (BLOCK_BILLING_INDICATORS.some(p => p.test(trimmed)) && (semicolons >= 1 || sentences >= 2)) {
+    // Split on semicolons or sentence boundaries
+    let mildTasks: string[];
+    if (semicolons >= 1) {
+      mildTasks = trimmed.split(/;\s*/).filter(t => t.length > 0);
+    } else {
+      mildTasks = trimmed.split(/\.\s+(?=[A-Z])/).filter(t => t.length > 0);
+    }
+    const mildSplitSuggestions = mildTasks.map((t, i) => `Entry ${i + 1}: ${t.trim().replace(/\.$/, "")}`).join("\n");
     flags.push({
       code: "BLOCK_BILL_MILD",
       severity: "review",
       message: "Possible block billing — multiple tasks in one entry",
-      suggested_action: "Consider splitting into separate entries or clarifying single-task nature",
+      suggested_action: `SPLIT into ${mildTasks.length} separate time entries`,
+      suggested_description: mildSplitSuggestions,
     });
   }
 

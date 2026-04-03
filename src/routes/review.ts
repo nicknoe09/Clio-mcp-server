@@ -404,7 +404,7 @@ router.get("/review", async (req: Request, res: Response) => {
         flags_json: JSON.stringify(e.flags.map(f => {
           const obj: any = { code: f.code, severity: f.severity, message: f.message };
           // For BLOCK_BILL, include split tasks for the UI
-          if (f.code === "BLOCK_BILL" && f.suggested_description) {
+          if ((f.code === "BLOCK_BILL" || f.code === "BLOCK_BILL_MILD") && f.suggested_description) {
             const taskLines = f.suggested_description.split("\n").filter(l => l.trim());
             const taskCount = taskLines.length || 1;
             const perTaskHours = Math.round((e.hours / taskCount) * 100) / 100;
@@ -1090,11 +1090,11 @@ function esc(s) {
 }
 
 function hasBlockBill(flags) {
-  return flags.some(f => f.code === 'BLOCK_BILL' && f.split_tasks && f.split_tasks.length > 0);
+  return flags.some(f => (f.code === 'BLOCK_BILL' || f.code === 'BLOCK_BILL_MILD') && f.split_tasks && f.split_tasks.length > 0);
 }
 
 function buildSplitUI(e, flags) {
-  const bb = flags.find(f => f.code === 'BLOCK_BILL' && f.split_tasks);
+  const bb = flags.find(f => (f.code === 'BLOCK_BILL' || f.code === 'BLOCK_BILL_MILD') && f.split_tasks);
   if (!bb) return '';
   const tasks = bb.split_tasks;
   const rows = tasks.map((t, i) =>
