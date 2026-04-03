@@ -127,7 +127,23 @@ async function suggestNote(
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return currentNote || "(no suggestion — ANTHROPIC_API_KEY not set)";
 
-  const prompt = `You are a legal billing assistant. Generate a concise, specific time entry description (1-2 sentences, no fluff) for a Texas probate attorney based on: Matter: ${matterName} | Date: ${date} | Hours: ${hours} | Existing note: ${currentNote || "none"}. Return only the description text.`;
+  const prompt = `You are a legal billing compliance assistant for a Texas probate law firm. Your job is to IMPROVE time entry descriptions so they are specific, defensible, and clearly describe the legal work performed.
+
+Here is a time entry to revise:
+- Matter: ${matterName}
+- Date: ${date}
+- Hours: ${hours}
+- Current description: "${currentNote || "none"}"
+
+Rules:
+1. The revised description MUST be materially different and more specific than the original. Do NOT return the same text.
+2. Include WHO was involved (if a communication), WHAT specific legal task was performed, and WHY (the purpose).
+3. Use active verbs: "Drafted", "Reviewed", "Analyzed", "Conferred with", "Prepared", "Researched".
+4. Reference specific documents, pleadings, or legal issues when the matter name gives context.
+5. 1-2 sentences max. No fluff, no filler words like "various" or "regarding matters".
+6. If the current note is already excellent and specific, you may keep it but still try to improve specificity.
+
+Return ONLY the revised description text, nothing else.`;
 
   const body = JSON.stringify({
     model: "claude-haiku-4-5-20251001",
@@ -226,7 +242,7 @@ router.get("/review", async (req: Request, res: Response) => {
       entries = [];
       for (const bill of draftBills) {
         const lineItems = await fetchAllPages<any>("/line_items", {
-          fields: "id,date,total,quantity,price,description,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note,quantity,price}",
+          fields: "id,total,type,date,description,quantity,price,bill{id},matter{id,display_number,description},user{id,name},activity{id,type,note}",
           bill_id: bill.id,
         });
 
@@ -235,14 +251,11 @@ router.get("/review", async (req: Request, res: Response) => {
           if (String(li.user?.id) !== String(userId)) continue;
 
           const matter = li.matter || bill.matters?.[0] || {};
-          // quantity may be on the line item or the activity — both are in seconds
-          const qty = li.quantity || li.activity?.quantity || 0;
-          const price = li.price || li.activity?.price || 0;
           entries.push({
             id: li.activity.id,
             date: li.date,
-            quantity: qty,
-            price: price,
+            quantity: li.quantity || 0,
+            price: li.price || 0,
             note: li.activity?.note || li.description || "",
             matter: {
               id: matter.id,
