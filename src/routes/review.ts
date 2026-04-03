@@ -170,10 +170,9 @@ async function suggestNote(
 // ---------------------------------------------------------------------------
 //  Auth — simple password gate via cookie
 // ---------------------------------------------------------------------------
-const REVIEW_PASSWORD = process.env.REVIEW_PASSWORD || "";
-
 function isAuthenticated(req: Request): boolean {
-  if (!REVIEW_PASSWORD) return true; // no password set = open access
+  const pw = process.env.REVIEW_PASSWORD || "";
+  if (!pw) return true; // no password set = open access
   const cookie = req.headers.cookie || "";
   const match = cookie.match(/review_auth=([^;]+)/);
   return match?.[1] === "granted";
@@ -181,8 +180,9 @@ function isAuthenticated(req: Request): boolean {
 
 router.post("/review/login", (req: Request, res: Response) => {
   const { password } = req.body || {};
-  if (password === REVIEW_PASSWORD) {
-    res.setHeader("Set-Cookie", "review_auth=granted; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400");
+  const expectedPw = process.env.REVIEW_PASSWORD || "";
+  if (password === expectedPw && expectedPw !== "") {
+    res.setHeader("Set-Cookie", "review_auth=granted; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
     res.json({ ok: true });
   } else {
     res.status(401).json({ ok: false, error: "Wrong password" });
