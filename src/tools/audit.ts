@@ -22,6 +22,9 @@ const HC_RATE_BRACKETS: { minYrs: number; maxYrs: number; label: string; max: nu
 ];
 const HC_PARALEGAL_MAX = 175;
 
+// HC rate caps apply only to guardianship / appointment matters (matched by matter description)
+const HC_RATE_CAP_DESCRIPTION_PATTERN = /\b(guardianship|appointment)\b/i;
+
 // Timekeeper roster — license dates drive dynamic HC rate cap calculation
 type TimekeeperInfo = {
   name: string;
@@ -118,12 +121,13 @@ function detectFlags(
   rate: number,
   hours: number,
   isHC: boolean,
-  userId?: number
+  userId?: number,
+  matterDescription?: string
 ): Flag[] {
   const flags: Flag[] = [];
 
-  // Rate cap check (HC only)
-  if (isHC && userId) {
+  // Rate cap check — HC guardianship and appointment matters only
+  if (isHC && userId && HC_RATE_CAP_DESCRIPTION_PATTERN.test(matterDescription || "")) {
     const cap = getHCRateCap(userId);
     if (cap && rate > cap.max) {
       flags.push({
@@ -366,7 +370,7 @@ export function registerAuditTools(server: McpServer): void {
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
 
-            const flags = detectFlags(note, rate, hours, isHC, li.user?.id);
+            const flags = detectFlags(note, rate, hours, isHC, li.user?.id, matterInfo?.description);
 
             allEntries.push({
               line_item_id: li.id,
@@ -464,7 +468,7 @@ export function registerAuditTools(server: McpServer): void {
           flagged_by_bill: Object.fromEntries(byBill),
           _meta: {
             hc_court_ids: [...HC_COURT_IDS],
-            standards_note: "HC = Harris County Probate Court fee standards (March 2025). General = billing hygiene (block billing, vague entries, clerical, duplicates).",
+            standards_note: "HC = Harris County Probate Court fee standards (March 2025). Rate caps apply only to HC matters whose description contains 'guardianship' or 'appointment'. General = billing hygiene (block billing, vague entries, clerical, duplicates).",
             severity_key: {
               strike: "Non-compensable — recommend striking entirely",
               reduce: "Reduce — entry overbilled or block-billed",
@@ -509,6 +513,7 @@ export function registerAuditTools(server: McpServer): void {
         const matterMap = new Map<number, {
           id: number;
           display_number: string;
+          description: string;
           practice_area: string;
           court_id: number | null;
           is_hc: boolean;
@@ -526,6 +531,7 @@ export function registerAuditTools(server: McpServer): void {
           matterMap.set(m.id, {
             id: m.id,
             display_number: m.display_number,
+            description: m.description || "",
             practice_area: pa,
             court_id: courtId,
             is_hc: courtId ? HC_COURT_IDS.has(courtId) : false,
@@ -577,7 +583,7 @@ export function registerAuditTools(server: McpServer): void {
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
 
-            const flags = detectFlags(note, rate, hours, isHC, li.user?.id);
+            const flags = detectFlags(note, rate, hours, isHC, li.user?.id, matterInfo?.description);
 
             allEntries.push({
               line_item_id: li.id,
