@@ -447,38 +447,40 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Time Entry Review</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=Lora:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
-    background: #0f1117;
-    color: #e2e8f0;
+    font-family: 'Lora', Georgia, 'Times New Roman', serif;
+    background: #faf9f7;
+    color: #1a1a1a;
     min-height: 100vh;
     padding: 0;
   }
 
   .header {
-    background: linear-gradient(135deg, #1a1d2e 0%, #0f1117 100%);
-    border-bottom: 1px solid #2d3348;
+    background: #1b2a3d;
+    border-bottom: 2px solid #c9a84c;
     padding: 28px 32px;
     position: sticky;
     top: 0;
     z-index: 100;
-    backdrop-filter: blur(12px);
   }
 
   .header h1 {
-    font-size: 22px;
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 26px;
     font-weight: 700;
-    color: #f8fafc;
+    color: #ffffff;
     margin-bottom: 4px;
+    letter-spacing: 0.02em;
   }
 
   .header .subtitle {
     font-size: 13px;
-    color: #94a3b8;
+    color: #c9cdd5;
+    letter-spacing: 0.01em;
   }
 
   .progress-wrap {
@@ -490,23 +492,21 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 
   .progress-bar {
     flex: 1;
-    height: 6px;
-    background: #1e2235;
-    border-radius: 3px;
+    height: 4px;
+    background: #2a3a50;
     overflow: hidden;
   }
 
   .progress-fill {
     height: 100%;
-    background: linear-gradient(90deg, #6366f1, #818cf8);
-    border-radius: 3px;
+    background: #c9a84c;
     transition: width 0.4s ease;
     width: 0%;
   }
 
   .progress-text {
     font-size: 13px;
-    color: #818cf8;
+    color: #c9a84c;
     font-weight: 600;
     min-width: 90px;
     text-align: right;
@@ -519,28 +519,29 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   }
 
   .card {
-    background: #1a1d2e;
-    border: 1px solid #2d3348;
-    border-radius: 12px;
-    margin-bottom: 16px;
+    background: #ffffff;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    margin-bottom: 14px;
     overflow: hidden;
-    transition: all 0.35s ease;
+    transition: all 0.3s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
   }
 
   .card.done {
     opacity: 0.5;
-    transform: scale(0.98);
   }
 
   .card.done .card-body { display: none; }
 
   .card-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid #2d3348;
+    padding: 14px 20px;
+    border-bottom: 1px solid #e8e5df;
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
     gap: 12px;
+    background: #f8f7f5;
   }
 
   .card.done .card-header {
@@ -548,18 +549,19 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   }
 
   .matter-name {
-    font-size: 14px;
-    font-weight: 600;
-    color: #f1f5f9;
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 16px;
+    font-weight: 700;
+    color: #1b2a3d;
     line-height: 1.4;
   }
 
   .meta-row {
     display: flex;
     gap: 16px;
-    margin-top: 6px;
+    margin-top: 4px;
     font-size: 12px;
-    color: #94a3b8;
+    color: #7a7568;
   }
 
   .meta-row span { display: flex; align-items: center; gap: 4px; }
@@ -573,12 +575,13 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 
   .flag-tag {
     display: inline-block;
+    font-family: 'Lora', Georgia, serif;
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     padding: 3px 8px;
-    border-radius: 4px;
+    border-radius: 2px;
     cursor: default;
   }
 
@@ -586,16 +589,16 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
     font-size: 11px;
     font-weight: 600;
     padding: 4px 10px;
-    border-radius: 20px;
+    border-radius: 2px;
     white-space: nowrap;
     display: none;
   }
 
   .card.done .status-badge { display: inline-block; }
 
-  .status-badge.accepted { background: #064e3b; color: #6ee7b7; }
-  .status-badge.edited { background: #1e3a5f; color: #7dd3fc; }
-  .status-badge.skipped { background: #374151; color: #9ca3af; }
+  .status-badge.accepted { background: #d1fae5; color: #065f46; }
+  .status-badge.edited { background: #dbeafe; color: #1e40af; }
+  .status-badge.skipped { background: #e8e5df; color: #7a7568; }
 
   .card-body { padding: 20px; }
 
@@ -603,32 +606,33 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
 
   .note-label {
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     margin-bottom: 6px;
   }
 
-  .note-label.current { color: #64748b; }
-  .note-label.suggested { color: #818cf8; }
+  .note-label.current { color: #7a7568; }
+  .note-label.suggested { color: #1b2a3d; }
 
   .note-box {
     padding: 12px 14px;
-    border-radius: 8px;
+    border-radius: 2px;
     font-size: 13px;
-    line-height: 1.6;
+    line-height: 1.7;
   }
 
   .note-box.current {
-    background: #111322;
-    color: #64748b;
-    border: 1px solid #1e2235;
+    background: #f5f4f1;
+    color: #7a7568;
+    border: 1px solid #e8e5df;
   }
 
   .note-box.suggested {
-    background: #1e1b4b;
-    color: #c7d2fe;
-    border: 1px solid #312e81;
+    background: #f0ede6;
+    color: #1a1a1a;
+    border: 1px solid #c9a84c;
+    border-left: 3px solid #c9a84c;
   }
 
   .edit-area {
@@ -639,19 +643,19 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   .edit-area textarea {
     width: 100%;
     min-height: 80px;
-    background: #111322;
-    border: 2px solid #6366f1;
-    border-radius: 8px;
-    color: #e2e8f0;
-    font-family: 'Inter', sans-serif;
+    background: #ffffff;
+    border: 2px solid #1b2a3d;
+    border-radius: 2px;
+    color: #1a1a1a;
+    font-family: 'Lora', Georgia, serif;
     font-size: 13px;
-    line-height: 1.6;
+    line-height: 1.7;
     padding: 12px 14px;
     resize: vertical;
     outline: none;
   }
 
-  .edit-area textarea:focus { border-color: #818cf8; }
+  .edit-area textarea:focus { border-color: #c9a84c; }
 
   .edit-actions {
     display: flex;
@@ -672,43 +676,43 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
     gap: 6px;
     padding: 8px 16px;
     border: none;
-    border-radius: 8px;
-    font-family: 'Inter', sans-serif;
+    border-radius: 2px;
+    font-family: 'Lora', Georgia, serif;
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: all 0.15s;
   }
 
   .btn:hover { transform: translateY(-1px); }
   .btn:active { transform: translateY(0); }
 
   .btn-accept {
-    background: linear-gradient(135deg, #059669, #047857);
+    background: #1b2a3d;
     color: #fff;
   }
-  .btn-accept:hover { background: linear-gradient(135deg, #047857, #065f46); }
+  .btn-accept:hover { background: #263b52; }
 
   .btn-edit {
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
-    color: #fff;
+    background: #c9a84c;
+    color: #1b2a3d;
   }
-  .btn-edit:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); }
+  .btn-edit:hover { background: #b8973f; }
 
   .btn-skip {
-    background: #374151;
-    color: #9ca3af;
+    background: #e8e5df;
+    color: #7a7568;
   }
-  .btn-skip:hover { background: #4b5563; }
+  .btn-skip:hover { background: #d4d0c8; }
 
   .btn-save {
-    background: linear-gradient(135deg, #059669, #047857);
+    background: #1b2a3d;
     color: #fff;
   }
 
   .btn-cancel {
-    background: #374151;
-    color: #9ca3af;
+    background: #e8e5df;
+    color: #7a7568;
   }
 
   .btn-sm { padding: 6px 12px; font-size: 12px; }
@@ -718,30 +722,31 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
     bottom: 0;
     left: 0;
     right: 0;
-    background: #1a1d2e;
-    border-top: 1px solid #2d3348;
+    background: #1b2a3d;
+    border-top: 2px solid #c9a84c;
     padding: 16px 32px;
     display: flex;
     justify-content: space-between;
     align-items: center;
     z-index: 100;
-    backdrop-filter: blur(12px);
   }
 
   .apply-stats {
     font-size: 13px;
-    color: #94a3b8;
+    color: #c9cdd5;
   }
 
-  .apply-stats strong { color: #6ee7b7; }
+  .apply-stats strong { color: #c9a84c; }
 
   .btn-apply {
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
-    color: #fff;
+    background: #c9a84c;
+    color: #1b2a3d;
     padding: 12px 28px;
     font-size: 14px;
-    border-radius: 10px;
+    border-radius: 2px;
     font-weight: 700;
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    letter-spacing: 0.03em;
   }
 
   .btn-apply:disabled {
@@ -751,23 +756,27 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   }
 
   .btn-apply:not(:disabled):hover {
-    background: linear-gradient(135deg, #4f46e5, #4338ca);
-    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.3);
+    background: #b8973f;
   }
 
   .empty-state {
     text-align: center;
     padding: 60px 20px;
-    color: #64748b;
+    color: #7a7568;
   }
 
-  .empty-state h2 { font-size: 18px; color: #94a3b8; margin-bottom: 8px; }
+  .empty-state h2 {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 20px;
+    color: #1b2a3d;
+    margin-bottom: 8px;
+  }
 
   .applying-overlay {
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(15, 17, 23, 0.85);
+    background: rgba(27, 42, 61, 0.85);
     z-index: 200;
     justify-content: center;
     align-items: center;
@@ -780,21 +789,21 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   .spinner {
     width: 40px;
     height: 40px;
-    border: 3px solid #2d3348;
-    border-top-color: #818cf8;
+    border: 3px solid #2a3a50;
+    border-top-color: #c9a84c;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .applying-text { font-size: 14px; color: #94a3b8; }
+  .applying-text { font-size: 14px; color: #c9cdd5; }
 
   .result-overlay {
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(15, 17, 23, 0.85);
+    background: rgba(27, 42, 61, 0.85);
     z-index: 200;
     justify-content: center;
     align-items: center;
@@ -803,16 +812,16 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, userN
   .result-overlay.show { display: flex; }
 
   .result-card {
-    background: #1a1d2e;
-    border: 1px solid #2d3348;
-    border-radius: 16px;
+    background: #ffffff;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
     padding: 32px 40px;
     text-align: center;
     max-width: 400px;
   }
 
-  .result-card h2 { font-size: 20px; margin-bottom: 12px; }
-  .result-card p { font-size: 14px; color: #94a3b8; line-height: 1.6; }
+  .result-card h2 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 22px; color: #1b2a3d; margin-bottom: 12px; }
+  .result-card p { font-size: 14px; color: #7a7568; line-height: 1.6; }
   .result-card .btn { margin-top: 20px; }
 </style>
 </head>
@@ -1022,59 +1031,62 @@ function buildLoginHTML(): string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Time Entry Review — Login</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=Lora:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'Inter', system-ui, sans-serif;
-    background: #0f1117;
-    color: #e2e8f0;
+    font-family: 'Lora', Georgia, 'Times New Roman', serif;
+    background: #faf9f7;
+    color: #1a1a1a;
     min-height: 100vh;
     display: flex;
     justify-content: center;
     align-items: center;
   }
   .panel {
-    background: #1a1d2e;
-    border: 1px solid #2d3348;
-    border-radius: 16px;
+    background: #ffffff;
+    border: 1px solid #d4d0c8;
+    border-top: 3px solid #1b2a3d;
+    border-radius: 2px;
     padding: 40px;
     width: 100%;
     max-width: 380px;
     text-align: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
   }
-  h1 { font-size: 22px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
-  .sub { font-size: 13px; color: #94a3b8; margin-bottom: 28px; }
+  h1 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 26px; font-weight: 700; color: #1b2a3d; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: #7a7568; margin-bottom: 28px; }
   input[type="password"] {
     width: 100%;
     padding: 12px 14px;
-    background: #111322;
-    border: 1px solid #2d3348;
-    border-radius: 8px;
-    color: #e2e8f0;
-    font-family: 'Inter', sans-serif;
+    background: #f8f7f5;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    color: #1a1a1a;
+    font-family: 'Lora', Georgia, serif;
     font-size: 14px;
     margin-bottom: 16px;
     outline: none;
     text-align: center;
   }
-  input[type="password"]:focus { border-color: #6366f1; }
+  input[type="password"]:focus { border-color: #c9a84c; }
   .btn {
     display: block;
     width: 100%;
     padding: 12px;
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    background: #1b2a3d;
     color: #fff;
     border: none;
-    border-radius: 10px;
-    font-family: 'Inter', sans-serif;
-    font-size: 14px;
+    border-radius: 2px;
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 16px;
     font-weight: 700;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: all 0.15s;
+    letter-spacing: 0.03em;
   }
-  .btn:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); transform: translateY(-1px); }
-  .error { color: #f87171; font-size: 13px; margin-top: 12px; display: none; }
+  .btn:hover { background: #263b52; }
+  .error { color: #991b1b; font-size: 13px; margin-top: 12px; display: none; }
   .error.show { display: block; }
 </style>
 </head>
@@ -1126,69 +1138,72 @@ function buildLandingHTML(): string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Time Entry Review</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=Lora:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'Inter', system-ui, sans-serif;
-    background: #0f1117;
-    color: #e2e8f0;
+    font-family: 'Lora', Georgia, 'Times New Roman', serif;
+    background: #faf9f7;
+    color: #1a1a1a;
     min-height: 100vh;
     display: flex;
     justify-content: center;
     align-items: center;
   }
   .panel {
-    background: #1a1d2e;
-    border: 1px solid #2d3348;
-    border-radius: 16px;
+    background: #ffffff;
+    border: 1px solid #d4d0c8;
+    border-top: 3px solid #1b2a3d;
+    border-radius: 2px;
     padding: 40px;
     width: 100%;
     max-width: 440px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
   }
-  h1 { font-size: 22px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
-  .sub { font-size: 13px; color: #94a3b8; margin-bottom: 28px; }
+  h1 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 26px; font-weight: 700; color: #1b2a3d; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: #7a7568; margin-bottom: 28px; }
   label {
     display: block;
-    font-size: 12px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #94a3b8;
+    letter-spacing: 0.06em;
+    color: #7a7568;
     margin-bottom: 6px;
   }
   select, input[type="date"] {
     width: 100%;
     padding: 10px 14px;
-    background: #111322;
-    border: 1px solid #2d3348;
-    border-radius: 8px;
-    color: #e2e8f0;
-    font-family: 'Inter', sans-serif;
+    background: #f8f7f5;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    color: #1a1a1a;
+    font-family: 'Lora', Georgia, serif;
     font-size: 14px;
     margin-bottom: 20px;
     outline: none;
   }
-  select:focus, input[type="date"]:focus { border-color: #6366f1; }
+  select:focus, input[type="date"]:focus { border-color: #c9a84c; }
   .date-row { display: flex; gap: 12px; }
   .date-row > div { flex: 1; }
   .btn {
     display: block;
     width: 100%;
     padding: 12px;
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    background: #1b2a3d;
     color: #fff;
     border: none;
-    border-radius: 10px;
-    font-family: 'Inter', sans-serif;
-    font-size: 14px;
+    border-radius: 2px;
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 16px;
     font-weight: 700;
     cursor: pointer;
     margin-top: 8px;
-    transition: all 0.2s;
+    transition: all 0.15s;
+    letter-spacing: 0.03em;
   }
-  .btn:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); transform: translateY(-1px); }
-  .loading { display: none; text-align: center; color: #94a3b8; font-size: 13px; margin-top: 16px; }
+  .btn:hover { background: #263b52; }
+  .loading { display: none; text-align: center; color: #7a7568; font-size: 13px; margin-top: 16px; }
   .loading.show { display: block; }
 </style>
 </head>
