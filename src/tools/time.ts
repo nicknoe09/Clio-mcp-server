@@ -334,4 +334,87 @@ export function registerTimeTools(server: McpServer): void {
       }
     }
   );
+
+  // apply_entry_revision — apply a single revision to a time entry in Clio
+  server.tool(
+    "apply_entry_revision",
+    "Apply a single revision to a Clio time entry. Used during interactive audit review to update one entry at a time. Can modify the description (note), hourly rate, and/or hours. Returns before/after state for confirmation.",
+    {
+      activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to update"),
+      new_note: z.string().optional().describe("Revised description/note for the entry"),
+      new_rate: z.coerce.number().optional().describe("Revised hourly rate"),
+      new_hours: z.coerce.number().optional().describe("Revised hours (converted to seconds for Clio)"),
+    },
+    async (params) => {
+      try {
+        if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
+            }],
+            isError: true,
+          };
+        }
+
+        // Read current state
+        const before = await rawGetSingle(`/activities/${params.activity_id}`, {
+          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
+        });
+        const entry = before.data;
+
+        // Build patch
+        const patchBody: Record<string, any> = {};
+        if (params.new_note) patchBody.note = params.new_note;
+        if (params.new_rate !== undefined) patchBody.price = params.new_rate;
+        if (params.new_hours !== undefined) patchBody.quantity = Math.round(params.new_hours * 3600);
+
+        // Apply
+        await rawPatchSingle(`/activities/${params.activity_id}`, { data: patchBody });
+
+        // Read after
+        const after = await rawGetSingle(`/activities/${params.activity_id}`, {
+          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
+        });
+        const updated = after.data;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              activity_id: params.activity_id,
+              matter: entry.matter?.display_number || "Unknown",
+              timekeeper: entry.user?.name || "Unknown",
+              before: {
+                note: entry.note,
+                hours: Math.round((entry.quantity / 3600) * 100) / 100,
+                rate: entry.price,
+              },
+              after: {
+                note: updated.note,
+                hours: Math.round((updated.quantity / 3600) * 100) / 100,
+                rate: updated.price,
+              },
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              activity_id: params.activity_id,
+              status,
+              message: err.message,
+              clio_error: err.response?.data || err.body,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }
