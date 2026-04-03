@@ -168,9 +168,37 @@ async function suggestNote(
 }
 
 // ---------------------------------------------------------------------------
+//  Auth — simple password gate via cookie
+// ---------------------------------------------------------------------------
+const REVIEW_PASSWORD = process.env.REVIEW_PASSWORD || "";
+
+function isAuthenticated(req: Request): boolean {
+  if (!REVIEW_PASSWORD) return true; // no password set = open access
+  const cookie = req.headers.cookie || "";
+  const match = cookie.match(/review_auth=([^;]+)/);
+  return match?.[1] === "granted";
+}
+
+router.post("/review/login", (req: Request, res: Response) => {
+  const { password } = req.body || {};
+  if (password === REVIEW_PASSWORD) {
+    res.setHeader("Set-Cookie", "review_auth=granted; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400");
+    res.json({ ok: true });
+  } else {
+    res.status(401).json({ ok: false, error: "Wrong password" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 //  GET /review?user_id=&start=&end=
 // ---------------------------------------------------------------------------
 router.get("/review", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) {
+    res.setHeader("Content-Type", "text/html");
+    res.send(buildLoginHTML());
+    return;
+  }
+
   const userId = req.query.user_id as string;
   const start = req.query.start as string;
   const end = req.query.end as string;
@@ -284,6 +312,7 @@ router.get("/review", async (req: Request, res: Response) => {
 //  POST /pending  — update a single row
 // ---------------------------------------------------------------------------
 router.post("/pending", (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
   const { activity_id, selected_note, status } = req.body || {};
   if (!activity_id || !status) {
     res.status(400).json({ ok: false, error: "activity_id and status required" });
@@ -307,6 +336,7 @@ router.post("/pending", (req: Request, res: Response) => {
 //  POST /pending/apply — apply accepted/edited entries to Clio
 // ---------------------------------------------------------------------------
 router.post("/pending/apply", async (_req: Request, res: Response) => {
+  if (!isAuthenticated(_req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
   try {
     const rows = readCSV();
     const toApply = rows.filter((r) => r.status === "accepted" || r.status === "edited");
@@ -893,6 +923,101 @@ updateProgress();
 // ---------------------------------------------------------------------------
 //  Landing page — user picker
 // ---------------------------------------------------------------------------
+function buildLoginHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Time Entry Review — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .panel {
+    background: #1a1d2e;
+    border: 1px solid #2d3348;
+    border-radius: 16px;
+    padding: 40px;
+    width: 100%;
+    max-width: 380px;
+    text-align: center;
+  }
+  h1 { font-size: 22px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+  .sub { font-size: 13px; color: #94a3b8; margin-bottom: 28px; }
+  input[type="password"] {
+    width: 100%;
+    padding: 12px 14px;
+    background: #111322;
+    border: 1px solid #2d3348;
+    border-radius: 8px;
+    color: #e2e8f0;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    margin-bottom: 16px;
+    outline: none;
+    text-align: center;
+  }
+  input[type="password"]:focus { border-color: #6366f1; }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); transform: translateY(-1px); }
+  .error { color: #f87171; font-size: 13px; margin-top: 12px; display: none; }
+  .error.show { display: block; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>Time Entry Review</h1>
+  <div class="sub">Enter password to continue</div>
+  <form onsubmit="login(event)">
+    <input type="password" id="pw" placeholder="Password" autofocus required>
+    <button type="submit" class="btn">Sign In</button>
+  </form>
+  <div class="error" id="err">Incorrect password</div>
+</div>
+<script>
+async function login(e) {
+  e.preventDefault();
+  const pw = document.getElementById('pw').value;
+  const res = await fetch('/review/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: pw }),
+  });
+  if (res.ok) {
+    window.location.reload();
+  } else {
+    document.getElementById('err').classList.add('show');
+    document.getElementById('pw').value = '';
+    document.getElementById('pw').focus();
+  }
+}
+</script>
+</body>
+</html>`;
+}
+
 function buildLandingHTML(): string {
   const users = getActiveUsers();
   const today = new Date().toISOString().split("T")[0];
