@@ -469,6 +469,40 @@ router.post("/pending", (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+//  POST /pending/fix-rate — reduce rate to HC cap
+// ---------------------------------------------------------------------------
+router.post("/pending/fix-rate", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_id, new_rate } = req.body || {};
+  if (!activity_id || new_rate === undefined) {
+    res.status(400).json({ ok: false, error: "activity_id and new_rate required" });
+    return;
+  }
+
+  try {
+    await rawPatchSingle(`/activities/${activity_id}`, {
+      data: { price: new_rate },
+    });
+
+    // Update CSV
+    const rows = readCSV();
+    const row = rows.find((r) => r.activity_id === String(activity_id));
+    if (row) {
+      row.status = "accepted";
+      row.selected_note = `Rate reduced to $${new_rate}/hr`;
+      row.rate = String(new_rate);
+      writeCSV(rows);
+    }
+
+    res.json({ ok: true, activity_id, new_rate });
+  } catch (err: any) {
+    console.error("[Review] Fix rate error:", err.message, err.response?.status);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 //  POST /pending/split — split a block-billed entry into multiple entries
 // ---------------------------------------------------------------------------
 router.post("/pending/split", async (req: Request, res: Response) => {
@@ -669,10 +703,18 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
     text-align: right;
   }
 
+  .filter-bar {
+    max-width: 820px;
+    margin: 12px auto 0;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+  }
+
   .container {
     max-width: 820px;
     margin: 0 auto;
-    padding: 24px 20px 120px;
+    padding: 12px 20px 120px;
   }
 
   .card {
@@ -993,6 +1035,13 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
   </div>
 </div>
 
+<div class="filter-bar" id="filterBar">
+  <label for="tkFilter" style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#7a7568;margin-right:8px">Timekeeper:</label>
+  <select id="tkFilter" onchange="render();updateProgress()" style="padding:6px 10px;background:#fff;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px;color:#1a1a1a">
+    <option value="">All</option>
+  </select>
+</div>
+
 <div class="container" id="cards"></div>
 
 <div class="apply-bar">
@@ -1014,14 +1063,33 @@ const entries = ${rowsJSON};
 const state = {};
 entries.forEach(e => { state[e.activity_id] = { status: 'pending', selected_note: '' }; });
 
+// Populate timekeeper filter
+const timekeepers = [...new Set(entries.map(e => e.timekeeper).filter(Boolean))].sort();
+const tkSelect = document.getElementById('tkFilter');
+timekeepers.forEach(tk => {
+  const opt = document.createElement('option');
+  opt.value = tk;
+  opt.textContent = tk;
+  tkSelect.appendChild(opt);
+});
+
+let currentFilter = '';
+
+function getFilteredEntries() {
+  currentFilter = document.getElementById('tkFilter').value;
+  if (!currentFilter) return entries;
+  return entries.filter(e => e.timekeeper === currentFilter);
+}
+
 function render() {
+  const filtered = getFilteredEntries();
   const container = document.getElementById('cards');
-  if (entries.length === 0) {
+  if (filtered.length === 0) {
     container.innerHTML = '<div class="empty-state"><h2>No time entries found</h2><p>No entries matched the date range.</p></div>';
     return;
   }
 
-  container.innerHTML = entries.map((e, i) => {
+  container.innerHTML = filtered.map((e, i) => {
     const s = state[e.activity_id];
     const isDone = s.status !== 'pending';
     const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
@@ -1047,11 +1115,13 @@ function render() {
             <span>$\${e.rate}/hr</span>
           </div>
         </div>
-        <span class="status-badge \${s.status}">\${
-          s.status === 'accepted' ? '\u2713 Accepted' :
-          s.status === 'edited' ? '\u270E Edited' :
-          s.status === 'skipped' ? 'Skipped' : ''
-        }</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="status-badge \${s.status}">\${
+            s.status === 'accepted' ? '\u2713 Accepted' :
+            s.status === 'edited' ? '\u270E Edited' :
+            s.status === 'skipped' ? 'Skipped' : ''
+          }</span>\${isDone ? '<button class="btn btn-sm" style="background:#e8e5df;color:#7a7568;font-size:11px;padding:3px 8px" onclick="undo(\\'' + e.activity_id + '\\')">Undo</button>' : ''}
+        </div>
       </div>
       <div class="card-body">\${flags.length > 0 ? '<div class="flag-row">' + flagTags + '</div>' : '<div class="flag-row"><span class="flag-tag" style="background:#064e3b;color:#6ee7b7">CLEAN</span></div>'}
         <div class="note-section">
@@ -1073,7 +1143,7 @@ function render() {
           hasBlockBill(flags)
             ? '<button class="btn btn-accept" onclick="showSplit(\\'' + e.activity_id + '\\')">\\u2702 Split Entries</button>'
             : '<button class="btn btn-accept" onclick="accept(\\'' + e.activity_id + '\\')">\\u2713 Accept</button>'
-        }
+        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}
           <button class="btn btn-edit" onclick="startEdit('\${e.activity_id}')">\\u270E Edit</button>
           <button class="btn btn-skip" onclick="skip('\${e.activity_id}')">\\u2717 Skip</button>
         </div>
@@ -1243,13 +1313,95 @@ async function applyAll() {
     rc.innerHTML = \`
       <h2>\${data.errors && data.errors.length ? '\u26A0\uFE0F Completed with errors' : '\u2705 All changes applied!'}</h2>
       <p>\${data.patched || 0} entries updated in Clio<br>\${data.skipped || 0} entries skipped\${data.errors && data.errors.length ? '<br>' + data.errors.length + ' errors' : ''}</p>
-      <button class="btn btn-apply" onclick="location.reload()">Done</button>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:20px">
+        <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download Comparison CSV</button>
+        <button class="btn btn-apply" onclick="location.reload()">Done</button>
+      </div>
     \`;
     document.getElementById('resultOverlay').classList.add('show');
   } catch (err) {
     overlay.classList.remove('show');
     alert('Error applying changes: ' + err.message);
   }
+}
+
+// --- Undo ---
+function undo(id) {
+  state[id] = { status: 'pending', selected_note: '' };
+  postUpdate(id, '', 'pending');
+  render();
+  updateProgress();
+}
+
+// --- Rate cap auto-fix ---
+function hasRateCap(flags) {
+  return flags.some(f => f.code === 'RATE_EXCEEDS_CAP');
+}
+
+async function fixRate(id) {
+  const entry = entries.find(e => e.activity_id === id);
+  const flags = entry.flags_json ? JSON.parse(entry.flags_json) : [];
+  const rcFlag = flags.find(f => f.code === 'RATE_EXCEEDS_CAP');
+  if (!rcFlag) return;
+
+  // Extract the cap rate from the message (e.g. "Reduce to $250/hr")
+  const match = rcFlag.message.match(/Reduce to \\\$(\d+)/);
+  if (!match) { alert('Could not parse cap rate from flag'); return; }
+  const capRate = parseFloat(match[1]);
+
+  try {
+    const res = await fetch('/pending/fix-rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, new_rate: capRate }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      state[id] = { status: 'accepted', selected_note: 'Rate reduced to $' + capRate + '/hr' };
+      render();
+      updateProgress();
+    } else {
+      alert('Rate fix failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Rate fix error: ' + err.message);
+  }
+}
+
+// --- Download comparison CSV ---
+function downloadCSV() {
+  const headers = ['Activity ID','Matter','Timekeeper','Date','Hours','Rate','Original Description','Action Taken','New Description'];
+  const csvRows = [headers.join(',')];
+  for (const e of entries) {
+    const s = state[e.activity_id];
+    if (s.status === 'pending') continue;
+    csvRows.push([
+      csvEscJS(e.activity_id),
+      csvEscJS(e.matter_name),
+      csvEscJS(e.timekeeper),
+      csvEscJS(e.date),
+      csvEscJS(e.hours),
+      csvEscJS(e.rate),
+      csvEscJS(e.current_note),
+      csvEscJS(s.status),
+      csvEscJS(s.selected_note),
+    ].join(','));
+  }
+  const blob = new Blob([csvRows.join('\\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'review-comparison-' + new Date().toISOString().split('T')[0] + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function csvEscJS(val) {
+  const s = String(val || '');
+  if (s.includes(',') || s.includes('"') || s.includes('\\n')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
 }
 
 render();
