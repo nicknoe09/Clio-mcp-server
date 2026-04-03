@@ -204,7 +204,7 @@ Return ONLY the revised description text, nothing else.`;
 // ---------------------------------------------------------------------------
 //  Audit draft bill entries for a specific user
 // ---------------------------------------------------------------------------
-async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
+async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEntry[]; billCount: number; matterCount: number }> {
   // First, get all matters where this user has billed time (as responsible attorney)
   const matters = await fetchAllPages<any>("/matters", {
     fields: "id,display_number,description,responsible_attorney{id},custom_field_values{id,field_name,value}",
@@ -256,22 +256,14 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
     for (const li of lineItems) {
       if (li.activity?.type !== "TimeEntry") continue;
 
-      // li.quantity is in seconds on line items (same as audit tool)
-      let hours = li.quantity ? li.quantity / 3600 : 0;
+      // Line items return quantity in HOURS (not seconds like /activities)
+      // Verify: li.quantity * li.price should ≈ li.total
+      let hours = li.quantity || 0;
       const rate = li.price || 0;
 
-      // If quantity is still 0, fetch the activity directly for its quantity
-      if (hours === 0 && li.activity?.id) {
-        try {
-          const act = await rawGetSingle(`/activities/${li.activity.id}`, {
-            fields: "id,quantity,price",
-          });
-          const actQty = act.data?.quantity || 0;
-          if (actQty) hours = actQty / 3600;
-        } catch {
-          // Fall back to total/rate
-          if (rate > 0 && li.total) hours = li.total / rate;
-        }
+      // Fallback: derive hours from total/rate
+      if (hours === 0 && rate > 0 && li.total) {
+        hours = li.total / rate;
       }
 
       // Debug first 3 entries
@@ -309,7 +301,7 @@ async function auditDraftBillEntries(userId: number): Promise<AuditEntry[]> {
   }
 
   console.log(`[Review] Total entries for user ${userId}: ${allEntries.length}`);
-  return allEntries;
+  return { entries: allEntries, billCount: relevantBills.length, matterCount: matterMap.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -360,9 +352,14 @@ router.get("/review", async (req: Request, res: Response) => {
 
   try {
     let auditEntries: AuditEntry[];
+    let billCount = 0;
+    let matterCount = 0;
 
     if (scope === "draft_bills") {
-      auditEntries = await auditDraftBillEntries(Number(userId));
+      const draftResult = await auditDraftBillEntries(Number(userId));
+      auditEntries = draftResult.entries;
+      billCount = draftResult.billCount;
+      matterCount = draftResult.matterCount;
     } else {
       const result = await auditTimeEntries(Number(userId), startDate, endDate);
       auditEntries = result.entries;
@@ -418,8 +415,19 @@ router.get("/review", async (req: Request, res: Response) => {
     // 4. Serve HTML
     res.setHeader("Content-Type", "text/html");
     const userName = findUserById(Number(userId))?.name || `User ${userId}`;
-    const scopeLabel = scope === "draft_bills" ? "Draft Bills Only" : "All Entries";
-    const subtitle = `${userName} &middot; ${scopeLabel} &middot; ${rows.length} flagged of ${totalEntries} entries`;
+    const totalAmount = Math.round(auditEntries.reduce((s, e) => s + e.amount, 0) * 100) / 100;
+    const flaggedAmount = Math.round(flaggedEntries.reduce((s, e) => s + e.amount, 0) * 100) / 100;
+    const fmt = (n: number) => n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+    let subtitle = `${userName} &middot; `;
+    if (scope === "draft_bills") {
+      subtitle += `${billCount} draft bills &middot; ${matterCount} matters &middot; `;
+    } else {
+      subtitle += `${startDate} to ${endDate} &middot; `;
+    }
+    subtitle += `${rows.length} flagged of ${totalEntries} entries`;
+    subtitle += ` &middot; $${fmt(totalAmount)} total &middot; $${fmt(flaggedAmount)} flagged`;
+
     res.send(buildHTML(rows, startDate, endDate, subtitle));
   } catch (err: any) {
     console.error("[Review] Error:", err.message, err.response?.status, err.response?.data);
