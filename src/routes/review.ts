@@ -1141,7 +1141,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
 
 <div class="header">
   <div style="display:flex;align-items:center;gap:16px;margin-bottom:8px">
-    <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:40px;width:auto">
+    <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:60px;width:auto">
     <h1>Time Entry Review</h1>
   </div>
   <div class="subtitle">${subtitle}</div>
@@ -1883,7 +1883,7 @@ function buildLoginHTML(): string {
 </head>
 <body>
 <div class="panel">
-  <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:40px;width:auto;margin-bottom:16px">
+  <div style="background:#1b2a3d;padding:16px 24px;border-radius:2px;margin-bottom:20px;text-align:center"><img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:60px;width:auto"></div>
   <h1>Time Entry Review</h1>
   <div class="sub">Enter password to continue</div>
   <form onsubmit="login(event)">
@@ -2001,7 +2001,7 @@ function buildLandingHTML(): string {
 </head>
 <body>
 <div class="panel">
-  <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:40px;width:auto;margin-bottom:16px">
+  <div style="background:#1b2a3d;padding:16px 24px;border-radius:2px;margin-bottom:20px;text-align:center"><img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:60px;width:auto"></div>
   <h1>Time Entry Review</h1>
   <div class="sub">Select a team member and date range to review their time entries.</div>
 
