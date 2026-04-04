@@ -1604,8 +1604,63 @@ function finishReview() {
   const skippedCount = Object.values(state).filter(s => s.status === 'skipped').length;
   const pendingCount = Object.values(state).filter(s => s.status === 'pending').length;
 
+  // --- Per-biller scorecard ---
+  const billerStats = {};
+  entries.forEach(e => {
+    const tk = e.timekeeper || 'Unknown';
+    if (!billerStats[tk]) billerStats[tk] = { total: 0, flagged: 0, accepted: 0, edited: 0, skipped: 0, issues: {} };
+    const bs = billerStats[tk];
+    bs.total++;
+    const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+    if (flags.length > 0) bs.flagged++;
+    const s = state[e.activity_id];
+    if (s.status === 'accepted') bs.accepted++;
+    if (s.status === 'edited') bs.edited++;
+    if (s.status === 'skipped') bs.skipped++;
+    // Count issue types that were actioned (accepted/edited = confirmed problems)
+    if (s.status === 'accepted' || s.status === 'edited') {
+      flags.forEach(f => {
+        bs.issues[f.code] = (bs.issues[f.code] || 0) + 1;
+      });
+    }
+  });
+
+  // Build scorecard HTML
+  let scorecardHTML = '';
+  const billers = Object.keys(billerStats).sort();
+  if (billers.length > 0) {
+    scorecardHTML = '<hr style="border:none;border-top:1px solid #d4d0c8;margin:12px 0">';
+    scorecardHTML += '<div style="font-family:Cormorant Garamond,Georgia,serif;font-size:16px;font-weight:700;color:#1b2a3d;margin-bottom:8px">Biller Scorecard</div>';
+    billers.forEach(tk => {
+      const bs = billerStats[tk];
+      const problemRate = bs.total > 0 ? Math.round(((bs.accepted + bs.edited) / bs.total) * 100) : 0;
+      // Color code: green < 10%, yellow 10-25%, orange 25-50%, red > 50%
+      const scoreColor = problemRate <= 10 ? '#064e3b' : problemRate <= 25 ? '#854d0e' : problemRate <= 50 ? '#92400e' : '#991b1b';
+      const scoreBg = problemRate <= 10 ? '#d1fae5' : problemRate <= 25 ? '#fef08a' : problemRate <= 50 ? '#fde68a' : '#fecaca';
+
+      // Top issues
+      const issueList = Object.entries(bs.issues).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      const issueStr = issueList.length > 0
+        ? issueList.map(([code, count]) => code + ' (' + count + ')').join(', ')
+        : 'None';
+
+      scorecardHTML += '<div style="background:#f8f7f5;border:1px solid #e8e5df;border-radius:2px;padding:10px 14px;margin-bottom:6px">';
+      scorecardHTML += '<div style="display:flex;justify-content:space-between;align-items:center">';
+      scorecardHTML += '<strong style="font-size:13px">' + esc(tk) + '</strong>';
+      scorecardHTML += '<span style="background:' + scoreBg + ';color:' + scoreColor + ';font-size:11px;font-weight:700;padding:2px 8px;border-radius:2px">' + problemRate + '% issue rate</span>';
+      scorecardHTML += '</div>';
+      scorecardHTML += '<div style="font-size:11px;color:#7a7568;margin-top:4px">';
+      scorecardHTML += bs.total + ' entries reviewed &middot; ' + (bs.accepted + bs.edited) + ' corrected &middot; ' + bs.skipped + ' removed';
+      scorecardHTML += '</div>';
+      if (issueList.length > 0) {
+        scorecardHTML += '<div style="font-size:11px;color:#92400e;margin-top:2px">Top issues: ' + issueStr + '</div>';
+      }
+      scorecardHTML += '</div>';
+    });
+  }
+
   const rc = document.getElementById('resultCard');
-  rc.style.maxWidth = '500px';
+  rc.style.maxWidth = '560px';
   rc.innerHTML = \`
     <h2>\\u2705 Review Complete</h2>
     <p style="font-size:12px;color:#7a7568;margin-bottom:12px">All accepted and edited entries have already been saved to Clio.</p>
@@ -1619,6 +1674,7 @@ function finishReview() {
       <div style="display:flex;justify-content:space-between"><span>Entries removed value:</span><strong style="color:#991b1b">-\${fmtD(removed)}</strong></div>
       <div style="display:flex;justify-content:space-between"><span>Total billed (after):</span><strong style="color:#064e3b">\${fmtD(totalAfter)}</strong></div>
       <div style="display:flex;justify-content:space-between"><span>Reduction:</span><strong>\${pctReduction}%</strong></div>
+      \${scorecardHTML}
     </div>
     <div style="display:flex;gap:8px;justify-content:center;margin-top:16px">
       <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download CSV</button>
