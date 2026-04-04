@@ -1140,10 +1140,10 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
 <body>
 
 <div class="header">
-  <div style="display:flex;align-items:center;gap:16px;margin-bottom:8px">
+  <div style="margin-bottom:12px">
     <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:60px;width:auto">
-    <h1>Time Entry Review</h1>
   </div>
+  <h1>Time Entry Review</h1>
   <div class="subtitle">${subtitle}</div>
   <div class="progress-wrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
