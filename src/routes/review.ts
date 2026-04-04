@@ -503,6 +503,29 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+//  POST /pending/patch-clio — immediately PATCH a single entry to Clio
+// ---------------------------------------------------------------------------
+router.post("/pending/patch-clio", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_id, new_note } = req.body || {};
+  if (!activity_id || !new_note) {
+    res.status(400).json({ ok: false, error: "activity_id and new_note required" });
+    return;
+  }
+
+  try {
+    await rawPatchSingle(`/activities/${activity_id}`, {
+      data: { note: new_note },
+    });
+    res.json({ ok: true, activity_id });
+  } catch (err: any) {
+    console.error("[Review] Patch-clio error:", err.message, err.response?.status);
+    res.status(500).json({ ok: false, error: err.message, clio_status: err.response?.status });
+  }
+});
+
+// ---------------------------------------------------------------------------
 //  POST /pending/ai-suggest — generate AI-enhanced description for an entry
 // ---------------------------------------------------------------------------
 router.post("/pending/ai-suggest", async (req: Request, res: Response) => {
@@ -1172,7 +1195,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
     <div class="apply-stats" id="applyStats">No entries reviewed yet</div>
     <div class="apply-stats" id="savingsStats" style="margin-top:2px"></div>
   </div>
-  <button class="btn btn-apply" id="applyBtn" disabled onclick="applyAll()">Apply All Changes</button>
+  <button class="btn btn-apply" id="applyBtn" disabled onclick="finishReview()">Finish Review</button>
 </div>
 
 <div class="applying-overlay" id="applyingOverlay">
@@ -1492,12 +1515,42 @@ async function postUpdate(activityId, selectedNote, status) {
   });
 }
 
+// Background PATCH to Clio — optimistic UI, revert on failure
+async function patchClio(id, newNote) {
+  try {
+    const res = await fetch('/pending/patch-clio', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, new_note: newNote }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      console.error('Clio PATCH failed for ' + id + ':', data.error);
+      // Revert to pending
+      state[id] = { status: 'pending', selected_note: '' };
+      postUpdate(id, '', 'pending');
+      render();
+      updateProgress();
+      alert('Failed to save entry ' + id + ' to Clio: ' + (data.error || 'Unknown error') + '. Entry reverted to pending.');
+    }
+  } catch (err) {
+    console.error('Clio PATCH network error for ' + id + ':', err);
+    state[id] = { status: 'pending', selected_note: '' };
+    postUpdate(id, '', 'pending');
+    render();
+    updateProgress();
+    alert('Network error saving entry ' + id + ' to Clio. Entry reverted to pending.');
+  }
+}
+
 function accept(id) {
   const entry = entries.find(e => e.activity_id === id);
   state[id] = { status: 'accepted', selected_note: entry.suggested_note };
   postUpdate(id, entry.suggested_note, 'accepted');
   render();
   updateProgress();
+  // Fire Clio PATCH in background
+  patchClio(id, entry.suggested_note);
 }
 
 function skip(id) {
@@ -1505,6 +1558,7 @@ function skip(id) {
   postUpdate(id, '', 'skipped');
   render();
   updateProgress();
+  // No Clio action for skips — handled at apply time
 }
 
 function startEdit(id) {
@@ -1525,57 +1579,50 @@ function saveEdit(id) {
   postUpdate(id, text, 'edited');
   render();
   updateProgress();
+  // Fire Clio PATCH in background
+  patchClio(id, text);
 }
 
-async function applyAll() {
-  const overlay = document.getElementById('applyingOverlay');
-  const text = document.getElementById('applyingText');
-  overlay.classList.add('show');
+function finishReview() {
+  // Changes are already saved to Clio in real-time.
+  // This just shows the summary.
 
-  try {
-    const res = await fetch('/pending/apply', { method: 'POST' });
-    const data = await res.json();
-    overlay.classList.remove('show');
+  const totalBefore = entries.reduce((s, e) => s + parseFloat(e.hours) * parseFloat(e.rate), 0);
+  let removed = 0;
+  entries.forEach(e => {
+    if (state[e.activity_id].status === 'skipped') removed += parseFloat(e.hours) * parseFloat(e.rate);
+  });
+  const totalAfter = totalBefore - removed;
+  const pctReduction = totalBefore > 0 ? ((removed / totalBefore) * 100).toFixed(1) : '0.0';
+  const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
 
-    // Calculate before/after summary
-    const totalBefore = entries.reduce((s, e) => s + parseFloat(e.hours) * parseFloat(e.rate), 0);
-    let removed = 0;
-    entries.forEach(e => {
-      if (state[e.activity_id].status === 'skipped') removed += parseFloat(e.hours) * parseFloat(e.rate);
-    });
-    const totalAfter = totalBefore - removed;
-    const pctReduction = totalBefore > 0 ? ((removed / totalBefore) * 100).toFixed(1) : '0.0';
-    const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+  const acceptedCount = Object.values(state).filter(s => s.status === 'accepted').length;
+  const editedCount = Object.values(state).filter(s => s.status === 'edited').length;
+  const skippedCount = Object.values(state).filter(s => s.status === 'skipped').length;
+  const pendingCount = Object.values(state).filter(s => s.status === 'pending').length;
 
-    const accepted = Object.values(state).filter(s => s.status === 'accepted').length;
-    const edited = Object.values(state).filter(s => s.status === 'edited').length;
-    const skippedCount = Object.values(state).filter(s => s.status === 'skipped').length;
-
-    const rc = document.getElementById('resultCard');
-    rc.style.maxWidth = '500px';
-    rc.innerHTML = \`
-      <h2>\${data.errors && data.errors.length ? '\\u26A0\\uFE0F Completed with errors' : '\\u2705 Changes Applied'}</h2>
-      <div style="text-align:left;margin:16px 0;font-size:13px;line-height:2;color:#1a1a1a">
-        <div style="display:flex;justify-content:space-between"><span>Entries updated:</span><strong>\${data.patched || 0}</strong></div>
-        <div style="display:flex;justify-content:space-between"><span>Entries skipped/removed:</span><strong>\${data.skipped || 0}</strong></div>
-        <div style="display:flex;justify-content:space-between"><span>Descriptions revised:</span><strong>\${accepted + edited}</strong></div>
-        \${data.errors && data.errors.length ? '<div style="color:#991b1b">' + data.errors.length + ' errors</div>' : ''}
-        <hr style="border:none;border-top:1px solid #d4d0c8;margin:8px 0">
-        <div style="display:flex;justify-content:space-between"><span>Total billed (before):</span><strong>\${fmtD(totalBefore)}</strong></div>
-        <div style="display:flex;justify-content:space-between"><span>Entries removed:</span><strong style="color:#991b1b">-\${fmtD(removed)}</strong></div>
-        <div style="display:flex;justify-content:space-between"><span>Total billed (after):</span><strong style="color:#064e3b">\${fmtD(totalAfter)}</strong></div>
-        <div style="display:flex;justify-content:space-between"><span>Reduction:</span><strong>\${pctReduction}%</strong></div>
-      </div>
-      <div style="display:flex;gap:8px;justify-content:center;margin-top:16px">
-        <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download CSV</button>
-        <button class="btn btn-apply" onclick="location.reload()">Done</button>
-      </div>
-    \`;
-    document.getElementById('resultOverlay').classList.add('show');
-  } catch (err) {
-    overlay.classList.remove('show');
-    alert('Error applying changes: ' + err.message);
-  }
+  const rc = document.getElementById('resultCard');
+  rc.style.maxWidth = '500px';
+  rc.innerHTML = \`
+    <h2>\\u2705 Review Complete</h2>
+    <p style="font-size:12px;color:#7a7568;margin-bottom:12px">All accepted and edited entries have already been saved to Clio.</p>
+    <div style="text-align:left;margin:16px 0;font-size:13px;line-height:2;color:#1a1a1a">
+      <div style="display:flex;justify-content:space-between"><span>Descriptions revised (accepted):</span><strong>\${acceptedCount}</strong></div>
+      <div style="display:flex;justify-content:space-between"><span>Descriptions revised (edited):</span><strong>\${editedCount}</strong></div>
+      <div style="display:flex;justify-content:space-between"><span>Entries skipped:</span><strong>\${skippedCount}</strong></div>
+      \${pendingCount > 0 ? '<div style="display:flex;justify-content:space-between;color:#92400e"><span>Entries not reviewed:</span><strong>' + pendingCount + '</strong></div>' : ''}
+      <hr style="border:none;border-top:1px solid #d4d0c8;margin:8px 0">
+      <div style="display:flex;justify-content:space-between"><span>Total billed (before):</span><strong>\${fmtD(totalBefore)}</strong></div>
+      <div style="display:flex;justify-content:space-between"><span>Entries removed value:</span><strong style="color:#991b1b">-\${fmtD(removed)}</strong></div>
+      <div style="display:flex;justify-content:space-between"><span>Total billed (after):</span><strong style="color:#064e3b">\${fmtD(totalAfter)}</strong></div>
+      <div style="display:flex;justify-content:space-between"><span>Reduction:</span><strong>\${pctReduction}%</strong></div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:center;margin-top:16px">
+      <button class="btn" style="background:#c9a84c;color:#1b2a3d" onclick="downloadCSV()">Download CSV</button>
+      <button class="btn btn-apply" onclick="location.reload()">Done</button>
+    </div>
+  \`;
+  document.getElementById('resultOverlay').classList.add('show');
 }
 
 // --- Undo ---
