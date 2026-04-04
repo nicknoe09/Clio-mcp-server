@@ -9,6 +9,39 @@ import { getActiveUsers, findUserById } from "../utils/userRoster";
 
 const router = Router();
 const CSV_PATH = path.join(process.cwd(), "pending.csv");
+const HISTORY_PATH = path.join(process.cwd(), "review_history.json");
+
+// ---------------------------------------------------------------------------
+//  History helpers
+// ---------------------------------------------------------------------------
+interface ReviewSession {
+  date: string;
+  attorney: string;
+  scope: string;
+  totalEntries: number;
+  flaggedEntries: number;
+  accepted: number;
+  edited: number;
+  skipped: number;
+  totalBefore: number;
+  totalAfter: number;
+  billerScores: Record<string, { total: number; corrected: number; issueRate: number; topIssues: string[] }>;
+}
+
+function readHistory(): ReviewSession[] {
+  try {
+    if (!fs.existsSync(HISTORY_PATH)) return [];
+    return JSON.parse(fs.readFileSync(HISTORY_PATH, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(session: ReviewSession): void {
+  const history = readHistory();
+  history.push(session);
+  fs.writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2), "utf-8");
+}
 
 const CSV_HEADERS = "activity_id,matter_id,matter_name,date,hours,rate,current_note,suggested_note,selected_note,status";
 
@@ -503,6 +536,38 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+//  POST /review/save-session — save review session to history
+// ---------------------------------------------------------------------------
+router.post("/review/save-session", (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+  try {
+    const session = req.body as ReviewSession;
+    if (!session || !session.date) {
+      res.status(400).json({ ok: false, error: "Invalid session data" });
+      return;
+    }
+    appendHistory(session);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+//  GET /review/history — historical trends page
+// ---------------------------------------------------------------------------
+router.get("/review/history", (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) {
+    res.setHeader("Content-Type", "text/html");
+    res.send(buildLoginHTML());
+    return;
+  }
+  const history = readHistory();
+  res.setHeader("Content-Type", "text/html");
+  res.send(buildHistoryHTML(history));
+});
+
+// ---------------------------------------------------------------------------
 //  POST /pending/patch-clio — immediately PATCH a single entry to Clio
 // ---------------------------------------------------------------------------
 router.post("/pending/patch-clio", async (req: Request, res: Response) => {
@@ -819,6 +884,88 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
   .group-header:hover { color: #c9a84c; }
 
   .group-header .toggle { font-size: 14px; color: #7a7568; margin-right: 8px; }
+
+  .toolbar-check {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: #1a1a1a;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .toolbar-check input { cursor: pointer; accent-color: #1b2a3d; }
+
+  .panel-section {
+    max-width: 820px;
+    margin: 12px auto 0;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #d4d0c8;
+    border-radius: 2px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+
+  .panel-title {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 16px;
+    font-weight: 700;
+    color: #1b2a3d;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid #c9a84c;
+  }
+
+  .matter-card {
+    background: #f8f7f5;
+    border: 1px solid #e8e5df;
+    border-radius: 2px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+  }
+
+  .matter-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .matter-card-title {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: 14px;
+    font-weight: 700;
+    color: #1b2a3d;
+  }
+
+  .matter-card-stats {
+    font-size: 11px;
+    color: #7a7568;
+    margin-top: 4px;
+  }
+
+  .matter-badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 2px;
+  }
+
+  .bill-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid #e8e5df;
+    font-size: 13px;
+  }
+
+  .bill-row:last-child { border-bottom: none; }
+
+  .bill-before { color: #7a7568; }
+  .bill-after { font-weight: 700; }
+  .bill-savings { color: #064e3b; font-weight: 600; font-size: 12px; }
+  .bill-increase { color: #991b1b; font-weight: 600; font-size: 12px; }
 
   .duplicate-highlight {
     border-left: 3px solid #991b1b !important;
@@ -1189,7 +1336,14 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
     <div style="flex:1"></div>
     <div class="toolbar-label" style="margin:0">Keyboard: <kbd>A</kbd> accept &middot; <kbd>S</kbd> skip &middot; <kbd>E</kbd> edit &middot; <kbd>U</kbd> undo</div>
   </div>
+  <div class="toolbar-row" style="margin-top:8px;border-top:1px solid #e8e5df;padding-top:8px">
+    <label class="toolbar-check"><input type="checkbox" id="showMatterSummary" onchange="toggleMatterSummary()"> Matter Summaries</label>
+    <label class="toolbar-check"><input type="checkbox" id="showBillComparison" onchange="toggleBillComparison()"> Bill Comparison</label>
+  </div>
 </div>
+
+<div id="matterSummaryPanel" style="display:none"></div>
+<div id="billComparisonPanel" style="display:none"></div>
 
 <div class="container" id="cards"></div>
 
@@ -1682,6 +1836,34 @@ function finishReview() {
     </div>
   \`;
   document.getElementById('resultOverlay').classList.add('show');
+
+  // Save session to history
+  const billerScoresData = {};
+  billers.forEach(tk => {
+    const bs = billerStats[tk];
+    const corrected = bs.accepted + bs.edited;
+    const issueRate = bs.total > 0 ? Math.round((corrected / bs.total) * 100) : 0;
+    const topIssuesList = Object.entries(bs.issues).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c]) => c);
+    billerScoresData[tk] = { total: bs.total, corrected, issueRate, topIssues: topIssuesList };
+  });
+
+  fetch('/review/save-session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      date: new Date().toISOString().split('T')[0],
+      attorney: document.querySelector('.subtitle')?.textContent?.split('\\u00B7')[0]?.trim() || 'Unknown',
+      scope: entries.length > 0 ? 'review' : 'unknown',
+      totalEntries: entries.length,
+      flaggedEntries: entries.length,
+      accepted: acceptedCount,
+      edited: editedCount,
+      skipped: skippedCount,
+      totalBefore,
+      totalAfter,
+      billerScores: billerScoresData,
+    }),
+  }).catch(() => {});
 }
 
 // --- Undo ---
@@ -1803,6 +1985,151 @@ async function aiSuggest(id) {
     if (btn) { btn.disabled = false; btn.textContent = '\\u2728 AI Suggest'; }
   }
 }
+
+// --- Matter Summaries ---
+function toggleMatterSummary() {
+  const panel = document.getElementById('matterSummaryPanel');
+  if (document.getElementById('showMatterSummary').checked) {
+    renderMatterSummary();
+    panel.style.display = 'block';
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+function renderMatterSummary() {
+  const matters = {};
+  entries.forEach(e => {
+    const key = e.matter_name || 'Unknown';
+    if (!matters[key]) matters[key] = { total: 0, flagged: 0, amount: 0, flaggedAmount: 0, issues: {}, timekeepers: new Set() };
+    const m = matters[key];
+    const amt = parseFloat(e.hours) * parseFloat(e.rate);
+    m.total++;
+    m.amount += amt;
+    m.timekeepers.add(e.timekeeper || 'Unknown');
+    const flags = e.flags_json ? JSON.parse(e.flags_json) : [];
+    if (flags.length > 0) {
+      m.flagged++;
+      m.flaggedAmount += amt;
+      flags.forEach(f => { m.issues[f.code] = (m.issues[f.code] || 0) + 1; });
+    }
+  });
+
+  const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+
+  let html = '<div class="panel-section"><div class="panel-title">Matter Summary</div>';
+  Object.keys(matters).sort().forEach(key => {
+    const m = matters[key];
+    const flagPct = m.total > 0 ? Math.round((m.flagged / m.total) * 100) : 0;
+    const badgeColor = flagPct <= 10 ? 'background:#d1fae5;color:#064e3b' : flagPct <= 30 ? 'background:#fef08a;color:#854d0e' : 'background:#fecaca;color:#991b1b';
+    const topIssues = Object.entries(m.issues).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+    html += '<div class="matter-card">';
+    html += '<div class="matter-card-header">';
+    html += '<div class="matter-card-title">' + esc(key) + '</div>';
+    html += '<span class="matter-badge" style="' + badgeColor + '">' + flagPct + '% flagged</span>';
+    html += '</div>';
+    html += '<div class="matter-card-stats">';
+    html += m.total + ' entries &middot; ' + fmtD(m.amount) + ' total &middot; ' + fmtD(m.flaggedAmount) + ' flagged &middot; ' + m.timekeepers.size + ' timekeepers';
+    if (topIssues.length > 0) {
+      html += '<br>Top issues: ' + topIssues.map(([c, n]) => c + ' (' + n + ')').join(', ');
+    }
+    html += '</div></div>';
+  });
+  html += '</div>';
+  document.getElementById('matterSummaryPanel').innerHTML = html;
+}
+
+// --- Bill Comparison ---
+function toggleBillComparison() {
+  const panel = document.getElementById('billComparisonPanel');
+  if (document.getElementById('showBillComparison').checked) {
+    renderBillComparison();
+    panel.style.display = 'block';
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+function renderBillComparison() {
+  // Group by matter, calculate before/after
+  const matters = {};
+  entries.forEach(e => {
+    const key = e.matter_name || 'Unknown';
+    if (!matters[key]) matters[key] = { before: 0, removed: 0, revised: 0 };
+    const m = matters[key];
+    const amt = parseFloat(e.hours) * parseFloat(e.rate);
+    m.before += amt;
+    const s = state[e.activity_id];
+    if (s.status === 'skipped') m.removed += amt;
+    if (s.status === 'accepted' || s.status === 'edited') m.revised++;
+  });
+
+  const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+
+  let totalBefore = 0, totalRemoved = 0;
+
+  let html = '<div class="panel-section"><div class="panel-title">Bill Comparison — Before &amp; After</div>';
+  Object.keys(matters).sort().forEach(key => {
+    const m = matters[key];
+    const after = m.before - m.removed;
+    totalBefore += m.before;
+    totalRemoved += m.removed;
+    const savingsPct = m.before > 0 ? ((m.removed / m.before) * 100).toFixed(1) : '0.0';
+
+    html += '<div class="bill-row">';
+    html += '<div style="flex:1"><strong style="font-size:12px">' + esc(key) + '</strong>';
+    if (m.revised > 0) html += '<br><span style="font-size:10px;color:#7a7568">' + m.revised + ' entries revised</span>';
+    html += '</div>';
+    html += '<div style="text-align:right;min-width:120px">';
+    html += '<span class="bill-before" style="text-decoration:' + (m.removed > 0 ? 'line-through' : 'none') + '">' + fmtD(m.before) + '</span>';
+    if (m.removed > 0) {
+      html += '<br><span class="bill-after">' + fmtD(after) + '</span>';
+      html += ' <span class="bill-savings">(-' + savingsPct + '%)</span>';
+    }
+    html += '</div></div>';
+  });
+
+  // Total row
+  const totalAfter = totalBefore - totalRemoved;
+  const totalPct = totalBefore > 0 ? ((totalRemoved / totalBefore) * 100).toFixed(1) : '0.0';
+  html += '<div style="display:flex;justify-content:space-between;padding:10px 0 0;margin-top:4px;border-top:2px solid #1b2a3d;font-size:14px">';
+  html += '<strong>Total</strong>';
+  html += '<div style="text-align:right">';
+  html += '<span class="bill-before" style="text-decoration:' + (totalRemoved > 0 ? 'line-through' : 'none') + '">' + fmtD(totalBefore) + '</span>';
+  if (totalRemoved > 0) {
+    html += '<br><strong>' + fmtD(totalAfter) + '</strong>';
+    html += ' <span class="bill-savings">(-' + totalPct + '%)</span>';
+  }
+  html += '</div></div>';
+  html += '</div>';
+  document.getElementById('billComparisonPanel').innerHTML = html;
+}
+
+// Update bill comparison on state changes
+const origRender = render;
+const wrappedRender = function() {
+  origRender();
+  if (document.getElementById('showBillComparison').checked) renderBillComparison();
+};
+// Patch render calls to also update comparison
+const origAccept = accept;
+const origSkip = skip;
+const origSaveEdit = saveEdit;
+const origUndo = undo;
+
+// We'll just call updatePanels after state changes instead of monkey-patching
+function updatePanels() {
+  if (document.getElementById('showBillComparison').checked) renderBillComparison();
+  if (document.getElementById('showMatterSummary').checked) renderMatterSummary();
+}
+
+// Override updateProgress to also refresh panels
+const baseUpdateProgress = updateProgress;
+updateProgress = function() {
+  baseUpdateProgress();
+  updatePanels();
+};
 
 // --- Bulk actions ---
 function bulkSkipStrikes() {
@@ -2107,6 +2434,148 @@ function go(e) {
   }
   window.location.href = url;
 }
+</script>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+//  History page
+// ---------------------------------------------------------------------------
+function buildHistoryHTML(history: ReviewSession[]): string {
+  const historyJSON = JSON.stringify(history).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Romano Sumner | Review History</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=Lora:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Lora', Georgia, serif; background: #faf9f7; color: #1a1a1a; min-height: 100vh; }
+  .header { background: #1b2a3d; border-bottom: 2px solid #c9a84c; padding: 28px 32px; }
+  .header h1 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 26px; font-weight: 700; color: #fff; }
+  .header .sub { font-size: 13px; color: #c9cdd5; margin-top: 4px; }
+  .container { max-width: 900px; margin: 24px auto; padding: 0 20px; }
+  .panel { background: #fff; border: 1px solid #d4d0c8; border-radius: 2px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .panel-title { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; font-weight: 700; color: #1b2a3d; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #c9a84c; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #7a7568; padding: 6px 8px; border-bottom: 2px solid #d4d0c8; }
+  td { padding: 8px; border-bottom: 1px solid #e8e5df; }
+  .trend-up { color: #991b1b; }
+  .trend-down { color: #064e3b; }
+  .trend-flat { color: #7a7568; }
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 2px; }
+  .empty { text-align: center; padding: 40px; color: #7a7568; }
+  .back-link { display: inline-block; margin-top: 12px; color: #c9a84c; font-size: 13px; text-decoration: none; }
+  .back-link:hover { text-decoration: underline; }
+  .biller-trend { margin-top: 12px; }
+  .biller-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #e8e5df; }
+  .biller-row:last-child { border-bottom: none; }
+  .biller-name { font-weight: 700; font-size: 13px; min-width: 180px; }
+  .rate-bar { flex: 1; height: 8px; background: #e8e5df; border-radius: 1px; overflow: hidden; }
+  .rate-fill { height: 100%; border-radius: 1px; }
+  .rate-label { font-size: 11px; min-width: 50px; text-align: right; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div style="margin-bottom:12px">
+    <img src="https://cdn-ilbhpgl.nitrocdn.com/FgwtxNuNOXVwbzaqkfWLwZAmZSDGhKta/assets/images/optimized/rev-d2bc0c9/romanosumner.com/wp-content/uploads/2020/04/logo.png" alt="Romano Sumner" style="height:60px;width:auto">
+  </div>
+  <h1>Review History &amp; Trends</h1>
+  <div class="sub">${history.length} review sessions recorded</div>
+  <a href="/review" class="back-link">&larr; Back to Review</a>
+</div>
+<div class="container" id="content"></div>
+<script>
+const history = ${historyJSON};
+
+function render() {
+  const container = document.getElementById('content');
+  if (history.length === 0) {
+    container.innerHTML = '<div class="panel"><div class="empty">No review sessions recorded yet. Complete a review to see trends here.</div></div>';
+    return;
+  }
+
+  let html = '';
+
+  // --- Session table ---
+  html += '<div class="panel"><div class="panel-title">Review Sessions</div>';
+  html += '<table><thead><tr><th>Date</th><th>Attorney</th><th>Entries</th><th>Accepted</th><th>Edited</th><th>Skipped</th><th>Before</th><th>After</th><th>Reduction</th></tr></thead><tbody>';
+  const sorted = [...history].reverse();
+  sorted.forEach(s => {
+    const reduction = s.totalBefore > 0 ? ((1 - s.totalAfter / s.totalBefore) * 100).toFixed(1) : '0.0';
+    const fmt = (n) => '$' + (n || 0).toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+    html += '<tr>';
+    html += '<td>' + s.date + '</td>';
+    html += '<td>' + (s.attorney || '—') + '</td>';
+    html += '<td>' + (s.totalEntries || s.flaggedEntries || 0) + '</td>';
+    html += '<td>' + (s.accepted || 0) + '</td>';
+    html += '<td>' + (s.edited || 0) + '</td>';
+    html += '<td>' + (s.skipped || 0) + '</td>';
+    html += '<td>' + fmt(s.totalBefore) + '</td>';
+    html += '<td>' + fmt(s.totalAfter) + '</td>';
+    html += '<td><strong>' + reduction + '%</strong></td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+
+  // --- Biller trends (aggregate across all sessions) ---
+  const billerAgg = {};
+  history.forEach(s => {
+    if (!s.billerScores) return;
+    Object.entries(s.billerScores).forEach(([name, data]) => {
+      if (!billerAgg[name]) billerAgg[name] = { sessions: [], totalEntries: 0, totalCorrected: 0, allIssues: {} };
+      const ba = billerAgg[name];
+      ba.sessions.push({ date: s.date, issueRate: data.issueRate, total: data.total, corrected: data.corrected });
+      ba.totalEntries += data.total;
+      ba.totalCorrected += data.corrected;
+      (data.topIssues || []).forEach(issue => {
+        ba.allIssues[issue] = (ba.allIssues[issue] || 0) + 1;
+      });
+    });
+  });
+
+  const billerNames = Object.keys(billerAgg).sort();
+  if (billerNames.length > 0) {
+    html += '<div class="panel"><div class="panel-title">Biller Trends (All Sessions)</div>';
+    html += '<div class="biller-trend">';
+    billerNames.forEach(name => {
+      const ba = billerAgg[name];
+      const avgRate = ba.totalEntries > 0 ? Math.round((ba.totalCorrected / ba.totalEntries) * 100) : 0;
+      const barColor = avgRate <= 10 ? '#064e3b' : avgRate <= 25 ? '#854d0e' : avgRate <= 50 ? '#92400e' : '#991b1b';
+      const topIssues = Object.entries(ba.allIssues).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+      // Trend arrow
+      let trendHTML = '';
+      if (ba.sessions.length >= 2) {
+        const recent = ba.sessions[ba.sessions.length - 1].issueRate;
+        const prior = ba.sessions[ba.sessions.length - 2].issueRate;
+        if (recent < prior) trendHTML = '<span class="trend-down">\\u2193 ' + (prior - recent) + '%</span>';
+        else if (recent > prior) trendHTML = '<span class="trend-up">\\u2191 +' + (recent - prior) + '%</span>';
+        else trendHTML = '<span class="trend-flat">\\u2192 flat</span>';
+      }
+
+      html += '<div class="biller-row">';
+      html += '<div class="biller-name">' + name + '</div>';
+      html += '<div class="rate-bar"><div class="rate-fill" style="width:' + Math.min(avgRate, 100) + '%;background:' + barColor + '"></div></div>';
+      html += '<div class="rate-label" style="color:' + barColor + '">' + avgRate + '%</div>';
+      html += '<div style="min-width:80px;text-align:right">' + trendHTML + '</div>';
+      html += '</div>';
+      if (topIssues.length > 0) {
+        html += '<div style="font-size:10px;color:#7a7568;padding:0 0 6px 192px">Recurring: ' + topIssues.map(([c, n]) => c + ' (' + n + 'x)').join(', ') + ' &middot; ' + ba.sessions.length + ' sessions</div>';
+      }
+    });
+    html += '</div></div>';
+  }
+
+  container.innerHTML = html;
+}
+
+render();
 </script>
 </body>
 </html>`;
