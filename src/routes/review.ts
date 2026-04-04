@@ -1537,7 +1537,7 @@ function renderCard(e) {
           hasBlockBill(flags)
             ? '<button class="btn btn-accept" onclick="showSplit(\\'' + e.activity_id + '\\')">\\u2702 Split Entries</button>'
             : '<button class="btn btn-accept" onclick="accept(\\'' + e.activity_id + '\\')">\\u2713 Accept</button>'
-        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}\${needsAI(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#c9a84c" id="ai-btn-' + e.activity_id + '" onclick="aiSuggest(\\'' + e.activity_id + '\\')">\\u2728 AI Suggest</button>' : ''}
+        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}\${hasFeePetition(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#fff" onclick="discount100(\\'' + e.activity_id + '\\')">Discount 100%</button>' : ''}\${needsAI(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#c9a84c" id="ai-btn-' + e.activity_id + '" onclick="aiSuggest(\\'' + e.activity_id + '\\')">\\u2728 AI Suggest</button>' : ''}
           <button class="btn btn-edit" onclick="startEdit('\${e.activity_id}')">\\u270E Edit</button>
           <button class="btn btn-skip" onclick="skip('\${e.activity_id}')">\\u2717 Skip</button>
         </div>
@@ -1872,6 +1872,31 @@ function undo(id) {
   postUpdate(id, '', 'pending');
   render();
   updateProgress();
+}
+
+// --- Fee petition discount ---
+function hasFeePetition(flags) {
+  return flags.some(f => f.code === 'FEE_PETITION');
+}
+
+async function discount100(id) {
+  try {
+    const res = await fetch('/pending/fix-rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, new_rate: 0 }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      state[id] = { status: 'accepted', selected_note: 'Discounted 100% — kept on bill at $0' };
+      render();
+      updateProgress();
+    } else {
+      alert('Discount failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Discount error: ' + err.message);
+  }
 }
 
 // --- Rate cap auto-fix ---

@@ -210,13 +210,13 @@ export function detectFlags(
     });
   }
 
-  // Fee petition prep (HC: strike; general: review)
+  // Fee petition prep (HC: discount 100% but keep on bill; general: review)
   if (FEE_PETITION_PATTERN.test(trimmed)) {
     flags.push({
       code: "FEE_PETITION",
-      severity: isHC ? "strike" : "review",
-      message: isHC ? "Fee petition preparation — not recoverable under HC standards" : "Fee petition preparation — consider whether recoverable",
-      suggested_action: isHC ? "REMOVE ENTRY — fee petition prep is not recoverable under HC standards" : "Review whether fee petition time is recoverable in this matter",
+      severity: isHC ? "reduce" : "review",
+      message: isHC ? "Fee petition preparation — not recoverable under HC standards. Discount 100% (keep on bill for tracking)." : "Fee petition preparation — consider whether recoverable",
+      suggested_action: isHC ? "DISCOUNT 100% — keep entry on bill at $0 for tracking" : "Review whether fee petition time is recoverable in this matter",
     });
   }
 
