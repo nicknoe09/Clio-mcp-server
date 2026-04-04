@@ -150,8 +150,8 @@ Rules:
 Return ONLY the revised description text, nothing else.`;
 
   const body = JSON.stringify({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 150,
+    model: "claude-sonnet-4-6",
+    max_tokens: 200,
     messages: [{ role: "user", content: prompt }],
   });
 
@@ -498,6 +498,31 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
     res.json({ ok: true, activity_id, new_rate });
   } catch (err: any) {
     console.error("[Review] Fix rate error:", err.message, err.response?.status);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+//  POST /pending/ai-suggest — generate AI-enhanced description for an entry
+// ---------------------------------------------------------------------------
+router.post("/pending/ai-suggest", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_id, matter_name, date, hours, current_note } = req.body || {};
+  if (!activity_id) {
+    res.status(400).json({ ok: false, error: "activity_id required" });
+    return;
+  }
+
+  try {
+    const suggestion = await suggestNote(
+      matter_name || "Unknown",
+      date || "",
+      hours || "0",
+      current_note || ""
+    );
+    res.json({ ok: true, suggestion });
+  } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -1332,7 +1357,7 @@ function renderCard(e) {
           hasBlockBill(flags)
             ? '<button class="btn btn-accept" onclick="showSplit(\\'' + e.activity_id + '\\')">\\u2702 Split Entries</button>'
             : '<button class="btn btn-accept" onclick="accept(\\'' + e.activity_id + '\\')">\\u2713 Accept</button>'
-        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}
+        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}\${needsAI(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#c9a84c" id="ai-btn-' + e.activity_id + '" onclick="aiSuggest(\\'' + e.activity_id + '\\')">\\u2728 AI Suggest</button>' : ''}
           <button class="btn btn-edit" onclick="startEdit('\${e.activity_id}')">\\u270E Edit</button>
           <button class="btn btn-skip" onclick="skip('\${e.activity_id}')">\\u2717 Skip</button>
         </div>
@@ -1630,6 +1655,47 @@ function csvEscJS(val) {
     return '"' + s.replace(/"/g, '""') + '"';
   }
   return s;
+}
+
+// --- AI Suggest ---
+const AI_FLAG_CODES = new Set(['VAGUE', 'CONFERENCE_VAGUE', 'RESEARCH_HC', 'RESEARCH_REPHRASE']);
+
+function needsAI(flags) {
+  return flags.some(f => AI_FLAG_CODES.has(f.code));
+}
+
+async function aiSuggest(id) {
+  const entry = entries.find(e => e.activity_id === id);
+  if (!entry) return;
+  const btn = document.getElementById('ai-btn-' + id);
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
+
+  try {
+    const res = await fetch('/pending/ai-suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        activity_id: id,
+        matter_name: entry.matter_name,
+        date: entry.date,
+        hours: entry.hours,
+        current_note: entry.current_note,
+      }),
+    });
+    const data = await res.json();
+    if (data.ok && data.suggestion) {
+      // Update the suggested note box and textarea
+      entry.suggested_note = data.suggestion;
+      render();
+      updateProgress();
+    } else {
+      alert('AI suggestion failed: ' + (data.error || 'Unknown error'));
+      if (btn) { btn.disabled = false; btn.textContent = '\\u2728 AI Suggest'; }
+    }
+  } catch (err) {
+    alert('AI error: ' + err.message);
+    if (btn) { btn.disabled = false; btn.textContent = '\\u2728 AI Suggest'; }
+  }
 }
 
 // --- Bulk actions ---
