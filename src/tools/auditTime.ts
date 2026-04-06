@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
-import { detectFlags, detectDuplicates, detectBillingSpikes, HC_COURT_IDS, Flag } from "./audit";
+import { detectFlags, detectDuplicates, detectBillingSpikes, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "./audit";
 
 export function registerAuditTimeTools(server: McpServer): void {
   server.tool(
@@ -111,12 +111,28 @@ export async function auditTimeEntries(
     line_item_id: e.activity_id,
   })));
 
+  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries.map(e => ({
+    ...e,
+    line_item_id: e.activity_id,
+  })));
+
   for (const e of allEntries) {
     if (dupeFlags.has(e.activity_id)) {
       e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(e.activity_id)! });
     }
     if (spikeFlags.has(e.activity_id)) {
       e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.activity_id)! });
+    }
+    if (combineFlags.has(e.activity_id)) {
+      // Find which group this entry belongs to
+      const group = combineGroups.find(g => g.activityIds.includes(e.activity_id));
+      e.flags.push({
+        code: "COMBINABLE",
+        severity: "review",
+        message: combineFlags.get(e.activity_id)!,
+        suggested_action: `COMBINE ${group?.activityIds.length || 0} entries into one (${group?.totalHours || 0} hrs)`,
+        suggested_description: group?.suggestedCombined,
+      });
     }
   }
 
@@ -176,6 +192,7 @@ export async function auditTimeEntries(
       flagged_amount: Math.round(flaggedAmount * 100) / 100,
     },
     entries: allEntries,
+    combineGroups,
     csv: csvRows.join("\n"),
   };
 }
@@ -207,5 +224,6 @@ export interface AuditResult {
     flagged_amount: number;
   };
   entries: AuditEntry[];
+  combineGroups: CombineGroup[];
   csv: string;
 }

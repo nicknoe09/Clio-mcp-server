@@ -360,6 +360,84 @@ export function detectBillingSpikes(entries: any[]): Map<number, string> {
   return spikeFlags;
 }
 
+// Communication/related-task patterns for detecting combinable entries
+const COMMS_PATTERN = /\b(email|e-mail|call|telephone|phone|voicemail|text|message|correspond|letter)\b/i;
+const REVIEW_PATTERN = /\b(review|read|analyze|consider|examine)\b/i;
+const DRAFT_PATTERN = /\b(draft|prepare|write|compose|revise|edit)\b/i;
+
+export interface CombineGroup {
+  groupId: string;
+  activityIds: number[];
+  totalHours: number;
+  descriptions: string[];
+  suggestedCombined: string;
+}
+
+export function detectCombinables(entries: any[]): { flags: Map<number, string>; groups: CombineGroup[] } {
+  const combineFlags = new Map<number, string>();
+  const groups: CombineGroup[] = [];
+
+  // Group entries by user + matter + date
+  const buckets = new Map<string, any[]>();
+  for (const e of entries) {
+    const key = `${e.user_id}|${e.matter_id}|${e.date}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(e);
+  }
+
+  for (const [key, bucket] of buckets) {
+    if (bucket.length < 2) continue;
+
+    // Find clusters of short, related entries
+    // Short = under 0.5 hrs
+    const shortEntries = bucket.filter(e => e.hours <= 0.5 && e.note && e.note.trim().length > 0);
+    if (shortEntries.length < 2) continue;
+
+    // Group by similarity: communications, review tasks, drafting tasks
+    const commEntries = shortEntries.filter(e => COMMS_PATTERN.test(e.note));
+    const reviewEntries = shortEntries.filter(e => REVIEW_PATTERN.test(e.note) && !COMMS_PATTERN.test(e.note));
+    const draftEntries = shortEntries.filter(e => DRAFT_PATTERN.test(e.note) && !COMMS_PATTERN.test(e.note));
+
+    // Also catch any remaining short entries on same day from same person/matter
+    // if there are 3+ of them, they're likely fragmentary billing
+    const clusters: any[][] = [];
+    if (commEntries.length >= 2) clusters.push(commEntries);
+    if (reviewEntries.length >= 2) clusters.push(reviewEntries);
+    if (draftEntries.length >= 2) clusters.push(draftEntries);
+
+    // Catch remaining short entries not in any category
+    const categorized = new Set([...commEntries, ...reviewEntries, ...draftEntries].map(e => e.activity_id || e.line_item_id));
+    const uncategorized = shortEntries.filter(e => !categorized.has(e.activity_id || e.line_item_id));
+    if (uncategorized.length >= 3) clusters.push(uncategorized);
+
+    for (const cluster of clusters) {
+      const ids = cluster.map(e => e.activity_id || e.line_item_id);
+      const totalHours = Math.round(cluster.reduce((s, e) => s + e.hours, 0) * 100) / 100;
+      const descriptions = cluster.map(e => (e.note || "").trim());
+
+      // Build a suggested combined description
+      const combined = descriptions.join("; ");
+      const suggestedCombined = combined.length > 200 ? combined.slice(0, 197) + "..." : combined;
+
+      const groupId = `combine-${key}-${ids[0]}`;
+
+      groups.push({
+        groupId,
+        activityIds: ids,
+        totalHours,
+        descriptions,
+        suggestedCombined,
+      });
+
+      for (const id of ids) {
+        combineFlags.set(id, `Combinable — ${cluster.length} short entries from same person/matter/date (${totalHours} hrs total). Consider combining into one entry.`);
+      }
+    }
+  }
+
+  return { flags: combineFlags, groups };
+}
+
 export function registerAuditTools(server: McpServer): void {
 
   // ============================================================

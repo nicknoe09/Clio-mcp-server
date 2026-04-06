@@ -4,7 +4,7 @@ import path from "path";
 import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
 import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
-import { detectFlags, HC_COURT_IDS, Flag } from "../tools/audit";
+import { detectFlags, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
 
 const router = Router();
@@ -333,8 +333,26 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
     }
   }
 
-  console.log(`[Review] Total entries for user ${userId}: ${allEntries.length}`);
-  return { entries: allEntries, billCount: relevantBills.length, matterCount: matterMap.size };
+  // Detect combinable entries
+  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries.map(e => ({
+    ...e,
+    line_item_id: e.activity_id,
+  })));
+  for (const e of allEntries) {
+    if (combineFlags.has(e.activity_id)) {
+      const group = combineGroups.find(g => g.activityIds.includes(e.activity_id));
+      e.flags.push({
+        code: "COMBINABLE",
+        severity: "review",
+        message: combineFlags.get(e.activity_id)!,
+        suggested_action: `COMBINE ${group?.activityIds.length || 0} entries into one (${group?.totalHours || 0} hrs)`,
+        suggested_description: group?.suggestedCombined,
+      });
+    }
+  }
+
+  console.log(`[Review] Total entries for user ${userId}: ${allEntries.length}, ${combineGroups.length} combine groups`);
+  return { entries: allEntries, combineGroups, billCount: relevantBills.length, matterCount: matterMap.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -385,17 +403,20 @@ router.get("/review", async (req: Request, res: Response) => {
 
   try {
     let auditEntries: AuditEntry[];
+    let allCombineGroups: CombineGroup[] = [];
     let billCount = 0;
     let matterCount = 0;
 
     if (scope === "draft_bills") {
       const draftResult = await auditDraftBillEntries(Number(userId));
       auditEntries = draftResult.entries;
+      allCombineGroups = draftResult.combineGroups || [];
       billCount = draftResult.billCount;
       matterCount = draftResult.matterCount;
     } else {
       const result = await auditTimeEntries(Number(userId), startDate, endDate);
       auditEntries = result.entries;
+      allCombineGroups = result.combineGroups || [];
     }
 
     // Convert flagged audit entries to pending rows (skip clean entries)
@@ -470,7 +491,7 @@ router.get("/review", async (req: Request, res: Response) => {
     subtitle += `${rows.length} flagged of ${totalEntries} entries`;
     subtitle += ` &middot; $${fmt(totalAmount)} total &middot; $${fmt(flaggedAmount)} flagged`;
 
-    res.send(buildHTML(rows, startDate, endDate, subtitle));
+    res.send(buildHTML(rows, startDate, endDate, subtitle, allCombineGroups));
   } catch (err: any) {
     console.error("[Review] Error:", err.message, err.response?.status, err.response?.data);
     res.status(500).send(`Error: ${err.message}${err.response?.status ? ` (Clio status: ${err.response.status})` : ''}`);
@@ -700,6 +721,85 @@ router.post("/pending/split", async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+//  POST /pending/combine — combine multiple entries into one
+// ---------------------------------------------------------------------------
+router.post("/pending/combine", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_ids, combined_description, combined_hours } = req.body || {};
+  // activity_ids: number[] — entries to combine
+  // combined_description: string — the merged description
+  // combined_hours: number — optional override, defaults to sum
+
+  if (!activity_ids || !Array.isArray(activity_ids) || activity_ids.length < 2 || !combined_description) {
+    res.status(400).json({ ok: false, error: "Need activity_ids (2+) and combined_description" });
+    return;
+  }
+
+  try {
+    // 1. Read the first activity to get matter, user, date, rate
+    const first = await rawGetSingle(`/activities/${activity_ids[0]}`, {
+      fields: "id,date,quantity,price,note,matter{id},user{id}",
+    });
+    const act = first.data;
+
+    // 2. Calculate total hours from all entries
+    let totalSeconds = 0;
+    for (const id of activity_ids) {
+      const entry = await rawGetSingle(`/activities/${id}`, { fields: "id,quantity" });
+      totalSeconds += entry.data?.quantity || 0;
+    }
+
+    // Use override if provided
+    const finalSeconds = combined_hours ? Math.round(combined_hours * 3600) : totalSeconds;
+
+    // 3. Create the combined entry
+    const result = await rawPostSingle("/activities", {
+      data: {
+        type: "TimeEntry",
+        date: act.date,
+        note: combined_description,
+        quantity: finalSeconds,
+        price: act.price || 0,
+        matter: { id: act.matter?.id },
+        user: { id: act.user?.id },
+      },
+    });
+
+    // 4. Zero out all original entries
+    for (const id of activity_ids) {
+      await rawPatchSingle(`/activities/${id}`, {
+        data: {
+          quantity: 0,
+          note: `[COMBINED] ${combined_description.slice(0, 50)}...`,
+        },
+      });
+    }
+
+    // 5. Update CSV status for all combined entries
+    const rows = readCSV();
+    for (const id of activity_ids) {
+      const row = rows.find(r => r.activity_id === String(id));
+      if (row) {
+        row.status = "accepted";
+        row.selected_note = `Combined into new entry`;
+      }
+    }
+    writeCSV(rows);
+
+    res.json({
+      ok: true,
+      new_activity_id: result.data?.id,
+      combined_count: activity_ids.length,
+      combined_hours: finalSeconds / 3600,
+    });
+  } catch (err: any) {
+    console.error("[Review] Combine error:", err.message, err.response?.status);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 //  POST /pending/apply — apply accepted/edited entries to Clio
 // ---------------------------------------------------------------------------
 router.post("/pending/apply", async (_req: Request, res: Response) => {
@@ -742,7 +842,7 @@ export { readCSV, writeCSV, PendingRow, CSV_PATH };
 // ---------------------------------------------------------------------------
 //  HTML builder
 // ---------------------------------------------------------------------------
-function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subtitle: string): string {
+function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subtitle: string, combineGroups: CombineGroup[] = []): string {
   const rowsJSON = JSON.stringify(rows).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 
   return `<!DOCTYPE html>
@@ -1366,6 +1466,7 @@ function buildHTML(rows: PendingRow[], startDate: string, endDate: string, subti
 
 <script>
 const entries = ${rowsJSON};
+const combineGroups = ${JSON.stringify(combineGroups).replace(/</g, "\\u003c").replace(/>/g, "\\u003e")};
 const state = {};
 entries.forEach(e => { state[e.activity_id] = { status: 'pending', selected_note: '' }; });
 
@@ -1537,7 +1638,7 @@ function renderCard(e) {
           hasBlockBill(flags)
             ? '<button class="btn btn-accept" onclick="showSplit(\\'' + e.activity_id + '\\')">\\u2702 Split Entries</button>'
             : '<button class="btn btn-accept" onclick="accept(\\'' + e.activity_id + '\\')">\\u2713 Accept</button>'
-        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}\${hasFeePetition(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#fff" onclick="discount100(\\'' + e.activity_id + '\\')">Discount 100%</button>' : ''}\${needsAI(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#c9a84c" id="ai-btn-' + e.activity_id + '" onclick="aiSuggest(\\'' + e.activity_id + '\\')">\\u2728 AI Suggest</button>' : ''}
+        }\${hasRateCap(flags) ? '<button class="btn btn-sm" style="background:#92400e;color:#fde68a" onclick="fixRate(\\'' + e.activity_id + '\\')">Fix Rate</button>' : ''}\${hasFeePetition(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#fff" onclick="discount100(\\'' + e.activity_id + '\\')">Discount 100%</button>' : ''}\${hasCombine(flags) ? '<button class="btn btn-sm" style="background:#1e3a5f;color:#7dd3fc" onclick="showCombine(\\'' + e.activity_id + '\\')">\\u2B50 Combine</button>' : ''}\${needsAI(flags) ? '<button class="btn btn-sm" style="background:#1b2a3d;color:#c9a84c" id="ai-btn-' + e.activity_id + '" onclick="aiSuggest(\\'' + e.activity_id + '\\')">\\u2728 AI Suggest</button>' : ''}
           <button class="btn btn-edit" onclick="startEdit('\${e.activity_id}')">\\u270E Edit</button>
           <button class="btn btn-skip" onclick="skip('\${e.activity_id}')">\\u2717 Skip</button>
         </div>
@@ -1872,6 +1973,83 @@ function undo(id) {
   postUpdate(id, '', 'pending');
   render();
   updateProgress();
+}
+
+// --- Combine entries ---
+function hasCombine(flags) {
+  return flags.some(f => f.code === 'COMBINABLE');
+}
+
+function showCombine(id) {
+  // Find the combine group this entry belongs to
+  const group = combineGroups.find(g => g.activityIds.map(String).includes(String(id)));
+  if (!group) { alert('No combine group found for this entry'); return; }
+
+  // Build a modal showing all entries in the group
+  const groupEntries = group.activityIds.map(aid => entries.find(e => String(e.activity_id) === String(aid))).filter(Boolean);
+  const totalHrs = groupEntries.reduce((s, e) => s + parseFloat(e.hours), 0).toFixed(2);
+
+  let entryList = groupEntries.map(e =>
+    '<div style="padding:6px 0;border-bottom:1px solid #e8e5df;font-size:12px">' +
+    '<strong>' + esc(e.timekeeper) + '</strong> &middot; ' + e.hours + ' hrs &middot; $' + e.rate + '/hr' +
+    '<div style="color:#7a7568;margin-top:2px">' + esc(e.current_note) + '</div>' +
+    '</div>'
+  ).join('');
+
+  const rc = document.getElementById('resultCard');
+  rc.style.maxWidth = '560px';
+  rc.innerHTML =
+    '<h2 style="font-family:Cormorant Garamond,Georgia,serif;font-size:20px;color:#1b2a3d">Combine ' + groupEntries.length + ' Entries</h2>' +
+    '<div style="font-size:12px;color:#7a7568;margin:8px 0">These entries will be merged into one (' + totalHrs + ' hrs total). Originals will be zeroed out.</div>' +
+    '<div style="text-align:left;max-height:200px;overflow-y:auto;margin:12px 0;border:1px solid #e8e5df;border-radius:2px;padding:8px">' + entryList + '</div>' +
+    '<div style="text-align:left">' +
+    '<label style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#7a7568;margin-bottom:4px;display:block">Combined Description</label>' +
+    '<textarea id="combine-desc" style="width:100%;min-height:80px;padding:10px;background:#f8f7f5;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px;color:#1a1a1a;resize:vertical">' + esc(group.suggestedCombined) + '</textarea>' +
+    '<div style="display:flex;gap:8px;align-items:center;margin-top:8px">' +
+    '<label style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#7a7568">Hours</label>' +
+    '<input type="number" step="0.1" id="combine-hrs" value="' + totalHrs + '" style="width:80px;padding:6px;background:#f8f7f5;border:1px solid #d4d0c8;border-radius:2px;font-family:Lora,Georgia,serif;font-size:13px">' +
+    '</div></div>' +
+    '<div style="display:flex;gap:8px;justify-content:center;margin-top:16px">' +
+    '<button class="btn" style="background:#e8e5df;color:#7a7568" onclick="document.getElementById(\\\'resultOverlay\\\').classList.remove(\\\'show\\\')">Cancel</button>' +
+    '<button class="btn" style="background:#1e3a5f;color:#7dd3fc" id="combine-apply-btn" onclick="applyCombine(' + JSON.stringify(group.activityIds) + ')">Combine Entries</button>' +
+    '</div>';
+  document.getElementById('resultOverlay').classList.add('show');
+}
+
+async function applyCombine(activityIds) {
+  const desc = document.getElementById('combine-desc').value.trim();
+  const hrs = parseFloat(document.getElementById('combine-hrs').value) || 0;
+  if (!desc) { alert('Description is required'); return; }
+
+  const btn = document.getElementById('combine-apply-btn');
+  btn.disabled = true;
+  btn.textContent = 'Combining...';
+
+  try {
+    const res = await fetch('/pending/combine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_ids: activityIds, combined_description: desc, combined_hours: hrs }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // Mark all combined entries as accepted
+      activityIds.forEach(id => {
+        state[String(id)] = { status: 'accepted', selected_note: 'Combined into new entry' };
+      });
+      document.getElementById('resultOverlay').classList.remove('show');
+      render();
+      updateProgress();
+    } else {
+      alert('Combine failed: ' + (data.error || 'Unknown'));
+      btn.disabled = false;
+      btn.textContent = 'Combine Entries';
+    }
+  } catch (err) {
+    alert('Combine error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Combine Entries';
+  }
 }
 
 // --- Fee petition discount ---
