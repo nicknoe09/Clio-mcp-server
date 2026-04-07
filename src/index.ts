@@ -23,6 +23,7 @@ import { registerDocumentTools } from "./tools/documents";
 import { registerAuditTools } from "./tools/audit";
 import { registerAuditTimeTools } from "./tools/auditTime";
 import { registerReviewTools } from "./tools/review";
+import { registerMorningReportTools } from "./tools/morningReport";
 import reviewRouter from "./routes/review";
 
 const app = express();
@@ -81,6 +82,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerAuditTools OK");
     registerAuditTimeTools(server);
     console.log("[MCP] registerAuditTimeTools OK");
+    registerMorningReportTools(server);
+    console.log("[MCP] registerMorningReportTools OK");
     registerReviewTools(server);
     console.log("[MCP] registerReviewTools OK");
 
