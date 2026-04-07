@@ -17,9 +17,10 @@ const EVENT_TYPES = {
 
 // NRN calendar IDs
 const NRN_CALENDARS = {
+  NRN_CLAUDE: 10217705,       // NRN - Claude Created (adhoc calendar)
   NRN_DEADLINES: 2882389,     // Deadlines (NRN)
   NRN_CANCELLED: 3107359,     // NRN - Cancelled or Reset
-  NRN_PERSONAL: 9473359,      // NRN - Personal
+  NRN_PERSONAL: 9473780,      // NRN - Personal
   NICHOLAS_NOE: 2882209,      // Nicholas Noe (user calendar)
 };
 
