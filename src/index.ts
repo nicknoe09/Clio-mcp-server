@@ -220,6 +220,71 @@ app.get("/probe-calendar", async (_req, res) => {
     results.event_types_alt = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
+  // 10. Test creating an event on NRN Claude calendar — try different approaches
+  const testEventBase = {
+    summary: "[TEST - DELETE ME] Probe calendar assignment",
+    start_at: "2026-04-08T10:00:00-05:00",
+    end_at: "2026-04-08T10:30:00-05:00",
+    calendar_entry_event_type: { id: 738425 }, // NRN Claude Events type
+  };
+
+  // Approach A: calendar_owner with adhoc calendar ID
+  try {
+    const r = await rawPostProbe("/calendar_entries", {
+      data: { ...testEventBase, summary: "[TEST A] calendar_owner = adhoc ID", calendar_owner: { id: 10217705 } },
+    });
+    const createdId = r.data?.id;
+    results.test_a_calendar_owner_adhoc = { ok: true, created_id: createdId, data: r.data };
+    // Clean up
+    if (createdId) {
+      try { await (await import("./clio/pagination")).rawDeleteSingle(`/calendar_entries/${createdId}`); } catch {}
+    }
+  } catch (e: any) {
+    results.test_a_calendar_owner_adhoc = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // Approach B: calendar field as relationship
+  try {
+    const r = await rawPostProbe("/calendar_entries", {
+      data: { ...testEventBase, summary: "[TEST B] calendar = adhoc ID", calendar: { id: 10217705 } },
+    });
+    const createdId = r.data?.id;
+    results.test_b_calendar_field = { ok: true, created_id: createdId, data: r.data };
+    if (createdId) {
+      try { await (await import("./clio/pagination")).rawDeleteSingle(`/calendar_entries/${createdId}`); } catch {}
+    }
+  } catch (e: any) {
+    results.test_b_calendar_field = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // Approach C: calendar_id as flat field
+  try {
+    const r = await rawPostProbe("/calendar_entries", {
+      data: { ...testEventBase, summary: "[TEST C] calendar_id flat", calendar_id: 10217705 },
+    });
+    const createdId = r.data?.id;
+    results.test_c_calendar_id_flat = { ok: true, created_id: createdId, data: r.data };
+    if (createdId) {
+      try { await (await import("./clio/pagination")).rawDeleteSingle(`/calendar_entries/${createdId}`); } catch {}
+    }
+  } catch (e: any) {
+    results.test_c_calendar_id_flat = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // Approach D: just event type, no calendar assignment (baseline — where does it land?)
+  try {
+    const r = await rawPostProbe("/calendar_entries", {
+      data: { ...testEventBase, summary: "[TEST D] event type only, no calendar" },
+    });
+    const createdId = r.data?.id;
+    results.test_d_type_only = { ok: true, created_id: createdId, data: r.data };
+    if (createdId) {
+      try { await (await import("./clio/pagination")).rawDeleteSingle(`/calendar_entries/${createdId}`); } catch {}
+    }
+  } catch (e: any) {
+    results.test_d_type_only = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
   res.json(results);
 });
 
