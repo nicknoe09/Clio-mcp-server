@@ -122,7 +122,7 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
       location: z.string().optional().describe("Event location"),
       all_day: z.boolean().optional().default(false).describe("Whether this is an all-day event"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user (defaults to token owner)"),
+      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user or calendar. Defaults to NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + "). Pass a user ID to put it on their personal calendar instead."),
       recurrence_rule: z.string().optional().describe(
         "RRULE for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=MONTHLY;BYMONTHDAY=15')"
       ),
@@ -144,7 +144,8 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
         if (params.description) body.data.description = params.description;
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
-        if (params.calendar_owner_id) body.data.calendar_owner = { id: params.calendar_owner_id };
+        // Default to NRN Claude calendar if no calendar specified
+        body.data.calendar_owner = { id: params.calendar_owner_id || NRN_CALENDARS.NRN_CLAUDE };
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;
 
         // Determine event type
