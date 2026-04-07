@@ -127,6 +127,72 @@ app.get("/health", (_req, res) => {
 // --- Review UI Routes ---
 app.use(reviewRouter);
 
+// --- Calendar API Probe ---
+import { rawGetSingle, rawPostSingle as rawPostProbe, fetchAllPages as fetchAllProbe } from "./clio/pagination";
+
+app.get("/probe-calendar", async (_req, res) => {
+  const results: Record<string, any> = {};
+
+  // 1. Try GET /calendars — does this endpoint exist?
+  try {
+    const r = await rawGetSingle("/calendars", { fields: "id,name,color,type,visible", limit: 10 });
+    results.calendars_endpoint = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.calendars_endpoint = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 2. Try GET /calendars with minimal fields
+  try {
+    const r = await rawGetSingle("/calendars", { fields: "id,name", limit: 5 });
+    results.calendars_minimal = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.calendars_minimal = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 3. Try paginated GET /calendars
+  try {
+    const r = await fetchAllProbe<any>("/calendars", { fields: "id,name", limit: 50 });
+    results.calendars_list = { ok: true, count: r.length, calendars: r };
+  } catch (e: any) {
+    results.calendars_list = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 4. Get a sample calendar entry with ALL possible fields
+  try {
+    const r = await rawGetSingle("/calendar_entries", {
+      fields: "id,summary,description,start_at,end_at,all_day,location,color,calendar_owner{id,name},matter{id},attendees{id,name,type},reminders,calendar{id,name},category,permission,created_at,updated_at",
+      limit: 1,
+    });
+    results.calendar_entry_all_fields = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.calendar_entry_all_fields = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 5. Get a sample entry with just the unknowns
+  try {
+    const r = await rawGetSingle("/calendar_entries", {
+      fields: "id,summary,color,calendar{id,name}",
+      limit: 1,
+    });
+    results.calendar_entry_unknowns = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.calendar_entry_unknowns = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 6. Try fetching calendar_entry with just basic + color
+  try {
+    const r = await rawGetSingle("/calendar_entries", {
+      fields: "id,summary,start_at,end_at",
+      limit: 1,
+    });
+    results.calendar_entry_basic = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.calendar_entry_basic = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  res.json(results);
+});
+
 // --- Debug: show query string construction ---
 app.get("/debug-fields", (_req, res) => {
   const { buildQueryString } = require("./clio/pagination");
