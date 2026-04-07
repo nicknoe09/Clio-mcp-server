@@ -196,12 +196,20 @@ app.get("/probe-calendar", async (_req, res) => {
     results.entry_with_nested_event_type = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
-  // 7. Check if /calendar_entry_event_types endpoint exists
+  // 7. Check if /calendar_entry_event_types endpoint exists — get ALL
   try {
-    const r = await rawGetSingle("/calendar_entry_event_types", { fields: "id,name,color", limit: 20 });
-    results.event_types_endpoint = { ok: true, data: r.data || r };
+    const r = await fetchAllProbe<any>("/calendar_entry_event_types", { fields: "id,name,color", limit: 50 });
+    results.event_types_endpoint = { ok: true, count: r.length, data: r };
   } catch (e: any) {
     results.event_types_endpoint = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 9. Full calendar list
+  try {
+    const r = await fetchAllProbe<any>("/calendars", { fields: "id,name,color,type,visible", limit: 100 });
+    results.all_calendars = { ok: true, count: r.length, data: r };
+  } catch (e: any) {
+    results.all_calendars = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
   // 8. Try /event_types
