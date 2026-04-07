@@ -133,61 +133,83 @@ import { rawGetSingle, rawPostSingle as rawPostProbe, fetchAllPages as fetchAllP
 app.get("/probe-calendar", async (_req, res) => {
   const results: Record<string, any> = {};
 
-  // 1. Try GET /calendars — does this endpoint exist?
+  // 1. List calendars
   try {
     const r = await rawGetSingle("/calendars", { fields: "id,name,color,type,visible", limit: 10 });
-    results.calendars_endpoint = { ok: true, data: r.data || r };
+    results.calendars = { ok: true, data: r.data || r };
   } catch (e: any) {
-    results.calendars_endpoint = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+    results.calendars = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
-  // 2. Try GET /calendars with minimal fields
-  try {
-    const r = await rawGetSingle("/calendars", { fields: "id,name", limit: 5 });
-    results.calendars_minimal = { ok: true, data: r.data || r };
-  } catch (e: any) {
-    results.calendars_minimal = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
-  }
-
-  // 3. Try paginated GET /calendars
-  try {
-    const r = await fetchAllProbe<any>("/calendars", { fields: "id,name", limit: 50 });
-    results.calendars_list = { ok: true, count: r.length, calendars: r };
-  } catch (e: any) {
-    results.calendars_list = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
-  }
-
-  // 4. Get a sample calendar entry with ALL possible fields
+  // 2. Get calendar entry with type/event_type fields
   try {
     const r = await rawGetSingle("/calendar_entries", {
-      fields: "id,summary,description,start_at,end_at,all_day,location,color,calendar_owner{id,name},matter{id},attendees{id,name,type},reminders,calendar{id,name},category,permission,created_at,updated_at",
-      limit: 1,
+      fields: "id,summary,start_at,end_at,all_day,location,description,type,calendar_owner{id,name},matter{id},attendees{id,name,type}",
+      limit: 3,
     });
-    results.calendar_entry_all_fields = { ok: true, data: r.data || r };
+    results.entry_with_type = { ok: true, data: r.data || r };
   } catch (e: any) {
-    results.calendar_entry_all_fields = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+    results.entry_with_type = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
-  // 5. Get a sample entry with just the unknowns
+  // 3. Try event_type field
   try {
     const r = await rawGetSingle("/calendar_entries", {
-      fields: "id,summary,color,calendar{id,name}",
-      limit: 1,
+      fields: "id,summary,event_type",
+      limit: 3,
     });
-    results.calendar_entry_unknowns = { ok: true, data: r.data || r };
+    results.entry_with_event_type = { ok: true, data: r.data || r };
   } catch (e: any) {
-    results.calendar_entry_unknowns = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+    results.entry_with_event_type = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
-  // 6. Try fetching calendar_entry with just basic + color
+  // 4. Try calendar_entry_type
   try {
     const r = await rawGetSingle("/calendar_entries", {
-      fields: "id,summary,start_at,end_at",
-      limit: 1,
+      fields: "id,summary,calendar_entry_type",
+      limit: 3,
     });
-    results.calendar_entry_basic = { ok: true, data: r.data || r };
+    results.entry_with_calendar_entry_type = { ok: true, data: r.data || r };
   } catch (e: any) {
-    results.calendar_entry_basic = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+    results.entry_with_calendar_entry_type = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 5. Try court_date, hearing_type, appointment_type
+  try {
+    const r = await rawGetSingle("/calendar_entries", {
+      fields: "id,summary,court_date,hearing_type,appointment_type",
+      limit: 3,
+    });
+    results.entry_with_misc_types = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.entry_with_misc_types = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 6. Try calendar_entry_event_type (Clio's typical nested naming)
+  try {
+    const r = await rawGetSingle("/calendar_entries", {
+      fields: "id,summary,calendar_entry_event_type{id,name,color}",
+      limit: 3,
+    });
+    results.entry_with_nested_event_type = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.entry_with_nested_event_type = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 7. Check if /calendar_entry_event_types endpoint exists
+  try {
+    const r = await rawGetSingle("/calendar_entry_event_types", { fields: "id,name,color", limit: 20 });
+    results.event_types_endpoint = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.event_types_endpoint = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
+  }
+
+  // 8. Try /event_types
+  try {
+    const r = await rawGetSingle("/event_types", { fields: "id,name,color", limit: 20 });
+    results.event_types_alt = { ok: true, data: r.data || r };
+  } catch (e: any) {
+    results.event_types_alt = { ok: false, status: e.response?.status || e.statusCode, error: e.response?.data || e.message };
   }
 
   res.json(results);
