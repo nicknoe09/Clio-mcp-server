@@ -7,6 +7,7 @@ import {
   ShadingType, PageBreak, PageNumber, LevelFormat,
 } from "docx";
 import ExcelJS from "exceljs";
+import { uploadToBox } from "../utils/box";
 
 // ========== SHARED HELPERS ==========
 
@@ -378,6 +379,7 @@ export function registerDocumentTools(server: McpServer): void {
     "Generate the firm-wide development meeting scorecard as a downloadable Excel file. Includes weekly and monthly data for all timekeepers. Returns the file as base64 for download.",
     {
       week_of: z.string().optional().describe("Date within the target week (YYYY-MM-DD). Defaults to today."),
+      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
     },
     async (params) => {
       try {
@@ -488,10 +490,16 @@ export function registerDocumentTools(server: McpServer): void {
         // Format currency column
         ws2.getColumn(4).numFmt = '"$"#,##0.00';
 
-        const buffer = await wb.xlsx.writeBuffer() as Buffer;
-        const base64 = Buffer.from(buffer).toString("base64");
+        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
         const filename = `Firm Scorecard - ${weekLabel.replace(/\//g, "-")}.xlsx`;
 
+        if (params.box_folder_id !== undefined) {
+          const folderId = params.box_folder_id || "375771584500";
+          const result = await uploadToBox({ buffer, filename, folderId });
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+        }
+
+        const base64 = buffer.toString("base64");
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
         };
@@ -512,6 +520,7 @@ export function registerDocumentTools(server: McpServer): void {
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
+      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
     },
     async (params) => {
       try {
@@ -607,10 +616,18 @@ export function registerDocumentTools(server: McpServer): void {
           }
         }
 
-        const buffer = await wb.xlsx.writeBuffer() as Buffer;
-        const base64 = Buffer.from(buffer).toString("base64");
+        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
         const filename = `${userName} Goals ${params.year}.xlsx`;
 
+        if (params.box_folder_id !== undefined) {
+          const initials = userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
+          const boxFilename = `${initials} Goals ${params.year}.xlsx`;
+          const folderId = params.box_folder_id || "372923594239";
+          const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+        }
+
+        const base64 = buffer.toString("base64");
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
         };
@@ -629,6 +646,7 @@ export function registerDocumentTools(server: McpServer): void {
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
+      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
     },
     async (params) => {
       try {
@@ -768,10 +786,17 @@ export function registerDocumentTools(server: McpServer): void {
         // Auto-fit columns
         ws.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
-        const buffer = await wb.xlsx.writeBuffer() as Buffer;
-        const base64 = Buffer.from(buffer).toString("base64");
-        const filename = `Dashboard Update - ${monthName} ${params.year}.xlsx`;
+        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
 
+        if (params.box_folder_id !== undefined) {
+          const boxFilename = `${params.year} Firm Dashboard.xlsx`;
+          const folderId = params.box_folder_id || "375774779182";
+          const result = await uploadToBox({ buffer, filename: boxFilename, folderId, overwriteFileId: "2191795122500" });
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+        }
+
+        const base64 = buffer.toString("base64");
+        const filename = `Dashboard Update - ${monthName} ${params.year}.xlsx`;
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
         };

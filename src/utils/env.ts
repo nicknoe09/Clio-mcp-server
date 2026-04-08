@@ -18,4 +18,7 @@ export const ENV = {
     get CLIO_REDIRECT_URI() { return getEnv("CLIO_REDIRECT_URI"); },
     get CLIO_ACCESS_TOKEN() { return process.env.CLIO_ACCESS_TOKEN ?? ""; },
     get CLIO_REFRESH_TOKEN() { return process.env.CLIO_REFRESH_TOKEN ?? ""; },
+    get BOX_CLIENT_ID() { return getEnv("BOX_CLIENT_ID", ""); },
+    get BOX_CLIENT_SECRET() { return getEnv("BOX_CLIENT_SECRET", ""); },
+    get BOX_REDIRECT_URI() { return getEnv("BOX_REDIRECT_URI", "https://clio-mcp-server-production-032d.up.railway.app/box/oauth/callback"); },
 };

@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { ENV } from "./utils/env";
 import { getAuthorizationUrl, exchangeCodeForTokens } from "./clio/auth";
+import { getBoxAuthorizationUrl, exchangeBoxCodeForTokens } from "./box/auth";
 import { registerMatterTools } from "./tools/matters";
 import { registerTimeTools } from "./tools/time";
 import { registerExpenseTools } from "./tools/expenses";
@@ -907,6 +908,29 @@ app.get("/oauth/callback", async (req, res) => {
   }
 });
 
+// --- Box OAuth ---
+app.get("/box/oauth/start", (_req, res) => {
+  const url = getBoxAuthorizationUrl();
+  res.redirect(url);
+});
+
+app.get("/box/oauth/callback", async (req, res) => {
+  const code = req.query.code as string;
+  if (!code) {
+    res.status(400).send("Missing authorization code");
+    return;
+  }
+
+  try {
+    const { email } = await exchangeBoxCodeForTokens(code);
+    res.send(
+      `<h1>Box OAuth Complete</h1><p>Tokens saved for ${email}. You can close this window.</p>`
+    );
+  } catch (err: any) {
+    res.status(500).send(`Box OAuth error: ${err.message}`);
+  }
+});
+
 // --- Start Server ---
 const PORT = ENV.PORT;
 app.listen(PORT, () => {
@@ -914,4 +938,5 @@ app.listen(PORT, () => {
   console.log(`  Health:   http://localhost:${PORT}/health`);
   console.log(`  SSE:      http://localhost:${PORT}/sse`);
   console.log(`  OAuth:    http://localhost:${PORT}/oauth/start`);
+  console.log(`  Box OAuth: http://localhost:${PORT}/box/oauth/start`);
 });
