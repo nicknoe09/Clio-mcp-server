@@ -620,7 +620,12 @@ export function registerDocumentTools(server: McpServer): void {
         const filename = `${userName} Goals ${params.year}.xlsx`;
 
         if (params.box_folder_id !== undefined) {
-          const initials = userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
+          const INITIALS_MAP: Record<number, string> = {
+            344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
+            358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
+            359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
+          };
+          const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
           const boxFilename = `${initials} Goals ${params.year}.xlsx`;
           const folderId = params.box_folder_id || "372923594239";
           const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
