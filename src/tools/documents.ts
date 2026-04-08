@@ -578,81 +578,88 @@ export function registerDocumentTools(server: McpServer): void {
           allWeeks.push({ key, monDate: new Date(mon) });
         }
 
-        // Build Excel — horizontal layout matching existing file
+        // Build Excel
         const wb = new ExcelJS.Workbook();
+        const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-        // Summary sheet: weeks as columns, metrics as rows
+        // Summary (Monthly) sheet
         const ws1 = wb.addWorksheet("Summary");
+        ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
+
+        let cumBillable = 0, cumGoal = 0;
+        for (let m = 1; m <= 12; m++) {
+          const key = `${params.year}-${String(m).padStart(2, "0")}`;
+          const data = months[key] || { billable: 0, nonbillable: 0 };
+          const wd = getWorkingDays(params.year, m);
+          const goal = round1(wd * dailyGoal);
+          const avail = wd * params.hours_per_day;
+          cumBillable += data.billable; cumGoal += goal;
+          const ou = round1(data.billable - goal);
+          const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
+          row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
+        }
+        const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", ""]);
+        totRow.font = { bold: true };
+        totRow.getCell(4).font = { bold: true, color: { argb: (cumBillable - cumGoal) >= 0 ? "FF008000" : "FFFF0000" } };
+
+        // Weekly sheet: horizontal layout — weeks as columns, metrics as rows
+        const ws2 = wb.addWorksheet("Weekly");
         // Row 1-3: empty
         // Row 4: week headers starting at column C
-        const headerRow = ws1.getRow(4);
+        const headerRow = ws2.getRow(4);
         for (let i = 0; i < allWeeks.length; i++) {
           headerRow.getCell(i + 3).value = allWeeks[i].key;
         }
 
         // Row 5: Billable
-        ws1.getCell("B5").value = "Billable";
-        ws1.getCell("B5").font = { bold: true };
+        ws2.getCell("B5").value = "Billable";
+        ws2.getCell("B5").font = { bold: true };
         for (let i = 0; i < allWeeks.length; i++) {
           const data = weeks[allWeeks[i].key];
-          ws1.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
+          ws2.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
         }
 
         // Row 6: Nonbillable
-        ws1.getCell("B6").value = "Nonbillable";
-        ws1.getCell("B6").font = { bold: true };
+        ws2.getCell("B6").value = "Nonbillable";
+        ws2.getCell("B6").font = { bold: true };
         for (let i = 0; i < allWeeks.length; i++) {
           const data = weeks[allWeeks[i].key];
-          ws1.getRow(6).getCell(i + 3).value = round1(data?.nonbillable ?? 0);
+          ws2.getRow(6).getCell(i + 3).value = round1(data?.nonbillable ?? 0);
         }
 
         // Row 7: Total Tracked
-        ws1.getCell("B7").value = "Total Tracked";
-        ws1.getCell("B7").font = { bold: true };
+        ws2.getCell("B7").value = "Total Tracked";
+        ws2.getCell("B7").font = { bold: true };
         for (let i = 0; i < allWeeks.length; i++) {
           const data = weeks[allWeeks[i].key];
-          ws1.getRow(7).getCell(i + 3).value = round1((data?.billable ?? 0) + (data?.nonbillable ?? 0));
+          ws2.getRow(7).getCell(i + 3).value = round1((data?.billable ?? 0) + (data?.nonbillable ?? 0));
         }
 
         // Row 8: blank
 
         // Row 9: Billable Goal
-        ws1.getCell("B9").value = "Billable Goal";
-        ws1.getCell("B9").font = { bold: true };
+        ws2.getCell("B9").value = "Billable Goal";
+        ws2.getCell("B9").font = { bold: true };
         for (let i = 0; i < allWeeks.length; i++) {
-          ws1.getRow(9).getCell(i + 3).value = params.weekly_billable_goal;
+          ws2.getRow(9).getCell(i + 3).value = params.weekly_billable_goal;
         }
 
         // Row 10: Over/Under
-        ws1.getCell("B10").value = "Over/Under";
-        ws1.getCell("B10").font = { bold: true };
+        ws2.getCell("B10").value = "Over/Under";
+        ws2.getCell("B10").font = { bold: true };
         for (let i = 0; i < allWeeks.length; i++) {
           const data = weeks[allWeeks[i].key];
           const billable = data?.billable ?? 0;
           const ou = round1(billable - params.weekly_billable_goal);
-          const cell = ws1.getRow(10).getCell(i + 3);
+          const cell = ws2.getRow(10).getCell(i + 3);
           cell.value = ou;
           cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
         }
 
         // Column widths
-        ws1.getColumn(2).width = 14;
+        ws2.getColumn(2).width = 14;
         for (let i = 0; i < allWeeks.length; i++) {
-          ws1.getColumn(i + 3).width = 10;
-        }
-
-        // Weekly sheet: vertical detail with daily breakdown potential
-        const ws2 = wb.addWorksheet("Weekly");
-        ws2.addRow(["Week", "Billable", "Goal", "Over/Under", "Nonbillable", "Total"]).font = { bold: true };
-
-        for (const w of allWeeks) {
-          const data = weeks[w.key] || { billable: 0, nonbillable: 0 };
-          const ou = round1(data.billable - params.weekly_billable_goal);
-          const row = ws2.addRow([w.key, round1(data.billable), params.weekly_billable_goal, ou, round1(data.nonbillable), round1(data.billable + data.nonbillable)]);
-          const ouCell = row.getCell(4);
-          if (typeof ouCell.value === "number") {
-            ouCell.font = { color: { argb: ouCell.value >= 0 ? "FF008000" : "FFFF0000" } };
-          }
+          ws2.getColumn(i + 3).width = 10;
         }
 
         const buffer = Buffer.from(await wb.xlsx.writeBuffer());
