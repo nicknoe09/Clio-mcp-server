@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
-import { detectFlags, detectDuplicates, detectBillingSpikes, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "./audit";
+import { detectFlags, detectDuplicates, detectBillingSpikes, detectCombinables, detectOverstaffing, detectRepeatedShortComms, HC_COURT_IDS, Flag, CombineGroup } from "./audit";
 
 export function registerAuditTimeTools(server: McpServer): void {
   server.tool(
@@ -115,6 +115,14 @@ export async function auditTimeEntries(
     ...e,
     line_item_id: e.activity_id,
   })));
+  const overstaffFlags = detectOverstaffing(allEntries.map(e => ({
+    ...e,
+    line_item_id: e.activity_id,
+  })));
+  const repeatCommFlags = detectRepeatedShortComms(allEntries.map(e => ({
+    ...e,
+    line_item_id: e.activity_id,
+  })));
 
   for (const e of allEntries) {
     if (dupeFlags.has(e.activity_id)) {
@@ -122,6 +130,12 @@ export async function auditTimeEntries(
     }
     if (spikeFlags.has(e.activity_id)) {
       e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.activity_id)! });
+    }
+    if (overstaffFlags.has(e.activity_id)) {
+      e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(e.activity_id)! });
+    }
+    if (repeatCommFlags.has(e.activity_id)) {
+      e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(e.activity_id)! });
     }
     if (combineFlags.has(e.activity_id)) {
       // Find which group this entry belongs to
