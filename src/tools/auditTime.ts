@@ -11,10 +11,11 @@ export function registerAuditTimeTools(server: McpServer): void {
       user_id: z.coerce.number().describe("Clio user ID of the timekeeper to audit"),
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
+      flagged_only: z.boolean().default(true).describe("Return only flagged entries (default true). Set false for full export."),
     },
     async (params) => {
       try {
-        const result = await auditTimeEntries(params.user_id, params.start_date, params.end_date);
+        const result = await auditTimeEntries(params.user_id, params.start_date, params.end_date, params.flagged_only);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -32,7 +33,8 @@ export function registerAuditTimeTools(server: McpServer): void {
 export async function auditTimeEntries(
   userId: number,
   startDate: string,
-  endDate: string
+  endDate: string,
+  flaggedOnly: boolean = true
 ): Promise<AuditResult> {
   // 1. Fetch time entries (simple fields — activities endpoint doesn't support deep nesting)
   const queryParams: Record<string, any> = {
@@ -166,10 +168,12 @@ export async function auditTimeEntries(
     return s;
   }
 
+  const outputEntries = flaggedOnly ? flaggedEntries : allEntries;
+
   const csvHeaders = "Activity ID,Matter,Date,Timekeeper,Hours,Rate,Amount,Description,Flags,Severity,Flag Details,Suggested Action,Suggested Revised Description";
   const csvRows = [csvHeaders];
 
-  for (const e of allEntries) {
+  for (const e of outputEntries) {
     const worstSeverity = e.flags.length > 0
       ? (e.flags.some(f => f.severity === "strike") ? "strike"
         : e.flags.some(f => f.severity === "reduce") ? "reduce"
@@ -205,7 +209,7 @@ export async function auditTimeEntries(
       flagged_hours: Math.round(flaggedHours * 100) / 100,
       flagged_amount: Math.round(flaggedAmount * 100) / 100,
     },
-    entries: allEntries,
+    entries: outputEntries,
     combineGroups,
     csv: csvRows.join("\n"),
   };
