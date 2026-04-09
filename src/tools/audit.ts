@@ -128,15 +128,30 @@ export function detectFlags(
 ): Flag[] {
   const flags: Flag[] = [];
 
-  // Rate cap check — HC guardianship and appointment matters only
-  if (isHC && userId && HC_RATE_CAP_DESCRIPTION_PATTERN.test(matterDescription || "")) {
+  // Rate cap scope (per firm memory):
+  //   • Appointment matters → rate cap applies at ANY county
+  //   • HC Guardianship → rate cap applies
+  //   • Fort Bend Guardianship → NO rate cap (Ovando 02625, Nugent 02711 confirmed)
+  const isAppointmentMatter  = /\bappointment\b/i.test(matterDescription || "");
+  const isGuardianshipMatter = /\bguardianship\b/i.test(matterDescription || "");
+  const rateCapsApply = isAppointmentMatter || (isHC && isGuardianshipMatter);
+
+  if (rateCapsApply && userId) {
     const cap = getHCRateCap(userId);
     if (cap && rate > cap.max) {
       flags.push({
         code: "RATE_EXCEEDS_CAP",
         severity: "reduce",
-        message: `Rate $${rate}/hr exceeds HC cap for ${cap.label}. Reduce to $${cap.max}/hr.`,
-        suggested_action: `REDUCE RATE TO $${cap.max}/hr`,
+        message: `Rate ${rate}/hr exceeds HC cap for ${cap.label}. Reduce to ${cap.max}/hr.`,
+        suggested_action: `REDUCE RATE TO ${cap.max}/hr`,
+      });
+    } else if (!cap && rate > 0) {
+      // Timekeeper not in roster — cannot verify compliance on a capped matter
+      flags.push({
+        code: "UNKNOWN_TIMEKEEPER_RATE",
+        severity: "review",
+        message: `Timekeeper ID ${userId} not in roster — cannot verify rate compliance on this ${isAppointmentMatter ? "appointment" : "guardianship"} matter.`,
+        suggested_action: `Confirm bar date and verify rate is within HC bracket (0-2 yrs: $250, 3-5: $300, 6-10: $400, 11-20: $500, 20+: $600)`,
       });
     }
   }
@@ -438,6 +453,71 @@ export function detectCombinables(entries: any[]): { flags: Map<number, string>;
   return { flags: combineFlags, groups };
 }
 
+export function detectOverstaffing(entries: any[]): Map<number, string> {
+  const overstaffingFlags = new Map<number, string>();
+
+  // Group by matter + date
+  const buckets = new Map<string, any[]>();
+  for (const e of entries) {
+    const key = `${e.matter_id}|${e.date}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(e);
+  }
+
+  for (const [, bucket] of buckets) {
+    const attorneys = bucket.filter(e => {
+      const tk = TIMEKEEPER_ROSTER[e.user_id];
+      return tk?.role === "attorney";
+    });
+
+    const uniqueAttorneyIds = [...new Set(attorneys.map(e => e.user_id))];
+    if (uniqueAttorneyIds.length < 2) continue;
+
+    const totalHours = Math.round(attorneys.reduce((s, e) => s + e.hours, 0) * 100) / 100;
+    const names = uniqueAttorneyIds
+      .map(uid => TIMEKEEPER_ROSTER[uid]?.name || `ID ${uid}`)
+      .join(", ");
+
+    for (const e of attorneys) {
+      overstaffingFlags.set(
+        e.line_item_id,
+        `Overstaffing — ${uniqueAttorneyIds.length} attorneys billed same matter on same date (${totalHours.toFixed(1)} hrs: ${names}). Verify each attorney's contribution was distinct and necessary.`
+      );
+    }
+  }
+
+  return overstaffingFlags;
+}
+
+export function detectRepeatedShortComms(entries: any[]): Map<number, string> {
+  const repeatFlags = new Map<number, string>();
+  const COMM_SHORT = /^(email|e-?mail|call|phone|voicemail|text|reviewed? email|left message)/i;
+
+  // Group by user + matter across the entire billing period
+  const buckets = new Map<string, any[]>();
+  for (const e of entries) {
+    if (!e.note) continue;
+    const key = `${e.user_id}|${e.matter_id}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(e);
+  }
+
+  for (const [, bucket] of buckets) {
+    const shortComms = bucket.filter(e =>
+      e.hours <= 0.3 && COMM_SHORT.test((e.note || "").trim())
+    );
+    if (shortComms.length < 5) continue;
+
+    const totalHours = Math.round(shortComms.reduce((s, e) => s + e.hours, 0) * 100) / 100;
+    const msg = `Repeated short comm entries — ${shortComms.length} entries ≤ 0.3 hrs on this matter (${totalHours} hrs total). HC pattern flag: excessive fragmented communications. Consider bundling or reducing.`;
+    for (const e of shortComms) {
+      repeatFlags.set(e.line_item_id, msg);
+    }
+  }
+
+  return repeatFlags;
+}
+
 export function registerAuditTools(server: McpServer): void {
 
   // ============================================================
@@ -572,8 +652,11 @@ export function registerAuditTools(server: McpServer): void {
         }
 
         // Step 4: Cross-entry pattern detection
-        const dupeFlags = detectDuplicates(allEntries);
-        const spikeFlags = detectBillingSpikes(allEntries);
+        const dupeFlags     = detectDuplicates(allEntries);
+        const spikeFlags    = detectBillingSpikes(allEntries);
+        const overstaffFlags = detectOverstaffing(allEntries);
+        const repeatCommFlags = detectRepeatedShortComms(allEntries);
+        const { flags: combineFlags } = detectCombinables(allEntries);
 
         for (const e of allEntries) {
           if (dupeFlags.has(e.line_item_id)) {
@@ -581,6 +664,15 @@ export function registerAuditTools(server: McpServer): void {
           }
           if (spikeFlags.has(e.line_item_id)) {
             e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.line_item_id) });
+          }
+          if (overstaffFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(e.line_item_id) });
+          }
+          if (repeatCommFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(e.line_item_id) });
+          }
+          if (combineFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(e.line_item_id) });
           }
         }
 
@@ -820,14 +912,27 @@ export function registerAuditTools(server: McpServer): void {
         }
 
         // Cross-entry detection
-        const dupeFlags = detectDuplicates(allEntries);
-        const spikeFlags = detectBillingSpikes(allEntries);
+        const dupeFlags      = detectDuplicates(allEntries);
+        const spikeFlags     = detectBillingSpikes(allEntries);
+        const overstaffFlags = detectOverstaffing(allEntries);
+        const repeatCommFlags = detectRepeatedShortComms(allEntries);
+        const { flags: combineFlags } = detectCombinables(allEntries);
+
         for (const e of allEntries) {
           if (dupeFlags.has(e.line_item_id)) {
             e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(e.line_item_id) });
           }
           if (spikeFlags.has(e.line_item_id)) {
             e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.line_item_id) });
+          }
+          if (overstaffFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(e.line_item_id) });
+          }
+          if (repeatCommFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(e.line_item_id) });
+          }
+          if (combineFlags.has(e.line_item_id)) {
+            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(e.line_item_id) });
           }
         }
 
