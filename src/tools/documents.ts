@@ -124,6 +124,186 @@ function applyTieredSplit(amount: number, ytdBefore: number) {
 
 // ========== REGISTER TOOLS ==========
 
+// ─── Extracted weekly-goals logic (reusable by both single + batch tools) ───
+
+interface WeeklyGoalsParams {
+  user_id: number;
+  year: number;
+  weekly_billable_goal: number;
+  hours_per_day?: number;
+  box_folder_id?: string;
+}
+
+async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
+  filename: string;
+  box_file_id?: string;
+  box_url?: string;
+  base64?: string;
+  size_kb?: number;
+}> {
+  const hoursPerDay = params.hours_per_day ?? 8;
+  const startDate = `${params.year}-01-01`;
+  const endDate = new Date().toISOString().split("T")[0];
+  const dailyGoal = params.weekly_billable_goal / 5;
+
+  const rawEntries = await fetchAllPages<any>("/activities", {
+    type: "TimeEntry", fields: "id,date,quantity,price,user{id,name}", user_id: params.user_id,
+    created_since: `${startDate}T00:00:00+00:00`,
+  });
+  const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+  const userName = entries[0]?.user?.name ?? "Unknown";
+
+  // Group by month and week
+  const months: Record<string, { billable: number; nonbillable: number }> = {};
+  const weeks: Record<string, { billable: number; nonbillable: number }> = {};
+
+  for (const e of entries) {
+    const hours = e.quantity / 3600;
+    const monthKey = e.date.slice(0, 7);
+    const d2 = new Date(e.date + "T12:00:00");
+    const dow = d2.getDay();
+    const mon = new Date(d2); mon.setDate(d2.getDate() - ((dow + 6) % 7));
+    const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+    const weekKey = `${mon.getMonth() + 1}/${mon.getDate()}-${sun.getMonth() + 1}/${sun.getDate()}`;
+
+    if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
+    if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
+
+    if ((e.price || 0) > 0) { months[monthKey].billable += hours; weeks[weekKey].billable += hours; }
+    else { months[monthKey].nonbillable += hours; weeks[weekKey].nonbillable += hours; }
+  }
+
+  function getWorkingDays(year: number, month: number): number {
+    let count = 0;
+    const dim = new Date(year, month, 0).getDate();
+    for (let d = 1; d <= dim; d++) { const dow = new Date(year, month - 1, d).getDay(); if (dow !== 0 && dow !== 6) count++; }
+    return count;
+  }
+
+  // Build all 52/53 weeks for the year (Mon-Sun)
+  const allWeeks: { key: string; monDate: Date }[] = [];
+  const jan1 = new Date(params.year, 0, 1);
+  const dow1 = jan1.getDay();
+  const firstMon = new Date(jan1);
+  firstMon.setDate(jan1.getDate() - ((dow1 + 6) % 7));
+  for (let d = new Date(firstMon); d.getFullYear() <= params.year; d.setDate(d.getDate() + 7)) {
+    const mon = new Date(d);
+    const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+    if (sun.getFullYear() < params.year) continue;
+    if (mon.getFullYear() > params.year) break;
+    const key = `${mon.getMonth() + 1}/${mon.getDate()}-${sun.getMonth() + 1}/${sun.getDate()}`;
+    allWeeks.push({ key, monDate: new Date(mon) });
+  }
+
+  // Build Excel
+  const wb = new ExcelJS.Workbook();
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  // Summary (Monthly) sheet
+  const ws1 = wb.addWorksheet("Summary");
+  ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
+
+  let cumBillable = 0, cumGoal = 0;
+  for (let m = 1; m <= 12; m++) {
+    const key = `${params.year}-${String(m).padStart(2, "0")}`;
+    const data = months[key] || { billable: 0, nonbillable: 0 };
+    const wd = getWorkingDays(params.year, m);
+    const goal = round1(wd * dailyGoal);
+    const avail = wd * hoursPerDay;
+    cumBillable += data.billable; cumGoal += goal;
+    const ou = round1(data.billable - goal);
+    const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
+    row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
+  }
+  const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", ""]);
+  totRow.font = { bold: true };
+  totRow.getCell(4).font = { bold: true, color: { argb: (cumBillable - cumGoal) >= 0 ? "FF008000" : "FFFF0000" } };
+
+  // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
+  const ws2 = wb.addWorksheet("Weekly");
+  const headerRow = ws2.getRow(4);
+  for (let i = 0; i < allWeeks.length; i++) {
+    headerRow.getCell(i + 3).value = allWeeks[i].key;
+  }
+
+  ws2.getCell("B5").value = "Billable";
+  ws2.getCell("B5").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    const data = weeks[allWeeks[i].key];
+    ws2.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
+  }
+
+  ws2.getCell("B6").value = "Nonbillable";
+  ws2.getCell("B6").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    const data = weeks[allWeeks[i].key];
+    ws2.getRow(6).getCell(i + 3).value = round1(data?.nonbillable ?? 0);
+  }
+
+  ws2.getCell("B7").value = "Total Tracked";
+  ws2.getCell("B7").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    const data = weeks[allWeeks[i].key];
+    ws2.getRow(7).getCell(i + 3).value = round1((data?.billable ?? 0) + (data?.nonbillable ?? 0));
+  }
+
+  ws2.getCell("B9").value = "Billable Goal";
+  ws2.getCell("B9").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    ws2.getRow(9).getCell(i + 3).value = params.weekly_billable_goal;
+  }
+
+  ws2.getCell("B10").value = "Over/Under";
+  ws2.getCell("B10").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    const data = weeks[allWeeks[i].key];
+    const billable = data?.billable ?? 0;
+    const ou = round1(billable - params.weekly_billable_goal);
+    const cell = ws2.getRow(10).getCell(i + 3);
+    cell.value = ou;
+    cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
+  }
+
+  ws2.getColumn(2).width = 14;
+  for (let i = 0; i < allWeeks.length; i++) {
+    ws2.getColumn(i + 3).width = 10;
+  }
+
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const filename = `${userName} Goals ${params.year}.xlsx`;
+
+  if (params.box_folder_id !== undefined) {
+    const INITIALS_MAP: Record<number, string> = {
+      344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
+      358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
+      359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
+    };
+    const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
+    const boxFilename = `${initials} Goals ${params.year}.xlsx`;
+    const folderId = params.box_folder_id || "372923594239";
+    const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
+    return { filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url };
+  }
+
+  const base64 = buffer.toString("base64");
+  return { filename, base64, size_kb: Math.round(buffer.byteLength / 1024) };
+}
+
+// ─── ROSTER (hardcoded for batch weekly goals) ───────────────────
+
+const WEEKLY_GOALS_ROSTER = [
+  { name: "Paul Romano",     user_id: 344117381, goal: 30 },
+  { name: "Kenny Sumner",    user_id: 344134017, goal: 30 },
+  { name: "Nicholas Noe",    user_id: 348755029, goal: 35 },
+  { name: "Nick Fernelius",  user_id: 359380639, goal: 30 },
+  { name: "Angela Alanis",   user_id: 358528744, goal: 28 },
+  { name: "Anna Lozano",     user_id: 358108805, goal: 28 },
+  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 28 },
+  { name: "Tzipora Simmons", user_id: 359711375, goal: 30 },
+  { name: "May Huynh",       user_id: 359576660, goal: 30 },
+  { name: "Jonathan Barbee", user_id: 360091325, goal: 30 },
+];
+
 export function registerDocumentTools(server: McpServer): void {
 
   // ============================================================
@@ -524,167 +704,63 @@ export function registerDocumentTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const startDate = `${params.year}-01-01`;
-        const endDate = new Date().toISOString().split("T")[0];
-        const dailyGoal = params.weekly_billable_goal / 5;
-
-        const rawEntries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry", fields: "id,date,quantity,price,user{id,name}", user_id: params.user_id,
-          created_since: `${startDate}T00:00:00+00:00`,
+        const result = await downloadWeeklyGoals({
+          user_id: params.user_id,
+          year: params.year,
+          weekly_billable_goal: params.weekly_billable_goal,
+          hours_per_day: params.hours_per_day,
+          box_folder_id: params.box_folder_id,
         });
-        const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
-        const userName = entries[0]?.user?.name ?? "Unknown";
 
-        // Group by month and week
-        const months: Record<string, { billable: number; nonbillable: number }> = {};
-        const weeks: Record<string, { billable: number; nonbillable: number }> = {};
-
-        for (const e of entries) {
-          const hours = e.quantity / 3600;
-          const monthKey = e.date.slice(0, 7);
-          const d2 = new Date(e.date + "T12:00:00");
-          const dow = d2.getDay();
-          const mon = new Date(d2); mon.setDate(d2.getDate() - ((dow + 6) % 7));
-          const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-          const weekKey = `${mon.getMonth() + 1}/${mon.getDate()}-${sun.getMonth() + 1}/${sun.getDate()}`;
-
-          if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
-          if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
-
-          if ((e.price || 0) > 0) { months[monthKey].billable += hours; weeks[weekKey].billable += hours; }
-          else { months[monthKey].nonbillable += hours; weeks[weekKey].nonbillable += hours; }
+        if (result.box_file_id) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: result.filename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
         }
-
-        function getWorkingDays(year: number, month: number): number {
-          let count = 0;
-          const dim = new Date(year, month, 0).getDate();
-          for (let d = 1; d <= dim; d++) { const dow = new Date(year, month - 1, d).getDay(); if (dow !== 0 && dow !== 6) count++; }
-          return count;
-        }
-
-        // Build all 52/53 weeks for the year (Mon–Sun)
-        const allWeeks: { key: string; monDate: Date }[] = [];
-        const jan1 = new Date(params.year, 0, 1);
-        const dow1 = jan1.getDay();
-        const firstMon = new Date(jan1);
-        firstMon.setDate(jan1.getDate() - ((dow1 + 6) % 7)); // Monday of the week containing Jan 1
-        for (let d = new Date(firstMon); d.getFullYear() <= params.year; d.setDate(d.getDate() + 7)) {
-          const mon = new Date(d);
-          const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-          // Include if any part of the week falls in this year
-          if (sun.getFullYear() < params.year) continue;
-          if (mon.getFullYear() > params.year) break;
-          const key = `${mon.getMonth() + 1}/${mon.getDate()}-${sun.getMonth() + 1}/${sun.getDate()}`;
-          allWeeks.push({ key, monDate: new Date(mon) });
-        }
-
-        // Build Excel
-        const wb = new ExcelJS.Workbook();
-        const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-        // Summary (Monthly) sheet
-        const ws1 = wb.addWorksheet("Summary");
-        ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
-
-        let cumBillable = 0, cumGoal = 0;
-        for (let m = 1; m <= 12; m++) {
-          const key = `${params.year}-${String(m).padStart(2, "0")}`;
-          const data = months[key] || { billable: 0, nonbillable: 0 };
-          const wd = getWorkingDays(params.year, m);
-          const goal = round1(wd * dailyGoal);
-          const avail = wd * params.hours_per_day;
-          cumBillable += data.billable; cumGoal += goal;
-          const ou = round1(data.billable - goal);
-          const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
-          row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
-        }
-        const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", ""]);
-        totRow.font = { bold: true };
-        totRow.getCell(4).font = { bold: true, color: { argb: (cumBillable - cumGoal) >= 0 ? "FF008000" : "FFFF0000" } };
-
-        // Weekly sheet: horizontal layout — weeks as columns, metrics as rows
-        const ws2 = wb.addWorksheet("Weekly");
-        // Row 1-3: empty
-        // Row 4: week headers starting at column C
-        const headerRow = ws2.getRow(4);
-        for (let i = 0; i < allWeeks.length; i++) {
-          headerRow.getCell(i + 3).value = allWeeks[i].key;
-        }
-
-        // Row 5: Billable
-        ws2.getCell("B5").value = "Billable";
-        ws2.getCell("B5").font = { bold: true };
-        for (let i = 0; i < allWeeks.length; i++) {
-          const data = weeks[allWeeks[i].key];
-          ws2.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
-        }
-
-        // Row 6: Nonbillable
-        ws2.getCell("B6").value = "Nonbillable";
-        ws2.getCell("B6").font = { bold: true };
-        for (let i = 0; i < allWeeks.length; i++) {
-          const data = weeks[allWeeks[i].key];
-          ws2.getRow(6).getCell(i + 3).value = round1(data?.nonbillable ?? 0);
-        }
-
-        // Row 7: Total Tracked
-        ws2.getCell("B7").value = "Total Tracked";
-        ws2.getCell("B7").font = { bold: true };
-        for (let i = 0; i < allWeeks.length; i++) {
-          const data = weeks[allWeeks[i].key];
-          ws2.getRow(7).getCell(i + 3).value = round1((data?.billable ?? 0) + (data?.nonbillable ?? 0));
-        }
-
-        // Row 8: blank
-
-        // Row 9: Billable Goal
-        ws2.getCell("B9").value = "Billable Goal";
-        ws2.getCell("B9").font = { bold: true };
-        for (let i = 0; i < allWeeks.length; i++) {
-          ws2.getRow(9).getCell(i + 3).value = params.weekly_billable_goal;
-        }
-
-        // Row 10: Over/Under
-        ws2.getCell("B10").value = "Over/Under";
-        ws2.getCell("B10").font = { bold: true };
-        for (let i = 0; i < allWeeks.length; i++) {
-          const data = weeks[allWeeks[i].key];
-          const billable = data?.billable ?? 0;
-          const ou = round1(billable - params.weekly_billable_goal);
-          const cell = ws2.getRow(10).getCell(i + 3);
-          cell.value = ou;
-          cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
-        }
-
-        // Column widths
-        ws2.getColumn(2).width = 14;
-        for (let i = 0; i < allWeeks.length; i++) {
-          ws2.getColumn(i + 3).width = 10;
-        }
-
-        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
-        const filename = `${userName} Goals ${params.year}.xlsx`;
-
-        if (params.box_folder_id !== undefined) {
-          const INITIALS_MAP: Record<number, string> = {
-            344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
-            358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
-            359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
-          };
-          const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
-          const boxFilename = `${initials} Goals ${params.year}.xlsx`;
-          const folderId = params.box_folder_id || "372923594239";
-          const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
-        }
-
-        const base64 = buffer.toString("base64");
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ filename: result.filename, format: "xlsx", size_kb: result.size_kb, base64: result.base64 }) }],
         };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
       }
+    }
+  );
+
+  // ============================================================
+  // TOOL 3b: download_all_weekly_goals (batch — entire firm)
+  // ============================================================
+  server.tool(
+    "download_all_weekly_goals",
+    "Update the weekly goals spreadsheet for all firm timekeepers. " +
+    "Runs all uploads in parallel to Box. No arguments required.",
+    {
+      year: z.number().optional().describe("Year (defaults to current year)"),
+      box_folder_id: z.string().optional().describe(
+        "Box folder ID to upload to. Omit or pass empty string for default folder."
+      ),
+    },
+    async ({ year, box_folder_id }) => {
+      const targetYear = year ?? new Date().getFullYear();
+      const folderId = box_folder_id ?? "";
+
+      const results = await Promise.allSettled(
+        WEEKLY_GOALS_ROSTER.map(({ name, user_id, goal }) =>
+          downloadWeeklyGoals({
+            user_id,
+            weekly_billable_goal: goal,
+            year: targetYear,
+            box_folder_id: folderId,
+          }).then(() => ({ name, status: "uploaded" }))
+            .catch((err: Error) => ({ name, status: `FAILED: ${err.message}` }))
+        )
+      );
+
+      const summary = results
+        .map((r) => (r.status === "fulfilled" ? r.value : r.reason))
+        .map((r: { name: string; status: string }) => `${r.name}: ${r.status}`)
+        .join("\n");
+
+      return {
+        content: [{ type: "text" as const, text: summary }],
+      };
     }
   );
 
