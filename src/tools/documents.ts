@@ -17,24 +17,26 @@ import { uploadToBox, downloadFromBox } from "../utils/box";
 
 async function surgicalWriteXlsx(
   originalBuffer: Buffer,
-  modifiedWb: ExcelJS.Workbook,
-  modifiedSheetNames: Set<string>,  // sheets we touched (modified or created)
-  deletedSheetNames: Set<string>,   // sheets we removed
+  modifiedSheetWb: ExcelJS.Workbook,  // small workbook with ONLY modified/new sheets
+  modifiedSheetNames: Set<string>,
+  deletedSheetNames: Set<string>,
 ): Promise<Buffer> {
+  // Strategy: start with original zip, inject only the sheets we changed/created.
+  // ExcelJS never touches the original — it only builds the new sheet XMLs.
   const origZip = await JSZip.loadAsync(originalBuffer);
-  const modBuffer = Buffer.from(await modifiedWb.xlsx.writeBuffer());
+
+  // Build a small workbook with only modified sheets, write it, extract sheet XMLs
+  const modBuffer = Buffer.from(await modifiedSheetWb.xlsx.writeBuffer());
   const modZip = await JSZip.loadAsync(modBuffer);
 
-  // Build sheet name -> file path mapping by parsing xl/workbook.xml
+  // Parse sheet maps
   async function getSheetMap(zip: JSZip): Promise<Record<string, string>> {
     const wbFile = zip.file("xl/workbook.xml");
     const relsFile = zip.file("xl/_rels/workbook.xml.rels");
     if (!wbFile || !relsFile) return {};
     const wbXml = await wbFile.async("string");
     const relsXml = await relsFile.async("string");
-    if (!wbXml || !relsXml) return {};
 
-    // Extract sheet entries: <sheet name="..." sheetId="..." r:id="rId..."/>
     const sheetEntries: { name: string; rId: string }[] = [];
     const sheetRegex = /<sheet[^>]+name="([^"]+)"[^>]+r:id="([^"]+)"[^>]*\/?>/g;
     let m: RegExpExecArray | null;
@@ -42,7 +44,6 @@ async function surgicalWriteXlsx(
       sheetEntries.push({ name: m[1], rId: m[2] });
     }
 
-    // Extract relationship entries: <Relationship Id="rId..." Target="worksheets/sheet1.xml"/>
     const relMap: Record<string, string> = {};
     const relRegex = /<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"[^>]*\/?>/g;
     while ((m = relRegex.exec(relsXml)) !== null) {
@@ -60,64 +61,109 @@ async function surgicalWriteXlsx(
   const origSheetMap = await getSheetMap(origZip);
   const modSheetMap = await getSheetMap(modZip);
 
-  // Start with the modified zip as the base
-  const resultZip = modZip;
+  // Start with the ORIGINAL zip as the base (preserves everything)
+  const resultZip = origZip;
 
-  // Remove deleted sheets from the result zip
-  for (const delName of deletedSheetNames) {
-    const modPath = modSheetMap[delName];
-    if (modPath) {
-      resultZip.remove(modPath);
-      const relsPath = modPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
-      if (resultZip.file(relsPath)) resultZip.remove(relsPath);
+  // For modified sheets that already exist in original, replace their XML
+  for (const name of modifiedSheetNames) {
+    const origPath = origSheetMap[name];
+    const modPath = modSheetMap[name];
+    if (origPath && modPath) {
+      // Overwrite original sheet XML with modified version
+      const modFile = modZip.file(modPath);
+      if (modFile) {
+        const content = await modFile.async("uint8array");
+        resultZip.file(origPath, content);
+      }
     }
   }
 
-  // Update workbook.xml to remove deleted sheet entries
-  const wbXmlFile = resultZip.file("xl/workbook.xml");
-  if (wbXmlFile) {
-    let wbXml = await wbXmlFile.async("string");
-    for (const delName of deletedSheetNames) {
-      // Remove <sheet> elements for deleted sheets
-      const escaped = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      wbXml = wbXml.replace(new RegExp(`<sheet[^>]+name="${escaped}"[^>]*/?>`, "g"), "");
-    }
-    resultZip.file("xl/workbook.xml", wbXml);
+  // For new sheets (in modified but not in original), add them
+  // Find the highest sheet number in the original to avoid collisions
+  const existingSheetFiles = Object.keys(origZip.files).filter(f => /^xl\/worksheets\/sheet\d+\.xml$/.test(f));
+  let maxSheetNum = 0;
+  for (const f of existingSheetFiles) {
+    const num = parseInt(f.match(/sheet(\d+)\.xml/)?.[1] || "0");
+    if (num > maxSheetNum) maxSheetNum = num;
   }
 
-  // For each sheet in the ORIGINAL that was NOT modified and NOT deleted,
-  // restore its XML from the original zip
-  for (const [name, origPath] of Object.entries(origSheetMap)) {
-    if (modifiedSheetNames.has(name) || deletedSheetNames.has(name)) continue;
+  // Find max rId and sheetId in original workbook.xml
+  const origWbXml = await resultZip.file("xl/workbook.xml")!.async("string");
+  const origRelsXml = await resultZip.file("xl/_rels/workbook.xml.rels")!.async("string");
+  let maxRid = 0;
+  const ridRegex = /Id="rId(\d+)"/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = ridRegex.exec(origRelsXml)) !== null) {
+    const n = parseInt(rm[1]); if (n > maxRid) maxRid = n;
+  }
+  let maxSheetId = 0;
+  const sidRegex = /sheetId="(\d+)"/g;
+  while ((rm = sidRegex.exec(origWbXml)) !== null) {
+    const n = parseInt(rm[1]); if (n > maxSheetId) maxSheetId = n;
+  }
 
+  let updatedWbXml = origWbXml;
+  let updatedRelsXml = origRelsXml;
+  let updatedContentTypes = await resultZip.file("[Content_Types].xml")!.async("string");
+
+  for (const name of modifiedSheetNames) {
+    if (origSheetMap[name]) continue; // already handled above
     const modPath = modSheetMap[name];
     if (!modPath) continue;
 
-    // Copy original sheet XML
-    const origXml = origZip.file(origPath);
-    if (origXml) {
-      const content = await origXml.async("uint8array");
-      resultZip.file(modPath, content);
+    maxSheetNum++;
+    maxRid++;
+    maxSheetId++;
+
+    const newFileName = `sheet${maxSheetNum}.xml`;
+    const newFilePath = `xl/worksheets/${newFileName}`;
+    const newRid = `rId${maxRid}`;
+
+    // Copy sheet XML from mod zip
+    const modFile = modZip.file(modPath);
+    if (modFile) {
+      const content = await modFile.async("uint8array");
+      resultZip.file(newFilePath, content);
     }
 
-    // Copy original sheet relationships file (contains table refs, etc.)
-    const origRelsPath = origPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
-    const modRelsPath = modPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
-    const origRels = origZip.file(origRelsPath);
-    if (origRels) {
-      const content = await origRels.async("uint8array");
-      resultZip.file(modRelsPath, content);
-    }
+    // Add to workbook.xml (before </sheets>)
+    const sheetEntry = `<sheet name="${name}" sheetId="${maxSheetId}" r:id="${newRid}"/>`;
+    updatedWbXml = updatedWbXml.replace("</sheets>", sheetEntry + "</sheets>");
+
+    // Add to relationships
+    const relEntry = `<Relationship Id="${newRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/${newFileName}"/>`;
+    updatedRelsXml = updatedRelsXml.replace("</Relationships>", relEntry + "</Relationships>");
+
+    // Add to content types
+    const ctEntry = `<Override PartName="/xl/worksheets/${newFileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
+    updatedContentTypes = updatedContentTypes.replace("</Types>", ctEntry + "</Types>");
   }
 
-  // Copy ALL table files from original (they belong to unmodified sheets)
-  const tableFiles = Object.keys(origZip.files).filter(f => f.startsWith("xl/tables/") && !origZip.files[f].dir);
-  for (const tf of tableFiles) {
-    const file = origZip.file(tf);
-    if (file) {
-      const content = await file.async("uint8array");
-      resultZip.file(tf, content);
-    }
+  // Remove deleted sheets
+  for (const delName of deletedSheetNames) {
+    const origPath = origSheetMap[delName];
+    if (!origPath) continue;
+
+    // Remove sheet XML file
+    resultZip.remove(origPath);
+    const relsPath = origPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
+    if (resultZip.file(relsPath)) resultZip.remove(relsPath);
+
+    // Remove from workbook.xml
+    const escaped = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    updatedWbXml = updatedWbXml.replace(new RegExp(`<sheet[^>]+name="${escaped}"[^>]*/?>`, "g"), "");
+  }
+
+  // Write updated metadata files
+  resultZip.file("xl/workbook.xml", updatedWbXml);
+  resultZip.file("xl/_rels/workbook.xml.rels", updatedRelsXml);
+  resultZip.file("[Content_Types].xml", updatedContentTypes);
+
+  // Also copy shared strings from the mod workbook (new sheets may reference them)
+  const modSharedStrings = modZip.file("xl/sharedStrings.xml");
+  if (modSharedStrings) {
+    // Merge: for now, keep original shared strings (our sheets mostly use inline values)
+    // If needed, we could merge shared string tables here
   }
 
   return Buffer.from(await resultZip.generateAsync({ type: "nodebuffer" }));
@@ -1708,9 +1754,35 @@ export function registerDocumentTools(server: McpServer): void {
           perfSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
           // ---- SAVE AND UPLOAD (surgical write to preserve Excel Tables) ----
-          const modifiedSheets = new Set(["26 Compare", "Bonus Config", "Bonus Tracker", "Attorney Performance"]);
+          // Build a clean workbook with ONLY the sheets we modified/created.
+          // ExcelJS can't round-trip the original file (corrupts Excel Tables),
+          // so we only use it to generate the sheet XMLs we need.
+          const cleanWb = new ExcelJS.Workbook();
+          const sheetsToCopy = ["26 Compare", "Bonus Config", "Bonus Tracker", "Attorney Performance"];
+          for (const sheetName of sheetsToCopy) {
+            const srcSheet = wb.getWorksheet(sheetName);
+            if (!srcSheet) continue;
+            const dstSheet = cleanWb.addWorksheet(sheetName);
+            // Copy cell values, formulas, and basic formatting
+            srcSheet.eachRow({ includeEmpty: false }, (srcRow, rowNum) => {
+              const dstRow = dstSheet.getRow(rowNum);
+              srcRow.eachCell({ includeEmpty: false }, (srcCell, colNum) => {
+                const dstCell = dstRow.getCell(colNum);
+                dstCell.value = srcCell.value;
+                if (srcCell.numFmt) dstCell.numFmt = srcCell.numFmt;
+                if (srcCell.font) dstCell.font = srcCell.font;
+              });
+              dstRow.commit();
+            });
+            // Copy column widths
+            srcSheet.columns.forEach((col, i) => {
+              if (col.width) dstSheet.getColumn(i + 1).width = col.width;
+            });
+          }
+
+          const modifiedSheets = new Set(sheetsToCopy);
           const deletedSheets = new Set(sheetsToDelete.map(ws => ws.name));
-          const outputBuffer = await surgicalWriteXlsx(fileBuffer, wb, modifiedSheets, deletedSheets);
+          const outputBuffer = await surgicalWriteXlsx(fileBuffer, cleanWb, modifiedSheets, deletedSheets);
           const result = await uploadToBox({
             buffer: outputBuffer,
             filename: `${params.year} Firm Dashboard - Claude Version.xlsx`,
