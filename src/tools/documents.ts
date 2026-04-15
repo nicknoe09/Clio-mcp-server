@@ -60,15 +60,36 @@ async function surgicalWriteXlsx(
   const origSheetMap = await getSheetMap(origZip);
   const modSheetMap = await getSheetMap(modZip);
 
-  // Start with the modified zip as the base (has correct workbook.xml for new/deleted sheets)
+  // Start with the modified zip as the base
   const resultZip = modZip;
+
+  // Remove deleted sheets from the result zip
+  for (const delName of deletedSheetNames) {
+    const modPath = modSheetMap[delName];
+    if (modPath) {
+      resultZip.remove(modPath);
+      const relsPath = modPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
+      if (resultZip.file(relsPath)) resultZip.remove(relsPath);
+    }
+  }
+
+  // Update workbook.xml to remove deleted sheet entries
+  const wbXmlFile = resultZip.file("xl/workbook.xml");
+  if (wbXmlFile) {
+    let wbXml = await wbXmlFile.async("string");
+    for (const delName of deletedSheetNames) {
+      // Remove <sheet> elements for deleted sheets
+      const escaped = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      wbXml = wbXml.replace(new RegExp(`<sheet[^>]+name="${escaped}"[^>]*/?>`, "g"), "");
+    }
+    resultZip.file("xl/workbook.xml", wbXml);
+  }
 
   // For each sheet in the ORIGINAL that was NOT modified and NOT deleted,
   // restore its XML from the original zip
   for (const [name, origPath] of Object.entries(origSheetMap)) {
     if (modifiedSheetNames.has(name) || deletedSheetNames.has(name)) continue;
 
-    // Find this sheet's path in the modified zip
     const modPath = modSheetMap[name];
     if (!modPath) continue;
 
@@ -1166,9 +1187,9 @@ export function registerDocumentTools(server: McpServer): void {
             tkUpdated++;
           }
 
-          // ---- DELETE OLD BONUS SHEETS ----
+          // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
+          // Don't remove from ExcelJS (causes writeBuffer crash) — surgical write handles deletion at zip level
           const sheetsToDelete = wb.worksheets.filter(ws => ws.name.toLowerCase().includes("bonus"));
-          for (const ws of sheetsToDelete) wb.removeWorksheet(ws.id);
 
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
@@ -1522,7 +1543,7 @@ export function registerDocumentTools(server: McpServer): void {
           const nafSheets = wb.worksheets.filter(ws =>
             ws.name.includes("NAF(") || ws.name.includes("NAF Admin")
           );
-          for (const ws of nafSheets) { sheetsToDelete.push(ws); wb.removeWorksheet(ws.id); }
+          for (const ws of nafSheets) { sheetsToDelete.push(ws); }
 
           // ---- ATTORNEY PERFORMANCE SHEET ----
           // Read 2026 Goals for per-attorney annual goals and billing rates
