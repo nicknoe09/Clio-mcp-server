@@ -1080,7 +1080,7 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
             { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "",    paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
@@ -1145,6 +1145,14 @@ export function registerDocumentTools(server: McpServer): void {
             configSheet.getRow(19).values = [3, 50000, 0.10];
             configSheet.getRow(20).values = [4, "Unlimited", 0.15];
             configSheet.getRow(22).values = ["MNH collections split equally among: PAR, KES, NRN"];
+            configSheet.getRow(24).values = ["Paralegal Hours Bonus"];
+            configSheet.getRow(24).font = { bold: true };
+            configSheet.getRow(25).values = ["Min Hours", "Bonus"];
+            configSheet.getRow(25).font = { bold: true };
+            configSheet.getRow(26).values = [110, 100];
+            configSheet.getRow(27).values = [121, 300];
+            configSheet.getRow(28).values = [133, 500];
+            configSheet.getRow(30).values = ["Paralegals: ACA, AFL, AKG"];
             configSheet.columns.forEach(col => { col.width = 16; });
           }
 
@@ -1317,7 +1325,7 @@ export function registerDocumentTools(server: McpServer): void {
             row.commit();
           }
 
-          // Format currency columns
+          // Format currency columns for attorney section
           for (let ai = 0; ai < attys.length; ai++) {
             const col = startCol + ai * colsPerAtty;
             for (const c of [col, col + 1, col + 2, col + 3]) {
@@ -1327,6 +1335,94 @@ export function registerDocumentTools(server: McpServer): void {
           for (const c of [2, 3, 5, 6, 7, 8]) {
             trackerSheet.getColumn(c).numFmt = '"$"#,##0.00';
           }
+
+          // ---- PARALEGAL HOURS BONUS SECTION ----
+          const PARALEGALS = ["ACA", "AFL", "AKG"];
+          const PARA_BONUS_TIERS = [
+            { minHours: 133, bonus: 500 },
+            { minHours: 121, bonus: 300 },
+            { minHours: 110, bonus: 100 },
+          ];
+
+          // Gather billable hours (col I) from all month blocks
+          const monthBillableHrs: Record<string, Record<string, number>> = {}; // month -> initials -> hours
+          for (let mi = 0; mi < 12; mi++) {
+            const mn = monthNames[mi];
+            const block = scanMonthBlock(compareSheet, mn);
+            if (!block) continue;
+            monthBillableHrs[mn] = {};
+            for (const [ini, rowNum] of Object.entries(block.map)) {
+              const val = compareSheet.getRow(rowNum).getCell(9).value; // col I = billable hours
+              monthBillableHrs[mn][ini] = typeof val === "number" ? val : (parseFloat(String(val)) || 0);
+            }
+          }
+
+          const paraStartRow = 21 + attys.length + 2;
+          trackerSheet.getRow(paraStartRow).getCell(1).value = "Paralegal Hours Bonus";
+          trackerSheet.getRow(paraStartRow).getCell(1).font = { bold: true, size: 12 };
+
+          // Sub-headers
+          const paraHeaderRow = paraStartRow + 1;
+          trackerSheet.getRow(paraHeaderRow).getCell(1).value = "Month";
+          trackerSheet.getRow(paraHeaderRow).getCell(1).font = { bold: true };
+          for (let pi = 0; pi < PARALEGALS.length; pi++) {
+            const col = 2 + pi * 3;
+            trackerSheet.getRow(paraStartRow).getCell(col).value = PARALEGALS[pi];
+            trackerSheet.getRow(paraStartRow).getCell(col).font = { bold: true, size: 12 };
+            trackerSheet.getRow(paraHeaderRow).getCell(col).value = "Billable Hrs";
+            trackerSheet.getRow(paraHeaderRow).getCell(col + 1).value = "Tier";
+            trackerSheet.getRow(paraHeaderRow).getCell(col + 2).value = "Bonus";
+          }
+          trackerSheet.getRow(paraHeaderRow).font = { bold: true };
+
+          // Monthly rows
+          const paraTotals: Record<string, { hours: number; bonus: number }> = {};
+          for (const p of PARALEGALS) paraTotals[p] = { hours: 0, bonus: 0 };
+
+          for (let mi = 0; mi < 12; mi++) {
+            const mn = monthNames[mi];
+            const rowNum = paraHeaderRow + 1 + mi;
+            const row = trackerSheet.getRow(rowNum);
+            row.getCell(1).value = mn;
+
+            for (let pi = 0; pi < PARALEGALS.length; pi++) {
+              const col = 2 + pi * 3;
+              const hrs = monthBillableHrs[mn]?.[PARALEGALS[pi]] || 0;
+              if (hrs > 0) {
+                // Determine bonus tier
+                let bonus = 0;
+                let tier = "-";
+                for (const t of PARA_BONUS_TIERS) {
+                  if (hrs >= t.minHours) { bonus = t.bonus; tier = `≥${t.minHours}`; break; }
+                }
+                row.getCell(col).value = round1(hrs);
+                row.getCell(col + 1).value = tier;
+                row.getCell(col + 2).value = bonus;
+                paraTotals[PARALEGALS[pi]].hours += hrs;
+                paraTotals[PARALEGALS[pi]].bonus += bonus;
+              }
+            }
+            row.commit();
+          }
+
+          // Totals row
+          const paraTotalRowNum = paraHeaderRow + 13;
+          const paraTotalRow = trackerSheet.getRow(paraTotalRowNum);
+          paraTotalRow.getCell(1).value = "TOTAL";
+          paraTotalRow.font = { bold: true };
+          for (let pi = 0; pi < PARALEGALS.length; pi++) {
+            const col = 2 + pi * 3;
+            paraTotalRow.getCell(col).value = round1(paraTotals[PARALEGALS[pi]].hours);
+            paraTotalRow.getCell(col + 2).value = paraTotals[PARALEGALS[pi]].bonus;
+          }
+          paraTotalRow.commit();
+
+          // Format paralegal bonus columns as currency
+          for (let pi = 0; pi < PARALEGALS.length; pi++) {
+            const col = 2 + pi * 3 + 2; // bonus column
+            trackerSheet.getColumn(col).numFmt = '"$"#,##0';
+          }
+
           trackerSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
           // ---- SAVE AND UPLOAD ----
