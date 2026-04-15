@@ -68,19 +68,47 @@ async function surgicalWriteXlsx(
   const origSheetMap = await getSheetMap(origZip);
   const modSheetMap = await getSheetMap(modZip);
 
+  // Build shared string lookup from the clean workbook so we can convert to inline strings
+  const modSSFile = modZip.file("xl/sharedStrings.xml");
+  const sharedStrings: string[] = [];
+  if (modSSFile) {
+    const ssXml = await modSSFile.async("string");
+    const siRegex = /<si>([\s\S]*?)<\/si>/g;
+    let sim: RegExpExecArray | null;
+    while ((sim = siRegex.exec(ssXml)) !== null) {
+      // Extract text from <t>...</t> within the <si> element
+      const tMatch = sim[1].match(/<t[^>]*>([\s\S]*?)<\/t>/);
+      sharedStrings.push(tMatch ? tMatch[1] : "");
+    }
+  }
+
+  // Convert shared string references to inline strings in a sheet XML
+  function convertToInlineStrings(sheetXml: string): string {
+    // Replace <c r="..." t="s" ...><v>N</v></c> with <c r="..." t="inlineStr" ...><is><t>TEXT</t></is></c>
+    return sheetXml.replace(
+      /(<c\s[^>]*?)t="s"([^>]*>)\s*<v>(\d+)<\/v>/g,
+      (match, prefix, suffix, indexStr) => {
+        const idx = parseInt(indexStr, 10);
+        const text = (idx < sharedStrings.length ? sharedStrings[idx] : "")
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return `${prefix}t="inlineStr"${suffix}<is><t>${text}</t></is>`;
+      }
+    );
+  }
+
   // Start with the ORIGINAL zip as the base (preserves everything)
   const resultZip = origZip;
 
-  // For modified sheets that already exist in original, replace their XML
+  // For modified sheets that already exist in original, replace their XML (with inline strings)
   for (const name of modifiedSheetNames) {
     const origPath = origSheetMap[name];
     const modPath = modSheetMap[name];
     if (origPath && modPath) {
-      // Overwrite original sheet XML with modified version
       const modFile = modZip.file(modPath);
       if (modFile) {
-        const content = await modFile.async("uint8array");
-        resultZip.file(origPath, content);
+        const rawXml = await modFile.async("string");
+        const fixedXml = convertToInlineStrings(rawXml);
+        resultZip.file(origPath, fixedXml);
       }
     }
   }
@@ -126,11 +154,12 @@ async function surgicalWriteXlsx(
     const newFilePath = `xl/worksheets/${newFileName}`;
     const newRid = `rId${maxRid}`;
 
-    // Copy sheet XML from mod zip
+    // Copy sheet XML from mod zip (with inline string conversion)
     const modFile = modZip.file(modPath);
     if (modFile) {
-      const content = await modFile.async("uint8array");
-      resultZip.file(newFilePath, content);
+      const rawXml = await modFile.async("string");
+      const fixedXml = convertToInlineStrings(rawXml);
+      resultZip.file(newFilePath, fixedXml);
     }
 
     // Add to workbook.xml (before </sheets>)
