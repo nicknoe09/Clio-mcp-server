@@ -204,13 +204,18 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
 
   let cumBillable = 0, cumGoal = 0;
+  const currentMonth = new Date().getMonth() + 1; // 1-indexed
+  const isCurrentYear = params.year === new Date().getFullYear();
   for (let m = 1; m <= 12; m++) {
     const key = `${params.year}-${String(m).padStart(2, "0")}`;
     const data = months[key] || { billable: 0, nonbillable: 0 };
     const wd = getWorkingDays(params.year, m);
     const goal = round1(wd * dailyGoal);
     const avail = wd * hoursPerDay;
-    cumBillable += data.billable; cumGoal += goal;
+    // Only accumulate YTD totals for months up to current month (or all months for past years)
+    if (!isCurrentYear || m <= currentMonth) {
+      cumBillable += data.billable; cumGoal += goal;
+    }
     const ou = round1(data.billable - goal);
     const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
     row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
@@ -262,6 +267,23 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const cell = ws2.getRow(10).getCell(i + 3);
     cell.value = ou;
     cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
+  }
+
+  // Row 12: YTD Over/Under — running cumulative, only through current week
+  ws2.getCell("B12").value = "YTD Over/Under";
+  ws2.getCell("B12").font = { bold: true };
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  let cumWeeklyOU = 0;
+  for (let i = 0; i < allWeeks.length; i++) {
+    // Only include weeks that have started (Monday <= today)
+    if (allWeeks[i].monDate > today) break;
+    const data = weeks[allWeeks[i].key];
+    const billable = data?.billable ?? 0;
+    cumWeeklyOU += billable - params.weekly_billable_goal;
+    const cell = ws2.getRow(12).getCell(i + 3);
+    cell.value = round1(cumWeeklyOU);
+    cell.font = { bold: true, color: { argb: cumWeeklyOU >= 0 ? "FF008000" : "FFFF0000" } };
   }
 
   ws2.getColumn(2).width = 14;
