@@ -289,19 +289,19 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   return { filename, base64, size_kb: Math.round(buffer.byteLength / 1024) };
 }
 
-// ─── ROSTER (hardcoded for batch weekly goals) ───────────────────
+// ─── ROSTER (hardcoded for batch weekly goals, grouped by team) ──
 
 const WEEKLY_GOALS_ROSTER = [
-  { name: "Paul Romano",     user_id: 344117381, goal: 30 },
-  { name: "Kenny Sumner",    user_id: 344134017, goal: 30 },
-  { name: "Nicholas Noe",    user_id: 348755029, goal: 35 },
-  { name: "Nick Fernelius",  user_id: 359380639, goal: 30 },
-  { name: "Angela Alanis",   user_id: 358528744, goal: 28 },
-  { name: "Anna Lozano",     user_id: 358108805, goal: 28 },
-  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 28 },
-  { name: "Tzipora Simmons", user_id: 359711375, goal: 30 },
-  { name: "May Huynh",       user_id: 359576660, goal: 30 },
-  { name: "Jonathan Barbee", user_id: 360091325, goal: 30 },
+  { name: "Nicholas Noe",    user_id: 348755029, goal: 35, group: "NRN" },
+  { name: "Tzipora Simmons", user_id: 359711375, goal: 30, group: "NRN" },
+  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 28, group: "NRN" },
+  { name: "Paul Romano",     user_id: 344117381, goal: 30, group: "PAR" },
+  { name: "Angela Alanis",   user_id: 358528744, goal: 28, group: "PAR" },
+  { name: "Nick Fernelius",  user_id: 359380639, goal: 30, group: "PAR" },
+  { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" },
+  { name: "Jonathan Barbee", user_id: 360091325, goal: 30, group: "KES" },
+  { name: "Anna Lozano",     user_id: 358108805, goal: 28, group: "KES" },
+  { name: "May Huynh",       user_id: 359576660, goal: 30, group: "MNH" },
 ];
 
 export function registerDocumentTools(server: McpServer): void {
@@ -742,18 +742,26 @@ export function registerDocumentTools(server: McpServer): void {
       const folderId = box_folder_id ?? "";
 
       const results = await Promise.allSettled(
-        WEEKLY_GOALS_ROSTER.map(({ name, user_id, goal }) =>
+        WEEKLY_GOALS_ROSTER.map(({ name, user_id, goal, group }) =>
           downloadWeeklyGoals({
             user_id,
             weekly_billable_goal: goal,
             year: targetYear,
             box_folder_id: folderId,
-          }).then((res) => ({ name, status: "uploaded" as const, filename: res.filename, box_url: res.box_url, box_file_id: res.box_file_id }))
-            .catch((err: Error) => ({ name, status: `FAILED: ${err.message}` as const, filename: null, box_url: null, box_file_id: null }))
+          }).then((res) => ({ name, group, status: "uploaded" as const, filename: res.filename, box_url: res.box_url, box_file_id: res.box_file_id }))
+            .catch((err: Error) => ({ name, group, status: `FAILED: ${err.message}` as const, filename: null, box_url: null, box_file_id: null }))
         )
       );
 
       const uploads = results.map((r) => (r.status === "fulfilled" ? r.value : r.reason));
+
+      // Group by team
+      const groups: Record<string, any[]> = {};
+      for (const u of uploads) {
+        const g = u.group || "Other";
+        if (!groups[g]) groups[g] = [];
+        groups[g].push({ name: u.name, status: u.status, filename: u.filename, box_url: u.box_url, box_file_id: u.box_file_id });
+      }
 
       return {
         content: [{
@@ -763,13 +771,7 @@ export function registerDocumentTools(server: McpServer): void {
             count: uploads.length,
             succeeded: uploads.filter((u: any) => u.status === "uploaded").length,
             failed: uploads.filter((u: any) => u.status !== "uploaded").length,
-            results: uploads.map((u: any) => ({
-              name: u.name,
-              status: u.status,
-              filename: u.filename,
-              box_url: u.box_url,
-              box_file_id: u.box_file_id,
-            })),
+            by_team: groups,
           }, null, 2),
         }],
       };
