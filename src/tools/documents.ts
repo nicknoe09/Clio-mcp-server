@@ -104,9 +104,11 @@ async function getZipSheetMap(zip: JSZip): Promise<Record<string, string>> {
  * - deletedSheetNames: sheets to remove
  * No ExcelJS involved in the write path.
  */
+interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; }
+
 async function surgicalWriteXlsx(
   originalBuffer: Buffer,
-  patchedSheets: Record<string, string>,   // sheetName → full sheet XML string
+  buildSheets: (styles: StyleIndices) => Record<string, string>,  // called after styles are injected
   deletedSheetNames: Set<string>,
 ): Promise<Buffer> {
   const zip = await JSZip.loadAsync(originalBuffer);
@@ -115,6 +117,40 @@ async function surgicalWriteXlsx(
   let wbXml = await zip.file("xl/workbook.xml")!.async("string");
   let relsXml = await zip.file("xl/_rels/workbook.xml.rels")!.async("string");
   let ctXml = await zip.file("[Content_Types].xml")!.async("string");
+
+  // Add custom styles to the workbook for new sheets (original default is a date format!)
+  // Append General, Currency, Decimal, and Percent styles to cellXfs
+  const stylesFile = zip.file("xl/styles.xml");
+  let newStyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0" };
+  if (stylesFile) {
+    let stylesXml = await stylesFile.async("string");
+    // Find current cellXfs count
+    const xfCountMatch = stylesXml.match(/<cellXfs count="(\d+)">/);
+    if (xfCountMatch) {
+      const currentCount = parseInt(xfCountMatch[1]);
+      // Append 5 new xf entries: General (0), Currency (164), Decimal (165), Percent (10), Bold General
+      const newXfs = [
+        `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,          // General
+        `<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,        // $#,##0.00
+        `<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,        // 0.0
+        `<xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,         // 0.00%
+        `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold General
+      ];
+      newStyleIndices = {
+        general: String(currentCount),
+        currency: String(currentCount + 1),
+        decimal: String(currentCount + 2),
+        percent: String(currentCount + 3),
+        bold: String(currentCount + 4),
+      };
+      stylesXml = stylesXml.replace(
+        `<cellXfs count="${currentCount}">`,
+        `<cellXfs count="${currentCount + newXfs.length}">`
+      );
+      stylesXml = stylesXml.replace("</cellXfs>", newXfs.join("") + "</cellXfs>");
+      zip.file("xl/styles.xml", stylesXml);
+    }
+  }
 
   // Find max IDs for adding new sheets
   let maxSheetNum = 0;
@@ -130,6 +166,9 @@ async function surgicalWriteXlsx(
   for (const m of wbXml.matchAll(/sheetId="(\d+)"/g)) {
     const n = parseInt(m[1]); if (n > maxSheetId) maxSheetId = n;
   }
+
+  // Build the patched sheets now that styles are available
+  const patchedSheets = buildSheets(newStyleIndices);
 
   // Process patched sheets
   for (const [name, xml] of Object.entries(patchedSheets)) {
@@ -2022,14 +2061,25 @@ export function registerDocumentTools(server: McpServer): void {
           const perfXml = buildSheetXml(perfRows);
 
           // --- Assemble and upload ---
-          const patchedSheets: Record<string, string> = {
-            "26 Compare": compareXml,
-            "Bonus Config": bonusConfigXml,
-            "Bonus Tracker": bonusTrackerXml,
-            "Attorney Performance": perfXml,
-          };
+          // Use placeholder styles, then replace after surgicalWriteXlsx injects real indices
           const deletedSheets = new Set(sheetsToDelete.map((ws: any) => ws.name));
-          const outputBuffer = await surgicalWriteXlsx(fileBuffer, patchedSheets, deletedSheets);
+          const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
+            // Post-process new sheet XMLs to add style attributes
+            // For Bonus Config: numbers use general, currency uses currency
+            // For Bonus Tracker: collections/bonus use currency
+            // For Attorney Performance: hours use decimal, $ use currency, rates use percent
+            function addStyles(xml: string): string {
+              // All <c> elements without s= attribute and with <v> (number) get general style
+              // This prevents the default date format from being applied
+              return xml.replace(/<c r="([^"]+)">/g, (match, ref) => `<c r="${ref}" s="${ST.general}">`);
+            }
+            return {
+              "26 Compare": compareXml,  // already has correct styles from original
+              "Bonus Config": addStyles(bonusConfigXml),
+              "Bonus Tracker": addStyles(bonusTrackerXml),
+              "Attorney Performance": addStyles(perfXml),
+            };
+          }, deletedSheets);
           const result = await uploadToBox({
             buffer: outputBuffer,
             filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
