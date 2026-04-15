@@ -10,199 +10,163 @@ import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import { uploadToBox, downloadFromBox } from "../utils/box";
 
-// ========== XLSX SURGICAL WRITE HELPER ==========
-// ExcelJS corrupts Excel Table objects on round-trip. This helper preserves
-// the original raw XML bytes for sheets we didn't modify, only replacing
-// sheets we actually changed or created.
+// ========== XLSX DIRECT XML HELPERS ==========
+// ExcelJS is only used for READING. All writes go through direct XML manipulation.
 
+const xmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** Build a single <c> element */
+function xmlCell(ref: string, value: number | string | null | undefined, opts?: { style?: string; formula?: string }): string {
+  if (value === null || value === undefined) {
+    if (opts?.formula) {
+      const s = opts.style ? ` s="${opts.style}"` : "";
+      return `<c r="${ref}"${s}><f>${xmlEsc(opts.formula)}</f></c>`;
+    }
+    return "";
+  }
+  const s = opts?.style ? ` s="${opts.style}"` : "";
+  if (opts?.formula) {
+    return `<c r="${ref}"${s}><f>${xmlEsc(opts.formula)}</f><v>${value}</v></c>`;
+  }
+  if (typeof value === "number") {
+    return `<c r="${ref}"${s}><v>${value}</v></c>`;
+  }
+  return `<c r="${ref}"${s} t="inlineStr"><is><t>${xmlEsc(String(value))}</t></is></c>`;
+}
+
+/** Build a <row> element from an array of cell specs */
+function xmlRow(rowNum: number, cells: string[]): string {
+  const filtered = cells.filter(Boolean);
+  if (filtered.length === 0) return "";
+  return `<row r="${rowNum}">${filtered.join("")}</row>`;
+}
+
+/** Build a complete minimal worksheet XML */
+function buildSheetXml(rows: string[]): string {
+  const filtered = rows.filter(Boolean);
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheetData>${filtered.join("")}</sheetData>
+</worksheet>`;
+}
+
+/** Update a cell's value in existing sheet XML. Returns modified XML. */
+function xmlUpdateCell(xml: string, ref: string, newValue: number): string {
+  // Match <c r="REF" ...>...<v>...</v>...</c> and replace the <v> content
+  const cellRegex = new RegExp(`(<c\\s[^>]*r="${ref}"[^>]*>)([\\s\\S]*?)(</c>)`);
+  const match = xml.match(cellRegex);
+  if (match) {
+    // Replace existing <v>...</v> or add one
+    let inner = match[2];
+    if (/<v>/.test(inner)) {
+      inner = inner.replace(/<v>[^<]*<\/v>/, `<v>${newValue}</v>`);
+    } else {
+      inner += `<v>${newValue}</v>`;
+    }
+    return xml.replace(cellRegex, `${match[1]}${inner}${match[3]}`);
+  }
+  // Cell doesn't exist — can't insert without knowing the row structure. Handled by row insertion instead.
+  return xml;
+}
+
+/** Parse the zip's sheet name → file path mapping */
+async function getZipSheetMap(zip: JSZip): Promise<Record<string, string>> {
+  const wbFile = zip.file("xl/workbook.xml");
+  const relsFile = zip.file("xl/_rels/workbook.xml.rels");
+  if (!wbFile || !relsFile) return {};
+  const wbXml = await wbFile.async("string");
+  const relsXml = await relsFile.async("string");
+
+  const sheetEntries: { name: string; rId: string }[] = [];
+  const sheetRegex = /<sheet[^>]+name="([^"]+)"[^>]+r:id="([^"]+)"[^>]*\/?>/g;
+  let m: RegExpExecArray | null;
+  while ((m = sheetRegex.exec(wbXml)) !== null) {
+    sheetEntries.push({ name: m[1], rId: m[2] });
+  }
+
+  const relMap: Record<string, string> = {};
+  const relRegex = /<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"[^>]*\/?>/g;
+  while ((m = relRegex.exec(relsXml)) !== null) {
+    relMap[m[1]] = m[2];
+  }
+
+  const result: Record<string, string> = {};
+  for (const s of sheetEntries) {
+    const target = relMap[s.rId];
+    if (target) result[s.name] = "xl/" + target;
+  }
+  return result;
+}
+
+/**
+ * Surgical xlsx write: modifies the original zip directly.
+ * - patchedSheets: map of sheet name → new XML content (for modified/new sheets)
+ * - deletedSheetNames: sheets to remove
+ * No ExcelJS involved in the write path.
+ */
 async function surgicalWriteXlsx(
   originalBuffer: Buffer,
-  modifiedSheetWb: ExcelJS.Workbook,  // small workbook with ONLY modified/new sheets
-  modifiedSheetNames: Set<string>,
+  patchedSheets: Record<string, string>,   // sheetName → full sheet XML string
   deletedSheetNames: Set<string>,
 ): Promise<Buffer> {
-  // Strategy: start with original zip, inject only the sheets we changed/created.
-  // ExcelJS never touches the original — it only builds the new sheet XMLs.
-  const origZip = await JSZip.loadAsync(originalBuffer);
+  const zip = await JSZip.loadAsync(originalBuffer);
+  const sheetMap = await getZipSheetMap(zip);
 
-  // Build a small workbook with only modified sheets, write it, extract sheet XMLs
-  // Debug: log clean workbook state
-  const cwSheets = modifiedSheetWb.worksheets.map((ws, i) => ws ? ws.name : `UNDEFINED@${i}`);
-  let modBuffer: Buffer;
-  try {
-    modBuffer = Buffer.from(await modifiedSheetWb.xlsx.writeBuffer());
-  } catch (writeErr: any) {
-    throw new Error(`ExcelJS writeBuffer failed on clean workbook (sheets: ${cwSheets.join(", ")}): ${writeErr.message}\n${writeErr.stack}`);
-  }
-  const modZip = await JSZip.loadAsync(modBuffer);
+  let wbXml = await zip.file("xl/workbook.xml")!.async("string");
+  let relsXml = await zip.file("xl/_rels/workbook.xml.rels")!.async("string");
+  let ctXml = await zip.file("[Content_Types].xml")!.async("string");
 
-  // Parse sheet maps
-  async function getSheetMap(zip: JSZip): Promise<Record<string, string>> {
-    const wbFile = zip.file("xl/workbook.xml");
-    const relsFile = zip.file("xl/_rels/workbook.xml.rels");
-    if (!wbFile || !relsFile) return {};
-    const wbXml = await wbFile.async("string");
-    const relsXml = await relsFile.async("string");
-
-    const sheetEntries: { name: string; rId: string }[] = [];
-    const sheetRegex = /<sheet[^>]+name="([^"]+)"[^>]+r:id="([^"]+)"[^>]*\/?>/g;
-    let m: RegExpExecArray | null;
-    while ((m = sheetRegex.exec(wbXml)) !== null) {
-      sheetEntries.push({ name: m[1], rId: m[2] });
-    }
-
-    const relMap: Record<string, string> = {};
-    const relRegex = /<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"[^>]*\/?>/g;
-    while ((m = relRegex.exec(relsXml)) !== null) {
-      relMap[m[1]] = m[2];
-    }
-
-    const result: Record<string, string> = {};
-    for (const s of sheetEntries) {
-      const target = relMap[s.rId];
-      if (target) result[s.name] = "xl/" + target;
-    }
-    return result;
-  }
-
-  const origSheetMap = await getSheetMap(origZip);
-  const modSheetMap = await getSheetMap(modZip);
-
-  // Build shared string lookup from the clean workbook so we can convert to inline strings
-  const modSSFile = modZip.file("xl/sharedStrings.xml");
-  const sharedStrings: string[] = [];
-  if (modSSFile) {
-    const ssXml = await modSSFile.async("string");
-    const siRegex = /<si>([\s\S]*?)<\/si>/g;
-    let sim: RegExpExecArray | null;
-    while ((sim = siRegex.exec(ssXml)) !== null) {
-      // Extract text from <t>...</t> within the <si> element
-      const tMatch = sim[1].match(/<t[^>]*>([\s\S]*?)<\/t>/);
-      sharedStrings.push(tMatch ? tMatch[1] : "");
-    }
-  }
-
-  // Convert shared string references to inline strings in a sheet XML
-  function convertToInlineStrings(sheetXml: string): string {
-    // Replace <c r="..." t="s" ...><v>N</v></c> with <c r="..." t="inlineStr" ...><is><t>TEXT</t></is></c>
-    return sheetXml.replace(
-      /(<c\s[^>]*?)t="s"([^>]*>)\s*<v>(\d+)<\/v>/g,
-      (match, prefix, suffix, indexStr) => {
-        const idx = parseInt(indexStr, 10);
-        const text = (idx < sharedStrings.length ? sharedStrings[idx] : "")
-          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        return `${prefix}t="inlineStr"${suffix}<is><t>${text}</t></is>`;
-      }
-    );
-  }
-
-  // Start with the ORIGINAL zip as the base (preserves everything)
-  const resultZip = origZip;
-
-  // For modified sheets that already exist in original, replace their XML (with inline strings)
-  for (const name of modifiedSheetNames) {
-    const origPath = origSheetMap[name];
-    const modPath = modSheetMap[name];
-    if (origPath && modPath) {
-      const modFile = modZip.file(modPath);
-      if (modFile) {
-        const rawXml = await modFile.async("string");
-        const fixedXml = convertToInlineStrings(rawXml);
-        resultZip.file(origPath, fixedXml);
-      }
-    }
-  }
-
-  // For new sheets (in modified but not in original), add them
-  // Find the highest sheet number in the original to avoid collisions
-  const existingSheetFiles = Object.keys(origZip.files).filter(f => /^xl\/worksheets\/sheet\d+\.xml$/.test(f));
+  // Find max IDs for adding new sheets
   let maxSheetNum = 0;
-  for (const f of existingSheetFiles) {
-    const num = parseInt(f.match(/sheet(\d+)\.xml/)?.[1] || "0");
-    if (num > maxSheetNum) maxSheetNum = num;
+  for (const f of Object.keys(zip.files)) {
+    const m = f.match(/^xl\/worksheets\/sheet(\d+)\.xml$/);
+    if (m) { const n = parseInt(m[1]); if (n > maxSheetNum) maxSheetNum = n; }
   }
-
-  // Find max rId and sheetId in original workbook.xml
-  const origWbXml = await resultZip.file("xl/workbook.xml")!.async("string");
-  const origRelsXml = await resultZip.file("xl/_rels/workbook.xml.rels")!.async("string");
   let maxRid = 0;
-  const ridRegex = /Id="rId(\d+)"/g;
-  let rm: RegExpExecArray | null;
-  while ((rm = ridRegex.exec(origRelsXml)) !== null) {
-    const n = parseInt(rm[1]); if (n > maxRid) maxRid = n;
+  for (const m of relsXml.matchAll(/Id="rId(\d+)"/g)) {
+    const n = parseInt(m[1]); if (n > maxRid) maxRid = n;
   }
   let maxSheetId = 0;
-  const sidRegex = /sheetId="(\d+)"/g;
-  while ((rm = sidRegex.exec(origWbXml)) !== null) {
-    const n = parseInt(rm[1]); if (n > maxSheetId) maxSheetId = n;
+  for (const m of wbXml.matchAll(/sheetId="(\d+)"/g)) {
+    const n = parseInt(m[1]); if (n > maxSheetId) maxSheetId = n;
   }
 
-  let updatedWbXml = origWbXml;
-  let updatedRelsXml = origRelsXml;
-  let updatedContentTypes = await resultZip.file("[Content_Types].xml")!.async("string");
+  // Process patched sheets
+  for (const [name, xml] of Object.entries(patchedSheets)) {
+    const existingPath = sheetMap[name];
+    if (existingPath) {
+      // Replace existing sheet XML
+      zip.file(existingPath, xml);
+    } else {
+      // Add new sheet
+      maxSheetNum++; maxRid++; maxSheetId++;
+      const fileName = `sheet${maxSheetNum}.xml`;
+      const filePath = `xl/worksheets/${fileName}`;
+      const rid = `rId${maxRid}`;
 
-  for (const name of modifiedSheetNames) {
-    if (origSheetMap[name]) continue; // already handled above
-    const modPath = modSheetMap[name];
-    if (!modPath) continue;
-
-    maxSheetNum++;
-    maxRid++;
-    maxSheetId++;
-
-    const newFileName = `sheet${maxSheetNum}.xml`;
-    const newFilePath = `xl/worksheets/${newFileName}`;
-    const newRid = `rId${maxRid}`;
-
-    // Copy sheet XML from mod zip (with inline string conversion)
-    const modFile = modZip.file(modPath);
-    if (modFile) {
-      const rawXml = await modFile.async("string");
-      const fixedXml = convertToInlineStrings(rawXml);
-      resultZip.file(newFilePath, fixedXml);
+      zip.file(filePath, xml);
+      wbXml = wbXml.replace("</sheets>", `<sheet name="${xmlEsc(name)}" sheetId="${maxSheetId}" r:id="${rid}"/></sheets>`);
+      relsXml = relsXml.replace("</Relationships>", `<Relationship Id="${rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/${fileName}"/></Relationships>`);
+      ctXml = ctXml.replace("</Types>", `<Override PartName="/xl/worksheets/${fileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`);
     }
-
-    // Add to workbook.xml (before </sheets>)
-    const sheetEntry = `<sheet name="${name}" sheetId="${maxSheetId}" r:id="${newRid}"/>`;
-    updatedWbXml = updatedWbXml.replace("</sheets>", sheetEntry + "</sheets>");
-
-    // Add to relationships
-    const relEntry = `<Relationship Id="${newRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/${newFileName}"/>`;
-    updatedRelsXml = updatedRelsXml.replace("</Relationships>", relEntry + "</Relationships>");
-
-    // Add to content types
-    const ctEntry = `<Override PartName="/xl/worksheets/${newFileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
-    updatedContentTypes = updatedContentTypes.replace("</Types>", ctEntry + "</Types>");
   }
 
   // Remove deleted sheets
   for (const delName of deletedSheetNames) {
-    const origPath = origSheetMap[delName];
-    if (!origPath) continue;
-
-    // Remove sheet XML file
-    resultZip.remove(origPath);
-    const relsPath = origPath.replace("worksheets/", "worksheets/_rels/") + ".rels";
-    if (resultZip.file(relsPath)) resultZip.remove(relsPath);
-
-    // Remove from workbook.xml
-    const escaped = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    updatedWbXml = updatedWbXml.replace(new RegExp(`<sheet[^>]+name="${escaped}"[^>]*/?>`, "g"), "");
+    const path = sheetMap[delName];
+    if (!path) continue;
+    zip.remove(path);
+    const relsPath = path.replace("worksheets/", "worksheets/_rels/") + ".rels";
+    if (zip.file(relsPath)) zip.remove(relsPath);
+    const esc = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    wbXml = wbXml.replace(new RegExp(`<sheet[^>]+name="${esc}"[^>]*/?>`, "g"), "");
   }
 
-  // Write updated metadata files
-  resultZip.file("xl/workbook.xml", updatedWbXml);
-  resultZip.file("xl/_rels/workbook.xml.rels", updatedRelsXml);
-  resultZip.file("[Content_Types].xml", updatedContentTypes);
+  zip.file("xl/workbook.xml", wbXml);
+  zip.file("xl/_rels/workbook.xml.rels", relsXml);
+  zip.file("[Content_Types].xml", ctXml);
 
-  // Also copy shared strings from the mod workbook (new sheets may reference them)
-  const modSharedStrings = modZip.file("xl/sharedStrings.xml");
-  if (modSharedStrings) {
-    // Merge: for now, keep original shared strings (our sheets mostly use inline values)
-    // If needed, we could merge shared string tables here
-  }
-
-  return Buffer.from(await resultZip.generateAsync({ type: "nodebuffer" }));
+  return Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
 }
 
 // ========== SHARED HELPERS ==========
@@ -1803,55 +1767,269 @@ export function registerDocumentTools(server: McpServer): void {
           perfSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
           _step = "surgical write + upload";
-          // ---- SAVE AND UPLOAD (surgical write to preserve Excel Tables) ----
-          // Build a clean workbook with ONLY the sheets we modified/created.
-          // ExcelJS can't round-trip the original file (corrupts Excel Tables),
-          // so we only use it to generate the sheet XMLs we need.
-          const cleanWb = new ExcelJS.Workbook();
-          const sheetsToCopy = ["26 Compare", "Bonus Config", "Bonus Tracker", "Attorney Performance"];
-          for (const sheetName of sheetsToCopy) {
-            const srcSheet = wb.getWorksheet(sheetName);
-            if (!srcSheet) continue;
-            const dstSheet = cleanWb.addWorksheet(sheetName);
-            // Copy cell values, converting shared formulas to avoid ExcelJS serialization crashes
-            srcSheet.eachRow({ includeEmpty: false }, (srcRow, rowNum) => {
-              const dstRow = dstSheet.getRow(rowNum);
-              srcRow.eachCell({ includeEmpty: false }, (srcCell, colNum) => {
-                const dstCell = dstRow.getCell(colNum);
-                const val = srcCell.value as any;
-                if (val && typeof val === "object") {
-                  if ("sharedFormula" in val) {
-                    // Shared formula clone — use cached result only
-                    dstCell.value = val.result ?? null;
-                  } else if ("formula" in val && "shareType" in val) {
-                    // Shared formula master — convert to regular formula
-                    dstCell.value = { formula: val.formula } as any;
-                  } else if ("formula" in val) {
-                    // Regular formula — keep as-is
-                    dstCell.value = { formula: val.formula } as any;
-                  } else if ("error" in val) {
-                    // Error value — write empty
-                    dstCell.value = null;
-                  } else {
-                    dstCell.value = val;
-                  }
-                } else {
-                  dstCell.value = val;
-                }
-                if (srcCell.numFmt) dstCell.numFmt = srcCell.numFmt;
-                if (srcCell.font) dstCell.font = srcCell.font;
-              });
-              dstRow.commit();
-            });
-            // Copy column widths
-            srcSheet.columns.forEach((col, i) => {
-              if (col.width) dstSheet.getColumn(i + 1).width = col.width;
-            });
+          // ---- SAVE AND UPLOAD (direct XML, no ExcelJS write) ----
+          // Style indices from the original 26 Compare sheet:
+          const S = { monthStr: "369", initials: "170", hrs1: "311", hrs: "171", hrsFormula: "330", totalFormula: "327", currency: "172", writeoffs: "62", collected: "173", respHrs: "174", respBilled: "175", respColl: "176", bold: "1" };
+          const colLetter = (c: number) => String.fromCharCode(64 + c);
+
+          // --- 26 Compare: patch the original XML ---
+          const origZip = await JSZip.loadAsync(fileBuffer);
+          const compareSheetMap = await getZipSheetMap(origZip);
+          const comparePath = compareSheetMap["26 Compare"];
+          let compareXml = await origZip.file(comparePath)!.async("string");
+
+          // Helper: update a cell value in the XML
+          function patchCell(xml: string, ref: string, val: number): string {
+            const re = new RegExp(`(<c\\s[^>]*r="${ref}"[^>]*>)([\\s\\S]*?)(</c>)`);
+            const m = xml.match(re);
+            if (m) {
+              let inner = m[2];
+              if (/<v>/.test(inner)) inner = inner.replace(/<v>[^<]*<\/v>/, `<v>${val}</v>`);
+              else inner += `<v>${val}</v>`;
+              return xml.replace(re, `${m[1]}${inner}${m[3]}`);
+            }
+            return xml;
           }
 
-          const modifiedSheets = new Set(sheetsToCopy);
-          const deletedSheets = new Set(sheetsToDelete.map(ws => ws.name));
-          const outputBuffer = await surgicalWriteXlsx(fileBuffer, cleanWb, modifiedSheets, deletedSheets);
+          // Patch existing month data cells (cells that already exist in the XML)
+          for (const r of ROSTER) {
+            const row = initialsRowMap[r.initials.toUpperCase()];
+            if (!row) continue;
+            const d = data[r.user_id];
+            const rd = respData[r.user_id];
+            const patches: [number, number][] = [
+              [4, round1(d.bizDev)], [5, round1(d.potentialClients)], [6, round1(d.cle)], [7, round1(d.otherAdmin)],
+              [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
+              [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
+              [11, round2(d.billedDollars)], [14, round2(d.indivCollected)],
+              [17, round1(rd.respHrs)], [18, round2(rd.respBilled)], [19, round2(d.respCollected)],
+            ];
+            for (const [col, val] of patches) {
+              compareXml = patchCell(compareXml, `${colLetter(col)}${row}`, val);
+            }
+          }
+
+          // If month block was created, we need to add new rows to the XML
+          if (blockCreated) {
+            // Build new row XML strings for the April block
+            const newRowsXml: string[] = [];
+            for (const ini of janBlock.initials) {
+              const row = initialsRowMap[ini];
+              if (!row) continue;
+              const rosterEntry = ROSTER.find(r => r.initials.toUpperCase() === ini);
+              const d = rosterEntry ? data[rosterEntry.user_id] : null;
+              const rd = rosterEntry ? respData[rosterEntry.user_id] : null;
+
+              const cells = [
+                xmlCell(`B${row}`, monthName, { style: S.monthStr }),
+                xmlCell(`C${row}`, ini, { style: S.initials }),
+                xmlCell(`D${row}`, d ? round1(d.bizDev) : 0, { style: S.hrs1 }),
+                xmlCell(`E${row}`, d ? round1(d.potentialClients) : 0, { style: S.hrs }),
+                xmlCell(`F${row}`, d ? round1(d.cle) : 0, { style: S.hrs }),
+                xmlCell(`G${row}`, d ? round1(d.otherAdmin) : 0, { style: S.hrs }),
+                xmlCell(`H${row}`, null, { style: S.hrsFormula, formula: `SUM(D${row}:G${row})` }),
+                xmlCell(`I${row}`, d ? round1(d.billableHrs) : 0, { style: S.hrsFormula }),
+                xmlCell(`J${row}`, null, { style: S.totalFormula, formula: `H${row}+I${row}` }),
+                xmlCell(`K${row}`, d ? round2(d.billedDollars) : 0, { style: S.currency }),
+                xmlCell(`L${row}`, 0, { style: S.writeoffs }),
+                xmlCell(`M${row}`, 0, { style: S.currency }),
+                xmlCell(`N${row}`, d ? round2(d.indivCollected) : 0, { style: S.collected }),
+                xmlCell(`Q${row}`, rd ? round1(rd.respHrs) : 0, { style: S.respHrs }),
+                xmlCell(`R${row}`, rd ? round2(rd.respBilled) : 0, { style: S.respBilled }),
+                xmlCell(`S${row}`, d ? round2(d.respCollected) : 0, { style: S.respColl }),
+              ];
+              newRowsXml.push(xmlRow(row, cells));
+            }
+
+            // Add SUM row for the month
+            if (monthBlock.sumRow) {
+              const sr = monthBlock.sumRow;
+              const first = monthBlock.firstRow;
+              const last = monthBlock.lastRow;
+              const sumCells = [4,5,6,7,8,9,10,11,12,13,14,17,18,19].map(col =>
+                xmlCell(`${colLetter(col)}${sr}`, null, { formula: `SUM(${colLetter(col)}${first}:${colLetter(col)}${last})` })
+              );
+              sumCells.unshift(xmlCell(`B${sr}`, monthName, { style: S.monthStr }));
+              newRowsXml.push(xmlRow(sr, sumCells));
+            }
+
+            // Insert before </sheetData>
+            compareXml = compareXml.replace("</sheetData>", newRowsXml.join("") + "</sheetData>");
+          }
+
+          // --- Build new sheet XMLs from data ---
+          // Bonus Config
+          const configRows: string[] = [];
+          configRows.push(xmlRow(1, [xmlCell("A1", "Bonus Configuration")]));
+          configRows.push(xmlRow(4, [xmlCell("A4", "Attorney"), xmlCell("B4", "Base Salary"), xmlCell("C4", "Associate"), xmlCell("D4", "Paralegal"), xmlCell("E4", "Para Salary"), xmlCell("F4", "Legal Asst"), xmlCell("G4", "Payroll %")]));
+          for (let i = 0; i < configAttorneys.length; i++) {
+            const a = configAttorneys[i];
+            configRows.push(xmlRow(5 + i, [xmlCell(`A${5+i}`, a.ini), xmlCell(`B${5+i}`, a.salary), xmlCell(`C${5+i}`, a.associate), xmlCell(`D${5+i}`, a.paralegal), xmlCell(`E${5+i}`, a.paraSalary), xmlCell(`F${5+i}`, a.legalAsst), xmlCell(`G${5+i}`, a.payroll)]));
+          }
+          configRows.push(xmlRow(13, [xmlCell("A13", "Firm Overhead"), xmlCell("B13", firmOverhead)]));
+          configRows.push(xmlRow(14, [xmlCell("A14", "# of Attorneys"), xmlCell("B14", numAttorneys)]));
+          configRows.push(xmlRow(16, [xmlCell("A16", "Bracket"), xmlCell("B16", "Width"), xmlCell("C16", "Rate")]));
+          configRows.push(xmlRow(17, [xmlCell("A17", 1), xmlCell("B17", "Base Target"), xmlCell("C17", 0)]));
+          configRows.push(xmlRow(18, [xmlCell("A18", 2), xmlCell("B18", 50000), xmlCell("C18", 0.05)]));
+          configRows.push(xmlRow(19, [xmlCell("A19", 3), xmlCell("B19", 50000), xmlCell("C19", 0.10)]));
+          configRows.push(xmlRow(20, [xmlCell("A20", 4), xmlCell("B20", "Unlimited"), xmlCell("C20", 0.15)]));
+          configRows.push(xmlRow(22, [xmlCell("A22", "MNH collections split equally among: PAR, KES, NRN")]));
+          configRows.push(xmlRow(24, [xmlCell("A24", "Paralegal Hours Bonus")]));
+          configRows.push(xmlRow(25, [xmlCell("A25", "Min Hours"), xmlCell("B25", "Bonus")]));
+          configRows.push(xmlRow(26, [xmlCell("A26", 110), xmlCell("B26", 100)]));
+          configRows.push(xmlRow(27, [xmlCell("A27", 121), xmlCell("B27", 300)]));
+          configRows.push(xmlRow(28, [xmlCell("A28", 133), xmlCell("B28", 500)]));
+          configRows.push(xmlRow(30, [xmlCell("A30", "Paralegals: ACA, AFL, AKG")]));
+          const bonusConfigXml = buildSheetXml(configRows);
+
+          // Bonus Tracker
+          const trackerRows: string[] = [];
+          trackerRows.push(xmlRow(1, [xmlCell("A1", `${params.year} Bonus Tracker`)]));
+          // Attorney headers
+          const xmlColsPerAtty = 4;
+          const trackerHeaderCells: string[] = [];
+          const trackerSubCells: string[] = [xmlCell("A4", "Month")];
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = 2 + ai * xmlColsPerAtty;
+            const L = colLetter(col);
+            trackerHeaderCells.push(xmlCell(`${L}3`, attys[ai].ini));
+            trackerSubCells.push(xmlCell(`${colLetter(col)}4`, "Collections"));
+            trackerSubCells.push(xmlCell(`${colLetter(col+1)}4`, "YTD"));
+            trackerSubCells.push(xmlCell(`${colLetter(col+2)}4`, "Bonus"));
+            trackerSubCells.push(xmlCell(`${colLetter(col+3)}4`, "Cum Bonus"));
+          }
+          trackerRows.push(xmlRow(3, trackerHeaderCells));
+          trackerRows.push(xmlRow(4, trackerSubCells));
+
+          for (let mi = 0; mi < 12; mi++) {
+            const rn = 5 + mi;
+            const cells: string[] = [xmlCell(`A${rn}`, monthNames[mi])];
+            for (let ai = 0; ai < attys.length; ai++) {
+              const col = 2 + ai * xmlColsPerAtty;
+              const br = bonusData[attys[ai].ini]?.rows[mi];
+              if (br && (br.collections > 0 || br.ytd > 0)) {
+                cells.push(xmlCell(`${colLetter(col)}${rn}`, br.collections));
+                cells.push(xmlCell(`${colLetter(col+1)}${rn}`, br.ytd));
+                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, br.bonusEarned));
+                cells.push(xmlCell(`${colLetter(col+3)}${rn}`, br.cumBonus));
+              }
+            }
+            trackerRows.push(xmlRow(rn, cells));
+          }
+
+          // Summary section
+          trackerRows.push(xmlRow(19, [xmlCell("A19", "Attorney Summary")]));
+          trackerRows.push(xmlRow(20, [xmlCell("A20", "Attorney"), xmlCell("B20", "Base Target"), xmlCell("C20", "YTD Collections"), xmlCell("D20", "Current Bracket"), xmlCell("E20", "To Next Bracket"), xmlCell("F20", "Total Bonus"), xmlCell("G20", "Paid"), xmlCell("H20", "Balance")]));
+          for (let ai = 0; ai < attys.length; ai++) {
+            const rn = 21 + ai;
+            const bd = bonusData[attys[ai].ini];
+            if (!bd) continue;
+            const lastActive = bd.rows.filter(r => r.collections > 0).pop() || bd.rows[0];
+            trackerRows.push(xmlRow(rn, [
+              xmlCell(`A${rn}`, attys[ai].ini), xmlCell(`B${rn}`, bd.baseTarget), xmlCell(`C${rn}`, lastActive.ytd),
+              xmlCell(`D${rn}`, lastActive.bracket), xmlCell(`E${rn}`, lastActive.toNext),
+              xmlCell(`F${rn}`, lastActive.cumBonus), xmlCell(`G${rn}`, 0), xmlCell(`H${rn}`, lastActive.cumBonus),
+            ]));
+          }
+
+          // Paralegal section
+          const paraStart = 21 + attys.length + 2;
+          trackerRows.push(xmlRow(paraStart, [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")]));
+          const paraHdr = paraStart + 1;
+          const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month")];
+          const XML_PARALEGALS = ["ACA", "AFL", "AKG"];
+          const XML_PARA_TIERS = [{ minHours: 133, bonus: 500 }, { minHours: 121, bonus: 300 }, { minHours: 110, bonus: 100 }];
+          for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
+            const col = 2 + pi * 3;
+            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
+            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`, "Billable Hrs"));
+            paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier"));
+            paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus"));
+          }
+          trackerRows.push(xmlRow(paraHdr, paraHdrCells));
+
+          for (let mi = 0; mi < 12; mi++) {
+            const rn = paraHdr + 1 + mi;
+            const cells: string[] = [xmlCell(`A${rn}`, monthNames[mi])];
+            for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
+              const col = 2 + pi * 3;
+              const hrs = monthBillableHrs[monthNames[mi]]?.[XML_PARALEGALS[pi]] || 0;
+              if (hrs > 0) {
+                let bonus = 0, tier = "-";
+                for (const t of XML_PARA_TIERS) { if (hrs >= t.minHours) { bonus = t.bonus; tier = `≥${t.minHours}`; break; } }
+                cells.push(xmlCell(`${colLetter(col)}${rn}`, round1(hrs)));
+                cells.push(xmlCell(`${colLetter(col+1)}${rn}`, tier));
+                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, bonus));
+              }
+            }
+            trackerRows.push(xmlRow(rn, cells));
+          }
+          const bonusTrackerXml = buildSheetXml(trackerRows);
+
+          // Attorney Performance
+          const perfRows: string[] = [];
+          perfRows.push(xmlRow(1, [xmlCell("A1", `${params.year} Attorney Performance`)]));
+          const PERF_HDRS = ["Month","BizDev","Pot Clients","CLE","Admin","TNB","Billable Hrs","Total Hrs","Billed $","Write-offs","Discounts","Collected","Goal","vs Goal","Util Rate","Util Goal","Real Rate","Real Goal","Coll Rate","Coll Goal"];
+          let pRow = 3;
+          for (const r of ROSTER) {
+            const goals = attyGoals[r.initials] || { annualGoal: 0, billingRate: 0, availableHrs: 1880, utilGoal: 0.75, realGoal: 0.75, collGoal: 0.75 };
+            const monthlyGoal = round2(goals.annualGoal / 12);
+            const monthlyAvail = round1(goals.availableHrs / 12);
+            perfRows.push(xmlRow(pRow, [xmlCell(`A${pRow}`, `${r.name} (${r.initials})`)]));
+            pRow++;
+            perfRows.push(xmlRow(pRow, PERF_HDRS.map((h, i) => xmlCell(`${colLetter(i + 1)}${pRow}`, h))));
+            pRow++;
+            let ytdColl = 0, ytdBilled = 0, ytdBillHrs = 0;
+            const dataStart = pRow;
+            for (let mi = 0; mi < 12; mi++) {
+              const mn = monthNames[mi];
+              const md = monthFullData[mn]?.[r.initials];
+              const cells: string[] = [xmlCell(`A${pRow}`, mn)];
+              if (md && (md.billableHrs > 0 || md.collected > 0 || md.totalHrs > 0)) {
+                ytdColl += md.collected; ytdBilled += md.billedAmt; ytdBillHrs += md.billableHrs;
+                cells.push(xmlCell(`B${pRow}`, round1(md.bizDev)), xmlCell(`C${pRow}`, round1(md.potClients)),
+                  xmlCell(`D${pRow}`, round1(md.cle)), xmlCell(`E${pRow}`, round1(md.admin)),
+                  xmlCell(`F${pRow}`, round1(md.tnb)), xmlCell(`G${pRow}`, round1(md.billableHrs)),
+                  xmlCell(`H${pRow}`, round1(md.totalHrs)), xmlCell(`I${pRow}`, round2(md.billedAmt)),
+                  xmlCell(`J${pRow}`, round2(md.writeOffs)), xmlCell(`K${pRow}`, round2(md.discounts)),
+                  xmlCell(`L${pRow}`, round2(md.collected)), xmlCell(`M${pRow}`, monthlyGoal),
+                  xmlCell(`N${pRow}`, round2(md.collected - monthlyGoal)));
+                const utilRate = monthlyAvail > 0 ? round2(md.billableHrs / monthlyAvail) : 0;
+                const expectedBilled = md.billableHrs * goals.billingRate;
+                const realRate = expectedBilled > 0 ? round2(md.billedAmt / expectedBilled) : 0;
+                const collRate = md.billedAmt > 0 ? round2(md.collected / md.billedAmt) : 0;
+                cells.push(xmlCell(`O${pRow}`, utilRate), xmlCell(`P${pRow}`, goals.utilGoal),
+                  xmlCell(`Q${pRow}`, realRate), xmlCell(`R${pRow}`, goals.realGoal),
+                  xmlCell(`S${pRow}`, collRate), xmlCell(`T${pRow}`, goals.collGoal));
+              }
+              perfRows.push(xmlRow(pRow, cells));
+              pRow++;
+            }
+            // YTD row
+            const ytdCells: string[] = [xmlCell(`A${pRow}`, "YTD")];
+            ytdCells.push(xmlCell(`L${pRow}`, round2(ytdColl)), xmlCell(`M${pRow}`, round2(monthlyGoal * 12)),
+              xmlCell(`N${pRow}`, round2(ytdColl - goals.annualGoal)));
+            const mwd = Object.keys(monthFullData).filter(mn => monthFullData[mn]?.[r.initials]?.totalHrs > 0).length;
+            if (mwd > 0) {
+              ytdCells.push(xmlCell(`O${pRow}`, round2(monthlyAvail * mwd > 0 ? ytdBillHrs / (monthlyAvail * mwd) : 0)));
+              const et = ytdBillHrs * goals.billingRate;
+              ytdCells.push(xmlCell(`Q${pRow}`, et > 0 ? round2(ytdBilled / et) : 0));
+              ytdCells.push(xmlCell(`S${pRow}`, ytdBilled > 0 ? round2(ytdColl / ytdBilled) : 0));
+            }
+            perfRows.push(xmlRow(pRow, ytdCells));
+            pRow += 2;
+          }
+          const perfXml = buildSheetXml(perfRows);
+
+          // --- Assemble and upload ---
+          const patchedSheets: Record<string, string> = {
+            "26 Compare": compareXml,
+            "Bonus Config": bonusConfigXml,
+            "Bonus Tracker": bonusTrackerXml,
+            "Attorney Performance": perfXml,
+          };
+          const deletedSheets = new Set(sheetsToDelete.map((ws: any) => ws.name));
+          const outputBuffer = await surgicalWriteXlsx(fileBuffer, patchedSheets, deletedSheets);
           const result = await uploadToBox({
             buffer: outputBuffer,
             filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
