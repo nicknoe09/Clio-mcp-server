@@ -980,6 +980,7 @@ export function registerDocumentTools(server: McpServer): void {
       update_existing: z.boolean().optional().describe("If true, downloads the firm dashboard from Box, updates the '26 Compare' sheet and bonus tabs, then uploads the modified file back."),
     },
     async (params) => {
+      let _step = "init";
       try {
         const ROSTER = [
           { initials: "PAR", name: "Paul Romano", user_id: 344117381 },
@@ -1082,7 +1083,6 @@ export function registerDocumentTools(server: McpServer): void {
         }
 
         // ---- UPDATE EXISTING DASHBOARD IN BOX ----
-        let _step = "init";
         if (params.update_existing) {
           const DASHBOARD_FILE_ID = "2199202082188";
           _step = "downloading from Box";
