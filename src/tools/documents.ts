@@ -924,80 +924,60 @@ export function registerDocumentTools(server: McpServer): void {
           const compareSheet = wb.getWorksheet("26 Compare");
           if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
 
-          // Helper: scan a month block in 26 Compare.
-          // Every row in a block has the month name in column B and initials in column C.
-          // Returns null if the month block doesn't exist.
-          function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): { firstRow: number; lastRow: number; sumRow: number; map: Record<string, number>; initials: string[] } | null {
+          // ---- Helper: scan a month block in 26 Compare ----
+          // Every row in a block has the month name in col B and initials in col C.
+          type MonthBlock = { firstRow: number; lastRow: number; sumRow: number; map: Record<string, number>; initials: string[] };
+          function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): MonthBlock | null {
             const map: Record<string, number> = {};
             const initials: string[] = [];
-            let firstRow = 0;
-            let lastRow = 0;
-            let sumRow = 0;
+            let firstRow = 0, lastRow = 0, sumRow = 0;
             sheet.eachRow((row, rowNum) => {
               const bVal = String(row.getCell(2).value ?? "").trim();
               if (bVal !== targetMonth) return;
               const cVal = String(row.getCell(3).value ?? "").trim();
               if (!firstRow) firstRow = rowNum;
               if (cVal) {
-                // Only record first occurrence of each initials (handles duplicate JPB in March)
-                if (!map[cVal.toUpperCase()]) {
-                  map[cVal.toUpperCase()] = rowNum;
-                  initials.push(cVal.toUpperCase());
-                }
+                if (!map[cVal.toUpperCase()]) { map[cVal.toUpperCase()] = rowNum; initials.push(cVal.toUpperCase()); }
                 lastRow = rowNum;
               } else {
-                // Row with month name but no initials = SUM row
                 sumRow = rowNum;
               }
             });
-            if (!firstRow) return null;
-            return { firstRow, lastRow, sumRow, map, initials };
+            return firstRow ? { firstRow, lastRow, sumRow, map, initials } : null;
           }
 
-          // Scan January block (always exists — source of truth for bonus formulas)
+          // Scan January block (always exists)
           const janBlock = scanMonthBlock(compareSheet, "January");
           if (!janBlock) throw new Error("January block not found in 26 Compare.");
 
-          // Reverse map: January row number -> initials
-          const janRowToInitials: Record<number, string> = {};
-          for (const [ini, row] of Object.entries(janBlock.map)) janRowToInitials[row] = ini;
-
-          // Check if target month block exists; if not, create it
+          // ---- Create month block if it doesn't exist (overwrite approach) ----
           let monthBlock = scanMonthBlock(compareSheet, monthName);
           let blockCreated = false;
 
           if (!monthBlock) {
-            // Find insertion point: after the last existing month block's SUM row, before "2026 Totals"
-            // Scan for "2026 Totals" or find the last month block
+            // Find "2026 Totals" section
             let totalsFirstRow = 0;
             compareSheet.eachRow((row, rowNum) => {
-              const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === "2026 Totals" && !totalsFirstRow) totalsFirstRow = rowNum;
+              if (String(row.getCell(2).value ?? "").trim() === "2026 Totals" && !totalsFirstRow) totalsFirstRow = rowNum;
             });
 
-            // Find last existing month block to know where to insert
-            let lastBlockSumRow = 0;
+            // Find last existing month's SUM row
+            let lastSumRow = 0;
             for (let mi = params.month - 2; mi >= 0; mi--) {
-              const prevBlock = scanMonthBlock(compareSheet, monthNames[mi]);
-              if (prevBlock && prevBlock.sumRow) { lastBlockSumRow = prevBlock.sumRow; break; }
+              const prev = scanMonthBlock(compareSheet, monthNames[mi]);
+              if (prev?.sumRow) { lastSumRow = prev.sumRow; break; }
             }
 
-            // Insert point: 2 rows after last block's SUM row (gap row + new block start)
-            const insertAt = lastBlockSumRow ? lastBlockSumRow + 3 : (totalsFirstRow ? totalsFirstRow : compareSheet.rowCount + 3);
-
-            // Use January's initials as the template
+            // New month block starts 3 rows after last SUM (gap rows)
+            const blockStart = lastSumRow ? lastSumRow + 3 : (totalsFirstRow || compareSheet.rowCount + 3);
             const templateInitials = janBlock.initials;
-            const blockSize = templateInitials.length; // data rows only
-            const totalInsert = blockSize + 1; // data rows + SUM row
+            const blockSize = templateInitials.length;
 
-            // Splice in empty rows (shifts existing rows down)
-            compareSheet.spliceRows(insertAt, 0, ...Array(totalInsert + 2).fill([])); // +2 for gap rows
-
-            // Write month name + initials into new block
+            // Write new month block data rows
             const newMap: Record<string, number> = {};
             const newInitials: string[] = [];
-            for (let i = 0; i < templateInitials.length; i++) {
-              const rowNum = insertAt + i;
+            for (let i = 0; i < blockSize; i++) {
+              const rowNum = blockStart + i;
               const row = compareSheet.getRow(rowNum);
               row.getCell(2).value = monthName;
               row.getCell(3).value = templateInitials[i];
@@ -1006,25 +986,70 @@ export function registerDocumentTools(server: McpServer): void {
               row.commit();
             }
 
-            // Write SUM row
-            const sumRowNum = insertAt + blockSize;
-            const sumRow = compareSheet.getRow(sumRowNum);
+            // Write SUM row for the new month
+            const newSumRow = blockStart + blockSize;
+            const sumRow = compareSheet.getRow(newSumRow);
             sumRow.getCell(2).value = monthName;
-            // Add SUM formulas for data columns D through S
-            const sumCols = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19];
-            for (const col of sumCols) {
-              const colLetter = String.fromCharCode(64 + col); // D=68-64=4 -> 'D'
-              sumRow.getCell(col).value = { formula: `SUM(${colLetter}${insertAt}:${colLetter}${insertAt + blockSize - 1})` } as any;
+            const colLetters = ["D","E","F","G","H","I","J","K","L","M","N","O","Q","R","S"];
+            const colNums =    [ 4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 17, 18, 19];
+            for (let ci = 0; ci < colLetters.length; ci++) {
+              sumRow.getCell(colNums[ci]).value = { formula: `SUM(${colLetters[ci]}${blockStart}:${colLetters[ci]}${blockStart + blockSize - 1})` } as any;
             }
             sumRow.commit();
 
-            monthBlock = { firstRow: insertAt, lastRow: insertAt + blockSize - 1, sumRow: sumRowNum, map: newMap, initials: newInitials };
+            // Rewrite "2026 Totals" section after the new block
+            // First, collect all existing month blocks to build totals formulas
+            const allBlocks: MonthBlock[] = [];
+            for (let mi = 0; mi < params.month; mi++) {
+              const b = mi === params.month - 1
+                ? { firstRow: blockStart, lastRow: blockStart + blockSize - 1, sumRow: newSumRow, map: newMap, initials: newInitials }
+                : scanMonthBlock(compareSheet, monthNames[mi]);
+              if (b) allBlocks.push(b);
+            }
+
+            // Clear old 2026 Totals rows if they exist
+            if (totalsFirstRow) {
+              for (let r = totalsFirstRow; r <= totalsFirstRow + blockSize + 2; r++) {
+                const row = compareSheet.getRow(r);
+                for (let c = 1; c <= 19; c++) row.getCell(c).value = null;
+                row.commit();
+              }
+            }
+
+            // Write new 2026 Totals starting 3 rows after new month's SUM
+            const newTotalsStart = newSumRow + 3;
+            for (let i = 0; i < templateInitials.length; i++) {
+              const ini = templateInitials[i];
+              const rowNum = newTotalsStart + i;
+              const row = compareSheet.getRow(rowNum);
+              row.getCell(2).value = "2026 Totals";
+              row.getCell(3).value = ini;
+              // For each data column, sum that initials' row across all month blocks
+              for (let ci = 0; ci < colLetters.length; ci++) {
+                const refs = allBlocks.map(b => b.map[ini] ? `${colLetters[ci]}${b.map[ini]}` : null).filter(Boolean);
+                if (refs.length > 0) {
+                  row.getCell(colNums[ci]).value = { formula: refs.join("+") } as any;
+                }
+              }
+              row.commit();
+            }
+
+            // Totals SUM row
+            const totalsSumRowNum = newTotalsStart + templateInitials.length;
+            const totalsSumRow = compareSheet.getRow(totalsSumRowNum);
+            totalsSumRow.getCell(2).value = "2026 Totals";
+            for (let ci = 0; ci < colLetters.length; ci++) {
+              totalsSumRow.getCell(colNums[ci]).value = { formula: `SUM(${colLetters[ci]}${newTotalsStart}:${colLetters[ci]}${newTotalsStart + templateInitials.length - 1})` } as any;
+            }
+            totalsSumRow.commit();
+
+            monthBlock = { firstRow: blockStart, lastRow: blockStart + blockSize - 1, sumRow: newSumRow, map: newMap, initials: newInitials };
             blockCreated = true;
           }
 
           const initialsRowMap = monthBlock.map;
 
-          // Write Clio data into 26 Compare for the target month
+          // ---- Write Clio data into 26 Compare ----
           let tkUpdated = 0;
           for (const r of ROSTER) {
             const row = initialsRowMap[r.initials.toUpperCase()];
@@ -1032,116 +1057,279 @@ export function registerDocumentTools(server: McpServer): void {
             const d = data[r.user_id];
             const rd = respData[r.user_id];
             const wsRow = compareSheet.getRow(row);
-
-            wsRow.getCell(4).value = round1(d.bizDev);            // D: BizDev
-            wsRow.getCell(5).value = round1(d.potentialClients);   // E: Potential clients
-            wsRow.getCell(6).value = round1(d.cle);                // F: CLE
-            wsRow.getCell(7).value = round1(d.otherAdmin);         // G: Admin
-            wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin); // H: TNB
-            wsRow.getCell(9).value = round1(d.billableHrs);        // I: Billable hours
-            wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs); // J: Total hours
-            wsRow.getCell(11).value = round2(d.billedDollars);     // K: Billed amount
-            wsRow.getCell(14).value = round2(d.indivCollected);    // N: Individual collected
-            wsRow.getCell(17).value = round1(rd.respHrs);          // Q: Responsible billable
-            wsRow.getCell(18).value = round2(rd.respBilled);       // R: Responsible billed
-            wsRow.getCell(19).value = round2(d.respCollected);     // S: Responsible collected
+            wsRow.getCell(4).value = round1(d.bizDev);
+            wsRow.getCell(5).value = round1(d.potentialClients);
+            wsRow.getCell(6).value = round1(d.cle);
+            wsRow.getCell(7).value = round1(d.otherAdmin);
+            wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
+            wsRow.getCell(9).value = round1(d.billableHrs);
+            wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs);
+            wsRow.getCell(11).value = round2(d.billedDollars);
+            wsRow.getCell(14).value = round2(d.indivCollected);
+            wsRow.getCell(17).value = round1(rd.respHrs);
+            wsRow.getCell(18).value = round2(rd.respBilled);
+            wsRow.getCell(19).value = round2(d.respCollected);
             wsRow.commit();
             tkUpdated++;
           }
 
-          // ---- REPAIR BONUS TAB FORMULAS ----
-          let bonusTabCount = 0;
+          // ---- DELETE OLD BONUS SHEETS ----
+          const sheetsToDelete = wb.worksheets.filter(ws => ws.name.toLowerCase().includes("bonus"));
+          for (const ws of sheetsToDelete) wb.removeWorksheet(ws.id);
 
-          wb.eachSheet((ws) => {
-            if (!ws.name.toLowerCase().includes("bonus")) return;
-            // Skip PARA Bonus (different structure — not attorney-specific)
-            if (ws.name.toUpperCase().includes("PARA")) return;
+          // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
+          const BONUS_ATTORNEYS = [
+            { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
+            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "",    paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+            { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+            { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            { ini: "TBS", salary: 137500, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            { ini: "JPB", salary: 129167, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+          ];
+          const FIRM_OVERHEAD = 500000;
+          const NUM_ATTORNEYS = 5;
+          const BRACKETS = [
+            { width: 0, rate: 0 },     // Bracket 1: base target at 0%
+            { width: 50000, rate: 0.05 },
+            { width: 50000, rate: 0.10 },
+            { width: Infinity, rate: 0.15 },
+          ];
+          const MNH_SPLIT_AMONG = ["PAR", "KES", "NRN"];
 
-            const initials = ws.name.split(/\s+/)[0].toUpperCase();
-            const primaryRow = initialsRowMap[initials];
-            if (!primaryRow) return; // attorney not in current month block
+          // Read config from existing "Bonus Config" sheet if present, else create with defaults
+          let configSheet = wb.getWorksheet("Bonus Config");
+          let configAttorneys = BONUS_ATTORNEYS;
+          let firmOverhead = FIRM_OVERHEAD;
+          let numAttorneys = NUM_ATTORNEYS;
 
-            // Find January row in bonus sheet: scan col B for "January"
-            let janBonusRow = 0;
-            ws.eachRow((row, rowNum) => {
-              const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === "January" && !janBonusRow) janBonusRow = rowNum;
-            });
-            if (!janBonusRow) return;
-
-            // Read January formula from column C
-            const janCell = ws.getRow(janBonusRow).getCell(3);
-            const janFormula = typeof janCell.value === "object" && janCell.value !== null && "formula" in (janCell.value as any)
-              ? (janCell.value as any).formula as string
-              : typeof (janCell as any).formula === "string" ? (janCell as any).formula : null;
-
-            // If January has no formula (e.g. NAF/MNH/TBS with value 0), skip
-            if (!janFormula) return;
-
-            // Parse cell references: '26 Compare'!<col><row>
-            const refRegex = /'26 Compare'!([A-Z]+)(\d+)/g;
-            const refs: { col: string; row: number; offset: number; length: number }[] = [];
-            let m: RegExpExecArray | null;
-            while ((m = refRegex.exec(janFormula)) !== null) {
-              refs.push({ col: m[1], row: parseInt(m[2], 10), offset: m.index, length: m[0].length });
-            }
-            if (refs.length === 0) return;
-
-            // Build the updated formula by replacing row numbers (right-to-left to preserve offsets)
-            let newFormula = janFormula;
-            const sortedRefs = [...refs].sort((a, b) => b.offset - a.offset);
-            for (const ref of sortedRefs) {
-              const refInitials = janRowToInitials[ref.row];
-              let newRow: number;
-              if (refInitials === initials) {
-                newRow = primaryRow;
-              } else if (refInitials && initialsRowMap[refInitials]) {
-                newRow = initialsRowMap[refInitials];
-              } else {
-                // Can't map this reference — skip this bonus sheet entirely
-                return;
-              }
-              const original = `'26 Compare'!${ref.col}${ref.row}`;
-              const replacement = `'26 Compare'!${ref.col}${newRow}`;
-              newFormula = newFormula.substring(0, ref.offset) + replacement + newFormula.substring(ref.offset + ref.length);
-            }
-
-            // Find the target month row in the bonus sheet (col B = monthName)
-            let targetBonusRow = 0;
-            ws.eachRow((row, rowNum) => {
-              const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === monthName && !targetBonusRow) targetBonusRow = rowNum;
-            });
-            if (!targetBonusRow) return;
-
-            // Write the updated formula
-            ws.getRow(targetBonusRow).getCell(3).value = { formula: newFormula } as any;
-            ws.getRow(targetBonusRow).commit();
-
-            // Suppress #REF! errors in future month rows
-            for (let mi = params.month; mi < 12; mi++) {
-              const futureMonth = monthNames[mi];
-              let futureRow = 0;
-              ws.eachRow((row, rowNum) => {
-                const bVal = String(row.getCell(2).value ?? "").trim();
-                if (bVal === futureMonth && !futureRow) futureRow = rowNum;
+          if (configSheet) {
+            // Read existing config
+            const readAttorneys: typeof BONUS_ATTORNEYS = [];
+            for (let r = 5; r <= 11; r++) {
+              const row = configSheet.getRow(r);
+              const ini = String(row.getCell(1).value ?? "").trim().toUpperCase();
+              if (!ini) continue;
+              readAttorneys.push({
+                ini,
+                salary: Number(row.getCell(2).value) || 0,
+                associate: String(row.getCell(3).value ?? "").trim().toUpperCase(),
+                paralegal: String(row.getCell(4).value ?? "").trim().toUpperCase(),
+                paraSalary: Number(row.getCell(5).value) || 0,
+                legalAsst: Number(row.getCell(6).value) || 0,
+                payroll: Number(row.getCell(7).value) || 0.17,
               });
-              if (!futureRow) continue;
-              const futureCell = ws.getRow(futureRow).getCell(3);
-              const fVal = futureCell.value;
-              const isError = (typeof fVal === "object" && fVal !== null && "error" in (fVal as any))
-                || (typeof fVal === "object" && fVal !== null && "result" in (fVal as any) && typeof (fVal as any).result === "object" && (fVal as any).result?.error)
-                || String(fVal ?? "").includes("#REF!");
-              if (isError) {
-                futureCell.value = "";
-                ws.getRow(futureRow).commit();
+            }
+            if (readAttorneys.length > 0) configAttorneys = readAttorneys;
+            firmOverhead = Number(configSheet.getRow(13).getCell(2).value) || FIRM_OVERHEAD;
+            numAttorneys = Number(configSheet.getRow(14).getCell(2).value) || NUM_ATTORNEYS;
+          } else {
+            // Create Bonus Config with defaults
+            configSheet = wb.addWorksheet("Bonus Config");
+            configSheet.getRow(1).values = ["Bonus Configuration"];
+            configSheet.getRow(1).font = { bold: true, size: 14 };
+            configSheet.getRow(3).values = [];
+            configSheet.getRow(4).values = ["Attorney", "Base Salary", "Associate", "Paralegal", "Para Salary", "Legal Asst", "Payroll %"];
+            configSheet.getRow(4).font = { bold: true };
+            for (let i = 0; i < BONUS_ATTORNEYS.length; i++) {
+              const a = BONUS_ATTORNEYS[i];
+              configSheet.getRow(5 + i).values = [a.ini, a.salary, a.associate, a.paralegal, a.paraSalary, a.legalAsst, a.payroll];
+            }
+            configSheet.getRow(13).values = ["Firm Overhead", FIRM_OVERHEAD];
+            configSheet.getRow(13).font = { bold: true };
+            configSheet.getRow(14).values = ["# of Attorneys", NUM_ATTORNEYS];
+            configSheet.getRow(16).values = ["Bracket", "Width", "Rate"];
+            configSheet.getRow(16).font = { bold: true };
+            configSheet.getRow(17).values = [1, "Base Target", 0];
+            configSheet.getRow(18).values = [2, 50000, 0.05];
+            configSheet.getRow(19).values = [3, 50000, 0.10];
+            configSheet.getRow(20).values = [4, "Unlimited", 0.15];
+            configSheet.getRow(22).values = ["MNH collections split equally among: PAR, KES, NRN"];
+            configSheet.columns.forEach(col => { col.width = 16; });
+          }
+
+          // ---- COMPUTE BONUS DATA ----
+          const overheadShare = firmOverhead / numAttorneys;
+
+          // Gather individual collected (col N) from ALL existing month blocks
+          const monthCollections: Record<string, Record<string, number>> = {}; // monthName -> initials -> collected
+          for (let mi = 0; mi < 12; mi++) {
+            const mn = monthNames[mi];
+            const block = scanMonthBlock(compareSheet, mn);
+            if (!block) continue;
+            monthCollections[mn] = {};
+            for (const [ini, rowNum] of Object.entries(block.map)) {
+              const val = compareSheet.getRow(rowNum).getCell(14).value; // col N
+              monthCollections[mn][ini] = typeof val === "number" ? val : (parseFloat(String(val)) || 0);
+            }
+          }
+
+          // Compute per-attorney bonus
+          interface BonusRow { month: string; collections: number; ytd: number; bracket: string; toNext: number; bonusEarned: number; cumBonus: number; }
+          const bonusData: Record<string, { baseTarget: number; rows: BonusRow[] }> = {};
+
+          for (const atty of configAttorneys) {
+            const baseTarget = atty.salary + atty.paraSalary + atty.legalAsst + (atty.payroll * (atty.salary + atty.paraSalary)) + overheadShare;
+            const bracketCeilings = [baseTarget, baseTarget + BRACKETS[1].width, baseTarget + BRACKETS[1].width + BRACKETS[2].width];
+            const rows: BonusRow[] = [];
+            let ytd = 0;
+            let cumBonus = 0;
+
+            for (let mi = 0; mi < 12; mi++) {
+              const mn = monthNames[mi];
+              const mc = monthCollections[mn];
+              if (!mc) { rows.push({ month: mn, collections: 0, ytd, bracket: "-", toNext: 0, bonusEarned: 0, cumBonus }); continue; }
+
+              // Attributed collections = own + associate + paralegal + MNH split
+              let collections = mc[atty.ini] || 0;
+              if (atty.associate) collections += mc[atty.associate] || 0;
+              if (atty.paralegal) collections += mc[atty.paralegal] || 0;
+              if (MNH_SPLIT_AMONG.includes(atty.ini)) {
+                collections += (mc["MNH"] || 0) / MNH_SPLIT_AMONG.length;
+              }
+              collections = round2(collections);
+
+              const prevYtd = ytd;
+              ytd = round2(ytd + collections);
+
+              // Bracket label
+              let bracket = "Bracket 1";
+              if (ytd > bracketCeilings[2]) bracket = "Bracket 4";
+              else if (ytd > bracketCeilings[1]) bracket = "Bracket 3";
+              else if (ytd > bracketCeilings[0]) bracket = "Bracket 2";
+
+              // To next bracket
+              let toNext = 0;
+              if (ytd <= bracketCeilings[0]) toNext = round2(bracketCeilings[0] - ytd + 0.01);
+              else if (ytd <= bracketCeilings[1]) toNext = round2(bracketCeilings[1] - ytd + 0.01);
+              else if (ytd <= bracketCeilings[2]) toNext = round2(bracketCeilings[2] - ytd + 0.01);
+
+              // Bonus earned this month (incremental bracket calculation)
+              let bonusEarned = 0;
+              // Apply each bracket rate to the portion of this month's collections that falls in it
+              let remaining = collections;
+              let cursor = prevYtd;
+              for (let bi = 0; bi < BRACKETS.length && remaining > 0; bi++) {
+                const ceil = bi < bracketCeilings.length ? bracketCeilings[bi] : Infinity;
+                const space = Math.max(0, ceil - cursor);
+                const inBracket = Math.min(remaining, space);
+                bonusEarned += inBracket * BRACKETS[bi].rate;
+                cursor += inBracket;
+                remaining -= inBracket;
+              }
+              // Any remaining above all ceilings gets the last bracket rate
+              if (remaining > 0) bonusEarned += remaining * BRACKETS[BRACKETS.length - 1].rate;
+              bonusEarned = round2(bonusEarned);
+              cumBonus = round2(cumBonus + bonusEarned);
+
+              rows.push({ month: mn, collections, ytd, bracket, toNext, bonusEarned, cumBonus });
+            }
+            bonusData[atty.ini] = { baseTarget: round2(baseTarget), rows };
+          }
+
+          // ---- CREATE BONUS TRACKER SHEET ----
+          let trackerSheet = wb.getWorksheet("Bonus Tracker");
+          if (trackerSheet) wb.removeWorksheet(trackerSheet.id);
+          trackerSheet = wb.addWorksheet("Bonus Tracker");
+
+          const attys = configAttorneys;
+          const colsPerAtty = 4; // Collections, YTD, Bonus Earned, Cum Bonus
+          const startCol = 2; // Col B onwards (Col A = month labels)
+
+          // Row 1: Title
+          trackerSheet.getRow(1).getCell(1).value = `${params.year} Bonus Tracker`;
+          trackerSheet.getRow(1).getCell(1).font = { bold: true, size: 14 };
+
+          // Row 3: Attorney headers (merged across 4 cols each)
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = startCol + ai * colsPerAtty;
+            trackerSheet.getRow(3).getCell(col).value = attys[ai].ini;
+            trackerSheet.getRow(3).getCell(col).font = { bold: true, size: 12 };
+          }
+
+          // Row 4: Sub-headers
+          trackerSheet.getRow(4).getCell(1).value = "Month";
+          trackerSheet.getRow(4).getCell(1).font = { bold: true };
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = startCol + ai * colsPerAtty;
+            trackerSheet.getRow(4).getCell(col).value = "Collections";
+            trackerSheet.getRow(4).getCell(col + 1).value = "YTD";
+            trackerSheet.getRow(4).getCell(col + 2).value = "Bonus";
+            trackerSheet.getRow(4).getCell(col + 3).value = "Cum Bonus";
+          }
+          trackerSheet.getRow(4).font = { bold: true };
+
+          // Rows 5-16: Monthly data
+          for (let mi = 0; mi < 12; mi++) {
+            const rowNum = 5 + mi;
+            const row = trackerSheet.getRow(rowNum);
+            row.getCell(1).value = monthNames[mi];
+            for (let ai = 0; ai < attys.length; ai++) {
+              const col = startCol + ai * colsPerAtty;
+              const br = bonusData[attys[ai].ini]?.rows[mi];
+              if (br && (br.collections > 0 || br.ytd > 0)) {
+                row.getCell(col).value = br.collections;
+                row.getCell(col + 1).value = br.ytd;
+                row.getCell(col + 2).value = br.bonusEarned;
+                row.getCell(col + 3).value = br.cumBonus;
               }
             }
+            row.commit();
+          }
 
-            bonusTabCount++;
-          });
+          // Row 17: Totals
+          const totalsRow = trackerSheet.getRow(17);
+          totalsRow.getCell(1).value = "TOTAL";
+          totalsRow.font = { bold: true };
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = startCol + ai * colsPerAtty;
+            const bd = bonusData[attys[ai].ini];
+            if (bd) {
+              const lastRow = bd.rows.filter(r => r.collections > 0).pop();
+              totalsRow.getCell(col).value = bd.rows.reduce((s, r) => s + r.collections, 0);
+              totalsRow.getCell(col + 1).value = lastRow?.ytd || 0;
+              totalsRow.getCell(col + 2).value = bd.rows.reduce((s, r) => s + r.bonusEarned, 0);
+              totalsRow.getCell(col + 3).value = lastRow?.cumBonus || 0;
+            }
+          }
+          totalsRow.commit();
 
-          // Save and upload back to Box
+          // Row 19+: Summary block
+          trackerSheet.getRow(19).getCell(1).value = "Attorney Summary";
+          trackerSheet.getRow(19).getCell(1).font = { bold: true, size: 12 };
+          const sumHeaders = ["Attorney", "Base Target", "YTD Collections", "Current Bracket", "To Next Bracket", "Total Bonus Earned", "Paid", "Balance"];
+          trackerSheet.getRow(20).values = sumHeaders;
+          trackerSheet.getRow(20).font = { bold: true };
+
+          for (let ai = 0; ai < attys.length; ai++) {
+            const row = trackerSheet.getRow(21 + ai);
+            const bd = bonusData[attys[ai].ini];
+            if (!bd) continue;
+            const lastActive = bd.rows.filter(r => r.collections > 0).pop() || bd.rows[0];
+            row.getCell(1).value = attys[ai].ini;
+            row.getCell(2).value = bd.baseTarget;
+            row.getCell(3).value = lastActive.ytd;
+            row.getCell(4).value = lastActive.bracket;
+            row.getCell(5).value = lastActive.toNext;
+            row.getCell(6).value = lastActive.cumBonus;
+            row.getCell(7).value = 0; // Paid — manually editable
+            row.getCell(8).value = lastActive.cumBonus; // Balance = bonus - paid
+            row.commit();
+          }
+
+          // Format currency columns
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = startCol + ai * colsPerAtty;
+            for (const c of [col, col + 1, col + 2, col + 3]) {
+              trackerSheet.getColumn(c).numFmt = '"$"#,##0.00';
+            }
+          }
+          for (const c of [2, 3, 5, 6, 7, 8]) {
+            trackerSheet.getColumn(c).numFmt = '"$"#,##0.00';
+          }
+          trackerSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
+
+          // ---- SAVE AND UPLOAD ----
           const outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
           const result = await uploadToBox({
             buffer: outputBuffer,
@@ -1159,8 +1347,9 @@ export function registerDocumentTools(server: McpServer): void {
                 month: monthName,
                 year: params.year,
                 timekeepers_updated: tkUpdated,
-                bonus_tabs_repaired: bonusTabCount,
                 block_created: blockCreated,
+                bonus_tracker_rebuilt: true,
+                attorneys_tracked: attys.length,
                 box_file_id: result.box_file_id,
                 box_url: result.box_url,
               }),
