@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawPatchSingle, rawGetSingle } from "../clio/pagination";
+import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -411,6 +411,78 @@ export function registerTimeTools(server: McpServer): void {
               message: err.message,
               clio_error: err.response?.data || err.body,
             }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // create_time_entry
+  server.tool(
+    "create_time_entry",
+    "Create a new time entry in Clio. Requires a date, user (timekeeper), matter, and duration. Optionally set the hourly rate and description. The entry is created as non-billable if rate is 0 or omitted, billable otherwise.",
+    {
+      date: z.string().describe("Date for the time entry (YYYY-MM-DD)"),
+      user_id: z.coerce.number().describe("Clio user ID of the timekeeper"),
+      matter_id: z.coerce.number().describe("Clio matter ID to log time against"),
+      hours: z.coerce.number().describe("Duration in decimal hours (e.g. 1.5 for 1h30m)"),
+      note: z.string().optional().describe("Description/narrative for the time entry"),
+      rate: z.coerce.number().optional().describe("Hourly rate in dollars. Omit or 0 for non-billable."),
+      activity_description_id: z.coerce.number().optional().describe("Clio activity description ID (pre-defined activity type). Optional."),
+    },
+    async (params) => {
+      try {
+        const quantity = Math.round(params.hours * 3600); // Clio stores time in seconds
+        if (quantity <= 0) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: "Hours must be greater than 0." }) }],
+            isError: true,
+          };
+        }
+
+        const body: any = {
+          data: {
+            type: "TimeEntry",
+            date: params.date,
+            quantity,
+            user: { id: params.user_id },
+            matter: { id: params.matter_id },
+          },
+        };
+
+        if (params.note) body.data.note = params.note;
+        if (params.rate !== undefined && params.rate > 0) body.data.price = params.rate;
+        if (params.activity_description_id) body.data.activity_description = { id: params.activity_description_id };
+
+        const result = await rawPostSingle("/activities", body);
+        const entry = result.data;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              activity_id: entry.id,
+              date: entry.date,
+              hours: Math.round((entry.quantity / 3600) * 100) / 100,
+              rate: entry.price,
+              note: entry.note,
+              matter_id: params.matter_id,
+              user_id: params.user_id,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status || err.statusCode,
+              clio_error: err.response?.data || err.body,
+            }),
           }],
           isError: true,
         };
