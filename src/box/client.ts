@@ -3,6 +3,7 @@ import FormData from "form-data";
 import { getBoxAccessToken } from "../utils/tokenStore";
 import { refreshBoxAccessToken } from "./auth";
 
+const BOX_API_BASE = "https://api.box.com/2.0";
 const BOX_UPLOAD_BASE = "https://upload.box.com/api/2.0";
 
 export interface BoxFileMetadata {
@@ -13,12 +14,7 @@ export interface BoxFileMetadata {
   parent?: { id: string; name: string };
 }
 
-function createUploadClient(userEmail: string): AxiosInstance {
-  const client = axios.create({
-    baseURL: BOX_UPLOAD_BASE,
-    timeout: 300000, // 5 min for large uploads
-  });
-
+function attachInterceptors(client: AxiosInstance, userEmail: string): void {
   client.interceptors.request.use((config) => {
     const token = getBoxAccessToken(userEmail);
     if (token) {
@@ -48,7 +44,23 @@ function createUploadClient(userEmail: string): AxiosInstance {
       throw error;
     }
   );
+}
 
+function createUploadClient(userEmail: string): AxiosInstance {
+  const client = axios.create({
+    baseURL: BOX_UPLOAD_BASE,
+    timeout: 300000,
+  });
+  attachInterceptors(client, userEmail);
+  return client;
+}
+
+function createApiClient(userEmail: string): AxiosInstance {
+  const client = axios.create({
+    baseURL: BOX_API_BASE,
+    timeout: 300000,
+  });
+  attachInterceptors(client, userEmail);
   return client;
 }
 
@@ -89,4 +101,15 @@ export async function boxUploadNewVersion(
   });
 
   return response.data.entries[0];
+}
+
+export async function boxDownloadFile(
+  fileId: string,
+  userEmail: string
+): Promise<Buffer> {
+  const client = createApiClient(userEmail);
+  const response = await client.get(`/files/${fileId}/content`, {
+    responseType: "arraybuffer",
+  });
+  return Buffer.from(response.data);
 }

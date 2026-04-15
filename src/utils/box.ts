@@ -1,9 +1,20 @@
-import { boxUploadFile, boxUploadNewVersion } from "../box/client";
+import { boxUploadFile, boxUploadNewVersion, boxDownloadFile } from "../box/client";
 import { getBoxRegisteredUsers } from "./tokenStore";
 
 interface UploadResult {
   box_file_id: string;
   box_url: string;
+}
+
+/**
+ * Download a file from Box by its file ID.
+ */
+export async function downloadFromBox(fileId: string): Promise<Buffer> {
+  const users = getBoxRegisteredUsers();
+  if (users.length === 0) {
+    throw new Error("No Box user authenticated. Visit /box/oauth/start to connect your Box account.");
+  }
+  return boxDownloadFile(fileId, users[0]);
 }
 
 /**

@@ -7,7 +7,7 @@ import {
   ShadingType, PageBreak, PageNumber, LevelFormat,
 } from "docx";
 import ExcelJS from "exceljs";
-import { uploadToBox } from "../utils/box";
+import { uploadToBox, downloadFromBox } from "../utils/box";
 
 // ========== SHARED HELPERS ==========
 
@@ -810,6 +810,7 @@ export function registerDocumentTools(server: McpServer): void {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
+      update_existing: z.boolean().optional().describe("If true, downloads the firm dashboard from Box, updates the '26 Compare' sheet and bonus tabs, then uploads the modified file back."),
     },
     async (params) => {
       try {
@@ -903,6 +904,194 @@ export function registerDocumentTools(server: McpServer): void {
           }
         }
 
+        // Pre-compute responsible hours/billed for each roster member (used by both paths)
+        const respData: Record<number, { respHrs: number; respBilled: number }> = {};
+        for (const r of ROSTER) {
+          const respHrs = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
+            .reduce((s: number, e: any) => s + e.quantity / 3600, 0);
+          const respBilled = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
+            .reduce((s: number, e: any) => s + (e.quantity / 3600) * (e.price || 0), 0);
+          respData[r.user_id] = { respHrs, respBilled };
+        }
+
+        // ---- UPDATE EXISTING DASHBOARD IN BOX ----
+        if (params.update_existing) {
+          const DASHBOARD_FILE_ID = "2167989734211";
+          const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
+          const wb = new ExcelJS.Workbook();
+          await wb.xlsx.load(fileBuffer);
+
+          const compareSheet = wb.getWorksheet("26 Compare");
+          if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
+
+          // Helper: scan a month block in 26 Compare and return { initials -> row number }
+          function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): { headerRow: number; map: Record<string, number> } {
+            let headerRow = 0;
+            sheet.eachRow((row, rowNum) => {
+              const bVal = String(row.getCell(2).value ?? "").trim();
+              if (bVal === targetMonth && headerRow === 0) headerRow = rowNum;
+            });
+            if (!headerRow) throw new Error(`Month '${targetMonth}' not found in column B of 26 Compare.`);
+            const map: Record<string, number> = {};
+            for (let r = headerRow + 1; r <= sheet.rowCount; r++) {
+              const row = sheet.getRow(r);
+              const bVal = String(row.getCell(2).value ?? "").trim();
+              const cVal = String(row.getCell(3).value ?? "").trim();
+              // Stop if we hit the next month name in column B (non-empty B with empty C means new header)
+              if (bVal && !cVal) break;
+              if (cVal) map[cVal.toUpperCase()] = r;
+            }
+            return { headerRow, map };
+          }
+
+          const { map: initialsRowMap } = scanMonthBlock(compareSheet, monthName);
+          const { map: janInitialsRowMap } = scanMonthBlock(compareSheet, "January");
+
+          // Reverse map: row number -> initials for January block
+          const janRowToInitials: Record<number, string> = {};
+          for (const [ini, row] of Object.entries(janInitialsRowMap)) janRowToInitials[row] = ini;
+
+          // Write Clio data into 26 Compare for the target month
+          let tkUpdated = 0;
+          for (const r of ROSTER) {
+            const row = initialsRowMap[r.initials.toUpperCase()];
+            if (!row) continue;
+            const d = data[r.user_id];
+            const rd = respData[r.user_id];
+            const wsRow = compareSheet.getRow(row);
+
+            wsRow.getCell(4).value = round1(d.bizDev);            // D: BizDev
+            wsRow.getCell(5).value = round1(d.potentialClients);   // E: Potential clients
+            wsRow.getCell(6).value = round1(d.cle);                // F: CLE
+            wsRow.getCell(7).value = round1(d.otherAdmin);         // G: Admin
+            wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin); // H: TNB
+            wsRow.getCell(9).value = round1(d.billableHrs);        // I: Billable hours
+            wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs); // J: Total hours
+            wsRow.getCell(11).value = round2(d.billedDollars);     // K: Billed amount
+            wsRow.getCell(14).value = round2(d.indivCollected);    // N: Individual collected
+            wsRow.getCell(17).value = round1(rd.respHrs);          // Q: Responsible billable
+            wsRow.getCell(18).value = round2(rd.respBilled);       // R: Responsible billed
+            wsRow.getCell(19).value = round2(d.respCollected);     // S: Responsible collected
+            wsRow.commit();
+            tkUpdated++;
+          }
+
+          // ---- REPAIR BONUS TAB FORMULAS ----
+          let bonusTabCount = 0;
+          const monthNames2 = monthNames; // reuse the array already in scope
+
+          wb.eachSheet((ws) => {
+            if (!ws.name.toLowerCase().includes("bonus")) return;
+
+            const initials = ws.name.split(/\s+/)[0].toUpperCase();
+            const primaryRow = initialsRowMap[initials];
+            if (!primaryRow) return; // attorney not in current month block
+
+            // Find January formula row in bonus sheet
+            let janFormulaRow = 0;
+            ws.eachRow((row, rowNum) => {
+              const bVal = String(row.getCell(2).value ?? "").trim();
+              if (bVal === "January" && janFormulaRow === 0) janFormulaRow = rowNum + 1;
+            });
+            if (!janFormulaRow) return;
+
+            const janCell = ws.getRow(janFormulaRow).getCell(3);
+            const janFormula = typeof janCell.value === "object" && janCell.value !== null && "formula" in janCell.value
+              ? (janCell.value as any).formula
+              : (janCell as any).formula;
+            if (!janFormula || typeof janFormula !== "string") return;
+
+            // Parse cell references: match '26 Compare'!<col><row> patterns
+            const refRegex = /'26 Compare'!([A-Z]+)(\d+)/g;
+            const refs: { full: string; col: string; row: number }[] = [];
+            let m: RegExpExecArray | null;
+            while ((m = refRegex.exec(janFormula)) !== null) {
+              refs.push({ full: m[0], col: m[1], row: parseInt(m[2], 10) });
+            }
+            if (refs.length === 0) return;
+
+            // Build the updated formula by replacing row numbers
+            let newFormula = janFormula;
+            for (const ref of refs) {
+              const refInitials = janRowToInitials[ref.row];
+              let newRow: number;
+              if (refInitials === initials) {
+                // Primary attorney
+                newRow = primaryRow;
+              } else if (refInitials && initialsRowMap[refInitials]) {
+                // Secondary/tertiary — find same initials in current month block
+                newRow = initialsRowMap[refInitials];
+              } else {
+                // Can't map — skip this bonus sheet
+                return;
+              }
+              newFormula = newFormula.replace(
+                `'26 Compare'!${ref.col}${ref.row}`,
+                `'26 Compare'!${ref.col}${newRow}`
+              );
+            }
+
+            // Find the target month row in the bonus sheet
+            let targetBonusRow = 0;
+            ws.eachRow((row, rowNum) => {
+              const bVal = String(row.getCell(2).value ?? "").trim();
+              if (bVal === monthName && targetBonusRow === 0) targetBonusRow = rowNum + 1;
+            });
+            if (!targetBonusRow) return;
+
+            // Write the updated formula
+            ws.getRow(targetBonusRow).getCell(3).value = { formula: newFormula } as any;
+            ws.getRow(targetBonusRow).commit();
+
+            // Suppress #REF! errors in future month rows
+            const currentMonthIdx = params.month - 1;
+            for (let mi = currentMonthIdx + 1; mi < 12; mi++) {
+              const futureMonth = monthNames2[mi];
+              let futureRow = 0;
+              ws.eachRow((row, rowNum) => {
+                const bVal = String(row.getCell(2).value ?? "").trim();
+                if (bVal === futureMonth && futureRow === 0) futureRow = rowNum + 1;
+              });
+              if (!futureRow) continue;
+              const futureCell = ws.getRow(futureRow).getCell(3);
+              const fVal = futureCell.value;
+              const hasError = (typeof fVal === "object" && fVal !== null && "error" in fVal)
+                || String(fVal ?? "").includes("#REF!");
+              if (hasError) {
+                futureCell.value = "";
+                ws.getRow(futureRow).commit();
+              }
+            }
+
+            bonusTabCount++;
+          });
+
+          // Save and upload back to Box
+          const outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
+          const result = await uploadToBox({
+            buffer: outputBuffer,
+            filename: `${params.year} Firm Dashboard.xlsx`,
+            folderId: "375774779182",
+            overwriteFileId: DASHBOARD_FILE_ID,
+          });
+
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                updated_sheet: "26 Compare",
+                month: monthName,
+                year: params.year,
+                timekeepers_updated: tkUpdated,
+                bonus_tabs_repaired: bonusTabCount,
+                box_file_id: result.box_file_id,
+                box_url: result.box_url,
+              }),
+            }],
+          };
+        }
+
         // Build Excel
         const wb = new ExcelJS.Workbook();
         const ws = wb.addWorksheet(`${monthName} ${params.year}`);
@@ -926,18 +1115,14 @@ export function registerDocumentTools(server: McpServer): void {
           const totalNonbill = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
           const totalHrs = round1(d.billableHrs + d.nonbillableHrs);
 
-          // Responsible hours = sum of all time on matters where this person is responsible attorney
-          const respHrs = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + e.quantity / 3600, 0);
-          const respBilled = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + (e.quantity / 3600) * (e.price || 0), 0);
+          const rd = respData[r.user_id];
 
           ws.addRow([
             r.initials, r.name,
             round1(d.bizDev), round1(d.potentialClients), round1(d.cle), round1(d.otherAdmin), totalNonbill,
             round1(d.billableHrs), totalHrs,
             round2(d.billedDollars), round2(d.indivCollected),
-            round1(respHrs), round2(respBilled), round2(d.respCollected),
+            round1(rd.respHrs), round2(rd.respBilled), round2(d.respCollected),
           ]);
         }
 
