@@ -1825,7 +1825,7 @@ export function registerDocumentTools(server: McpServer): void {
           const outputBuffer = await surgicalWriteXlsx(fileBuffer, cleanWb, modifiedSheets, deletedSheets);
           const result = await uploadToBox({
             buffer: outputBuffer,
-            filename: `${params.year} Firm Dashboard - Claude Version.xlsx`,
+            filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
             folderId: "348313592902",
             overwriteFileId: DASHBOARD_FILE_ID,
           });
