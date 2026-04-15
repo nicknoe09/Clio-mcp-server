@@ -25,18 +25,13 @@ async function surgicalWriteXlsx(
   const modBuffer = Buffer.from(await modifiedWb.xlsx.writeBuffer());
   const modZip = await JSZip.loadAsync(modBuffer);
 
-  // Parse workbook.xml.rels to map rIds to file paths in both zips
-  function parseRels(zip: JSZip): Record<string, string> {
-    const relsXml = zip.file("xl/_rels/workbook.xml.rels");
-    if (!relsXml) return {};
-    // We'll parse synchronously from the already-loaded zip
-    return {};
-  }
-
   // Build sheet name -> file path mapping by parsing xl/workbook.xml
   async function getSheetMap(zip: JSZip): Promise<Record<string, string>> {
-    const wbXml = await zip.file("xl/workbook.xml")?.async("string");
-    const relsXml = await zip.file("xl/_rels/workbook.xml.rels")?.async("string");
+    const wbFile = zip.file("xl/workbook.xml");
+    const relsFile = zip.file("xl/_rels/workbook.xml.rels");
+    if (!wbFile || !relsFile) return {};
+    const wbXml = await wbFile.async("string");
+    const relsXml = await relsFile.async("string");
     if (!wbXml || !relsXml) return {};
 
     // Extract sheet entries: <sheet name="..." sheetId="..." r:id="rId..."/>
@@ -95,13 +90,13 @@ async function surgicalWriteXlsx(
   }
 
   // Copy ALL table files from original (they belong to unmodified sheets)
-  origZip.folder("xl/tables")?.forEach((relativePath, file) => {
-    // Will be copied synchronously below
-  });
-  const tableFiles = Object.keys(origZip.files).filter(f => f.startsWith("xl/tables/"));
+  const tableFiles = Object.keys(origZip.files).filter(f => f.startsWith("xl/tables/") && !origZip.files[f].dir);
   for (const tf of tableFiles) {
-    const content = await origZip.file(tf)!.async("uint8array");
-    resultZip.file(tf, content);
+    const file = origZip.file(tf);
+    if (file) {
+      const content = await file.async("uint8array");
+      resultZip.file(tf, content);
+    }
   }
 
   return Buffer.from(await resultZip.generateAsync({ type: "nodebuffer" }));
