@@ -1084,9 +1084,12 @@ export function registerDocumentTools(server: McpServer): void {
         // ---- UPDATE EXISTING DASHBOARD IN BOX ----
         if (params.update_existing) {
           const DASHBOARD_FILE_ID = "2199202082188";
+          let _step = "downloading from Box";
           const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
+          _step = "loading workbook";
           const wb = new ExcelJS.Workbook();
           await wb.xlsx.load(fileBuffer);
+          _step = "getting 26 Compare sheet";
 
           const compareSheet = wb.getWorksheet("26 Compare");
           if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
@@ -1117,6 +1120,7 @@ export function registerDocumentTools(server: McpServer): void {
           const janBlock = scanMonthBlock(compareSheet, "January");
           if (!janBlock) throw new Error("January block not found in 26 Compare.");
 
+          _step = "creating month block";
           // ---- Create month block if it doesn't exist (overwrite approach) ----
           let monthBlock = scanMonthBlock(compareSheet, monthName);
           let blockCreated = false;
@@ -1216,6 +1220,7 @@ export function registerDocumentTools(server: McpServer): void {
 
           const initialsRowMap = monthBlock.map;
 
+          _step = "writing Clio data to 26 Compare";
           // ---- Write Clio data into 26 Compare ----
           let tkUpdated = 0;
           for (const r of ROSTER) {
@@ -1240,10 +1245,12 @@ export function registerDocumentTools(server: McpServer): void {
             tkUpdated++;
           }
 
+          _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
           // Don't remove from ExcelJS (causes writeBuffer crash) — surgical write handles deletion at zip level
           const sheetsToDelete = wb.worksheets.filter(ws => ws.name.toLowerCase().includes("bonus"));
 
+          _step = "creating Bonus Config";
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
             { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
@@ -1323,6 +1330,7 @@ export function registerDocumentTools(server: McpServer): void {
             configSheet.columns.forEach(col => { col.width = 16; });
           }
 
+          _step = "computing bonus data";
           // ---- COMPUTE BONUS DATA ----
           const overheadShare = firmOverhead / numAttorneys;
 
@@ -1402,6 +1410,7 @@ export function registerDocumentTools(server: McpServer): void {
             bonusData[atty.ini] = { baseTarget: round2(baseTarget), rows };
           }
 
+          _step = "creating Bonus Tracker";
           // ---- CREATE BONUS TRACKER SHEET ----
           let trackerSheet = wb.getWorksheet("Bonus Tracker");
           if (trackerSheet) wb.removeWorksheet(trackerSheet.id);
@@ -1503,6 +1512,7 @@ export function registerDocumentTools(server: McpServer): void {
             trackerSheet.getColumn(c).numFmt = '"$"#,##0.00';
           }
 
+          _step = "paralegal hours bonus";
           // ---- PARALEGAL HOURS BONUS SECTION ----
           const PARALEGALS = ["ACA", "AFL", "AKG"];
           const PARA_BONUS_TIERS = [
@@ -1592,12 +1602,14 @@ export function registerDocumentTools(server: McpServer): void {
 
           trackerSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
+          _step = "deleting NAF tabs";
           // ---- DELETE OLD NAF TABS ----
           const nafSheets = wb.worksheets.filter(ws =>
             ws.name.includes("NAF(") || ws.name.includes("NAF Admin")
           );
           for (const ws of nafSheets) { sheetsToDelete.push(ws); }
 
+          _step = "building Attorney Performance";
           // ---- ATTORNEY PERFORMANCE SHEET ----
           // Read 2026 Goals for per-attorney annual goals and billing rates
           const goalsSheet = wb.getWorksheet("2026 Goals ") || wb.getWorksheet("2026 Goals");
@@ -1760,6 +1772,7 @@ export function registerDocumentTools(server: McpServer): void {
           }
           perfSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
+          _step = "surgical write + upload";
           // ---- SAVE AND UPLOAD (surgical write to preserve Excel Tables) ----
           // Build a clean workbook with ONLY the sheets we modified/created.
           // ExcelJS can't round-trip the original file (corrupts Excel Tables),
@@ -1892,7 +1905,7 @@ export function registerDocumentTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
         };
       } catch (err: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, step: _step, message: err.message, stack: err.stack?.split("\n").slice(0, 5).join(" | ") }) }], isError: true };
       }
     }
   );
