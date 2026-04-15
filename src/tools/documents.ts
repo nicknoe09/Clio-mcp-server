@@ -924,32 +924,105 @@ export function registerDocumentTools(server: McpServer): void {
           const compareSheet = wb.getWorksheet("26 Compare");
           if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
 
-          // Helper: scan a month block in 26 Compare and return { initials -> row number }
-          function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): { headerRow: number; map: Record<string, number> } {
-            let headerRow = 0;
+          // Helper: scan a month block in 26 Compare.
+          // Every row in a block has the month name in column B and initials in column C.
+          // Returns null if the month block doesn't exist.
+          function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): { firstRow: number; lastRow: number; sumRow: number; map: Record<string, number>; initials: string[] } | null {
+            const map: Record<string, number> = {};
+            const initials: string[] = [];
+            let firstRow = 0;
+            let lastRow = 0;
+            let sumRow = 0;
             sheet.eachRow((row, rowNum) => {
               const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === targetMonth && headerRow === 0) headerRow = rowNum;
-            });
-            if (!headerRow) throw new Error(`Month '${targetMonth}' not found in column B of 26 Compare.`);
-            const map: Record<string, number> = {};
-            for (let r = headerRow + 1; r <= sheet.rowCount; r++) {
-              const row = sheet.getRow(r);
-              const bVal = String(row.getCell(2).value ?? "").trim();
+              if (bVal !== targetMonth) return;
               const cVal = String(row.getCell(3).value ?? "").trim();
-              // Stop if we hit the next month name in column B (non-empty B with empty C means new header)
-              if (bVal && !cVal) break;
-              if (cVal) map[cVal.toUpperCase()] = r;
-            }
-            return { headerRow, map };
+              if (!firstRow) firstRow = rowNum;
+              if (cVal) {
+                // Only record first occurrence of each initials (handles duplicate JPB in March)
+                if (!map[cVal.toUpperCase()]) {
+                  map[cVal.toUpperCase()] = rowNum;
+                  initials.push(cVal.toUpperCase());
+                }
+                lastRow = rowNum;
+              } else {
+                // Row with month name but no initials = SUM row
+                sumRow = rowNum;
+              }
+            });
+            if (!firstRow) return null;
+            return { firstRow, lastRow, sumRow, map, initials };
           }
 
-          const { map: initialsRowMap } = scanMonthBlock(compareSheet, monthName);
-          const { map: janInitialsRowMap } = scanMonthBlock(compareSheet, "January");
+          // Scan January block (always exists — source of truth for bonus formulas)
+          const janBlock = scanMonthBlock(compareSheet, "January");
+          if (!janBlock) throw new Error("January block not found in 26 Compare.");
 
-          // Reverse map: row number -> initials for January block
+          // Reverse map: January row number -> initials
           const janRowToInitials: Record<number, string> = {};
-          for (const [ini, row] of Object.entries(janInitialsRowMap)) janRowToInitials[row] = ini;
+          for (const [ini, row] of Object.entries(janBlock.map)) janRowToInitials[row] = ini;
+
+          // Check if target month block exists; if not, create it
+          let monthBlock = scanMonthBlock(compareSheet, monthName);
+          let blockCreated = false;
+
+          if (!monthBlock) {
+            // Find insertion point: after the last existing month block's SUM row, before "2026 Totals"
+            // Scan for "2026 Totals" or find the last month block
+            let totalsFirstRow = 0;
+            compareSheet.eachRow((row, rowNum) => {
+              const bVal = String(row.getCell(2).value ?? "").trim();
+              if (bVal === "2026 Totals" && !totalsFirstRow) totalsFirstRow = rowNum;
+            });
+
+            // Find last existing month block to know where to insert
+            let lastBlockSumRow = 0;
+            for (let mi = params.month - 2; mi >= 0; mi--) {
+              const prevBlock = scanMonthBlock(compareSheet, monthNames[mi]);
+              if (prevBlock && prevBlock.sumRow) { lastBlockSumRow = prevBlock.sumRow; break; }
+            }
+
+            // Insert point: 2 rows after last block's SUM row (gap row + new block start)
+            const insertAt = lastBlockSumRow ? lastBlockSumRow + 3 : (totalsFirstRow ? totalsFirstRow : compareSheet.rowCount + 3);
+
+            // Use January's initials as the template
+            const templateInitials = janBlock.initials;
+            const blockSize = templateInitials.length; // data rows only
+            const totalInsert = blockSize + 1; // data rows + SUM row
+
+            // Splice in empty rows (shifts existing rows down)
+            compareSheet.spliceRows(insertAt, 0, ...Array(totalInsert + 2).fill([])); // +2 for gap rows
+
+            // Write month name + initials into new block
+            const newMap: Record<string, number> = {};
+            const newInitials: string[] = [];
+            for (let i = 0; i < templateInitials.length; i++) {
+              const rowNum = insertAt + i;
+              const row = compareSheet.getRow(rowNum);
+              row.getCell(2).value = monthName;
+              row.getCell(3).value = templateInitials[i];
+              newMap[templateInitials[i]] = rowNum;
+              newInitials.push(templateInitials[i]);
+              row.commit();
+            }
+
+            // Write SUM row
+            const sumRowNum = insertAt + blockSize;
+            const sumRow = compareSheet.getRow(sumRowNum);
+            sumRow.getCell(2).value = monthName;
+            // Add SUM formulas for data columns D through S
+            const sumCols = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19];
+            for (const col of sumCols) {
+              const colLetter = String.fromCharCode(64 + col); // D=68-64=4 -> 'D'
+              sumRow.getCell(col).value = { formula: `SUM(${colLetter}${insertAt}:${colLetter}${insertAt + blockSize - 1})` } as any;
+            }
+            sumRow.commit();
+
+            monthBlock = { firstRow: insertAt, lastRow: insertAt + blockSize - 1, sumRow: sumRowNum, map: newMap, initials: newInitials };
+            blockCreated = true;
+          }
+
+          const initialsRowMap = monthBlock.map;
 
           // Write Clio data into 26 Compare for the target month
           let tkUpdated = 0;
@@ -978,64 +1051,66 @@ export function registerDocumentTools(server: McpServer): void {
 
           // ---- REPAIR BONUS TAB FORMULAS ----
           let bonusTabCount = 0;
-          const monthNames2 = monthNames; // reuse the array already in scope
 
           wb.eachSheet((ws) => {
             if (!ws.name.toLowerCase().includes("bonus")) return;
+            // Skip PARA Bonus (different structure — not attorney-specific)
+            if (ws.name.toUpperCase().includes("PARA")) return;
 
             const initials = ws.name.split(/\s+/)[0].toUpperCase();
             const primaryRow = initialsRowMap[initials];
             if (!primaryRow) return; // attorney not in current month block
 
-            // Find January formula row in bonus sheet
-            let janFormulaRow = 0;
+            // Find January row in bonus sheet: scan col B for "January"
+            let janBonusRow = 0;
             ws.eachRow((row, rowNum) => {
               const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === "January" && janFormulaRow === 0) janFormulaRow = rowNum + 1;
+              if (bVal === "January" && !janBonusRow) janBonusRow = rowNum;
             });
-            if (!janFormulaRow) return;
+            if (!janBonusRow) return;
 
-            const janCell = ws.getRow(janFormulaRow).getCell(3);
-            const janFormula = typeof janCell.value === "object" && janCell.value !== null && "formula" in janCell.value
-              ? (janCell.value as any).formula
-              : (janCell as any).formula;
-            if (!janFormula || typeof janFormula !== "string") return;
+            // Read January formula from column C
+            const janCell = ws.getRow(janBonusRow).getCell(3);
+            const janFormula = typeof janCell.value === "object" && janCell.value !== null && "formula" in (janCell.value as any)
+              ? (janCell.value as any).formula as string
+              : typeof (janCell as any).formula === "string" ? (janCell as any).formula : null;
 
-            // Parse cell references: match '26 Compare'!<col><row> patterns
+            // If January has no formula (e.g. NAF/MNH/TBS with value 0), skip
+            if (!janFormula) return;
+
+            // Parse cell references: '26 Compare'!<col><row>
             const refRegex = /'26 Compare'!([A-Z]+)(\d+)/g;
-            const refs: { full: string; col: string; row: number }[] = [];
+            const refs: { col: string; row: number; offset: number; length: number }[] = [];
             let m: RegExpExecArray | null;
             while ((m = refRegex.exec(janFormula)) !== null) {
-              refs.push({ full: m[0], col: m[1], row: parseInt(m[2], 10) });
+              refs.push({ col: m[1], row: parseInt(m[2], 10), offset: m.index, length: m[0].length });
             }
             if (refs.length === 0) return;
 
-            // Build the updated formula by replacing row numbers
+            // Build the updated formula by replacing row numbers (right-to-left to preserve offsets)
             let newFormula = janFormula;
-            for (const ref of refs) {
+            const sortedRefs = [...refs].sort((a, b) => b.offset - a.offset);
+            for (const ref of sortedRefs) {
               const refInitials = janRowToInitials[ref.row];
               let newRow: number;
               if (refInitials === initials) {
-                // Primary attorney
                 newRow = primaryRow;
               } else if (refInitials && initialsRowMap[refInitials]) {
-                // Secondary/tertiary — find same initials in current month block
                 newRow = initialsRowMap[refInitials];
               } else {
-                // Can't map — skip this bonus sheet
+                // Can't map this reference — skip this bonus sheet entirely
                 return;
               }
-              newFormula = newFormula.replace(
-                `'26 Compare'!${ref.col}${ref.row}`,
-                `'26 Compare'!${ref.col}${newRow}`
-              );
+              const original = `'26 Compare'!${ref.col}${ref.row}`;
+              const replacement = `'26 Compare'!${ref.col}${newRow}`;
+              newFormula = newFormula.substring(0, ref.offset) + replacement + newFormula.substring(ref.offset + ref.length);
             }
 
-            // Find the target month row in the bonus sheet
+            // Find the target month row in the bonus sheet (col B = monthName)
             let targetBonusRow = 0;
             ws.eachRow((row, rowNum) => {
               const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal === monthName && targetBonusRow === 0) targetBonusRow = rowNum + 1;
+              if (bVal === monthName && !targetBonusRow) targetBonusRow = rowNum;
             });
             if (!targetBonusRow) return;
 
@@ -1044,20 +1119,20 @@ export function registerDocumentTools(server: McpServer): void {
             ws.getRow(targetBonusRow).commit();
 
             // Suppress #REF! errors in future month rows
-            const currentMonthIdx = params.month - 1;
-            for (let mi = currentMonthIdx + 1; mi < 12; mi++) {
-              const futureMonth = monthNames2[mi];
+            for (let mi = params.month; mi < 12; mi++) {
+              const futureMonth = monthNames[mi];
               let futureRow = 0;
               ws.eachRow((row, rowNum) => {
                 const bVal = String(row.getCell(2).value ?? "").trim();
-                if (bVal === futureMonth && futureRow === 0) futureRow = rowNum + 1;
+                if (bVal === futureMonth && !futureRow) futureRow = rowNum;
               });
               if (!futureRow) continue;
               const futureCell = ws.getRow(futureRow).getCell(3);
               const fVal = futureCell.value;
-              const hasError = (typeof fVal === "object" && fVal !== null && "error" in fVal)
+              const isError = (typeof fVal === "object" && fVal !== null && "error" in (fVal as any))
+                || (typeof fVal === "object" && fVal !== null && "result" in (fVal as any) && typeof (fVal as any).result === "object" && (fVal as any).result?.error)
                 || String(fVal ?? "").includes("#REF!");
-              if (hasError) {
+              if (isError) {
                 futureCell.value = "";
                 ws.getRow(futureRow).commit();
               }
@@ -1085,6 +1160,7 @@ export function registerDocumentTools(server: McpServer): void {
                 year: params.year,
                 timekeepers_updated: tkUpdated,
                 bonus_tabs_repaired: bonusTabCount,
+                block_created: blockCreated,
                 box_file_id: result.box_file_id,
                 box_url: result.box_url,
               }),
