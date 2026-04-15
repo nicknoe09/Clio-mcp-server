@@ -1084,7 +1084,7 @@ export function registerDocumentTools(server: McpServer): void {
 
         // ---- UPDATE EXISTING DASHBOARD IN BOX ----
         if (params.update_existing) {
-          const DASHBOARD_FILE_ID = "2199202082188";
+          const DASHBOARD_FILE_ID = "2199324794140"; // Claude Version 2
           _step = "downloading from Box";
           const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
           _step = "loading workbook";
