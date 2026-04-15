@@ -1082,9 +1082,10 @@ export function registerDocumentTools(server: McpServer): void {
         }
 
         // ---- UPDATE EXISTING DASHBOARD IN BOX ----
+        let _step = "init";
         if (params.update_existing) {
           const DASHBOARD_FILE_ID = "2199202082188";
-          let _step = "downloading from Box";
+          _step = "downloading from Box";
           const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
           _step = "loading workbook";
           const wb = new ExcelJS.Workbook();
