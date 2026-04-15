@@ -1523,8 +1523,176 @@ export function registerDocumentTools(server: McpServer): void {
 
           trackerSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
+          // ---- DELETE OLD NAF TABS ----
+          const nafSheets = wb.worksheets.filter(ws =>
+            ws.name.includes("NAF(") || ws.name.includes("NAF Admin")
+          );
+          for (const ws of nafSheets) { sheetsToDelete.push(ws); wb.removeWorksheet(ws.id); }
+
+          // ---- ATTORNEY PERFORMANCE SHEET ----
+          // Read 2026 Goals for per-attorney annual goals and billing rates
+          const goalsSheet = wb.getWorksheet("2026 Goals ") || wb.getWorksheet("2026 Goals");
+          const attyGoals: Record<string, { annualGoal: number; billingRate: number; availableHrs: number; utilGoal: number; realGoal: number; collGoal: number }> = {};
+          if (goalsSheet) {
+            for (let r = 3; r <= 15; r++) {
+              const row = goalsSheet.getRow(r);
+              const ini = String(row.getCell(1).value ?? "").trim().toUpperCase();
+              if (!ini || ini === "TOTAL") continue;
+              const availRaw = row.getCell(2).value;
+              const availHrs = typeof availRaw === "object" && availRaw !== null && "result" in (availRaw as any)
+                ? (availRaw as any).result : (typeof availRaw === "number" ? availRaw : 1880);
+              const utilGoal = Number(row.getCell(3).value) || 0.75;
+              const realGoal = Number(row.getCell(5).value) || 0.75;
+              const collGoal = Number(row.getCell(7).value) || 0.75;
+              const billingRate = Number(row.getCell(9).value) || 0;
+              const goalRaw = row.getCell(10).value;
+              const annualGoal = typeof goalRaw === "object" && goalRaw !== null && "result" in (goalRaw as any)
+                ? (goalRaw as any).result : (typeof goalRaw === "number" ? goalRaw : 0);
+              attyGoals[ini] = { annualGoal, billingRate, availableHrs: availHrs, utilGoal, realGoal, collGoal };
+            }
+          }
+
+          // Read ALL columns from 26 Compare for each month (including L=write-offs, M=discounts)
+          const monthFullData: Record<string, Record<string, {
+            bizDev: number; potClients: number; cle: number; admin: number; tnb: number;
+            billableHrs: number; totalHrs: number; billedAmt: number; writeOffs: number;
+            discounts: number; collected: number;
+          }>> = {};
+          for (let mi = 0; mi < 12; mi++) {
+            const mn = monthNames[mi];
+            const block = scanMonthBlock(compareSheet, mn);
+            if (!block) continue;
+            monthFullData[mn] = {};
+            for (const [ini, rowNum] of Object.entries(block.map)) {
+              const r = compareSheet.getRow(rowNum);
+              const getNum = (col: number) => { const v = r.getCell(col).value; return typeof v === "number" ? v : (parseFloat(String(v)) || 0); };
+              monthFullData[mn][ini] = {
+                bizDev: getNum(4), potClients: getNum(5), cle: getNum(6), admin: getNum(7),
+                tnb: getNum(8), billableHrs: getNum(9), totalHrs: getNum(10), billedAmt: getNum(11),
+                writeOffs: getNum(12), discounts: getNum(13), collected: getNum(14),
+              };
+            }
+          }
+
+          // Create the sheet
+          let perfSheet = wb.getWorksheet("Attorney Performance");
+          if (perfSheet) wb.removeWorksheet(perfSheet.id);
+          perfSheet = wb.addWorksheet("Attorney Performance");
+
+          const PERF_HEADERS = [
+            "Month", "BizDev", "Pot Clients", "CLE", "Admin", "TNB",
+            "Billable Hrs", "Total Hrs", "Billed $", "Write-offs", "Discounts",
+            "Collected", "Goal", "vs Goal",
+            "Util Rate", "Util Goal", "Real Rate", "Real Goal", "Coll Rate", "Coll Goal",
+          ];
+
+          let perfRow = 1;
+          perfSheet.getRow(perfRow).getCell(1).value = `${params.year} Attorney Performance`;
+          perfSheet.getRow(perfRow).getCell(1).font = { bold: true, size: 14 };
+          perfRow += 2;
+
+          for (const r of ROSTER) {
+            const goals = attyGoals[r.initials] || { annualGoal: 0, billingRate: 0, availableHrs: 1880, utilGoal: 0.75, realGoal: 0.75, collGoal: 0.75 };
+            const monthlyGoal = round2(goals.annualGoal / 12);
+            const monthlyAvail = round1(goals.availableHrs / 12);
+
+            // Attorney header
+            perfSheet.getRow(perfRow).getCell(1).value = `${r.name} (${r.initials})`;
+            perfSheet.getRow(perfRow).getCell(1).font = { bold: true, size: 12 };
+            perfRow++;
+
+            // Column headers
+            const hdrRow = perfSheet.getRow(perfRow);
+            PERF_HEADERS.forEach((h, i) => { hdrRow.getCell(i + 1).value = h; });
+            hdrRow.font = { bold: true };
+            perfRow++;
+
+            // Monthly data
+            let ytdCollected = 0, ytdBilled = 0, ytdBillableHrs = 0;
+            const dataStartRow = perfRow;
+
+            for (let mi = 0; mi < 12; mi++) {
+              const mn = monthNames[mi];
+              const md = monthFullData[mn]?.[r.initials];
+              const row = perfSheet.getRow(perfRow);
+              row.getCell(1).value = mn;
+
+              if (md && (md.billableHrs > 0 || md.collected > 0 || md.totalHrs > 0)) {
+                ytdCollected += md.collected;
+                ytdBilled += md.billedAmt;
+                ytdBillableHrs += md.billableHrs;
+
+                row.getCell(2).value = round1(md.bizDev);
+                row.getCell(3).value = round1(md.potClients);
+                row.getCell(4).value = round1(md.cle);
+                row.getCell(5).value = round1(md.admin);
+                row.getCell(6).value = round1(md.tnb);
+                row.getCell(7).value = round1(md.billableHrs);
+                row.getCell(8).value = round1(md.totalHrs);
+                row.getCell(9).value = round2(md.billedAmt);
+                row.getCell(10).value = round2(md.writeOffs);
+                row.getCell(11).value = round2(md.discounts);
+                row.getCell(12).value = round2(md.collected);
+                row.getCell(13).value = monthlyGoal;
+                row.getCell(14).value = round2(md.collected - monthlyGoal);
+
+                const utilRate = monthlyAvail > 0 ? md.billableHrs / monthlyAvail : 0;
+                row.getCell(15).value = round2(utilRate);
+                row.getCell(16).value = goals.utilGoal;
+
+                const expectedBilled = md.billableHrs * goals.billingRate;
+                const realRate = expectedBilled > 0 ? md.billedAmt / expectedBilled : 0;
+                row.getCell(17).value = round2(realRate);
+                row.getCell(18).value = goals.realGoal;
+
+                const collRate = md.billedAmt > 0 ? md.collected / md.billedAmt : 0;
+                row.getCell(19).value = round2(collRate);
+                row.getCell(20).value = goals.collGoal;
+              }
+              row.commit();
+              perfRow++;
+            }
+
+            // Totals row
+            const totRow = perfSheet.getRow(perfRow);
+            totRow.getCell(1).value = "YTD";
+            totRow.font = { bold: true };
+            // Sum columns 2-12 from data rows
+            for (let ci = 2; ci <= 12; ci++) {
+              let sum = 0;
+              for (let dr = dataStartRow; dr < dataStartRow + 12; dr++) {
+                const v = perfSheet.getRow(dr).getCell(ci).value;
+                if (typeof v === "number") sum += v;
+              }
+              totRow.getCell(ci).value = round2(sum);
+            }
+            totRow.getCell(13).value = round2(monthlyGoal * 12);
+            totRow.getCell(14).value = round2(ytdCollected - goals.annualGoal);
+            // Average rates
+            const monthsWithData = Object.keys(monthFullData).filter(mn => monthFullData[mn]?.[r.initials]?.totalHrs > 0).length;
+            if (monthsWithData > 0) {
+              const avgUtil = monthlyAvail * monthsWithData > 0 ? ytdBillableHrs / (monthlyAvail * monthsWithData) : 0;
+              totRow.getCell(15).value = round2(avgUtil);
+              const expectedTotal = ytdBillableHrs * goals.billingRate;
+              totRow.getCell(17).value = expectedTotal > 0 ? round2(ytdBilled / expectedTotal) : 0;
+              totRow.getCell(19).value = ytdBilled > 0 ? round2(ytdCollected / ytdBilled) : 0;
+            }
+            totRow.commit();
+            perfRow += 2; // gap before next attorney
+          }
+
+          // Format currency columns
+          for (const col of [9, 10, 11, 12, 13, 14]) {
+            perfSheet.getColumn(col).numFmt = '"$"#,##0.00';
+          }
+          // Format rate columns as percentages
+          for (const col of [15, 16, 17, 18, 19, 20]) {
+            perfSheet.getColumn(col).numFmt = '0%';
+          }
+          perfSheet.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
+
           // ---- SAVE AND UPLOAD (surgical write to preserve Excel Tables) ----
-          const modifiedSheets = new Set(["26 Compare", "Bonus Config", "Bonus Tracker"]);
+          const modifiedSheets = new Set(["26 Compare", "Bonus Config", "Bonus Tracker", "Attorney Performance"]);
           const deletedSheets = new Set(sheetsToDelete.map(ws => ws.name));
           const outputBuffer = await surgicalWriteXlsx(fileBuffer, wb, modifiedSheets, deletedSheets);
           const result = await uploadToBox({
