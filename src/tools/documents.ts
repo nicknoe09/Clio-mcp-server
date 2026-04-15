@@ -1763,12 +1763,31 @@ export function registerDocumentTools(server: McpServer): void {
             const srcSheet = wb.getWorksheet(sheetName);
             if (!srcSheet) continue;
             const dstSheet = cleanWb.addWorksheet(sheetName);
-            // Copy cell values, formulas, and basic formatting
+            // Copy cell values, converting shared formulas to avoid ExcelJS serialization crashes
             srcSheet.eachRow({ includeEmpty: false }, (srcRow, rowNum) => {
               const dstRow = dstSheet.getRow(rowNum);
               srcRow.eachCell({ includeEmpty: false }, (srcCell, colNum) => {
                 const dstCell = dstRow.getCell(colNum);
-                dstCell.value = srcCell.value;
+                const val = srcCell.value as any;
+                if (val && typeof val === "object") {
+                  if ("sharedFormula" in val) {
+                    // Shared formula clone — use cached result only
+                    dstCell.value = val.result ?? null;
+                  } else if ("formula" in val && "shareType" in val) {
+                    // Shared formula master — convert to regular formula
+                    dstCell.value = { formula: val.formula } as any;
+                  } else if ("formula" in val) {
+                    // Regular formula — keep as-is
+                    dstCell.value = { formula: val.formula } as any;
+                  } else if ("error" in val) {
+                    // Error value — write empty
+                    dstCell.value = null;
+                  } else {
+                    dstCell.value = val;
+                  }
+                } else {
+                  dstCell.value = val;
+                }
                 if (srcCell.numFmt) dstCell.numFmt = srcCell.numFmt;
                 if (srcCell.font) dstCell.font = srcCell.font;
               });
