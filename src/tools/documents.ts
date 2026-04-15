@@ -26,7 +26,14 @@ async function surgicalWriteXlsx(
   const origZip = await JSZip.loadAsync(originalBuffer);
 
   // Build a small workbook with only modified sheets, write it, extract sheet XMLs
-  const modBuffer = Buffer.from(await modifiedSheetWb.xlsx.writeBuffer());
+  // Debug: log clean workbook state
+  const cwSheets = modifiedSheetWb.worksheets.map((ws, i) => ws ? ws.name : `UNDEFINED@${i}`);
+  let modBuffer: Buffer;
+  try {
+    modBuffer = Buffer.from(await modifiedSheetWb.xlsx.writeBuffer());
+  } catch (writeErr: any) {
+    throw new Error(`ExcelJS writeBuffer failed on clean workbook (sheets: ${cwSheets.join(", ")}): ${writeErr.message}\n${writeErr.stack}`);
+  }
   const modZip = await JSZip.loadAsync(modBuffer);
 
   // Parse sheet maps
