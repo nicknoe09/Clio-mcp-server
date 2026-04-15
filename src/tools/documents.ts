@@ -748,18 +748,30 @@ export function registerDocumentTools(server: McpServer): void {
             weekly_billable_goal: goal,
             year: targetYear,
             box_folder_id: folderId,
-          }).then(() => ({ name, status: "uploaded" }))
-            .catch((err: Error) => ({ name, status: `FAILED: ${err.message}` }))
+          }).then((res) => ({ name, status: "uploaded" as const, filename: res.filename, box_url: res.box_url, box_file_id: res.box_file_id }))
+            .catch((err: Error) => ({ name, status: `FAILED: ${err.message}` as const, filename: null, box_url: null, box_file_id: null }))
         )
       );
 
-      const summary = results
-        .map((r) => (r.status === "fulfilled" ? r.value : r.reason))
-        .map((r: { name: string; status: string }) => `${r.name}: ${r.status}`)
-        .join("\n");
+      const uploads = results.map((r) => (r.status === "fulfilled" ? r.value : r.reason));
 
       return {
-        content: [{ type: "text" as const, text: summary }],
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            year: targetYear,
+            count: uploads.length,
+            succeeded: uploads.filter((u: any) => u.status === "uploaded").length,
+            failed: uploads.filter((u: any) => u.status !== "uploaded").length,
+            results: uploads.map((u: any) => ({
+              name: u.name,
+              status: u.status,
+              filename: u.filename,
+              box_url: u.box_url,
+              box_file_id: u.box_file_id,
+            })),
+          }, null, 2),
+        }],
       };
     }
   );
