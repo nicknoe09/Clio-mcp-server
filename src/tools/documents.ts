@@ -1291,8 +1291,8 @@ export function registerDocumentTools(server: McpServer): void {
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            { ini: "TBS", salary: 137500, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            { ini: "JPB", salary: 129167, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            { ini: "TBS", salary: 167500, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            { ini: "JPB", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
           ];
           const FIRM_OVERHEAD = 500000;
           const NUM_ATTORNEYS = 5;
