@@ -66,18 +66,44 @@ function extractBearer(req: express.Request): string | null {
   return null;
 }
 
-// Blocks CSRF-style browser drive-by: EventSource can't set custom headers,
-// so a page loaded in the token holder's browser could otherwise open an SSE
-// stream using their ambient cookies. Non-browser clients don't send Origin.
-function mcpGuard(req: express.Request, res: express.Response, next: express.NextFunction): void {
+function checkOrigin(req: express.Request, res: express.Response): boolean {
+  // Blocks CSRF-style browser drive-by: EventSource can't set custom headers,
+  // so a page loaded in the token holder's browser could otherwise open an SSE
+  // stream using their ambient cookies. Non-browser clients don't send Origin.
   const origin = req.headers.origin;
   if (typeof origin === "string" && origin.length > 0) {
     if (!ALLOWED_ORIGINS.has(origin)) {
       res.status(403).json({ error: "Origin not allowed" });
-      return;
+      return false;
     }
   }
+  return true;
+}
 
+function sseGuard(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!checkOrigin(req, res)) return;
+  const token = extractBearer(req);
+  if (!token || !timingSafeEqualStr(token, MCP_AUTH_TOKEN)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+// /messages is the follow-up leg of the SSE handshake: the client posts here
+// using the sessionId advertised by the `event: endpoint` frame. Claude.ai
+// doesn't propagate the `?token=` query (or Authorization header) from the
+// initial /sse URL into these POSTs, so we accept a live sessionId as proof
+// of prior auth. Possession of the sessionId implies the client already
+// passed the bearer check on /sse. Falls back to the bearer check for
+// clients that do propagate credentials.
+function messagesGuard(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!checkOrigin(req, res)) return;
+  const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
+  if (sessionId && transports[sessionId]) {
+    next();
+    return;
+  }
   const token = extractBearer(req);
   if (!token || !timingSafeEqualStr(token, MCP_AUTH_TOKEN)) {
     res.status(401).json({ error: "Unauthorized" });
@@ -152,7 +178,7 @@ function createMcpServer(): McpServer {
 // Track active transports by session
 const transports: Record<string, SSEServerTransport> = {};
 
-app.get("/sse", mcpGuard, async (req, res) => {
+app.get("/sse", sseGuard, async (req, res) => {
   console.log(
     `[MCP] /sse connect origin=${req.headers.origin || "none"} ua=${req.headers["user-agent"] || "none"} ip=${req.ip || "?"}`,
   );
@@ -167,7 +193,7 @@ app.get("/sse", mcpGuard, async (req, res) => {
   await mcpServer.connect(transport);
 });
 
-app.post("/messages", mcpGuard, async (req, res) => {
+app.post("/messages", messagesGuard, async (req, res) => {
   const sessionId = req.query.sessionId as string;
   const transport = transports[sessionId];
   if (!transport) {
