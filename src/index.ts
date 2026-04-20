@@ -153,6 +153,9 @@ function createMcpServer(): McpServer {
 const transports: Record<string, SSEServerTransport> = {};
 
 app.get("/sse", mcpGuard, async (req, res) => {
+  console.log(
+    `[MCP] /sse connect origin=${req.headers.origin || "none"} ua=${req.headers["user-agent"] || "none"} ip=${req.ip || "?"}`,
+  );
   const transport = new SSEServerTransport("/messages", res);
   const mcpServer = createMcpServer();
   transports[transport.sessionId] = transport;
