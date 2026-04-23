@@ -343,7 +343,6 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const hoursPerDay = params.hours_per_day ?? 8;
   const startDate = `${params.year}-01-01`;
   const endDate = new Date().toISOString().split("T")[0];
-  const dailyGoal = params.weekly_billable_goal / 5;
 
   const rawEntries = await fetchAllPages<any>("/activities", {
     type: "TimeEntry", fields: "id,date,quantity,price,user{id,name}", user_id: params.user_id,
@@ -405,12 +404,18 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   let cumBillable = 0, cumGoal = 0;
   const currentMonth = new Date().getMonth() + 1; // 1-indexed
   const isCurrentYear = params.year === new Date().getFullYear();
+
+  // Flat monthly goal: 1880 available hrs/yr × 80% utilization = 1504 ÷ 12 = 125/mo
+  const ANNUAL_AVAILABLE_HOURS = 1880;
+  const UTILIZATION_RATE = 0.80;
+  const flatMonthlyGoal = Math.round(ANNUAL_AVAILABLE_HOURS * UTILIZATION_RATE / 12); // 125
+  const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
+
   for (let m = 1; m <= 12; m++) {
     const key = `${params.year}-${String(m).padStart(2, "0")}`;
     const data = months[key] || { billable: 0, nonbillable: 0 };
-    const wd = getWorkingDays(params.year, m);
-    const goal = round1(wd * dailyGoal);
-    const avail = wd * hoursPerDay;
+    const goal = flatMonthlyGoal;
+    const avail = flatMonthlyAvailable;
     // Only accumulate YTD totals for months up to current month (or all months for past years)
     if (!isCurrentYear || m <= currentMonth) {
       cumBillable += data.billable; cumGoal += goal;

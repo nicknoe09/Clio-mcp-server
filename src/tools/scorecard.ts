@@ -323,7 +323,6 @@ export function registerScorecardTools(server: McpServer): void {
         const startDate = `${params.year}-01-01`;
         const today = new Date();
         const endDate = today.toISOString().split("T")[0];
-        const dailyGoal = params.weekly_billable_goal / 5;
 
         const rawEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
@@ -357,26 +356,29 @@ export function registerScorecardTools(server: McpServer): void {
         const monthlySummary = [];
         let cumBillable = 0, cumGoal = 0;
 
+        // Flat monthly goal: 1880 available hrs/yr × 80% utilization = 1504 ÷ 12 = 125/mo
+        const ANNUAL_AVAILABLE_HOURS = 1880;
+        const UTILIZATION_RATE = 0.80;
+        const flatMonthlyGoal = Math.round(ANNUAL_AVAILABLE_HOURS * UTILIZATION_RATE / 12); // 125
+        const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
+
         for (let m = 1; m <= 12; m++) {
           const key = `${params.year}-${String(m).padStart(2, "0")}`;
           const data = months[key];
           if (!data) continue;
-          const workDays = getWorkingDays(params.year, m);
-          const monthlyGoal = round1(workDays * dailyGoal);
-          const totalAvailable = workDays * params.hours_per_day;
           const billable = round1(data.billable);
           const nonbillable = round1(data.nonbillable);
           cumBillable += billable;
-          cumGoal += monthlyGoal;
+          cumGoal += flatMonthlyGoal;
           monthlySummary.push({
             month: monthNames[m - 1],
             billable_actual: billable,
-            billable_goal: monthlyGoal,
+            billable_goal: flatMonthlyGoal,
             nonbillable,
             total_time: round1(billable + nonbillable),
-            over_under: round1(billable - monthlyGoal),
-            total_available_time: totalAvailable,
-            utilization_rate: round1((billable / totalAvailable) * 100),
+            over_under: round1(billable - flatMonthlyGoal),
+            total_available_time: flatMonthlyAvailable,
+            utilization_rate: round1((billable / flatMonthlyAvailable) * 100),
           });
         }
 
