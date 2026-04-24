@@ -1068,7 +1068,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Generate a firm dashboard data update as a downloadable Excel file. Pulls all metrics from Clio for the specified month: individual hours, billed $, collected $, responsible collected $, utilization, realization, potential calls, case counts. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible. Use this to update Rachel's monthly dashboard.",
+    "Generate a firm dashboard data update as a downloadable Excel file. Pulls all metrics from Clio for the specified month: individual hours, billed $, collected $, responsible collected $, utilization, realization, potential calls, case counts. When update_existing=true, the hours/billable/billed columns are REWRITTEN for ALL year-to-date months (Jan through the target month) — this catches stale values from prior calc-logic bugs automatically. Collections (cols N + S) are only written for the target month because the fee allocation CSV is single-period. Takes ~3-5min per run for full-year rewrites (vs ~30s for a fresh-build run). Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible. Use this to update Rachel's monthly dashboard.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1179,6 +1179,72 @@ export function registerDocumentTools(server: McpServer): void {
           const respBilled = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
             .reduce((s: number, e: any) => s + ((e.rounded_quantity ?? e.quantity) / 3600) * (e.price || 0), 0);
           respData[r.user_id] = { respHrs, respBilled };
+        }
+
+        // ---- Per-month aggregator (used by update_existing to backfill all
+        // YTD months on each run, so stale hours from prior calc-logic bugs
+        // get rewritten automatically). Returns time-entry data only —
+        // collections stay target-month-only per caller contract because the
+        // fee allocation CSV is single-period and we can't reliably map it
+        // to historical months without a report-matching strategy.
+        type PerUserData = {
+          billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
+          billableDollars: number; billedDollars: number;
+          bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
+          indivCollected: number; respCollected: number;
+        };
+        async function aggregateMonthTimeData(monthNum: number): Promise<{
+          data: Record<number, PerUserData>;
+          respData: Record<number, { respHrs: number; respBilled: number }>;
+          entryCount: number;
+        }> {
+          const mStart = `${params.year}-${String(monthNum).padStart(2, "0")}-01`;
+          const mEndDay = new Date(params.year, monthNum, 0).getDate();
+          const mEnd = `${params.year}-${String(monthNum).padStart(2, "0")}-${mEndDay}`;
+          const mEntries = await fetchAllPages<any>("/activities", {
+            type: "TimeEntry",
+            fields: "id,date,quantity,rounded_quantity,price,billed,note,user{id,name},matter{id,display_number,responsible_attorney}",
+            created_since: `${mStart}T00:00:00+00:00`,
+          }).then(e => e.filter((x: any) => x.date >= mStart && x.date <= mEnd));
+
+          const d: Record<number, PerUserData> = {};
+          for (const r of ROSTER) {
+            d[r.user_id] = {
+              billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
+              billableDollars: 0, billedDollars: 0,
+              bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
+              indivCollected: 0, respCollected: 0,
+            };
+          }
+          for (const e of mEntries) {
+            const uid = e.user?.id;
+            if (!uid || !d[uid]) continue;
+            const hours = (e.rounded_quantity ?? e.quantity) / 3600;
+            const rate = e.price || 0;
+            if (rate > 0) {
+              d[uid].billableHrs += hours;
+              d[uid].billableDollars += hours * rate;
+              if (e.billed) { d[uid].billedHrs += hours; d[uid].billedDollars += hours * rate; }
+              else { d[uid].unbilledHrs += hours; }
+            } else {
+              d[uid].nonbillableHrs += hours;
+              const note = (e.note || "").toLowerCase();
+              if (note.includes("biz dev") || note.includes("business dev") || note.includes("marketing")) d[uid].bizDev += hours;
+              else if (note.includes("potential") || note.includes("consult")) d[uid].potentialClients += hours;
+              else if (note.includes("cle") || note.includes("education") || note.includes("training")) d[uid].cle += hours;
+              else d[uid].otherAdmin += hours;
+            }
+          }
+
+          const rd: Record<number, { respHrs: number; respBilled: number }> = {};
+          for (const r of ROSTER) {
+            const rh = mEntries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
+              .reduce((s: number, e: any) => s + (e.rounded_quantity ?? e.quantity) / 3600, 0);
+            const rb = mEntries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
+              .reduce((s: number, e: any) => s + ((e.rounded_quantity ?? e.quantity) / 3600) * (e.price || 0), 0);
+            rd[r.user_id] = { respHrs: rh, respBilled: rb };
+          }
+          return { data: d, respData: rd, entryCount: mEntries.length };
         }
 
         // ---- UPDATE EXISTING DASHBOARD IN BOX ----
@@ -1320,30 +1386,69 @@ export function registerDocumentTools(server: McpServer): void {
 
           const initialsRowMap = monthBlock.map;
 
-          _step = "writing Clio data to 26 Compare";
-          // ---- Write Clio data into 26 Compare ----
-          let tkUpdated = 0;
-          for (const r of ROSTER) {
-            const row = initialsRowMap[r.initials.toUpperCase()];
-            if (!row) continue;
-            const d = data[r.user_id];
-            const rd = respData[r.user_id];
-            const wsRow = compareSheet.getRow(row);
-            wsRow.getCell(4).value = round1(d.bizDev);
-            wsRow.getCell(5).value = round1(d.potentialClients);
-            wsRow.getCell(6).value = round1(d.cle);
-            wsRow.getCell(7).value = round1(d.otherAdmin);
-            wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
-            wsRow.getCell(9).value = round1(d.billableHrs);
-            wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs);
-            wsRow.getCell(11).value = round2(d.billedDollars);
-            wsRow.getCell(14).value = round2(d.indivCollected);
-            wsRow.getCell(17).value = round1(rd.respHrs);
-            wsRow.getCell(18).value = round2(rd.respBilled);
-            wsRow.getCell(19).value = round2(d.respCollected);
-            wsRow.commit();
-            tkUpdated++;
+          _step = "backfilling prior months";
+          // ---- BACKFILL ALL YTD MONTHS ----
+          // Loop months 1..target, rewriting hours/billed columns for each.
+          // Collections (cols N=14, S=19) are only written for the target
+          // month because the fee allocation CSV is single-period — the
+          // target-month `data` already has CSV collections merged in
+          // (lines ~1154); prior months' `data` from aggregateMonthTimeData
+          // has those columns zero, and we deliberately skip writing them.
+          type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
+          const monthsData: MonthBundle[] = [];
+          for (let m = 1; m <= params.month; m++) {
+            if (m === params.month) {
+              // Reuse the upfront target-month aggregation (already has CSV collections)
+              monthsData.push({ month: m, monthName, data, respData });
+              console.log(`[Dashboard] month=${monthNames[m-1]} using upfront target-month data`);
+            } else {
+              console.log(`[Dashboard] backfill fetching ${monthNames[m-1]} ${params.year} entries`);
+              const { data: md, respData: mrd, entryCount } = await aggregateMonthTimeData(m);
+              console.log(`[Dashboard] month=${monthNames[m-1]} entries=${entryCount}`);
+              monthsData.push({ month: m, monthName: monthNames[m-1], data: md, respData: mrd });
+            }
           }
+
+          _step = "writing Clio data to 26 Compare (all months)";
+          let tkUpdated = 0;
+          let monthsSkipped = 0;
+          for (const md of monthsData) {
+            const block = md.month === params.month ? monthBlock : scanMonthBlock(compareSheet, md.monthName);
+            if (!block) {
+              console.warn(`[Dashboard] no month block for ${md.monthName} — skipping (run the tool with month=${md.month} to create it)`);
+              monthsSkipped++;
+              continue;
+            }
+            const rowMap = block.map;
+            const isTarget = md.month === params.month;
+            for (const r of ROSTER) {
+              const row = rowMap[r.initials.toUpperCase()];
+              if (!row) continue;
+              const d = md.data[r.user_id];
+              const rd = md.respData[r.user_id];
+              const wsRow = compareSheet.getRow(row);
+              // Hours / billable / billed — always rewritten (we have fresh per-month data)
+              wsRow.getCell(4).value = round1(d.bizDev);
+              wsRow.getCell(5).value = round1(d.potentialClients);
+              wsRow.getCell(6).value = round1(d.cle);
+              wsRow.getCell(7).value = round1(d.otherAdmin);
+              wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
+              wsRow.getCell(9).value = round1(d.billableHrs);
+              wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs);
+              wsRow.getCell(11).value = round2(d.billedDollars);
+              wsRow.getCell(17).value = round1(rd.respHrs);
+              wsRow.getCell(18).value = round2(rd.respBilled);
+              // Collections — target month only. CSV is single-period so
+              // writing the same value to prior months would corrupt them.
+              if (isTarget) {
+                wsRow.getCell(14).value = round2(d.indivCollected);
+                wsRow.getCell(19).value = round2(d.respCollected);
+              }
+              wsRow.commit();
+              tkUpdated++;
+            }
+          }
+          console.log(`[Dashboard] wrote tkUpdated=${tkUpdated} across months_processed=${monthsData.length - monthsSkipped} months_skipped=${monthsSkipped}`);
 
           _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
@@ -2159,6 +2264,9 @@ export function registerDocumentTools(server: McpServer): void {
             month: monthName,
             year: params.year,
             timekeepers_updated: tkUpdated,
+            months_processed: params.month - monthsSkipped,
+            months_skipped: monthsSkipped,
+            backfilled_through: `${monthNames[0]}–${monthName}`,
             block_created: blockCreated,
             bonus_tracker_rebuilt: true,
             attorneys_tracked: attys.length,
