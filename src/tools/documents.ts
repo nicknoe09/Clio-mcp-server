@@ -9,6 +9,7 @@ import {
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import { uploadToBox, downloadFromBox } from "../utils/box";
+import { registerDownload, mimeForFilename } from "../utils/downloadStore";
 
 // ========== XLSX DIRECT XML HELPERS ==========
 // ExcelJS is only used for READING. All writes go through direct XML manipulation.
@@ -497,6 +498,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   const filename = `${userName} Goals ${params.year}.xlsx`;
+  const size_kb = Math.round(buffer.byteLength / 1024);
 
   if (params.box_folder_id !== undefined) {
     const INITIALS_MAP: Record<number, string> = {
@@ -508,11 +510,23 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const boxFilename = `${initials} Goals ${params.year}.xlsx`;
     const folderId = params.box_folder_id || "372923594239";
     const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
-    return { filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url };
+    if (result.uploaded) {
+      return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url };
+    }
+    return {
+      filename: boxFilename,
+      size_kb: result.size_kb,
+      direct_download_url: result.direct_download_url,
+      expires_at: result.expires_at,
+      reason: result.reason,
+      note: result.note,
+    };
   }
 
-  const base64 = buffer.toString("base64");
-  return { filename, base64, size_kb: Math.round(buffer.byteLength / 1024) };
+  // No Box target — park the buffer and hand back a direct-download URL.
+  console.warn(`[Doc] generate_weekly_goals — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+  const reg = registerDownload(buffer, filename, mimeForFilename(filename));
+  return { filename, size_kb, direct_download_url: reg.url, expires_at: reg.expires_at };
 }
 
 // ─── ROSTER (hardcoded for batch weekly goals, grouped by team) ──
@@ -537,7 +551,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_vd_statement",
-    "Generate a V&D Of Counsel compensation statement as a downloadable Word document. Includes cover letter from Rachel Trevino, compensation summary with tier breakdown, timekeeper detail, and payment history. Returns the document as base64 for download.",
+    "Generate a V&D Of Counsel compensation statement as a downloadable Word document. Includes cover letter from Rachel Trevino, compensation summary with tier breakdown, timekeeper detail, and payment history. Returns a short-lived direct_download_url (1-hour TTL) for the generated .docx.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -749,8 +763,10 @@ export function registerDocumentTools(server: McpServer): void {
         });
 
         const buffer = await Packer.toBuffer(doc);
-        const base64 = buffer.toString("base64");
         const filename = `V&D Compensation Statement - ${monthName} ${params.year}.docx`;
+        const size_kb = Math.round(buffer.length / 1024);
+        console.warn(`[Doc] download_vd_statement — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
 
         return {
           content: [{
@@ -758,8 +774,10 @@ export function registerDocumentTools(server: McpServer): void {
             text: JSON.stringify({
               filename,
               format: "docx",
-              size_kb: Math.round(buffer.length / 1024),
-              base64,
+              size_kb,
+              direct_download_url: reg.url,
+              expires_at: reg.expires_at,
+              note: "Download the file from direct_download_url within 1 hour.",
               summary: {
                 period: `${monthName} ${params.year}`,
                 total_vd_compensation: fmt(round2(grandVD)),
@@ -782,10 +800,10 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_firm_scorecard",
-    "Generate the firm-wide development meeting scorecard as a downloadable Excel file. Includes weekly and monthly data for all timekeepers. Returns the file as base64 for download.",
+    "Generate the firm-wide development meeting scorecard as a downloadable Excel file. Includes weekly and monthly data for all timekeepers. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible.",
     {
       week_of: z.string().optional().describe("Date within the target week (YYYY-MM-DD). Defaults to today."),
-      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
+      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
     },
     async (params) => {
       try {
@@ -898,16 +916,21 @@ export function registerDocumentTools(server: McpServer): void {
 
         const buffer = Buffer.from(await wb.xlsx.writeBuffer());
         const filename = `Firm Scorecard - ${weekLabel.replace(/\//g, "-")}.xlsx`;
+        const size_kb = Math.round(buffer.byteLength / 1024);
 
         if (params.box_folder_id !== undefined) {
           const folderId = params.box_folder_id || "375771584500";
           const result = await uploadToBox({ buffer, filename, folderId });
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          if (result.uploaded) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, filename, size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note }) }] };
         }
 
-        const base64 = buffer.toString("base64");
+        console.warn(`[Doc] download_firm_scorecard — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, note: "Download the file from direct_download_url within 1 hour." }) }],
         };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
@@ -920,13 +943,13 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_weekly_goals",
-    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Returns as base64 for download.",
+    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
-      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
+      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
     },
     async (params) => {
       try {
@@ -974,8 +997,31 @@ export function registerDocumentTools(server: McpServer): void {
             weekly_billable_goal: goal,
             year: targetYear,
             box_folder_id: folderId,
-          }).then((res) => ({ name, group, status: "uploaded" as const, filename: res.filename, box_url: res.box_url, box_file_id: res.box_file_id }))
-            .catch((err: Error) => ({ name, group, status: `FAILED: ${err.message}` as const, filename: null, box_url: null, box_file_id: null }))
+          }).then((res: any) => {
+            const uploaded = !!res.box_file_id;
+            return {
+              name,
+              group,
+              status: uploaded ? ("uploaded" as const) : ("download_link" as const),
+              filename: res.filename ?? null,
+              box_url: res.box_url ?? null,
+              box_file_id: res.box_file_id ?? null,
+              direct_download_url: res.direct_download_url ?? null,
+              expires_at: res.expires_at ?? null,
+              reason: res.reason ?? null,
+            };
+          })
+            .catch((err: Error) => ({
+              name,
+              group,
+              status: `FAILED: ${err.message}` as const,
+              filename: null,
+              box_url: null,
+              box_file_id: null,
+              direct_download_url: null,
+              expires_at: null,
+              reason: err.message,
+            }))
         )
       );
 
@@ -986,7 +1032,15 @@ export function registerDocumentTools(server: McpServer): void {
       for (const u of uploads) {
         const g = u.group || "Other";
         if (!groups[g]) groups[g] = [];
-        groups[g].push({ name: u.name, status: u.status, filename: u.filename, box_url: u.box_url, box_file_id: u.box_file_id });
+        groups[g].push({
+          name: u.name,
+          status: u.status,
+          filename: u.filename,
+          box_url: u.box_url,
+          box_file_id: u.box_file_id,
+          direct_download_url: u.direct_download_url,
+          expires_at: u.expires_at,
+        });
       }
 
       return {
@@ -996,7 +1050,8 @@ export function registerDocumentTools(server: McpServer): void {
             year: targetYear,
             count: uploads.length,
             succeeded: uploads.filter((u: any) => u.status === "uploaded").length,
-            failed: uploads.filter((u: any) => u.status !== "uploaded").length,
+            download_link: uploads.filter((u: any) => u.status === "download_link").length,
+            failed: uploads.filter((u: any) => typeof u.status === "string" && u.status.startsWith("FAILED")).length,
             by_team: groups,
           }, null, 2),
         }],
@@ -1009,11 +1064,11 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Generate a firm dashboard data update as a downloadable Excel file. Pulls all metrics from Clio for the specified month: individual hours, billed $, collected $, responsible collected $, utilization, realization, potential calls, case counts. Returns as base64 for download. Use this to update Rachel's monthly dashboard.",
+    "Generate a firm dashboard data update as a downloadable Excel file. Pulls all metrics from Clio for the specified month: individual hours, billed $, collected $, responsible collected $, utilization, realization, potential calls, case counts. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible. Use this to update Rachel's monthly dashboard.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
-      box_folder_id: z.string().optional().describe("Box folder ID to upload to. Omit to return base64. Empty string uses default folder."),
+      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
       update_existing: z.boolean().optional().describe("If true, downloads the firm dashboard from Box, updates the '26 Compare' sheet and bonus tabs, then uploads the modified file back."),
     },
     async (params) => {
@@ -2092,20 +2147,41 @@ export function registerDocumentTools(server: McpServer): void {
             overwriteFileId: DASHBOARD_FILE_ID,
           });
 
+          const common = {
+            updated_sheet: "26 Compare",
+            month: monthName,
+            year: params.year,
+            timekeepers_updated: tkUpdated,
+            block_created: blockCreated,
+            bonus_tracker_rebuilt: true,
+            attorneys_tracked: attys.length,
+          };
+
+          if (result.uploaded) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: true,
+                  ...common,
+                  box_file_id: result.box_file_id,
+                  box_url: result.box_url,
+                }),
+              }],
+            };
+          }
+
           return {
             content: [{
               type: "text" as const,
               text: JSON.stringify({
-                success: true,
-                updated_sheet: "26 Compare",
-                month: monthName,
-                year: params.year,
-                timekeepers_updated: tkUpdated,
-                block_created: blockCreated,
-                bonus_tracker_rebuilt: true,
-                attorneys_tracked: attys.length,
-                box_file_id: result.box_file_id,
-                box_url: result.box_url,
+                success: false,
+                ...common,
+                size_kb: result.size_kb,
+                direct_download_url: result.direct_download_url,
+                expires_at: result.expires_at,
+                reason: result.reason,
+                note: result.note,
               }),
             }],
           };
@@ -2154,18 +2230,23 @@ export function registerDocumentTools(server: McpServer): void {
         ws.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
 
         const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+        const filename = `Dashboard Update - ${monthName} ${params.year}.xlsx`;
+        const size_kb = Math.round(buffer.byteLength / 1024);
 
         if (params.box_folder_id !== undefined) {
           const boxFilename = `${params.year} Firm Dashboard.xlsx`;
           const folderId = params.box_folder_id || "375774779182";
           const result = await uploadToBox({ buffer, filename: boxFilename, folderId, overwriteFileId: "2191795122500" });
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          if (result.uploaded) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, filename: boxFilename, size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note }) }] };
         }
 
-        const base64 = buffer.toString("base64");
-        const filename = `Dashboard Update - ${monthName} ${params.year}.xlsx`;
+        console.warn(`[Doc] download_dashboard_update — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb: Math.round(buffer.byteLength / 1024), base64 }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, note: "Download the file from direct_download_url within 1 hour." }) }],
         };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, step: _step, message: err.message, stack: err.stack?.split("\n").slice(0, 5).join(" | ") }) }], isError: true };

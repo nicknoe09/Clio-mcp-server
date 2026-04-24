@@ -25,6 +25,7 @@ import { registerAuditTimeTools } from "./tools/auditTime";
 import { registerReviewTools } from "./tools/review";
 import { registerMorningReportTools } from "./tools/morningReport";
 import reviewRouter from "./routes/review";
+import { getDownload } from "./utils/downloadStore";
 
 // Fail closed: refuse to start without a bearer secret. /sse + /messages
 // expose every registered tool against the firm's shared Clio OAuth identity,
@@ -206,6 +207,27 @@ app.post("/messages", messagesGuard, async (req, res) => {
 // --- Health Check ---
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "clio-mcp", version: "1.1.0", build: "all-tools" });
+});
+
+// --- Token-addressed file downloads (Box upload fallback) ---
+// No auth: the unguessable token IS the authorization. See utils/downloadStore.ts.
+app.get("/download/:token", (req, res) => {
+  const token = req.params.token;
+  const entry = getDownload(token);
+  if (!entry) {
+    console.warn(`[Download] 404 token=${token.slice(0, 8)}…`);
+    res.status(404).json({ error: "Download not found or expired" });
+    return;
+  }
+  const safeName = entry.filename.replace(/["\\\r\n]/g, "");
+  res.setHeader("Content-Type", entry.mimetype);
+  res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+  res.setHeader("Content-Length", entry.buffer.length.toString());
+  res.setHeader("Cache-Control", "private, no-store");
+  console.log(
+    `[Download] served filename=${entry.filename} size_kb=${Math.round(entry.buffer.length / 1024)} token=${token.slice(0, 8)}…`,
+  );
+  res.end(entry.buffer);
 });
 
 // --- Review UI Routes ---

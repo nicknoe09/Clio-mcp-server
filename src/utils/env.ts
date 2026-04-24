@@ -21,4 +21,8 @@ export const ENV = {
     get BOX_CLIENT_ID() { return getEnv("BOX_CLIENT_ID", ""); },
     get BOX_CLIENT_SECRET() { return getEnv("BOX_CLIENT_SECRET", ""); },
     get BOX_REDIRECT_URI() { return getEnv("BOX_REDIRECT_URI", "https://clio-mcp-server-production-032d.up.railway.app/box/oauth/callback"); },
+    // Public base URL for this server. Used to construct /download/:token
+    // URLs when the MCP client needs to retrieve generated files directly
+    // (Box upload fallback path). Must be the externally reachable origin.
+    get PUBLIC_BASE_URL() { return getEnv("PUBLIC_BASE_URL", "https://clio-mcp-server-production-032d.up.railway.app"); },
 };
