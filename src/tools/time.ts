@@ -3,13 +3,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
 
 const TIME_ENTRY_FIELDS =
-  "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
+  "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
 
 export function registerTimeTools(server: McpServer): void {
   // get_time_entries
   server.tool(
     "get_time_entries",
-    "Get time entries with filters. Hours are returned in decimal (quantity from Clio is seconds / 3600).",
+    "Get time entries with filters. Hours use Clio rounded_quantity (billed hours, rounded to billing increment).",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       user_id: z.coerce.number().optional().describe("Filter by user/timekeeper ID"),
@@ -42,9 +42,9 @@ export function registerTimeTools(server: McpServer): void {
         const formatted = entries.map((e: any) => ({
           id: e.id,
           date: e.date,
-          hours: Math.round((e.quantity / 3600) * 100) / 100,
+          hours: Math.round(((e.rounded_quantity || e.quantity) / 3600) * 100) / 100,
           rate: e.price,
-          amount: Math.round(((e.quantity / 3600) * (e.price || 0)) * 100) / 100,
+          amount: Math.round((((e.rounded_quantity || e.quantity) / 3600) * (e.price || 0)) * 100) / 100,
           description: e.note,
           billed: e.billed,
           matter: e.matter
@@ -150,7 +150,7 @@ export function registerTimeTools(server: McpServer): void {
               total_value: 0,
             };
           }
-          const hours = e.quantity / 3600;
+          const hours = (e.rounded_quantity || e.quantity) / 3600;
           const value = hours * (e.price || 0);
           byMatter[mid].entries.push({
             id: e.id,
@@ -234,14 +234,14 @@ export function registerTimeTools(server: McpServer): void {
       try {
         // Step 1: Read the current state
         const before = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number},user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number},user{id,name}",
         });
 
         const entry = before.data;
         const beforeState = {
           id: entry.id,
           date: entry.date,
-          hours: Math.round((entry.quantity / 3600) * 100) / 100,
+          hours: Math.round(((entry.rounded_quantity || entry.quantity) / 3600) * 100) / 100,
           rate: entry.price,
           note: entry.note,
           billed: entry.billed,
@@ -280,14 +280,14 @@ export function registerTimeTools(server: McpServer): void {
 
         // Step 3: Read again to confirm
         const after = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number},user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number},user{id,name}",
         });
 
         const afterEntry = after.data;
         const afterState = {
           id: afterEntry.id,
           date: afterEntry.date,
-          hours: Math.round((afterEntry.quantity / 3600) * 100) / 100,
+          hours: Math.round(((afterEntry.rounded_quantity || afterEntry.quantity) / 3600) * 100) / 100,
           rate: afterEntry.price,
           note: afterEntry.note,
           billed: afterEntry.billed,
@@ -359,7 +359,7 @@ export function registerTimeTools(server: McpServer): void {
 
         // Read current state
         const before = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
         });
         const entry = before.data;
 
@@ -374,7 +374,7 @@ export function registerTimeTools(server: McpServer): void {
 
         // Read after
         const after = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
         });
         const updated = after.data;
 
@@ -388,12 +388,12 @@ export function registerTimeTools(server: McpServer): void {
               timekeeper: entry.user?.name || "Unknown",
               before: {
                 note: entry.note,
-                hours: Math.round((entry.quantity / 3600) * 100) / 100,
+                hours: Math.round(((entry.rounded_quantity || entry.quantity) / 3600) * 100) / 100,
                 rate: entry.price,
               },
               after: {
                 note: updated.note,
-                hours: Math.round((updated.quantity / 3600) * 100) / 100,
+                hours: Math.round(((updated.rounded_quantity || updated.quantity) / 3600) * 100) / 100,
                 rate: updated.price,
               },
             }, null, 2),
@@ -465,7 +465,7 @@ export function registerTimeTools(server: McpServer): void {
               success: true,
               activity_id: entry.id,
               date: entry.date,
-              hours: Math.round((entry.quantity / 3600) * 100) / 100,
+              hours: Math.round(((entry.rounded_quantity || entry.quantity) / 3600) * 100) / 100,
               rate: entry.price,
               note: entry.note,
               matter_id: params.matter_id,

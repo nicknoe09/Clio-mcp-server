@@ -278,7 +278,7 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
 
   for (const bill of relevantBills) {
     const lineItems = await fetchAllPages<any>("/line_items", {
-      fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+      fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
       bill_id: bill.id,
     });
 
@@ -291,7 +291,7 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
 
       // Line items return quantity in HOURS (not seconds like /activities)
       // Verify: li.quantity * li.price should ≈ li.total
-      let hours = li.quantity || 0;
+      let hours = li.rounded_quantity || li.quantity || 0;
       const rate = li.price || 0;
 
       // Fallback: derive hours from total/rate
@@ -301,7 +301,7 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
 
       // Debug first 3 entries
       if (allEntries.length < 3) {
-        console.log(`[Review] Entry #${allEntries.length}: li.quantity=${li.quantity}, li.price=${li.price}, li.total=${li.total}, hours=${hours}`);
+        console.log(`[Review] Entry #${allEntries.length}: li.rounded_quantity=${li.rounded_quantity}, li.quantity=${li.quantity}, li.price=${li.price}, li.total=${li.total}, hours=${hours}`);
       }
 
       const note = li.activity?.note || li.description || "";
@@ -653,7 +653,7 @@ router.post("/pending/split", async (req: Request, res: Response) => {
   try {
     // 1. Read the original activity to get matter, date, user, rate
     const original = await rawGetSingle(`/activities/${activity_id}`, {
-      fields: "id,date,quantity,price,note,matter{id},user{id}",
+      fields: "id,date,quantity,rounded_quantity,price,note,matter{id},user{id}",
     });
     const act = original.data;
     const matterId = act.matter?.id;
@@ -739,15 +739,15 @@ router.post("/pending/combine", async (req: Request, res: Response) => {
   try {
     // 1. Read the first activity to get matter, user, date, rate
     const first = await rawGetSingle(`/activities/${activity_ids[0]}`, {
-      fields: "id,date,quantity,price,note,matter{id},user{id}",
+      fields: "id,date,quantity,rounded_quantity,price,note,matter{id},user{id}",
     });
     const act = first.data;
 
     // 2. Calculate total hours from all entries
     let totalSeconds = 0;
     for (const id of activity_ids) {
-      const entry = await rawGetSingle(`/activities/${id}`, { fields: "id,quantity" });
-      totalSeconds += entry.data?.quantity || 0;
+      const entry = await rawGetSingle(`/activities/${id}`, { fields: "id,quantity,rounded_quantity" });
+      totalSeconds += entry.data?.rounded_quantity || entry.data?.quantity || 0;
     }
 
     // Use override if provided

@@ -605,7 +605,7 @@ export function registerAuditTools(server: McpServer): void {
 
         for (const bill of relevantBills) {
           const lineItems = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+            fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
             bill_id: bill.id,
           });
 
@@ -615,7 +615,7 @@ export function registerAuditTools(server: McpServer): void {
           for (const li of lineItems) {
             if (li.activity?.type !== "TimeEntry") continue;
 
-            const hours = li.quantity ? li.quantity / 3600 : 0;
+            const hours = (li.rounded_quantity || li.quantity) ? (li.rounded_quantity || li.quantity) / 3600 : 0;
             const rate = li.price || 0;
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
@@ -872,7 +872,7 @@ export function registerAuditTools(server: McpServer): void {
 
         for (const bill of relevantBills) {
           const lineItems = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+            fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
             bill_id: bill.id,
           });
 
@@ -882,7 +882,7 @@ export function registerAuditTools(server: McpServer): void {
           for (const li of lineItems) {
             if (li.activity?.type !== "TimeEntry") continue;
 
-            const hours = li.quantity ? li.quantity / 3600 : 0;
+            const hours = (li.rounded_quantity || li.quantity) ? (li.rounded_quantity || li.quantity) / 3600 : 0;
             const rate = li.price || 0;
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;

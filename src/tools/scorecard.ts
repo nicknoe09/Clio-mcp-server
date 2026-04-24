@@ -85,7 +85,7 @@ export function registerScorecardTools(server: McpServer): void {
         // --- Fetch all time entries for the week (all users at once) ---
         const weekTimeEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
-          fields: "id,date,quantity,price,billed,user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
           created_since: `${week.start}T00:00:00+00:00`,
         }).then(entries => entries.filter((e: any) => e.date >= week.start && e.date <= week.end));
 
@@ -108,7 +108,7 @@ export function registerScorecardTools(server: McpServer): void {
         for (const e of weekTimeEntries) {
           const uid = e.user?.id;
           if (!uid || !weeklyData[uid]) continue;
-          const hours = e.quantity / 3600;
+          const hours = (e.rounded_quantity || e.quantity) / 3600;
           if ((e.price || 0) > 0) {
             weeklyData[uid].billable += hours;
           } else {
@@ -132,7 +132,7 @@ export function registerScorecardTools(server: McpServer): void {
           // Fetch month time entries
           const monthTimeEntries = await fetchAllPages<any>("/activities", {
             type: "TimeEntry",
-            fields: "id,date,quantity,price,billed,user{id,name},matter{id,display_number}",
+            fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name},matter{id,display_number}",
             created_since: `${month.start}T00:00:00+00:00`,
           }).then(entries => entries.filter((e: any) => e.date >= month.start && e.date <= month.end));
 
@@ -197,7 +197,7 @@ export function registerScorecardTools(server: McpServer): void {
           for (const e of monthTimeEntries) {
             const uid = e.user?.id;
             if (!uid || !monthlyData[uid]) continue;
-            const hours = e.quantity / 3600;
+            const hours = (e.rounded_quantity || e.quantity) / 3600;
             const value = hours * (e.price || 0);
 
             if ((e.price || 0) > 0) {
@@ -326,7 +326,7 @@ export function registerScorecardTools(server: McpServer): void {
 
         const rawEntries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
-          fields: "id,date,quantity,price,billed,user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
           user_id: params.user_id,
           created_since: `${startDate}T00:00:00+00:00`,
         });
@@ -337,7 +337,7 @@ export function registerScorecardTools(server: McpServer): void {
         const weeks: Record<string, { billable: number; nonbillable: number }> = {};
 
         for (const e of entries) {
-          const hours = e.quantity / 3600;
+          const hours = (e.rounded_quantity || e.quantity) / 3600;
           const monthKey = e.date.slice(0, 7);
           const weekKey = getWeekKey(e.date);
           if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };

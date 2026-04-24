@@ -39,7 +39,7 @@ export async function auditTimeEntries(
   // 1. Fetch time entries (simple fields — activities endpoint doesn't support deep nesting)
   const queryParams: Record<string, any> = {
     type: "TimeEntry",
-    fields: "id,date,quantity,price,note,matter{id,display_number,description},user{id,name}",
+    fields: "id,date,quantity,rounded_quantity,price,note,matter{id,display_number,description},user{id,name}",
     user_id: userId,
     created_since: `${startDate}T00:00:00+00:00`,
   };
@@ -77,7 +77,7 @@ export async function auditTimeEntries(
     const mid = e.matter?.id;
     const matterInfo = mid ? matterHC.get(mid) : null;
     const isHC = matterInfo?.isHC || false;
-    const hours = e.quantity ? e.quantity / 3600 : 0;
+    const hours = (e.rounded_quantity || e.quantity) ? (e.rounded_quantity || e.quantity) / 3600 : 0;
     const rate = e.price || 0;
     const note = e.note || "";
 

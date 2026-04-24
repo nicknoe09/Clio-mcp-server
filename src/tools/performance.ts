@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport } from "../clio/pagination";
 
 const TIME_FIELDS =
-  "id,date,quantity,price,total,note,billed,matter{id,display_number,description},user{id,name}";
+  "id,date,quantity,rounded_quantity,price,total,note,billed,matter{id,display_number,description},user{id,name}";
 
 /**
  * Parse CSV content into an array of objects using header row as keys.
@@ -168,7 +168,7 @@ export function registerPerformanceTools(server: McpServer): void {
               matterHours: {},
             };
           }
-          const hours = e.quantity / 3600;
+          const hours = (e.rounded_quantity || e.quantity) / 3600;
           const value = hours * (e.price || 0);
           byUser[uid].total_hours += hours;
           byUser[uid].total_value += value;
@@ -303,7 +303,7 @@ export function registerPerformanceTools(server: McpServer): void {
               weekly: {},
             };
           }
-          const hours = e.quantity / 3600;
+          const hours = (e.rounded_quantity || e.quantity) / 3600;
           byUser[uid].billable_hours += hours;
 
           if (showTrend) {
@@ -438,7 +438,7 @@ export function registerPerformanceTools(server: McpServer): void {
 
         // Firm-wide worked value
         const totalWorkedValue = timeEntries.reduce(
-          (s: number, e: any) => s + (e.quantity / 3600) * (e.price || 0),
+          (s: number, e: any) => s + ((e.rounded_quantity || e.quantity) / 3600) * (e.price || 0),
           0
         );
         const totalBilledValue = bills.reduce(
@@ -481,7 +481,7 @@ export function registerPerformanceTools(server: McpServer): void {
                 worked_value: 0,
               };
             }
-            const hours = e.quantity / 3600;
+            const hours = (e.rounded_quantity || e.quantity) / 3600;
             byUser[uid].worked_hours += hours;
             byUser[uid].worked_value += hours * (e.price || 0);
           }
@@ -498,7 +498,7 @@ export function registerPerformanceTools(server: McpServer): void {
             if (!billedByUser[uid]) {
               billedByUser[uid] = { billed_hours: 0, billed_value: 0 };
             }
-            const hours = e.quantity / 3600;
+            const hours = (e.rounded_quantity || e.quantity) / 3600;
             billedByUser[uid].billed_hours += hours;
             billedByUser[uid].billed_value += hours * (e.price || 0);
           }
@@ -555,7 +555,7 @@ export function registerPerformanceTools(server: McpServer): void {
                 worked_value: 0,
               };
             }
-            const hours = e.quantity / 3600;
+            const hours = (e.rounded_quantity || e.quantity) / 3600;
             byMatter[mid].worked_hours += hours;
             byMatter[mid].worked_value += hours * (e.price || 0);
           }
@@ -650,7 +650,7 @@ export function registerPerformanceTools(server: McpServer): void {
           let standard_rate = 0;
 
           for (const e of items) {
-            const hours = e.quantity / 3600;
+            const hours = (e.rounded_quantity || e.quantity) / 3600;
             const value = hours * (e.price || 0);
             worked_hours += hours;
             worked_value += value;
