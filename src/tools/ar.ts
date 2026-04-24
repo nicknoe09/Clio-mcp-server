@@ -187,7 +187,7 @@ export function registerARTools(server: McpServer): void {
           type: "TimeEntry",
           billed: false,
           fields:
-            "id,date,quantity,price,matter{id,display_number,description,client,responsible_attorney}",
+            "id,date,quantity,rounded_quantity,price,matter{id,display_number,description,client,responsible_attorney}",
           created_since: `${defaultStart}T00:00:00+00:00`,
         };
         const expenseParams: Record<string, any> = {
@@ -232,7 +232,9 @@ export function registerARTools(server: McpServer): void {
               oldest_entry: e.date,
             };
           }
-          const hours = e.quantity / 3600;
+          // Use rounded_quantity (billed increment) not raw quantity, so WIP
+          // matches what the client will actually see invoiced.
+          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
           byMatter[mid].unbilled_hours += hours;
           byMatter[mid].unbilled_time_value += hours * (e.price || 0);
           if (e.date < byMatter[mid].oldest_entry) {

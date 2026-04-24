@@ -346,7 +346,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const endDate = new Date().toISOString().split("T")[0];
 
   const rawEntries = await fetchAllPages<any>("/activities", {
-    type: "TimeEntry", fields: "id,date,quantity,price,user{id,name}", user_id: params.user_id,
+    type: "TimeEntry", fields: "id,date,quantity,rounded_quantity,price,user{id,name}", user_id: params.user_id,
     created_since: `${startDate}T00:00:00+00:00`,
   });
   const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
@@ -357,7 +357,10 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const weeks: Record<string, { billable: number; nonbillable: number }> = {};
 
   for (const e of entries) {
-    const hours = e.quantity / 3600;
+    // rounded_quantity = seconds rounded to billing increment (what the client
+    // is billed for). Raw `quantity` = actual tracked seconds, which under-
+    // reports billed hours and is NOT what these goals/scorecard reports want.
+    const hours = (e.rounded_quantity ?? e.quantity) / 3600;
     const monthKey = e.date.slice(0, 7);
     const d2 = new Date(e.date + "T12:00:00");
     const dow = d2.getDay();
@@ -838,7 +841,7 @@ export function registerDocumentTools(server: McpServer): void {
         // Fetch time entries for the month (covers the week too)
         const entries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
-          fields: "id,date,quantity,price,billed,user{id,name}",
+          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
           created_since: `${monthStart}T00:00:00+00:00`,
         }).then(e => e.filter((x: any) => x.date >= monthStart && x.date <= monthEnd));
 
@@ -851,7 +854,8 @@ export function registerDocumentTools(server: McpServer): void {
         for (const e of entries) {
           const uid = e.user?.id;
           if (!uid || !userData[uid]) continue;
-          const hours = e.quantity / 3600;
+          // Use rounded_quantity (billed hours) not raw quantity (actual tracked).
+          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
           const isBillable = (e.price || 0) > 0;
           const inWeek = e.date >= weekStart && e.date <= weekEnd;
 
@@ -1098,7 +1102,7 @@ export function registerDocumentTools(server: McpServer): void {
         // Fetch time entries
         const entries = await fetchAllPages<any>("/activities", {
           type: "TimeEntry",
-          fields: "id,date,quantity,price,billed,note,user{id,name},matter{id,display_number,responsible_attorney}",
+          fields: "id,date,quantity,rounded_quantity,price,billed,note,user{id,name},matter{id,display_number,responsible_attorney}",
           created_since: `${monthStart}T00:00:00+00:00`,
         }).then(e => e.filter((x: any) => x.date >= monthStart && x.date <= monthEnd));
 
@@ -1126,7 +1130,9 @@ export function registerDocumentTools(server: McpServer): void {
         for (const e of entries) {
           const uid = e.user?.id;
           if (!uid || !data[uid]) continue;
-          const hours = e.quantity / 3600;
+          // rounded_quantity = billed hours rounded to billing increment.
+          // Using raw quantity here was under-reporting by up to ~20%.
+          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
           const rate = e.price || 0;
 
           if (rate > 0) {
@@ -1165,12 +1171,13 @@ export function registerDocumentTools(server: McpServer): void {
         }
 
         // Pre-compute responsible hours/billed for each roster member (used by both paths)
+        // Uses rounded_quantity (billed hours) same as the main loop above.
         const respData: Record<number, { respHrs: number; respBilled: number }> = {};
         for (const r of ROSTER) {
           const respHrs = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + e.quantity / 3600, 0);
+            .reduce((s: number, e: any) => s + (e.rounded_quantity ?? e.quantity) / 3600, 0);
           const respBilled = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + (e.quantity / 3600) * (e.price || 0), 0);
+            .reduce((s: number, e: any) => s + ((e.rounded_quantity ?? e.quantity) / 3600) * (e.price || 0), 0);
           respData[r.user_id] = { respHrs, respBilled };
         }
 
