@@ -145,3 +145,16 @@ export async function boxDownloadFile(
   });
   return Buffer.from(response.data);
 }
+
+/**
+ * Permanently delete a file by ID. Used to clean up orphan uploads when
+ * boxUploadFile unexpectedly creates a new file (instead of hitting the
+ * expected 409 conflict we use as a lookup mechanism).
+ */
+export async function boxDeleteFile(
+  fileId: string,
+  userEmail: string,
+): Promise<void> {
+  const client = createApiClient(userEmail);
+  await client.delete(`/files/${fileId}`);
+}
