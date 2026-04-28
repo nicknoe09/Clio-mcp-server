@@ -107,13 +107,15 @@ export function registerCalendarTools(server: McpServer): void {
 
 Event types (use event_type_id or event_type name):
 - "hard_scheduled" (ID ${EVENT_TYPES.HARD_SCHEDULED}) — hearings, trials, depositions, mediations, calls, conferences
-- "nrn_claude" (ID ${EVENT_TYPES.NRN_CLAUDE}) — default for all Claude-created events
+- "nrn_claude" (ID ${EVENT_TYPES.NRN_CLAUDE}) — Claude-created events on NRN's calendar
 - "trial_hearing" (ID ${EVENT_TYPES.TRIAL_HEARING}) — Trial/Hearing/Depositions/Mediations
 - "deadline" (ID ${EVENT_TYPES.DEADLINE}) — Deadlines
 - "admin" (ID ${EVENT_TYPES.ADMIN}) — Admin events
 - "personal" (ID ${EVENT_TYPES.OUT_PERSONAL}) — Out for Personal
 
-If no event type is specified, Claude-created events default to "nrn_claude". If the summary matches a hard-scheduled pattern (hearing, trial, deposition, etc.), it auto-sets to "hard_scheduled".`,
+Calendar routing: events are auto-routed to the NRN - Claude Created calendar (ID ${NRN_CALENDARS.NRN_CLAUDE}) ONLY when the target is Nicholas Noe's NRN calendar (ID ${NRN_CALENDARS.NICHOLAS_NOE}) or no calendar_owner_id is provided. Events for any other user are placed on that user's own calendar and are not routed to NRN Claude.
+
+Event type defaults: if the summary matches a hard-scheduled pattern (hearing, trial, deposition, etc.), it auto-sets to "hard_scheduled". Otherwise, the "nrn_claude" event type is only applied when the event is being routed to NRN's calendar — events on other users' calendars are left without an auto-applied event type.`,
     {
       summary: z.string().describe("Event title/summary"),
       start_at: z.string().describe("Start datetime (ISO 8601, e.g. 2026-03-25T14:00:00-05:00)"),
@@ -122,7 +124,7 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
       location: z.string().optional().describe("Event location"),
       all_day: z.boolean().optional().default(false).describe("Whether this is an all-day event"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user or calendar. Defaults to NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + "). Pass a user ID to put it on their personal calendar instead."),
+      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user or calendar. If the target is Nicholas Noe's NRN calendar (ID " + NRN_CALENDARS.NICHOLAS_NOE + "), the event is auto-routed to the NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + "). For any other user, the event is placed on their own calendar and is NOT routed to NRN Claude."),
       recurrence_rule: z.string().optional().describe(
         "RRULE for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=MONTHLY;BYMONTHDAY=15')"
       ),
@@ -144,8 +146,22 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
         if (params.description) body.data.description = params.description;
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
-        // Default to NRN Claude calendar if no calendar specified
-        body.data.calendar_owner = { id: params.calendar_owner_id || NRN_CALENDARS.NRN_CLAUDE };
+
+        // Auto-route to the NRN Claude calendar ONLY when the event is targeted
+        // at Nicholas Noe's NRN calendar (or already explicitly NRN Claude, or
+        // no calendar specified at all). For any other user, keep the event on
+        // their own calendar so events from other users of this MCP do not
+        // pollute NRN's Claude calendar.
+        const targetsNrn =
+          params.calendar_owner_id === undefined ||
+          params.calendar_owner_id === NRN_CALENDARS.NICHOLAS_NOE ||
+          params.calendar_owner_id === NRN_CALENDARS.NRN_CLAUDE;
+
+        if (targetsNrn) {
+          body.data.calendar_owner = { id: NRN_CALENDARS.NRN_CLAUDE };
+        } else {
+          body.data.calendar_owner = { id: params.calendar_owner_id };
+        }
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;
 
         // Determine event type
@@ -164,10 +180,14 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
           };
           eventTypeId = typeMap[params.event_type.toLowerCase()] || null;
         } else {
-          // Auto-detect: hard scheduled events by summary, otherwise default to NRN Claude
+          // Auto-detect: hard scheduled events by summary always get the
+          // hard-scheduled type. The NRN Claude event type is only applied
+          // when the event is actually being routed to NRN's calendar — for
+          // other users we leave the event type unset so it doesn't tag
+          // their events as NRN Claude.
           if (HARD_SCHEDULED_PATTERNS.test(params.summary)) {
             eventTypeId = EVENT_TYPES.HARD_SCHEDULED;
-          } else {
+          } else if (targetsNrn) {
             eventTypeId = EVENT_TYPES.NRN_CLAUDE;
           }
         }
