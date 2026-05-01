@@ -56,15 +56,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         const matter = matterRes.data;
         const clientId = matter?.client?.id;
 
-        // Trust balance has multiple candidate sources because Clio doesn't
-        // expose a single canonical per-matter balance:
-        //   1. contact.pending_funds_in_trust — typical Clio UI source
-        //   2. contact.funds_in_trust — alternate field name
-        //   3. sum of /trust_line_items?contact_id=X — net of all client
-        //      transactions; captures bill-payment disbursements that the
-        //      ?matter_id=X scope misses (those are tagged to the bill, which
-        //      lives under the contact, not the matter).
-        // We fetch all three and pick the first one that returns a value.
+        // Trust balance: the contact-balance fields (pending_funds_in_trust,
+        // funds_in_trust) returned null in live testing, and summing
+        // /trust_line_items?contact_id=X overcounts because clients commonly
+        // have many matters. The reliable approach is a cross-reference:
+        // pull the contact-scoped ledger with bill linkage, then filter to
+        // entries that are either tagged to this matter OR tagged to a bill
+        // that lives on this matter. That captures both deposits
+        // (matter-tagged) and bill-payment disbursements (bill-tagged).
         const clientPromise: Promise<any> = clientId
           ? rawGetSingle(`/contacts/${clientId}`, {
               fields: "id,name,pending_funds_in_trust,funds_in_trust",
@@ -76,10 +75,12 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: TRUST_FIELDS,
         });
 
+        // Contact-scoped ledger with bill linkage so we can attribute
+        // disbursements to the right matter via the bill.
         const contactTrustLedgerPromise: Promise<any[]> = clientId
           ? fetchAllPages<any>("/trust_line_items", {
               contact_id: clientId,
-              fields: TRUST_FIELDS,
+              fields: "id,date,total,matter{id},bill{id}",
             }).catch(() => [])
           : Promise.resolve([]);
 
@@ -112,6 +113,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: BILL_FIELDS,
         });
 
+        // Every bill on this matter, regardless of state, used to attribute
+        // bill-tagged trust line items (typically disbursements paid from
+        // trust) back to this matter.
+        const allMatterBillsPromise = fetchAllPages<any>("/bills", {
+          matter_id: matterId,
+          fields: "id,state",
+        });
+
         const [
           clientRes,
           trustEntries,
@@ -120,6 +129,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           expenseEntries,
           draftBills,
           outstandingBills,
+          allMatterBills,
         ] = await Promise.all([
           clientPromise,
           trustPromise,
@@ -128,15 +138,41 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           expensePromise,
           draftBillsPromise,
           outstandingBillsPromise,
+          allMatterBillsPromise,
         ]);
 
         const today = new Date();
 
         // --- Trust ---
-        // Pick the first source that returns a value:
-        //   1. contact.pending_funds_in_trust
-        //   2. contact.funds_in_trust
-        //   3. sum of trust_line_items by contact_id (captures disbursements)
+        // Cross-reference the contact's trust ledger against this matter's
+        // bills: an entry counts toward this matter if it is matter-tagged
+        // OR if it is tagged to a bill that lives on this matter (which is
+        // how bill-payment disbursements get linked back to the matter that
+        // benefited from the payment).
+        const matterBillIds = new Set<number>(
+          (allMatterBills || []).map((b: any) => b.id).filter(Boolean)
+        );
+
+        const matterRelatedTrustEntries = contactTrustEntries.filter((e: any) => {
+          if (e?.matter?.id === matterId) return true;
+          if (e?.bill?.id && matterBillIds.has(e.bill.id)) return true;
+          return false;
+        });
+
+        const crossRefSum = matterRelatedTrustEntries.length
+          ? matterRelatedTrustEntries.reduce(
+              (s: number, e: any) => s + (e.total || 0),
+              0
+            )
+          : null;
+
+        const matterTaggedSum = trustEntries.length
+          ? trustEntries.reduce(
+              (s: number, e: any) => s + (e.total || 0),
+              0
+            )
+          : null;
+
         const contactData = clientRes?.data ?? null;
         const pendingFunds =
           typeof contactData?.pending_funds_in_trust === "number"
@@ -146,24 +182,25 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           typeof contactData?.funds_in_trust === "number"
             ? contactData.funds_in_trust
             : null;
-        const contactLedgerSum = contactTrustEntries.length
-          ? contactTrustEntries.reduce(
-              (s: number, e: any) => s + (e.total || 0),
-              0
-            )
-          : null;
 
+        // Priority order: cross-referenced ledger first (most accurate when
+        // bill-linkage data is present), then any contact-level field Clio
+        // happens to populate, then matter-tagged sum (which only sees
+        // deposits and is the least reliable).
         let clientFundsInTrust: number | null = null;
         let trustBalanceSource: string | null = null;
-        if (pendingFunds !== null) {
+        if (crossRefSum !== null) {
+          clientFundsInTrust = crossRefSum;
+          trustBalanceSource = "trust_line_items.cross_referenced_by_matter_bills";
+        } else if (pendingFunds !== null) {
           clientFundsInTrust = pendingFunds;
           trustBalanceSource = "contacts.pending_funds_in_trust";
         } else if (fundsInTrust !== null) {
           clientFundsInTrust = fundsInTrust;
           trustBalanceSource = "contacts.funds_in_trust";
-        } else if (contactLedgerSum !== null) {
-          clientFundsInTrust = contactLedgerSum;
-          trustBalanceSource = "trust_line_items.sum_by_contact_id";
+        } else if (matterTaggedSum !== null) {
+          clientFundsInTrust = matterTaggedSum;
+          trustBalanceSource = "trust_line_items.sum_by_matter_id";
         }
 
         let lastDeposit: string | null = null;
@@ -329,19 +366,25 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             // so this is the client's net trust balance — accurate even when
             // the client has multiple matters with this firm.
             balance: clientFundsInTrust !== null ? round2(clientFundsInTrust) : null,
-            balance_scope: "client",
+            balance_scope: "matter",
             balance_source: trustBalanceSource,
-            // Diagnostic: the candidate values we considered, so we can see
-            // which Clio fields are populated for this account.
+            // Diagnostic: the candidate values we considered. cross_ref is
+            // the matter-tagged + bill-tagged ledger sum (preferred);
+            // matter_tagged_sum sees only deposits; pending/funds are
+            // contact-level fields that may or may not be populated.
             balance_candidates: {
+              cross_referenced:
+                crossRefSum !== null ? round2(crossRefSum) : null,
               pending_funds_in_trust:
                 pendingFunds !== null ? round2(pendingFunds) : null,
               funds_in_trust: fundsInTrust !== null ? round2(fundsInTrust) : null,
-              contact_ledger_sum:
-                contactLedgerSum !== null ? round2(contactLedgerSum) : null,
+              matter_tagged_sum:
+                matterTaggedSum !== null ? round2(matterTaggedSum) : null,
             },
             client_id: clientId ?? null,
-            ledger_entry_count: trustEntries.length,
+            matter_bill_count: matterBillIds.size,
+            matter_tagged_entry_count: trustEntries.length,
+            cross_referenced_entry_count: matterRelatedTrustEntries.length,
             contact_ledger_entry_count: contactTrustEntries.length,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
