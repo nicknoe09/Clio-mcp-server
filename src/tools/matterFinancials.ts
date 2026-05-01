@@ -93,14 +93,18 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: TRUST_FIELDS,
         });
 
-        // Contact-scoped ledger with subject expansion. Clio's trust line
-        // items use a polymorphic `subject` association (e.g. Bill, Matter)
-        // — bill-payment disbursements have subject.type === "Bill" and
-        // subject.id pointing at the paid bill.
+        // Contact-scoped ledger with kitchen-sink expansion. Each {...}
+        // expansion that doesn't have a relationship returns null rather
+        // than 400'ing, so we can ask for every plausible linkage at once
+        // and discover which one Clio actually populates for this account.
+        // Avoids the rabbit hole of guessing one field name at a time.
+        // (Note: `type` as a flat field 400s — JSON-API reserved — so we
+        // can't request it on subject expansion either.)
         const contactTrustLedgerPromise: Promise<any[]> = clientId
           ? fetchAllPages<any>("/trust_line_items", {
               contact_id: clientId,
-              fields: "id,date,total,matter{id},subject{id,type}",
+              fields:
+                "id,date,total,matter{id},bill{id},subject{id},transaction{id},bank_account{id}",
             }).catch(() => [])
           : Promise.resolve([]);
 
@@ -141,15 +145,9 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: "id,state",
         });
 
-        // Diagnostic probe — request a single page of trust_line_items for
-        // this matter with NO `fields` parameter so Clio returns its default
-        // field set. Used to discover which linkage fields (subject, bill,
-        // subject_id, etc.) actually exist on a real entry without guessing.
-        const trustProbePromise: Promise<any[]> = fetchAllPages<any>(
-          "/trust_line_items",
-          { matter_id: matterId },
-          1
-        ).catch(() => []);
+        // (Removed: list-endpoint probe was useless — Clio returns only
+        // id/etag on the list endpoint by default. We probe a single
+        // resource below, after we have an ID to fetch.)
 
         const [
           clientRes,
@@ -160,7 +158,6 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           draftBills,
           outstandingBills,
           allMatterBills,
-          trustProbe,
         ] = await Promise.all([
           clientPromise,
           trustPromise,
@@ -170,11 +167,18 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           draftBillsPromise,
           outstandingBillsPromise,
           allMatterBillsPromise,
-          trustProbePromise,
         ]);
 
-        // Capture the first probe entry as a raw sample for diagnostics.
-        const rawTrustSample = trustProbe?.[0] ?? null;
+        // Single-resource probe for the actual default field shape of a
+        // trust_line_item. The list endpoint returns only id/etag, but the
+        // single-resource endpoint returns Clio's full default attribute
+        // set, which exposes the canonical linkage field names.
+        const probeId = trustEntries[0]?.id ?? contactTrustEntries[0]?.id;
+        const rawTrustSample = probeId
+          ? await rawGetSingle(`/trust_line_items/${probeId}`)
+              .then((r: any) => r?.data ?? null)
+              .catch(() => null)
+          : null;
 
         const today = new Date();
 
@@ -187,12 +191,26 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           (allMatterBills || []).map((b: any) => b.id).filter(Boolean)
         );
 
+        // Match against every linkage we asked for. Whichever expansion
+        // Clio populates, that's the path that will hit.
         const matterRelatedTrustEntries = contactTrustEntries.filter((e: any) => {
           if (e?.matter?.id === matterId) return true;
-          const subj = e?.subject;
-          if (subj?.type === "Bill" && subj?.id && matterBillIds.has(subj.id)) return true;
+          if (e?.bill?.id && matterBillIds.has(e.bill.id)) return true;
+          if (e?.subject?.id && matterBillIds.has(e.subject.id)) return true;
+          if (e?.transaction?.id && matterBillIds.has(e.transaction.id)) return true;
           return false;
         });
+
+        // Diagnostic: which expansion fields actually populated. Tells us
+        // unambiguously which linkage path Clio uses on this account so we
+        // can tighten the query in the next iteration.
+        const linkageFieldStats = {
+          matter_populated: contactTrustEntries.filter((e: any) => e?.matter?.id != null).length,
+          bill_populated: contactTrustEntries.filter((e: any) => e?.bill?.id != null).length,
+          subject_populated: contactTrustEntries.filter((e: any) => e?.subject?.id != null).length,
+          transaction_populated: contactTrustEntries.filter((e: any) => e?.transaction?.id != null).length,
+          bank_account_populated: contactTrustEntries.filter((e: any) => e?.bank_account?.id != null).length,
+        };
 
         const crossRefSum = matterRelatedTrustEntries.length
           ? matterRelatedTrustEntries.reduce(
@@ -472,10 +490,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             cross_referenced_entry_count: matterRelatedTrustEntries.length,
             contact_ledger_entry_count: contactTrustEntries.length,
             subject_expansion_returned_data: anySubjectPresent,
-            // Sample of the raw default field shape, included so we can
-            // discover what linkage fields Clio actually exposes (subject?
-            // bill? subject_id flat? something else). Lets us pick the
-            // right expansion for the cross-ref filter without guessing.
+            // Counts of how many contact-scoped entries had each linkage
+            // expansion populated. Reveals which path Clio actually uses
+            // on this account.
+            linkage_field_stats: linkageFieldStats,
+            // Single-resource probe: Clio returns a richer default attribute
+            // set when fetching one trust_line_item by id than via the list
+            // endpoint (which only returns id/etag). Exposes canonical
+            // linkage field names if the list-endpoint expansions miss them.
             sample_raw_entry: rawTrustSample,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
