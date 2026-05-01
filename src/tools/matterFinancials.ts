@@ -107,6 +107,45 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: BILL_FIELDS,
         });
 
+        // Per the firm: the Clio UI computes per-matter trust balance from
+        // transactions on the IOLTA (trust) bank account, not from
+        // /trust_line_items. Pull bank accounts to identify the trust
+        // account IDs and matter-scoped transactions to net deposits and
+        // disbursements.
+        const bankAccountsPromise = fetchAllPages<any>("/bank_accounts", {
+          fields: "id,name,type",
+        }).catch(() => [] as any[]);
+
+        const matterTransactionsPromise = fetchAllPages<any>("/transactions", {
+          matter_id: matterId,
+          fields:
+            "id,date,description,type,amount,total,matter{id},bank_account{id,name,type}",
+        }).catch(() =>
+          // Retry with a smaller field list in case description/type/amount
+          // aren't accepted on /transactions either.
+          fetchAllPages<any>("/transactions", {
+            matter_id: matterId,
+            fields: "id,date,total,matter{id},bank_account{id,name,type}",
+          }).catch(() => [] as any[])
+        );
+
+        // Diagnostic: trust_requests by matter and by client. The CREATE
+        // docs imply this is the withdrawal/refund resource.
+        const trustRequestsByMatterPromise = fetchAllPages<any>(
+          "/trust_requests",
+          {
+            matter_id: matterId,
+            fields: "id,issue_date,due_date,trust_amount,note,approved,trust_type",
+          }
+        ).catch(() => [] as any[]);
+
+        const trustRequestsByClientPromise: Promise<any[]> = clientId
+          ? fetchAllPages<any>("/trust_requests", {
+              client_id: clientId,
+              fields: "id,issue_date,due_date,trust_amount,note,approved,trust_type",
+            }).catch(() => [] as any[])
+          : Promise.resolve([]);
+
         const [
           trustByMatterEntries,
           trustByBillResults,
@@ -114,6 +153,10 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           expenseEntries,
           draftBills,
           outstandingBills,
+          bankAccounts,
+          matterTransactions,
+          trustRequestsByMatter,
+          trustRequestsByClient,
         ] = await Promise.all([
           trustByMatterPromise,
           Promise.all(trustByBillPromises),
@@ -121,7 +164,50 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           expensePromise,
           draftBillsPromise,
           outstandingBillsPromise,
+          bankAccountsPromise,
+          matterTransactionsPromise,
+          trustRequestsByMatterPromise,
+          trustRequestsByClientPromise,
         ]);
+
+        // Identify trust accounts so we can scope transactions to IOLTA only.
+        const trustBankAccountIds = new Set<number>(
+          bankAccounts
+            .filter((a: any) => {
+              const t = (a?.type || "").toLowerCase();
+              return t === "trust" || t.includes("iolta");
+            })
+            .map((a: any) => a.id)
+            .filter((id: any): id is number => typeof id === "number")
+        );
+
+        // Trust transactions = matter transactions whose bank_account is a
+        // trust account. Sum the signed amount/total to get the net balance.
+        const trustTransactions = matterTransactions.filter((t: any) =>
+          t?.bank_account?.id != null
+            ? trustBankAccountIds.has(t.bank_account.id)
+            : false
+        );
+        const trustTransactionsBalance = trustTransactions.reduce(
+          (s: number, t: any) =>
+            s + (typeof t.total === "number" ? t.total : t.amount || 0),
+          0
+        );
+
+        // Probe one of the bills referenced by a trust deposit. The
+        // matter-scoped trust query showed deposits carrying bill_ids that
+        // are NOT in the matter's bills list — fetching one of those bills
+        // tells us what kind of entity it is (a contact-level "deposit
+        // slip"? something else?) and may reveal where disbursements live.
+        const probeBillId = trustByMatterEntries[0]?.bill?.id ?? null;
+        const trustDepositBillProbe = probeBillId
+          ? await rawGetSingle(`/bills/${probeBillId}`, {
+              fields:
+                "id,number,total,balance,paid_amount,state,issued_at,matter{id,display_number},client{id,name}",
+            })
+              .then((r: any) => r?.data ?? null)
+              .catch((e: any) => ({ error: true, status: e?.response?.status }))
+          : null;
 
         const today = new Date();
 
@@ -139,10 +225,25 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           }
         }
 
-        const trustBalance = allTrustEntries.reduce(
+        const trustLineItemsBalance = allTrustEntries.reduce(
           (s: number, e: any) => s + (e.total || 0),
           0
         );
+
+        // Primary balance source: signed sum of matter-scoped transactions
+        // on trust bank accounts (matches what the Clio UI shows). Falls
+        // back to the trust_line_items union when /transactions returns
+        // nothing (e.g. endpoint not authorized, account uses a different
+        // ledger structure).
+        let trustBalance: number;
+        let trustBalanceSource: string;
+        if (trustTransactions.length > 0) {
+          trustBalance = trustTransactionsBalance;
+          trustBalanceSource = "transactions.matter_id_on_trust_bank_account";
+        } else {
+          trustBalance = trustLineItemsBalance;
+          trustBalanceSource = "trust_line_items.matter_id_union_bill_id";
+        }
 
         const matterTaggedSum = trustByMatterEntries.reduce(
           (s: number, e: any) => s + (e.total || 0),
@@ -313,7 +414,17 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           trust: {
             balance: round2(trustBalance),
             balance_scope: "matter",
-            balance_source: "trust_line_items.matter_id_union_bill_id",
+            balance_source: trustBalanceSource,
+            balance_candidates: {
+              transactions_sum: round2(trustTransactionsBalance),
+              trust_line_items_sum: round2(trustLineItemsBalance),
+            },
+            trust_bank_account_ids: Array.from(trustBankAccountIds),
+            trust_bank_account_names: bankAccounts
+              .filter((a: any) => trustBankAccountIds.has(a.id))
+              .map((a: any) => a.name),
+            transactions_count: matterTransactions.length,
+            trust_transactions_count: trustTransactions.length,
             client_id: clientId ?? null,
             matter_bill_count: matterBillIds.length,
             matter_tagged_entry_count: trustByMatterEntries.length,
@@ -327,6 +438,39 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             days_since_last_activity: trustDormancyDays,
             flags: trustFlags,
             recent_entries: recentTrust,
+            // Diagnostics: where might disbursements live?
+            // The matter-scoped trust ledger has only 4 deposits totaling
+            // $2,000 but the UI shows $847 — $1,153 is unaccounted for.
+            // The deposits' bill_id values point to bills NOT in this
+            // matter's bill list. Surface trust_requests results and a
+            // probe of one deposit's bill to see what entity it is.
+            trust_requests_by_matter: {
+              count: trustRequestsByMatter.length,
+              sum_trust_amount: round2(
+                trustRequestsByMatter.reduce(
+                  (s: number, r: any) => s + (r.trust_amount || 0),
+                  0
+                )
+              ),
+              entries: trustRequestsByMatter.slice(0, 5).map((r: any) => ({
+                id: r.id,
+                issue_date: r.issue_date,
+                trust_amount: r.trust_amount,
+                approved: r.approved,
+                trust_type: r.trust_type,
+                note: r.note,
+              })),
+            },
+            trust_requests_by_client: {
+              count: trustRequestsByClient.length,
+              sum_trust_amount: round2(
+                trustRequestsByClient.reduce(
+                  (s: number, r: any) => s + (r.trust_amount || 0),
+                  0
+                )
+              ),
+            },
+            trust_deposit_bill_probe: trustDepositBillProbe,
           },
           wip: {
             unbilled_hours: round2(unbilledHours),
