@@ -48,22 +48,38 @@ export function registerMatterFinancialsTools(server: McpServer): void {
       try {
         const matterId = params.matter_id;
 
-        // Pull the matter first so we can use the client id to fetch the
-        // authoritative trust balance (Clio holds trust per-contact, not per-matter).
-        const matterRes = await rawGetSingle(`/matters/${matterId}`, {
-          fields: MATTER_FIELDS,
-        });
+        // Try fetching the matter with extended trust-balance fields. Some
+        // Clio installations expose pending_funds_in_trust directly on the
+        // matter resource, which is exactly the per-matter UI value. If
+        // Clio rejects the field, fall back to standard fields.
+        let matterRes: any = null;
+        let matterPendingTrust: number | null = null;
+        let matterFundsInTrust: number | null = null;
+        try {
+          matterRes = await rawGetSingle(`/matters/${matterId}`, {
+            fields: MATTER_FIELDS + ",pending_funds_in_trust,funds_in_trust",
+          });
+          if (typeof matterRes?.data?.pending_funds_in_trust === "number") {
+            matterPendingTrust = matterRes.data.pending_funds_in_trust;
+          }
+          if (typeof matterRes?.data?.funds_in_trust === "number") {
+            matterFundsInTrust = matterRes.data.funds_in_trust;
+          }
+        } catch {
+          matterRes = await rawGetSingle(`/matters/${matterId}`, {
+            fields: MATTER_FIELDS,
+          });
+        }
         const matter = matterRes.data;
         const clientId = matter?.client?.id;
 
-        // Trust balance: the contact-balance fields (pending_funds_in_trust,
-        // funds_in_trust) returned null in live testing, and summing
-        // /trust_line_items?contact_id=X overcounts because clients commonly
-        // have many matters. The reliable approach is a cross-reference:
-        // pull the contact-scoped ledger with bill linkage, then filter to
-        // entries that are either tagged to this matter OR tagged to a bill
-        // that lives on this matter. That captures both deposits
-        // (matter-tagged) and bill-payment disbursements (bill-tagged).
+        // Trust balance: tries multiple sources because Clio doesn't expose a
+        // single canonical per-matter balance and field names vary by account.
+        // Priority order (highest first):
+        //   1. matter.pending_funds_in_trust / matter.funds_in_trust
+        //   2. cross-referenced ledger (matter-tagged + bill-tagged via subject)
+        //   3. contact.pending_funds_in_trust / contact.funds_in_trust
+        //   4. matter-tagged ledger sum (deposits only — last resort)
         const clientPromise: Promise<any> = clientId
           ? rawGetSingle(`/contacts/${clientId}`, {
               fields: "id,name,pending_funds_in_trust,funds_in_trust",
@@ -75,12 +91,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: TRUST_FIELDS,
         });
 
-        // Contact-scoped ledger with bill linkage so we can attribute
-        // disbursements to the right matter via the bill.
+        // Contact-scoped ledger with subject expansion. Clio's trust line
+        // items use a polymorphic `subject` association (e.g. Bill, Matter)
+        // — bill-payment disbursements have subject.type === "Bill" and
+        // subject.id pointing at the paid bill.
         const contactTrustLedgerPromise: Promise<any[]> = clientId
           ? fetchAllPages<any>("/trust_line_items", {
               contact_id: clientId,
-              fields: "id,date,total,matter{id},bill{id}",
+              fields: "id,date,total,matter{id},subject{id,type}",
             }).catch(() => [])
           : Promise.resolve([]);
 
@@ -145,17 +163,17 @@ export function registerMatterFinancialsTools(server: McpServer): void {
 
         // --- Trust ---
         // Cross-reference the contact's trust ledger against this matter's
-        // bills: an entry counts toward this matter if it is matter-tagged
-        // OR if it is tagged to a bill that lives on this matter (which is
-        // how bill-payment disbursements get linked back to the matter that
-        // benefited from the payment).
+        // bills using subject expansion. An entry counts toward this matter
+        // if it is matter-tagged OR if it is a Bill subject pointing at one
+        // of this matter's bills (bill-payment disbursements).
         const matterBillIds = new Set<number>(
           (allMatterBills || []).map((b: any) => b.id).filter(Boolean)
         );
 
         const matterRelatedTrustEntries = contactTrustEntries.filter((e: any) => {
           if (e?.matter?.id === matterId) return true;
-          if (e?.bill?.id && matterBillIds.has(e.bill.id)) return true;
+          const subj = e?.subject;
+          if (subj?.type === "Bill" && subj?.id && matterBillIds.has(subj.id)) return true;
           return false;
         });
 
@@ -165,6 +183,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
               0
             )
           : null;
+
+        // Did the subject expansion actually return linkage data? If every
+        // entry has subject undefined, the field expansion silently dropped
+        // and cross-ref is no better than matter-tagged. Track this so the
+        // priority chain can skip cross-ref when it's not informative.
+        const anySubjectPresent = contactTrustEntries.some(
+          (e: any) => e?.subject?.id != null
+        );
 
         const matterTaggedSum = trustEntries.length
           ? trustEntries.reduce(
@@ -183,13 +209,23 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             ? contactData.funds_in_trust
             : null;
 
-        // Priority order: cross-referenced ledger first (most accurate when
-        // bill-linkage data is present), then any contact-level field Clio
-        // happens to populate, then matter-tagged sum (which only sees
-        // deposits and is the least reliable).
+        // Priority order:
+        //   1. matter.pending_funds_in_trust / matter.funds_in_trust  — if
+        //      the matter resource exposes the per-matter UI value directly
+        //   2. cross-referenced ledger — but only when subject expansion
+        //      actually returned linkage data (otherwise it just equals the
+        //      matter-tagged sum and is misleading)
+        //   3. contact-level fields (in case any account populates them)
+        //   4. matter-tagged ledger sum — deposits only, last resort
         let clientFundsInTrust: number | null = null;
         let trustBalanceSource: string | null = null;
-        if (crossRefSum !== null) {
+        if (matterPendingTrust !== null) {
+          clientFundsInTrust = matterPendingTrust;
+          trustBalanceSource = "matters.pending_funds_in_trust";
+        } else if (matterFundsInTrust !== null) {
+          clientFundsInTrust = matterFundsInTrust;
+          trustBalanceSource = "matters.funds_in_trust";
+        } else if (crossRefSum !== null && anySubjectPresent) {
           clientFundsInTrust = crossRefSum;
           trustBalanceSource = "trust_line_items.cross_referenced_by_matter_bills";
         } else if (pendingFunds !== null) {
@@ -362,22 +398,23 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             open_date: matter?.open_date,
           },
           trust: {
-            // Clio holds trust against the client (contact), not the matter,
-            // so this is the client's net trust balance — accurate even when
-            // the client has multiple matters with this firm.
             balance: clientFundsInTrust !== null ? round2(clientFundsInTrust) : null,
             balance_scope: "matter",
             balance_source: trustBalanceSource,
-            // Diagnostic: the candidate values we considered. cross_ref is
-            // the matter-tagged + bill-tagged ledger sum (preferred);
-            // matter_tagged_sum sees only deposits; pending/funds are
-            // contact-level fields that may or may not be populated.
+            // Diagnostic: every candidate we considered, in priority order.
+            // Inspect these to see which Clio fields/strategies actually
+            // returned a value for this account.
             balance_candidates: {
+              matter_pending_funds_in_trust:
+                matterPendingTrust !== null ? round2(matterPendingTrust) : null,
+              matter_funds_in_trust:
+                matterFundsInTrust !== null ? round2(matterFundsInTrust) : null,
               cross_referenced:
                 crossRefSum !== null ? round2(crossRefSum) : null,
-              pending_funds_in_trust:
+              contact_pending_funds_in_trust:
                 pendingFunds !== null ? round2(pendingFunds) : null,
-              funds_in_trust: fundsInTrust !== null ? round2(fundsInTrust) : null,
+              contact_funds_in_trust:
+                fundsInTrust !== null ? round2(fundsInTrust) : null,
               matter_tagged_sum:
                 matterTaggedSum !== null ? round2(matterTaggedSum) : null,
             },
@@ -386,6 +423,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             matter_tagged_entry_count: trustEntries.length,
             cross_referenced_entry_count: matterRelatedTrustEntries.length,
             contact_ledger_entry_count: contactTrustEntries.length,
+            subject_expansion_returned_data: anySubjectPresent,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
             last_activity_date: lastTrustActivity,
