@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, addToDraftBill } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -346,14 +346,15 @@ export function registerTimeTools(server: McpServer): void {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to update"),
       new_note: z.string().optional().describe("Revised description/note for the entry"),
       new_rate: z.coerce.number().optional().describe("Revised hourly rate"),
-      new_hours: z.coerce.number().optional().describe("Revised hours (converted to seconds for Clio)"),
+      new_hours: z.coerce.number().optional().describe("Revised hours (decimal). Helper handles unit conversion per routing target."),
+      new_date: z.string().optional().describe("Revised date in YYYY-MM-DD format. Use this instead of strip-and-recreate when only the date is changing."),
     },
     async (params) => {
-      if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined) {
+      if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined && params.new_date === undefined) {
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
+            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours, new_date" }),
           }],
           isError: true,
         };
@@ -363,6 +364,7 @@ export function registerTimeTools(server: McpServer): void {
       if (params.new_note) patch.note = params.new_note;
       if (params.new_rate !== undefined) patch.price = params.new_rate;
       if (params.new_hours !== undefined) patch.hours = params.new_hours;
+      if (params.new_date !== undefined) patch.date = params.new_date;
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
@@ -545,14 +547,15 @@ export function registerTimeTools(server: McpServer): void {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID"),
       new_note: z.string().optional().describe("Revised description/note"),
       new_rate: z.coerce.number().optional().describe("Hourly rate (dollars)"),
-      new_hours: z.coerce.number().optional().describe("Hours (will be converted to seconds)"),
+      new_hours: z.coerce.number().optional().describe("Hours (decimal). Helper handles unit conversion per routing target."),
+      new_date: z.string().optional().describe("New date YYYY-MM-DD. Use this for date-only changes instead of strip-and-recreate."),
     },
     async (params) => {
-      if (params.new_note === undefined && params.new_rate === undefined && params.new_hours === undefined) {
+      if (params.new_note === undefined && params.new_rate === undefined && params.new_hours === undefined && params.new_date === undefined) {
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
+            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours, new_date" }),
           }],
           isError: true,
         };
@@ -562,6 +565,7 @@ export function registerTimeTools(server: McpServer): void {
       if (params.new_note !== undefined) patch.note = params.new_note;
       if (params.new_rate !== undefined) patch.price = params.new_rate;
       if (params.new_hours !== undefined) patch.hours = params.new_hours;
+      if (params.new_date !== undefined) patch.date = params.new_date;
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
@@ -749,6 +753,56 @@ export function registerTimeTools(server: McpServer): void {
               message: err.message,
               context: err.response?.data?.context,
               clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // add_to_draft_bill — POST /line_items to attach an existing activity to
+  // a DRAFT bill. Closes the gap left by create_time_entry, which doesn't
+  // auto-attach. Used after delete-and-recreate workflows or when an
+  // activity was unbilled (intentionally or otherwise) and needs to be
+  // reattached. Idempotent: if the activity is already on the bill, returns
+  // the existing line_item.
+  server.tool(
+    "add_to_draft_bill",
+    "Attach an existing activity to a DRAFT bill by creating a line_item. Use this after creating a new time entry that needs to land on an existing draft bill, or to reattach an activity that was previously unbilled. Refuses if the bill is not in draft state. Refuses if the activity is already on a different bill (use remove_from_draft_bill first). Idempotent if the activity is already on the requested bill.",
+    {
+      activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to attach"),
+      bill_id: z.coerce.number().describe("The draft bill ID to attach the activity to"),
+    },
+    async (params) => {
+      try {
+        const result = await addToDraftBill({ activity_id: params.activity_id, bill_id: params.bill_id });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              line_item_id: result.line_item_id,
+              activity_id: result.activity_id,
+              bill: result.bill,
+              already_on_bill: result.already_on_bill,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              activity_id: params.activity_id,
+              bill_id: params.bill_id,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+              request_body: err.response?.request_body,
             }, null, 2),
           }],
           isError: true,

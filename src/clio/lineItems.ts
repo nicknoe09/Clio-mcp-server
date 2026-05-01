@@ -1,4 +1,4 @@
-import { fetchAllPages, rawGetSingle, rawPatchSingle, rawDeleteSingle } from "./pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawDeleteSingle, rawPostSingle } from "./pagination";
 
 export interface LineItemSummary {
   id: number;
@@ -425,5 +425,83 @@ export async function discountLineItem(args: {
     after: afterResp.data,
     discount_amount_applied: discountAmount,
     discount_pct_applied: Math.round(discountPct * 100) / 100,
+  };
+}
+
+export interface AddToDraftBillResult {
+  line_item_id: number;
+  activity_id: number;
+  bill: { id: number; state?: string; number?: string };
+  already_on_bill: boolean;
+}
+
+// Add an existing activity to a DRAFT bill by creating a line_item that
+// references both. Used after delete-and-recreate workflows (e.g.
+// changing an entry's date) where the new activity is unbilled and needs
+// to be reattached to a draft bill that was already mid-edit.
+//
+// Refuses if:
+//   - the bill is not in draft state (touching issued bills can corrupt
+//     accounting)
+//   - the activity is already attached to a different bill (caller must
+//     unbill first via remove_from_draft_bill)
+// Idempotent: if the activity is already on the requested bill, returns
+// the existing line_item with already_on_bill=true.
+export async function addToDraftBill(args: {
+  activity_id: number;
+  bill_id: number;
+}): Promise<AddToDraftBillResult> {
+  const billResp = await rawGetSingle(`/bills/${args.bill_id}`, { fields: "id,number,state" });
+  const bill = billResp.data;
+  if (!bill) {
+    const err: any = new Error(`Bill ${args.bill_id} not found.`);
+    err.response = { status: 404 };
+    throw err;
+  }
+  if (bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to add line_item to bill ${args.bill_id}: state is "${bill.state}", not "draft".`,
+    );
+    err.response = { status: 409, data: { context: "bill_not_draft", bill_state: bill.state } };
+    throw err;
+  }
+
+  const routing = await resolveActivityRouting(args.activity_id);
+  if (routing.bill && routing.bill.id !== args.bill_id) {
+    const err: any = new Error(
+      `Activity ${args.activity_id} is already on bill ${routing.bill.id} (state="${routing.bill.state}"). Remove it from that bill first via remove_from_draft_bill, then re-attempt.`,
+    );
+    err.response = { status: 409, data: { context: "activity_on_other_bill", current_bill: routing.bill } };
+    throw err;
+  }
+  if (routing.bill && routing.bill.id === args.bill_id && routing.line_item) {
+    return {
+      line_item_id: routing.line_item.id,
+      activity_id: args.activity_id,
+      bill: { id: args.bill_id, state: bill.state, number: bill.number },
+      already_on_bill: true,
+    };
+  }
+
+  const body = {
+    data: {
+      bill: { id: args.bill_id },
+      activity: { id: args.activity_id },
+    },
+  };
+  let resp: any;
+  try {
+    resp = await rawPostSingle("/line_items", body);
+  } catch (err: any) {
+    console.error(`[addToDraftBill] POST /line_items failed status=${err.response?.status} body=${JSON.stringify(body)} clio_error=${JSON.stringify(err.response?.data || {}).slice(0, 400)}`);
+    if (err.response) err.response.request_body = body;
+    throw err;
+  }
+  const lineItem = resp.data;
+  return {
+    line_item_id: lineItem.id,
+    activity_id: args.activity_id,
+    bill: { id: args.bill_id, state: bill.state, number: bill.number },
+    already_on_bill: false,
   };
 }
