@@ -5,7 +5,6 @@ export interface LineItemSummary {
   description?: string;
   note?: string;
   quantity?: number;
-  rounded_quantity?: number;
   price?: number;
   total?: number;
   activity?: { id: number };
@@ -22,7 +21,7 @@ const ACTIVITY_ROUTING_FIELDS =
   "id,date,note,price,quantity,rounded_quantity,billed,bill{id,state,number},matter{id,display_number},user{id,name}";
 
 const LINE_ITEM_FIELDS =
-  "id,description,note,quantity,rounded_quantity,price,total,activity{id},bill{id,state,number}";
+  "id,description,note,quantity,price,total,activity{id},bill{id,state,number}";
 
 // Resolve where an activity's edits should be written. If the activity is on
 // a bill (draft or otherwise), Clio locks PATCH /activities/{id} with a 422
