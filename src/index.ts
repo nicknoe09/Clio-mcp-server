@@ -209,8 +209,27 @@ app.post("/messages", messagesGuard, async (req, res) => {
 });
 
 // --- Health Check ---
+// Reports the deployed git SHA via RAILWAY_GIT_COMMIT_SHA (Railway sets this
+// automatically on each deploy). Lets callers verify "is my latest commit
+// actually live?" without guessing at deploy timing.
+const DEPLOY_SHA =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT_SHA ||
+  process.env.SOURCE_VERSION || // Heroku
+  "unknown";
+const DEPLOY_BRANCH = process.env.RAILWAY_GIT_BRANCH || process.env.GIT_BRANCH || "unknown";
+const STARTED_AT = new Date().toISOString();
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "clio-mcp", version: "1.1.0", build: "all-tools" });
+  res.json({
+    status: "ok",
+    server: "clio-mcp",
+    version: "1.1.0",
+    build: "all-tools",
+    git_sha: DEPLOY_SHA,
+    git_sha_short: DEPLOY_SHA === "unknown" ? "unknown" : DEPLOY_SHA.slice(0, 7),
+    git_branch: DEPLOY_BRANCH,
+    started_at: STARTED_AT,
+  });
 });
 
 // --- Token-addressed file downloads (Box upload fallback) ---
