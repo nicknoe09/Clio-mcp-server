@@ -483,10 +483,26 @@ export async function addToDraftBill(args: {
     };
   }
 
+  const matterId = routing.activity?.matter?.id;
+  if (!matterId) {
+    const err: any = new Error(
+      `Activity ${args.activity_id} has no matter — cannot attach to a bill.`,
+    );
+    err.response = { status: 400, data: { context: "activity_has_no_matter" } };
+    throw err;
+  }
+
+  // Clio's POST /line_items rejected the minimal {bill, activity} body with
+  // "The matter is invalid." (verified live, 04/2026). Including matter as
+  // a top-level association is the documented convention used elsewhere in
+  // Clio's v4 API; the line_item record is denormalized rather than a thin
+  // join table. If Clio names additional missing fields in a future 422,
+  // add them here based on request_body + clio_error in the log.
   const body = {
     data: {
       bill: { id: args.bill_id },
       activity: { id: args.activity_id },
+      matter: { id: matterId },
     },
   };
   let resp: any;
