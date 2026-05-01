@@ -5,21 +5,18 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
 
-// trust_line_items has limited fields per Clio. `type` is reserved (JSON-API
-// resource-type identifier) and `description` isn't supported either. Stick
-// to what the endpoint actually accepts.
-const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
+// Per Clio's documented trust_line_item resource: id, etag, date, total,
+// note, created_at, updated_at, plus relations bill / matter / client.
+// (No `description`, no `type`, no `subject`, no `transaction`.)
+const TRUST_FIELDS =
+  "id,date,total,note,bill{id},matter{id,display_number,client}";
 
-// bill{id,state} lets us bucket activities into truly unbilled vs. draft-billed.
-// Clio leaves activities flagged billed=false until a bill is *issued*, so an
-// entry can be on a draft bill and still come back from billed=false queries.
 const TIME_FIELDS =
   "id,date,quantity,rounded_quantity,price,note,user{id,name},bill{id,state}";
 
 const EXPENSE_FIELDS = "id,date,price,note,user{id,name},bill{id,state}";
 
-const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state";
+const BILL_FIELDS = "id,number,issued_at,due_at,balance,total,state";
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -32,7 +29,7 @@ function daysBetween(a: Date, b: Date): number {
 export function registerMatterFinancialsTools(server: McpServer): void {
   server.tool(
     "get_matter_financial_summary",
-    "Per-matter financial snapshot: trust balance (from the client's funds_in_trust), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR). Mirrors the WIP/Draft/AR breakdown shown on the Clio matter dashboard.",
+    "Per-matter financial snapshot: trust balance (matter-tagged deposits net of bill-tagged disbursements), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR). Matches the Clio matter dashboard.",
     {
       matter_id: z.coerce.number().describe("Clio matter ID"),
       trust_history_limit: z
@@ -50,63 +47,39 @@ export function registerMatterFinancialsTools(server: McpServer): void {
       try {
         const matterId = params.matter_id;
 
-        // Try fetching the matter with extended trust-balance fields. Some
-        // Clio installations expose pending_funds_in_trust directly on the
-        // matter resource, which is exactly the per-matter UI value. If
-        // Clio rejects the field, fall back to standard fields.
-        let matterRes: any = null;
-        let matterPendingTrust: number | null = null;
-        let matterFundsInTrust: number | null = null;
-        try {
-          matterRes = await rawGetSingle(`/matters/${matterId}`, {
-            fields: MATTER_FIELDS + ",pending_funds_in_trust,funds_in_trust",
-          });
-          if (typeof matterRes?.data?.pending_funds_in_trust === "number") {
-            matterPendingTrust = matterRes.data.pending_funds_in_trust;
-          }
-          if (typeof matterRes?.data?.funds_in_trust === "number") {
-            matterFundsInTrust = matterRes.data.funds_in_trust;
-          }
-        } catch {
-          matterRes = await rawGetSingle(`/matters/${matterId}`, {
-            fields: MATTER_FIELDS,
-          });
-        }
+        const matterRes = await rawGetSingle(`/matters/${matterId}`, {
+          fields: MATTER_FIELDS,
+        });
         const matter = matterRes.data;
         const clientId = matter?.client?.id;
 
-        // Trust balance: tries multiple sources because Clio doesn't expose a
-        // single canonical per-matter balance and field names vary by account.
-        // Priority order (highest first):
-        //   1. matter.pending_funds_in_trust / matter.funds_in_trust
-        //   2. cross-referenced ledger (matter-tagged + bill-tagged via subject)
-        //   3. contact.pending_funds_in_trust / contact.funds_in_trust
-        //   4. matter-tagged ledger sum (deposits only — last resort)
-        const clientPromise: Promise<any> = clientId
-          ? rawGetSingle(`/contacts/${clientId}`, {
-              fields: "id,name,pending_funds_in_trust,funds_in_trust",
-            }).catch(() => null)
-          : Promise.resolve(null);
+        // Fetch the matter's bills first because the per-matter trust
+        // balance is computed from matter-tagged deposits PLUS bill-tagged
+        // disbursements — we need the full bill list to fan out trust
+        // queries by bill_id (the only documented bill linkage filter on
+        // /trust_line_items).
+        const allMatterBills = await fetchAllPages<any>("/bills", {
+          matter_id: matterId,
+          fields: "id,state",
+        });
+        const matterBillIds: number[] = allMatterBills
+          .map((b: any) => b.id)
+          .filter((id: any): id is number => typeof id === "number");
 
-        const trustPromise = fetchAllPages<any>("/trust_line_items", {
+        const trustByMatterPromise = fetchAllPages<any>("/trust_line_items", {
           matter_id: matterId,
           fields: TRUST_FIELDS,
         });
 
-        // Contact-scoped ledger with kitchen-sink expansion. Each {...}
-        // expansion that doesn't have a relationship returns null rather
-        // than 400'ing, so we can ask for every plausible linkage at once
-        // and discover which one Clio actually populates for this account.
-        // Avoids the rabbit hole of guessing one field name at a time.
-        // (Note: `type` as a flat field 400s — JSON-API reserved — so we
-        // can't request it on subject expansion either.)
-        const contactTrustLedgerPromise: Promise<any[]> = clientId
-          ? fetchAllPages<any>("/trust_line_items", {
-              contact_id: clientId,
-              fields:
-                "id,date,total,matter{id},bill{id},subject{id},transaction{id},bank_account{id}",
-            }).catch(() => [])
-          : Promise.resolve([]);
+        // One query per bill — Clio's documented filter is bill_id (single
+        // value), so we fan out and dedupe on the way back. .catch returns
+        // [] so a single bad bill doesn't drop the whole report.
+        const trustByBillPromises = matterBillIds.map((billId) =>
+          fetchAllPages<any>("/trust_line_items", {
+            bill_id: billId,
+            fields: TRUST_FIELDS,
+          }).catch(() => [] as any[])
+        );
 
         const timePromise = fetchAllPages<any>("/activities", {
           type: "TimeEntry",
@@ -122,9 +95,6 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: EXPENSE_FIELDS,
         });
 
-        // Pull draft bills separately so we can report Clio's "Draft" total
-        // (which reflects bill total after any write-downs/discounts, not the
-        // raw activity sum).
         const draftBillsPromise = fetchAllPages<any>("/bills", {
           matter_id: matterId,
           state: "draft",
@@ -137,172 +107,61 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: BILL_FIELDS,
         });
 
-        // Every bill on this matter, regardless of state, used to attribute
-        // bill-tagged trust line items (typically disbursements paid from
-        // trust) back to this matter.
-        const allMatterBillsPromise = fetchAllPages<any>("/bills", {
-          matter_id: matterId,
-          fields: "id,state",
-        });
-
-        // (Removed: list-endpoint probe was useless — Clio returns only
-        // id/etag on the list endpoint by default. We probe a single
-        // resource below, after we have an ID to fetch.)
-
         const [
-          clientRes,
-          trustEntries,
-          contactTrustEntries,
+          trustByMatterEntries,
+          trustByBillResults,
           timeEntries,
           expenseEntries,
           draftBills,
           outstandingBills,
-          allMatterBills,
         ] = await Promise.all([
-          clientPromise,
-          trustPromise,
-          contactTrustLedgerPromise,
+          trustByMatterPromise,
+          Promise.all(trustByBillPromises),
           timePromise,
           expensePromise,
           draftBillsPromise,
           outstandingBillsPromise,
-          allMatterBillsPromise,
         ]);
-
-        // Single-resource probe for the actual default field shape of a
-        // trust_line_item. The list endpoint returns only id/etag, but the
-        // single-resource endpoint returns Clio's full default attribute
-        // set, which exposes the canonical linkage field names.
-        const probeId = trustEntries[0]?.id ?? contactTrustEntries[0]?.id;
-        const rawTrustSample = probeId
-          ? await rawGetSingle(`/trust_line_items/${probeId}`)
-              .then((r: any) => r?.data ?? null)
-              .catch(() => null)
-          : null;
 
         const today = new Date();
 
         // --- Trust ---
-        // Cross-reference the contact's trust ledger against this matter's
-        // bills using subject expansion. An entry counts toward this matter
-        // if it is matter-tagged OR if it is a Bill subject pointing at one
-        // of this matter's bills (bill-payment disbursements).
-        const matterBillIds = new Set<number>(
-          (allMatterBills || []).map((b: any) => b.id).filter(Boolean)
-        );
-
-        // Match against every linkage we asked for. Whichever expansion
-        // Clio populates, that's the path that will hit.
-        const matterRelatedTrustEntries = contactTrustEntries.filter((e: any) => {
-          if (e?.matter?.id === matterId) return true;
-          if (e?.bill?.id && matterBillIds.has(e.bill.id)) return true;
-          if (e?.subject?.id && matterBillIds.has(e.subject.id)) return true;
-          if (e?.transaction?.id && matterBillIds.has(e.transaction.id)) return true;
-          return false;
-        });
-
-        // Diagnostic: which expansion fields actually populated. Tells us
-        // unambiguously which linkage path Clio uses on this account so we
-        // can tighten the query in the next iteration.
-        const linkageFieldStats = {
-          matter_populated: contactTrustEntries.filter((e: any) => e?.matter?.id != null).length,
-          bill_populated: contactTrustEntries.filter((e: any) => e?.bill?.id != null).length,
-          subject_populated: contactTrustEntries.filter((e: any) => e?.subject?.id != null).length,
-          transaction_populated: contactTrustEntries.filter((e: any) => e?.transaction?.id != null).length,
-          bank_account_populated: contactTrustEntries.filter((e: any) => e?.bank_account?.id != null).length,
-        };
-
-        const crossRefSum = matterRelatedTrustEntries.length
-          ? matterRelatedTrustEntries.reduce(
-              (s: number, e: any) => s + (e.total || 0),
-              0
-            )
-          : null;
-
-        // Did the subject expansion actually return linkage data? If every
-        // entry has subject undefined, the field expansion silently dropped
-        // and cross-ref is no better than matter-tagged. Track this so the
-        // priority chain can skip cross-ref when it's not informative.
-        const anySubjectPresent = contactTrustEntries.some(
-          (e: any) => e?.subject?.id != null
-        );
-
-        const matterTaggedSum = trustEntries.length
-          ? trustEntries.reduce(
-              (s: number, e: any) => s + (e.total || 0),
-              0
-            )
-          : null;
-
-        const contactData = clientRes?.data ?? null;
-        const pendingFunds =
-          typeof contactData?.pending_funds_in_trust === "number"
-            ? contactData.pending_funds_in_trust
-            : null;
-        const fundsInTrust =
-          typeof contactData?.funds_in_trust === "number"
-            ? contactData.funds_in_trust
-            : null;
-
-        // Type/sign distribution across the matter-scoped ledger — useful
-        // for diagnosing whether Clio is actually returning disbursements
-        // (negative totals) for this matter. type isn't requestable so we
-        // bucket by sign instead.
-        let positiveCount = 0;
-        let negativeCount = 0;
-        let positiveSum = 0;
-        let negativeSum = 0;
-        for (const e of trustEntries) {
-          const total = (e?.total as number) || 0;
-          if (total >= 0) {
-            positiveCount++;
-            positiveSum += total;
-          } else {
-            negativeCount++;
-            negativeSum += total;
+        // Union the matter-tagged ledger (deposits and any matter-direct
+        // disbursements) with bill-tagged entries (disbursements paid from
+        // trust against this matter's bills). Dedupe by id since an entry
+        // could in theory carry both linkages.
+        const seenTrustIds = new Set<number>();
+        const allTrustEntries: any[] = [];
+        for (const e of [...trustByMatterEntries, ...trustByBillResults.flat()]) {
+          if (e?.id != null && !seenTrustIds.has(e.id)) {
+            seenTrustIds.add(e.id);
+            allTrustEntries.push(e);
           }
         }
-        const matterLedgerHasNegatives = negativeCount > 0;
 
-        // Priority order — matter-scoped sum is the cleanest answer when
-        // Clio actually tags disbursements with matter_id, but on this
-        // firm's account it tends to only see deposits. Fall through to the
-        // matter-resource probe and cross-ref strategies.
-        let clientFundsInTrust: number | null = null;
-        let trustBalanceSource: string | null = null;
-        if (matterPendingTrust !== null) {
-          clientFundsInTrust = matterPendingTrust;
-          trustBalanceSource = "matters.pending_funds_in_trust";
-        } else if (matterFundsInTrust !== null) {
-          clientFundsInTrust = matterFundsInTrust;
-          trustBalanceSource = "matters.funds_in_trust";
-        } else if (crossRefSum !== null && anySubjectPresent) {
-          clientFundsInTrust = crossRefSum;
-          trustBalanceSource = "trust_line_items.cross_referenced_by_matter_bills";
-        } else if (matterTaggedSum !== null && matterLedgerHasNegatives) {
-          // Only trust the matter-scoped sum when it actually contains
-          // disbursements; deposits-only is a known wrong answer.
-          clientFundsInTrust = matterTaggedSum;
-          trustBalanceSource = "trust_line_items.sum_by_matter_id";
-        } else if (pendingFunds !== null) {
-          clientFundsInTrust = pendingFunds;
-          trustBalanceSource = "contacts.pending_funds_in_trust";
-        } else if (fundsInTrust !== null) {
-          clientFundsInTrust = fundsInTrust;
-          trustBalanceSource = "contacts.funds_in_trust";
-        } else if (matterTaggedSum !== null) {
-          // Last resort — matter-tagged sum without disbursements (likely
-          // overstates the balance). Flagged via balance_source so callers
-          // know to be skeptical.
-          clientFundsInTrust = matterTaggedSum;
-          trustBalanceSource = "trust_line_items.sum_by_matter_id (deposits_only)";
-        }
+        const trustBalance = allTrustEntries.reduce(
+          (s: number, e: any) => s + (e.total || 0),
+          0
+        );
+
+        const matterTaggedSum = trustByMatterEntries.reduce(
+          (s: number, e: any) => s + (e.total || 0),
+          0
+        );
+        const billTaggedEntries = trustByBillResults
+          .flat()
+          .filter((e: any) => !trustByMatterEntries.some((m: any) => m.id === e.id));
+        const billTaggedSum = billTaggedEntries.reduce(
+          (s: number, e: any) => s + (e.total || 0),
+          0
+        );
+
+        const sortedTrust = [...allTrustEntries].sort((a: any, b: any) =>
+          (b.date || "").localeCompare(a.date || "")
+        );
 
         let lastDeposit: string | null = null;
         let lastDisbursement: string | null = null;
-        const sortedTrust = [...trustEntries].sort((a: any, b: any) =>
-          (b.date || "").localeCompare(a.date || "")
-        );
         for (const entry of sortedTrust) {
           const amount = entry.total || 0;
           if (amount > 0 && !lastDeposit) lastDeposit = entry.date;
@@ -314,26 +173,31 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           : null;
 
         const trustFlags: string[] = [];
-        if (clientFundsInTrust !== null && clientFundsInTrust < 500) {
-          trustFlags.push("LOW_BALANCE");
+        if (trustBalance < 500) trustFlags.push("LOW_BALANCE");
+        if (trustDormancyDays !== null && trustDormancyDays > 90) {
+          trustFlags.push("DORMANT");
         }
-        if (trustDormancyDays !== null && trustDormancyDays > 90) trustFlags.push("DORMANT");
+
+        const limit = Math.max(0, params.trust_history_limit ?? 10);
+        const recentTrust = sortedTrust.slice(0, limit).map((e: any) => ({
+          id: e.id,
+          date: e.date,
+          amount: round2(e.total || 0),
+          note: e.note ?? null,
+          bill_id: e.bill?.id ?? null,
+        }));
 
         // --- WIP buckets ---
-        // bill === null  → truly unbilled (Clio's "Unbilled" number)
-        // bill.state === "draft" → on a draft bill (Clio's "Draft" number — but
-        //   we use the bill total below, not the raw activity sum, because
-        //   draft bills can include write-downs/discounts).
-        // Other bill states → already on an issued bill; ignore (shouldn't
-        //   normally appear under billed=false but we defensively skip).
+        // bill === null → truly unbilled; bill.state === "draft" → on a
+        // draft bill (Clio's "Draft" total reflects the bill total post-
+        // write-down, not the raw activity sum, so we fetch draft bills
+        // separately and use their `total` instead of summing activities).
         let unbilledHours = 0;
         let unbilledTimeValue = 0;
         let oldestUnbilledDate: string | null = null;
-
         const unbilledTimeDetail: any[] = [];
         for (const e of timeEntries) {
-          const onBill = e.bill?.id != null;
-          if (onBill) continue;
+          if (e.bill?.id != null) continue;
           const hours = (e.rounded_quantity ?? e.quantity ?? 0) / 3600;
           const value = hours * (e.price || 0);
           unbilledHours += hours;
@@ -357,8 +221,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         let unbilledExpenses = 0;
         const unbilledExpenseDetail: any[] = [];
         for (const e of expenseEntries) {
-          const onBill = e.bill?.id != null;
-          if (onBill) continue;
+          if (e.bill?.id != null) continue;
           unbilledExpenses += e.price || 0;
           if (!oldestUnbilledDate || (e.date && e.date < oldestUnbilledDate)) {
             oldestUnbilledDate = e.date;
@@ -376,7 +239,6 @@ export function registerMatterFinancialsTools(server: McpServer): void {
 
         const unbilledTotal = unbilledTimeValue + unbilledExpenses;
 
-        // Draft bills — sum the bill totals (post write-downs).
         const draftBillTotal = draftBills.reduce(
           (s: number, b: any) => s + (b.total || 0),
           0
@@ -388,18 +250,16 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           balance: round2(b.balance || 0),
         }));
 
-        // Combined WIP = unbilled + draft (matches Clio's matter dashboard "Work in Progress")
         const combinedWip = unbilledTotal + draftBillTotal;
 
         const wipDaysSinceOldest = oldestUnbilledDate
           ? daysBetween(today, new Date(oldestUnbilledDate))
           : null;
-
         const wipFlags: string[] = [];
         if (wipDaysSinceOldest !== null && wipDaysSinceOldest > 60) wipFlags.push("RED");
         else if (wipDaysSinceOldest !== null && wipDaysSinceOldest > 30) wipFlags.push("YELLOW");
 
-        // --- AR (outstanding bills for this matter) ---
+        // --- AR ---
         let arBalance = 0;
         let oldestDueDate: string | null = null;
         const outstanding = outstandingBills.map((b: any) => {
@@ -410,7 +270,9 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             oldestDueDate = dueRef;
           }
           const dueDate = dueRef ? new Date(dueRef) : null;
-          const daysOutstanding = dueDate ? Math.max(daysBetween(today, dueDate), 0) : null;
+          const daysOutstanding = dueDate
+            ? Math.max(daysBetween(today, dueDate), 0)
+            : null;
           return {
             bill_id: b.id,
             bill_number: b.number,
@@ -422,26 +284,18 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             state: b.state,
           };
         });
-        outstanding.sort((a: any, b: any) => (b.days_outstanding ?? 0) - (a.days_outstanding ?? 0));
+        outstanding.sort(
+          (a: any, b: any) => (b.days_outstanding ?? 0) - (a.days_outstanding ?? 0)
+        );
 
         const oldestArDays = oldestDueDate
           ? Math.max(daysBetween(today, new Date(oldestDueDate)), 0)
           : null;
-
         const arFlags: string[] = [];
         if (oldestArDays !== null && oldestArDays > 90) arFlags.push("OVER_90");
         else if (oldestArDays !== null && oldestArDays > 60) arFlags.push("OVER_60");
         else if (oldestArDays !== null && oldestArDays > 30) arFlags.push("OVER_30");
 
-        // --- Recent trust activity (limited) ---
-        const limit = Math.max(0, params.trust_history_limit ?? 10);
-        const recentTrust = sortedTrust.slice(0, limit).map((e: any) => ({
-          id: e.id,
-          date: e.date,
-          amount: round2(e.total || 0),
-        }));
-
-        const trustBalanceForTotals = clientFundsInTrust ?? 0;
         const totalExposure = round2(combinedWip + arBalance);
 
         const result: any = {
@@ -457,48 +311,16 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             open_date: matter?.open_date,
           },
           trust: {
-            balance: clientFundsInTrust !== null ? round2(clientFundsInTrust) : null,
+            balance: round2(trustBalance),
             balance_scope: "matter",
-            balance_source: trustBalanceSource,
-            // Diagnostic: every candidate we considered, in priority order.
-            // Inspect these to see which Clio fields/strategies actually
-            // returned a value for this account.
-            balance_candidates: {
-              matter_pending_funds_in_trust:
-                matterPendingTrust !== null ? round2(matterPendingTrust) : null,
-              matter_funds_in_trust:
-                matterFundsInTrust !== null ? round2(matterFundsInTrust) : null,
-              cross_referenced:
-                crossRefSum !== null ? round2(crossRefSum) : null,
-              contact_pending_funds_in_trust:
-                pendingFunds !== null ? round2(pendingFunds) : null,
-              contact_funds_in_trust:
-                fundsInTrust !== null ? round2(fundsInTrust) : null,
-              matter_tagged_sum:
-                matterTaggedSum !== null ? round2(matterTaggedSum) : null,
-            },
+            balance_source: "trust_line_items.matter_id_union_bill_id",
             client_id: clientId ?? null,
-            matter_bill_count: matterBillIds.size,
-            matter_tagged_entry_count: trustEntries.length,
-            matter_ledger_has_negatives: matterLedgerHasNegatives,
-            matter_ledger_sign_distribution: {
-              positive_entries: positiveCount,
-              negative_entries: negativeCount,
-              positive_sum: round2(positiveSum),
-              negative_sum: round2(negativeSum),
-            },
-            cross_referenced_entry_count: matterRelatedTrustEntries.length,
-            contact_ledger_entry_count: contactTrustEntries.length,
-            subject_expansion_returned_data: anySubjectPresent,
-            // Counts of how many contact-scoped entries had each linkage
-            // expansion populated. Reveals which path Clio actually uses
-            // on this account.
-            linkage_field_stats: linkageFieldStats,
-            // Single-resource probe: Clio returns a richer default attribute
-            // set when fetching one trust_line_item by id than via the list
-            // endpoint (which only returns id/etag). Exposes canonical
-            // linkage field names if the list-endpoint expansions miss them.
-            sample_raw_entry: rawTrustSample,
+            matter_bill_count: matterBillIds.length,
+            matter_tagged_entry_count: trustByMatterEntries.length,
+            matter_tagged_sum: round2(matterTaggedSum),
+            bill_tagged_entry_count: billTaggedEntries.length,
+            bill_tagged_sum: round2(billTaggedSum),
+            total_entry_count: allTrustEntries.length,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
             last_activity_date: lastTrustActivity,
@@ -507,16 +329,13 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             recent_entries: recentTrust,
           },
           wip: {
-            // Truly unbilled (no bill association)
             unbilled_hours: round2(unbilledHours),
             unbilled_time_value: round2(unbilledTimeValue),
             unbilled_expenses: round2(unbilledExpenses),
             unbilled_total: round2(unbilledTotal),
-            // On draft bills (sum of bill totals, post write-down)
             draft_bill_count: draftBills.length,
             draft_bill_total: round2(draftBillTotal),
             draft_bills: draftBillSummary,
-            // Combined — matches Clio's matter-dashboard "Work in Progress"
             combined_wip_value: round2(combinedWip),
             time_entry_count: timeEntries.length,
             expense_entry_count: expenseEntries.length,
@@ -533,7 +352,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             outstanding_bills: outstanding,
           },
           totals: {
-            trust_balance: clientFundsInTrust !== null ? round2(trustBalanceForTotals) : null,
+            trust_balance: round2(trustBalance),
             wip_value: round2(combinedWip),
             ar_balance: round2(arBalance),
             wip_plus_ar: totalExposure,
