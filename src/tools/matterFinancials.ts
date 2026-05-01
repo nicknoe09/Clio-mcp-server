@@ -8,10 +8,13 @@ const MATTER_FIELDS =
 // trust_line_items has limited fields per Clio — id/date/total only, no description/type
 const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
 
+// bill{id,state} lets us bucket activities into truly unbilled vs. draft-billed.
+// Clio leaves activities flagged billed=false until a bill is *issued*, so an
+// entry can be on a draft bill and still come back from billed=false queries.
 const TIME_FIELDS =
-  "id,date,quantity,rounded_quantity,price,note,user{id,name}";
+  "id,date,quantity,rounded_quantity,price,note,user{id,name},bill{id,state}";
 
-const EXPENSE_FIELDS = "id,date,price,note,user{id,name}";
+const EXPENSE_FIELDS = "id,date,price,note,user{id,name},bill{id,state}";
 
 const BILL_FIELDS =
   "id,number,issued_at,due_at,balance,total,state";
@@ -27,7 +30,7 @@ function daysBetween(a: Date, b: Date): number {
 export function registerMatterFinancialsTools(server: McpServer): void {
   server.tool(
     "get_matter_financial_summary",
-    "Per-matter financial snapshot: trust balance, recent trust activity, unbilled time and expenses (WIP), and outstanding invoices (AR). Use this when you need to see the full financial picture for a single matter.",
+    "Per-matter financial snapshot: trust balance (from the client's funds_in_trust), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR). Mirrors the WIP/Draft/AR breakdown shown on the Clio matter dashboard.",
     {
       matter_id: z.coerce.number().describe("Clio matter ID"),
       trust_history_limit: z
@@ -45,9 +48,22 @@ export function registerMatterFinancialsTools(server: McpServer): void {
       try {
         const matterId = params.matter_id;
 
-        const matterPromise = rawGetSingle(`/matters/${matterId}`, {
+        // Pull the matter first so we can use the client id to fetch the
+        // authoritative trust balance (Clio holds trust per-contact, not per-matter).
+        const matterRes = await rawGetSingle(`/matters/${matterId}`, {
           fields: MATTER_FIELDS,
         });
+        const matter = matterRes.data;
+        const clientId = matter?.client?.id;
+
+        // funds_in_trust is the contact's net trust balance — what Clio's UI
+        // shows. Summing trust_line_items by matter_id misses bill-payment
+        // disbursements, which post against the contact, not the matter.
+        const clientPromise: Promise<any> = clientId
+          ? rawGetSingle(`/contacts/${clientId}`, {
+              fields: "id,name,funds_in_trust",
+            }).catch(() => null)
+          : Promise.resolve(null);
 
         const trustPromise = fetchAllPages<any>("/trust_line_items", {
           matter_id: matterId,
@@ -68,26 +84,47 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: EXPENSE_FIELDS,
         });
 
-        const billsPromise = fetchAllPages<any>("/bills", {
+        // Pull draft bills separately so we can report Clio's "Draft" total
+        // (which reflects bill total after any write-downs/discounts, not the
+        // raw activity sum).
+        const draftBillsPromise = fetchAllPages<any>("/bills", {
+          matter_id: matterId,
+          state: "draft",
+          fields: BILL_FIELDS,
+        });
+
+        const outstandingBillsPromise = fetchAllPages<any>("/bills", {
           matter_id: matterId,
           state: "awaiting_payment",
           fields: BILL_FIELDS,
         });
 
-        const [matterRes, trustEntries, timeEntries, expenseEntries, outstandingBills] =
-          await Promise.all([
-            matterPromise,
-            trustPromise,
-            timePromise,
-            expensePromise,
-            billsPromise,
-          ]);
+        const [
+          clientRes,
+          trustEntries,
+          timeEntries,
+          expenseEntries,
+          draftBills,
+          outstandingBills,
+        ] = await Promise.all([
+          clientPromise,
+          trustPromise,
+          timePromise,
+          expensePromise,
+          draftBillsPromise,
+          outstandingBillsPromise,
+        ]);
 
-        const matter = matterRes.data;
         const today = new Date();
 
         // --- Trust ---
-        let trustBalance = 0;
+        // Use the client's funds_in_trust as the authoritative balance.
+        // The trust_line_items query is kept only for ledger history.
+        const clientFundsInTrust =
+          typeof clientRes?.data?.funds_in_trust === "number"
+            ? clientRes.data.funds_in_trust
+            : null;
+
         let lastDeposit: string | null = null;
         let lastDisbursement: string | null = null;
         const sortedTrust = [...trustEntries].sort((a: any, b: any) =>
@@ -95,7 +132,6 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         );
         for (const entry of sortedTrust) {
           const amount = entry.total || 0;
-          trustBalance += amount;
           if (amount > 0 && !lastDeposit) lastDeposit = entry.date;
           if (amount < 0 && !lastDisbursement) lastDisbursement = entry.date;
         }
@@ -105,25 +141,35 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           : null;
 
         const trustFlags: string[] = [];
-        if (trustBalance < 500) trustFlags.push("LOW_BALANCE");
+        if (clientFundsInTrust !== null && clientFundsInTrust < 500) {
+          trustFlags.push("LOW_BALANCE");
+        }
         if (trustDormancyDays !== null && trustDormancyDays > 90) trustFlags.push("DORMANT");
 
-        // --- WIP (unbilled time + expenses) ---
+        // --- WIP buckets ---
+        // bill === null  → truly unbilled (Clio's "Unbilled" number)
+        // bill.state === "draft" → on a draft bill (Clio's "Draft" number — but
+        //   we use the bill total below, not the raw activity sum, because
+        //   draft bills can include write-downs/discounts).
+        // Other bill states → already on an issued bill; ignore (shouldn't
+        //   normally appear under billed=false but we defensively skip).
         let unbilledHours = 0;
         let unbilledTimeValue = 0;
-        let oldestEntryDate: string | null = null;
+        let oldestUnbilledDate: string | null = null;
 
-        const timeDetail: any[] = [];
+        const unbilledTimeDetail: any[] = [];
         for (const e of timeEntries) {
+          const onBill = e.bill?.id != null;
+          if (onBill) continue;
           const hours = (e.rounded_quantity ?? e.quantity ?? 0) / 3600;
           const value = hours * (e.price || 0);
           unbilledHours += hours;
           unbilledTimeValue += value;
-          if (!oldestEntryDate || (e.date && e.date < oldestEntryDate)) {
-            oldestEntryDate = e.date;
+          if (!oldestUnbilledDate || (e.date && e.date < oldestUnbilledDate)) {
+            oldestUnbilledDate = e.date;
           }
           if (params.include_unbilled_detail) {
-            timeDetail.push({
+            unbilledTimeDetail.push({
               id: e.id,
               date: e.date,
               hours: round2(hours),
@@ -136,14 +182,16 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         }
 
         let unbilledExpenses = 0;
-        const expenseDetail: any[] = [];
+        const unbilledExpenseDetail: any[] = [];
         for (const e of expenseEntries) {
+          const onBill = e.bill?.id != null;
+          if (onBill) continue;
           unbilledExpenses += e.price || 0;
-          if (!oldestEntryDate || (e.date && e.date < oldestEntryDate)) {
-            oldestEntryDate = e.date;
+          if (!oldestUnbilledDate || (e.date && e.date < oldestUnbilledDate)) {
+            oldestUnbilledDate = e.date;
           }
           if (params.include_unbilled_detail) {
-            expenseDetail.push({
+            unbilledExpenseDetail.push({
               id: e.id,
               date: e.date,
               amount: round2(e.price || 0),
@@ -153,15 +201,30 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           }
         }
 
-        const wipDaysSinceOldest = oldestEntryDate
-          ? daysBetween(today, new Date(oldestEntryDate))
+        const unbilledTotal = unbilledTimeValue + unbilledExpenses;
+
+        // Draft bills — sum the bill totals (post write-downs).
+        const draftBillTotal = draftBills.reduce(
+          (s: number, b: any) => s + (b.total || 0),
+          0
+        );
+        const draftBillSummary = draftBills.map((b: any) => ({
+          bill_id: b.id,
+          bill_number: b.number,
+          total: round2(b.total || 0),
+          balance: round2(b.balance || 0),
+        }));
+
+        // Combined WIP = unbilled + draft (matches Clio's matter dashboard "Work in Progress")
+        const combinedWip = unbilledTotal + draftBillTotal;
+
+        const wipDaysSinceOldest = oldestUnbilledDate
+          ? daysBetween(today, new Date(oldestUnbilledDate))
           : null;
 
         const wipFlags: string[] = [];
         if (wipDaysSinceOldest !== null && wipDaysSinceOldest > 60) wipFlags.push("RED");
         else if (wipDaysSinceOldest !== null && wipDaysSinceOldest > 30) wipFlags.push("YELLOW");
-
-        const combinedWip = unbilledTimeValue + unbilledExpenses;
 
         // --- AR (outstanding bills for this matter) ---
         let arBalance = 0;
@@ -205,6 +268,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           amount: round2(e.total || 0),
         }));
 
+        const trustBalanceForTotals = clientFundsInTrust ?? 0;
         const totalExposure = round2(combinedWip + arBalance);
 
         const result: any = {
@@ -220,8 +284,14 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             open_date: matter?.open_date,
           },
           trust: {
-            balance: round2(trustBalance),
-            entry_count: trustEntries.length,
+            // Clio holds trust against the client (contact), not the matter,
+            // so this is the client's net trust balance — accurate even when
+            // the client has multiple matters with this firm.
+            balance: clientFundsInTrust !== null ? round2(clientFundsInTrust) : null,
+            balance_scope: "client",
+            balance_source: "contacts.funds_in_trust",
+            client_id: clientId ?? null,
+            ledger_entry_count: trustEntries.length,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
             last_activity_date: lastTrustActivity,
@@ -230,14 +300,21 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             recent_entries: recentTrust,
           },
           wip: {
+            // Truly unbilled (no bill association)
             unbilled_hours: round2(unbilledHours),
             unbilled_time_value: round2(unbilledTimeValue),
             unbilled_expenses: round2(unbilledExpenses),
+            unbilled_total: round2(unbilledTotal),
+            // On draft bills (sum of bill totals, post write-down)
+            draft_bill_count: draftBills.length,
+            draft_bill_total: round2(draftBillTotal),
+            draft_bills: draftBillSummary,
+            // Combined — matches Clio's matter-dashboard "Work in Progress"
             combined_wip_value: round2(combinedWip),
             time_entry_count: timeEntries.length,
             expense_entry_count: expenseEntries.length,
-            oldest_entry_date: oldestEntryDate,
-            days_since_oldest_entry: wipDaysSinceOldest,
+            oldest_unbilled_entry_date: oldestUnbilledDate,
+            days_since_oldest_unbilled: wipDaysSinceOldest,
             flags: wipFlags,
           },
           ar: {
@@ -249,7 +326,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             outstanding_bills: outstanding,
           },
           totals: {
-            trust_balance: round2(trustBalance),
+            trust_balance: clientFundsInTrust !== null ? round2(trustBalanceForTotals) : null,
             wip_value: round2(combinedWip),
             ar_balance: round2(arBalance),
             wip_plus_ar: totalExposure,
@@ -257,8 +334,8 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         };
 
         if (params.include_unbilled_detail) {
-          result.wip.unbilled_time_entries = timeDetail;
-          result.wip.unbilled_expense_entries = expenseDetail;
+          result.wip.unbilled_time_entries = unbilledTimeDetail;
+          result.wip.unbilled_expense_entries = unbilledExpenseDetail;
         }
 
         return {
