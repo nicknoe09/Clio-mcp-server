@@ -348,6 +348,7 @@ export function registerTimeTools(server: McpServer): void {
       new_rate: z.coerce.number().optional().describe("Revised hourly rate"),
       new_hours: z.coerce.number().optional().describe("Revised hours (decimal). Helper handles unit conversion per routing target."),
       new_date: z.string().optional().describe("Revised date in YYYY-MM-DD format. Use this instead of strip-and-recreate when only the date is changing."),
+      update_original_record: z.enum(["true", "false"]).optional().describe("When the entry is on a bill, controls whether Clio also updates the underlying activity record with the same values. Default true (keep records in sync). Set to false if you want bill-line edits without altering the time-entry record."),
     },
     async (params) => {
       if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined && params.new_date === undefined) {
@@ -365,6 +366,7 @@ export function registerTimeTools(server: McpServer): void {
       if (params.new_rate !== undefined) patch.price = params.new_rate;
       if (params.new_hours !== undefined) patch.hours = params.new_hours;
       if (params.new_date !== undefined) patch.date = params.new_date;
+      if (params.update_original_record !== undefined) patch.update_original_record = params.update_original_record === "true";
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
@@ -549,6 +551,7 @@ export function registerTimeTools(server: McpServer): void {
       new_rate: z.coerce.number().optional().describe("Hourly rate (dollars)"),
       new_hours: z.coerce.number().optional().describe("Hours (decimal). Helper handles unit conversion per routing target."),
       new_date: z.string().optional().describe("New date YYYY-MM-DD. Use this for date-only changes instead of strip-and-recreate."),
+      update_original_record: z.enum(["true", "false"]).optional().describe("When the entry is on a bill, controls whether Clio also updates the underlying activity record. Default true (keep records in sync)."),
     },
     async (params) => {
       if (params.new_note === undefined && params.new_rate === undefined && params.new_hours === undefined && params.new_date === undefined) {
@@ -566,6 +569,7 @@ export function registerTimeTools(server: McpServer): void {
       if (params.new_rate !== undefined) patch.price = params.new_rate;
       if (params.new_hours !== undefined) patch.hours = params.new_hours;
       if (params.new_date !== undefined) patch.date = params.new_date;
+      if (params.update_original_record !== undefined) patch.update_original_record = params.update_original_record === "true";
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
