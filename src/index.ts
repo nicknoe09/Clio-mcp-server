@@ -8,6 +8,7 @@ import { ENV } from "./utils/env";
 import { getAuthorizationUrl, exchangeCodeForTokens } from "./clio/auth";
 import { getBoxAuthorizationUrl, exchangeBoxCodeForTokens } from "./box/auth";
 import { registerMatterTools } from "./tools/matters";
+import { registerMatterFinancialsTools } from "./tools/matterFinancials";
 import { registerTimeTools } from "./tools/time";
 import { registerExpenseTools } from "./tools/expenses";
 import { registerContactTools } from "./tools/contacts";
@@ -124,6 +125,9 @@ function createMcpServer(): McpServer {
 
     registerMatterTools(server);
     console.log("[MCP] registerMatterTools OK");
+
+    registerMatterFinancialsTools(server);
+    console.log("[MCP] registerMatterFinancialsTools OK");
 
     registerTimeTools(server);
     console.log("[MCP] registerTimeTools OK");
