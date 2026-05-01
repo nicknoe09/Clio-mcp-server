@@ -555,6 +555,7 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
       error: detail,
       clio_status: status,
       clio_error: err.response?.data,
+      request_body: err.response?.request_body,
     });
   }
 });
@@ -624,6 +625,7 @@ router.post("/pending/patch-clio", async (req: Request, res: Response) => {
       error: detail,
       clio_status: status,
       clio_error: err.response?.data,
+      request_body: err.response?.request_body,
     });
   }
 });
