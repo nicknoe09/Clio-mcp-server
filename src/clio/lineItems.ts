@@ -54,6 +54,11 @@ export interface SmartPatch {
   price?: number;
   hours?: number; // decimal hours; helper converts as needed per routing target
   date?: string;
+  // When PATCHing /line_items/{id}, ask Clio to propagate the change back
+  // to the underlying activity record (note, quantity, etc.). Default true
+  // so internal time-entry records stay in sync with bill-line edits.
+  // Ignored on the /activities path (no-op there).
+  update_original_record?: boolean;
 }
 
 export interface SmartPatchResult {
@@ -95,6 +100,9 @@ function buildLineItemBody(patch: SmartPatch): Record<string, any> {
   if (patch.price !== undefined) out.price = patch.price;
   if (patch.hours !== undefined) out.quantity = patch.hours;
   if (patch.date !== undefined) out.date = patch.date;
+  // Default true: keep underlying activity in sync with bill-line edits
+  // unless the caller explicitly opts out.
+  out.update_original_record = patch.update_original_record !== false;
   return out;
 }
 
@@ -322,7 +330,7 @@ export interface DiscountLineItemResult {
   line_item_id: number;
   activity_id?: number;
   bill: { id: number; state?: string; number?: string };
-  before: { price?: number; quantity?: number; total?: number; discount_total?: number };
+  before: { price?: number; quantity?: number; total?: number; discount?: any };
   after: any;
   discount_amount_applied: number;
   discount_pct_applied: number;
@@ -352,7 +360,7 @@ export async function discountLineItem(args: {
   let beforeLineItem: any;
 
   if (lineItemId) {
-    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount_total" });
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
     beforeLineItem = liResp.data;
     if (!beforeLineItem) {
       const err: any = new Error(`Line item ${lineItemId} not found`);
@@ -370,7 +378,7 @@ export async function discountLineItem(args: {
     }
     lineItemId = routing.line_item.id;
     bill = routing.bill;
-    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount_total" });
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
     beforeLineItem = liResp.data;
   }
 
@@ -402,7 +410,12 @@ export async function discountLineItem(args: {
     );
   }
 
-  const body = { discount_total: discountAmount };
+  // Per Clio's PATCH /line_items docs, `discount` is an object (Discount_base
+  // schema), not a `discount_total` scalar. The inner field set isn't fully
+  // documented, so this is a best-evidence guess at the shape; if Clio
+  // rejects it, the request_body and clio_error logging will surface what
+  // the real shape should be.
+  const body = { discount: { total: discountAmount } };
   try {
     await rawPatchSingle(`/line_items/${lineItemId}`, { data: body });
   } catch (err: any) {
@@ -410,7 +423,7 @@ export async function discountLineItem(args: {
     if (err.response) err.response.request_body = body;
     throw err;
   }
-  const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount_total" });
+  const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
 
   return {
     line_item_id: lineItemId!,
@@ -420,7 +433,7 @@ export async function discountLineItem(args: {
       price: beforeLineItem?.price,
       quantity: beforeLineItem?.quantity,
       total: beforeLineItem?.total,
-      discount_total: beforeLineItem?.discount_total,
+      discount: beforeLineItem?.discount,
     },
     after: afterResp.data,
     discount_amount_applied: discountAmount,
