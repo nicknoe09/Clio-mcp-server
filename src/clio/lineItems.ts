@@ -1,4 +1,4 @@
-import { fetchAllPages, rawGetSingle, rawPatchSingle } from "./pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawDeleteSingle } from "./pagination";
 
 export interface LineItemSummary {
   id: number;
@@ -121,4 +121,62 @@ export async function patchTimeEntrySmart(
     before,
     after: afterResp.data,
   };
+}
+
+export interface RemoveFromBillResult {
+  line_item_id: number;
+  activity_id?: number;
+  bill: { id: number; state?: string; number?: string };
+}
+
+// Remove a line_item from a DRAFT bill. Refuses if the bill is in any other
+// state (issued / awaiting_payment / paid / void) — those edits are
+// considered destructive and require manual intervention. The underlying
+// activity is preserved; only the bill association is removed.
+export async function removeFromDraftBill(
+  args: { line_item_id?: number; activity_id?: number },
+): Promise<RemoveFromBillResult> {
+  let lineItemId = args.line_item_id;
+  let bill: { id: number; state?: string; number?: string } | null = null;
+  let activityId = args.activity_id;
+
+  if (lineItemId) {
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS });
+    const li = liResp.data;
+    if (!li) {
+      const err: any = new Error(`Line item ${lineItemId} not found`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    bill = li.bill ? { id: li.bill.id, state: li.bill.state, number: li.bill.number } : null;
+    activityId = activityId ?? li.activity?.id;
+  } else if (activityId) {
+    const routing = await resolveActivityRouting(activityId);
+    if (!routing.bill || !routing.line_item) {
+      const err: any = new Error(`Activity ${activityId} is not on a bill — nothing to remove.`);
+      err.response = { status: 409, data: { context: "activity_not_on_bill" } };
+      throw err;
+    }
+    lineItemId = routing.line_item.id;
+    bill = routing.bill;
+  } else {
+    throw new Error("removeFromDraftBill: provide line_item_id or activity_id");
+  }
+
+  if (!bill) {
+    const err: any = new Error(`Line item ${lineItemId} has no bill association.`);
+    err.response = { status: 409, data: { context: "no_bill_association" } };
+    throw err;
+  }
+
+  if (bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to remove line_item ${lineItemId} from bill ${bill.id}: bill state is "${bill.state}", not "draft". Removing line items from issued/finalized bills can corrupt accounting and is not supported here.`,
+    );
+    err.response = { status: 409, data: { context: "bill_not_draft", bill_state: bill.state } };
+    throw err;
+  }
+
+  await rawDeleteSingle(`/line_items/${lineItemId}`);
+  return { line_item_id: lineItemId, activity_id: activityId, bill };
 }

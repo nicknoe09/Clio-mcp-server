@@ -103,28 +103,13 @@ export async function auditTimeEntries(
     });
   }
 
-  // 4. Cross-entry detection
-  const dupeFlags = detectDuplicates(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
-  const spikeFlags = detectBillingSpikes(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
-
-  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
-  const overstaffFlags = detectOverstaffing(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
-  const repeatCommFlags = detectRepeatedShortComms(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
+  // 4. Cross-entry detection — detection helpers key by entryUid (activity_id
+  // when sourced from /activities, line_item_id when sourced from /line_items).
+  const dupeFlags = detectDuplicates(allEntries);
+  const spikeFlags = detectBillingSpikes(allEntries);
+  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries);
+  const overstaffFlags = detectOverstaffing(allEntries);
+  const repeatCommFlags = detectRepeatedShortComms(allEntries);
 
   for (const e of allEntries) {
     if (dupeFlags.has(e.activity_id)) {
