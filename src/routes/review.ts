@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
+import { patchTimeEntrySmart, resolveActivityRouting } from "../clio/lineItems";
 import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
 import { detectFlags, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
@@ -535,9 +536,7 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
   }
 
   try {
-    await rawPatchSingle(`/activities/${activity_id}`, {
-      data: { price: new_rate },
-    });
+    const result = await patchTimeEntrySmart(Number(activity_id), { price: Number(new_rate) });
 
     // Update CSV
     const rows = readCSV();
@@ -549,10 +548,17 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
       writeCSV(rows);
     }
 
-    res.json({ ok: true, activity_id, new_rate });
+    res.json({ ok: true, activity_id, new_rate, path: result.path, line_item_id: result.line_item_id });
   } catch (err: any) {
-    console.error("[Review] Fix rate error:", err.message, err.response?.status);
-    res.status(500).json({ ok: false, error: err.message });
+    const status = err.response?.status;
+    const detail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
+    console.error("[Review] Fix rate error:", detail, status);
+    res.status(status && status < 500 ? status : 500).json({
+      ok: false,
+      error: detail,
+      clio_status: status,
+      clio_error: err.response?.data,
+    });
   }
 });
 
@@ -601,13 +607,27 @@ router.post("/pending/patch-clio", async (req: Request, res: Response) => {
   }
 
   try {
-    await rawPatchSingle(`/activities/${activity_id}`, {
-      data: { note: new_note },
+    const result = await patchTimeEntrySmart(Number(activity_id), { note: new_note });
+    res.json({
+      ok: true,
+      activity_id: result.activity_id,
+      path: result.path,
+      line_item_id: result.line_item_id,
+      bill: result.bill,
     });
-    res.json({ ok: true, activity_id });
   } catch (err: any) {
-    console.error("[Review] Patch-clio error:", err.message, err.response?.status);
-    res.status(500).json({ ok: false, error: err.message, clio_status: err.response?.status });
+    const status = err.response?.status;
+    const clioErrors = err.response?.data?.error?.message
+      || err.response?.data?.errors?.map((e: any) => e.message).join("; ")
+      || err.response?.data?.message;
+    const detail = clioErrors || err.message;
+    console.error("[Review] Patch-clio error:", detail, status, JSON.stringify(err.response?.data || {}).slice(0, 300));
+    res.status(status && status < 500 ? status : 500).json({
+      ok: false,
+      error: detail,
+      clio_status: status,
+      clio_error: err.response?.data,
+    });
   }
 });
 
@@ -651,11 +671,25 @@ router.post("/pending/split", async (req: Request, res: Response) => {
   }
 
   try {
-    // 1. Read the original activity to get matter, date, user, rate
-    const original = await rawGetSingle(`/activities/${activity_id}`, {
-      fields: "id,date,quantity,rounded_quantity,price,note,matter{id},user{id}",
-    });
-    const act = original.data;
+    // Splitting requires zeroing out the original activity, but Clio locks
+    // PATCH /activities/{id} once the entry is on any bill. The line_item
+    // PATCH path can't help here either — newly-created activities won't be
+    // on the bill, so the split would silently shift hours off the invoice.
+    // Refuse with a clear error; the caller has to remove the line_item from
+    // the draft bill first.
+    const routing = await resolveActivityRouting(Number(activity_id));
+    if (routing.bill) {
+      res.status(409).json({
+        ok: false,
+        error: "Cannot split an entry that's on a bill. Remove the line_item from the draft bill first, then retry the split. (Splitting creates new activities, which would not be reattached to the bill — silently shifting hours off the invoice.)",
+        clio_status: 409,
+        bill: routing.bill,
+        line_item_id: routing.line_item?.id,
+      });
+      return;
+    }
+
+    const act = routing.activity;
     const matterId = act.matter?.id;
     const userId = act.user?.id;
     const date = act.date;
@@ -737,6 +771,25 @@ router.post("/pending/combine", async (req: Request, res: Response) => {
   }
 
   try {
+    // Combine zeroes out the originals and creates a new activity. Both
+    // operations break for entries on a bill: PATCH /activities is locked,
+    // and the new activity wouldn't be reattached to the bill — quietly
+    // shifting hours off the invoice. Refuse with a clear error.
+    const billedIds: { activity_id: number; bill: any }[] = [];
+    for (const id of activity_ids) {
+      const routing = await resolveActivityRouting(Number(id));
+      if (routing.bill) billedIds.push({ activity_id: Number(id), bill: routing.bill });
+    }
+    if (billedIds.length > 0) {
+      res.status(409).json({
+        ok: false,
+        error: "Cannot combine entries that are on a bill. Remove the line_items from the draft bill first, then retry.",
+        clio_status: 409,
+        billed_entries: billedIds,
+      });
+      return;
+    }
+
     // 1. Read the first activity to get matter, user, date, rate
     const first = await rawGetSingle(`/activities/${activity_ids[0]}`, {
       fields: "id,date,quantity,rounded_quantity,price,note,matter{id},user{id}",
@@ -814,12 +867,11 @@ router.post("/pending/apply", async (_req: Request, res: Response) => {
 
     for (const row of toApply) {
       try {
-        await rawPatchSingle(`/activities/${row.activity_id}`, {
-          data: { note: row.selected_note },
-        });
+        await patchTimeEntrySmart(Number(row.activity_id), { note: row.selected_note });
         patched++;
       } catch (err: any) {
-        errors.push(`Activity ${row.activity_id}: ${err.message}`);
+        const detail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
+        errors.push(`Activity ${row.activity_id}: ${detail}`);
       }
     }
 
@@ -1618,7 +1670,7 @@ function renderCard(e) {
           }</span>\${isDone ? '<button class="btn btn-sm" style="background:#e8e5df;color:#7a7568;font-size:11px;padding:3px 8px" onclick="undo(\\'' + e.activity_id + '\\')">Undo</button>' : ''}
         </div>
       </div>
-      <div class="card-body">\${flags.length > 0 ? '<div class="flag-row">' + flagTags + '</div>' : '<div class="flag-row"><span class="flag-tag" style="background:#064e3b;color:#6ee7b7">CLEAN</span></div>'}
+      <div class="card-body">\${s.save_failed ? '<div class="save-failed-banner" style="background:#7f1d1d;color:#fecaca;padding:10px 14px;margin-bottom:12px;border-radius:4px;display:flex;justify-content:space-between;align-items:center;gap:10px"><div><strong>Failed to save to Clio.</strong> ' + esc(s.save_error || 'Unknown error') + '</div><div style="display:flex;gap:6px"><button class="btn btn-sm" style="background:#fecaca;color:#7f1d1d" onclick="retrySave(\\'' + e.activity_id + '\\')">Retry</button><button class="btn btn-sm" style="background:#3a342a;color:#fde68a" onclick="undo(\\'' + e.activity_id + '\\')">Undo</button></div></div>' : ''}\${s.save_in_flight ? '<div style="background:#1e3a5f;color:#bfdbfe;padding:8px 14px;margin-bottom:12px;border-radius:4px;font-size:12px">Saving to Clio\\u2026</div>' : ''}\${flags.length > 0 ? '<div class="flag-row">' + flagTags + '</div>' : '<div class="flag-row"><span class="flag-tag" style="background:#064e3b;color:#6ee7b7">CLEAN</span></div>'}
         <div class="note-section">
           <div class="note-label current">Current</div>
           <div class="note-box current">\${esc(e.current_note) || '<em style="opacity:0.5">No description</em>'}</div>
@@ -1773,8 +1825,17 @@ async function postUpdate(activityId, selectedNote, status) {
   });
 }
 
-// Background PATCH to Clio — optimistic UI, revert on failure
+// Background PATCH to Clio — optimistic UI. On failure we keep the user's
+// edit/accept state so it doesn't disappear, mark the card with save_failed,
+// and surface an inline retry banner. Auto-reverting (the previous behavior)
+// silently swallowed PATCH failures on draft-bill entries — see the line_item
+// routing fix in /pending/patch-clio.
 async function patchClio(id, newNote) {
+  state[id] = state[id] || { status: 'pending', selected_note: '' };
+  state[id].save_failed = false;
+  state[id].save_error = '';
+  state[id].save_in_flight = true;
+  state[id].pending_note = newNote;
   try {
     const res = await fetch('/pending/patch-clio', {
       method: 'POST',
@@ -1782,23 +1843,38 @@ async function patchClio(id, newNote) {
       body: JSON.stringify({ activity_id: id, new_note: newNote }),
     });
     const data = await res.json();
+    state[id].save_in_flight = false;
     if (!data.ok) {
-      console.error('Clio PATCH failed for ' + id + ':', data.error);
-      // Revert to pending
-      state[id] = { status: 'pending', selected_note: '' };
-      postUpdate(id, '', 'pending');
+      console.error('Clio PATCH failed for ' + id + ':', data);
+      const detail = data.error || ('HTTP ' + (data.clio_status || res.status));
+      state[id].save_failed = true;
+      state[id].save_error = detail;
       render();
       updateProgress();
-      alert('Failed to save entry ' + id + ' to Clio: ' + (data.error || 'Unknown error') + '. Entry reverted to pending.');
+    } else {
+      state[id].save_failed = false;
+      state[id].save_error = '';
+      state[id].save_path = data.path;
+      state[id].save_line_item_id = data.line_item_id;
+      render();
+      updateProgress();
     }
   } catch (err) {
     console.error('Clio PATCH network error for ' + id + ':', err);
-    state[id] = { status: 'pending', selected_note: '' };
-    postUpdate(id, '', 'pending');
+    state[id].save_in_flight = false;
+    state[id].save_failed = true;
+    state[id].save_error = 'Network error: ' + (err && err.message ? err.message : 'unknown');
     render();
     updateProgress();
-    alert('Network error saving entry ' + id + ' to Clio. Entry reverted to pending.');
   }
+}
+
+function retrySave(id) {
+  const s = state[id];
+  if (!s) return;
+  const note = s.pending_note || s.selected_note;
+  if (!note) return;
+  patchClio(id, note);
 }
 
 function accept(id) {

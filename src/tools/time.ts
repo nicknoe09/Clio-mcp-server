@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
+import { patchTimeEntrySmart, resolveActivityRouting } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -335,10 +336,12 @@ export function registerTimeTools(server: McpServer): void {
     }
   );
 
-  // apply_entry_revision — apply a single revision to a time entry in Clio
+  // apply_entry_revision — apply a single revision to a time entry in Clio.
+  // Routes to /line_items when the entry is on a bill (Clio locks /activities
+  // PATCH for any billed entry, including draft bills).
   server.tool(
     "apply_entry_revision",
-    "Apply a single revision to a Clio time entry. Used during interactive audit review to update one entry at a time. Can modify the description (note), hourly rate, and/or hours. Returns before/after state for confirmation.",
+    "Apply a single revision to a Clio time entry. Used during interactive audit review to update one entry at a time. Can modify the description (note), hourly rate, and/or hours. Transparently routes through /line_items when the entry is on a bill (draft or otherwise) — Clio locks PATCH /activities for billed entries, so the line_item is the editable surface. Returns before/after state plus which path was used.",
     {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to update"),
       new_note: z.string().optional().describe("Revised description/note for the entry"),
@@ -346,56 +349,230 @@ export function registerTimeTools(server: McpServer): void {
       new_hours: z.coerce.number().optional().describe("Revised hours (converted to seconds for Clio)"),
     },
     async (params) => {
+      if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
+          }],
+          isError: true,
+        };
+      }
+
+      const patch: Record<string, any> = {};
+      if (params.new_note) patch.note = params.new_note;
+      if (params.new_rate !== undefined) patch.price = params.new_rate;
+      if (params.new_hours !== undefined) patch.quantity = Math.round(params.new_hours * 3600);
+
       try {
-        if (!params.new_note && params.new_rate === undefined && params.new_hours === undefined) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
-            }],
-            isError: true,
-          };
-        }
-
-        // Read current state
-        const before = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
-        });
-        const entry = before.data;
-
-        // Build patch
-        const patchBody: Record<string, any> = {};
-        if (params.new_note) patchBody.note = params.new_note;
-        if (params.new_rate !== undefined) patchBody.price = params.new_rate;
-        if (params.new_hours !== undefined) patchBody.quantity = Math.round(params.new_hours * 3600);
-
-        // Apply
-        await rawPatchSingle(`/activities/${params.activity_id}`, { data: patchBody });
-
-        // Read after
-        const after = await rawGetSingle(`/activities/${params.activity_id}`, {
-          fields: "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description},user{id,name}",
-        });
-        const updated = after.data;
-
+        const result = await patchTimeEntrySmart(params.activity_id, patch);
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
               success: true,
+              path: result.path,
+              activity_id: result.activity_id,
+              line_item_id: result.line_item_id,
+              bill: result.bill,
+              before: result.before,
+              after: result.after,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
               activity_id: params.activity_id,
-              matter: entry.matter?.display_number || "Unknown",
-              timekeeper: entry.user?.name || "Unknown",
-              before: {
-                note: entry.note,
-                hours: Math.round(((entry.rounded_quantity || entry.quantity) / 3600) * 100) / 100,
-                rate: entry.price,
-              },
-              after: {
-                note: updated.note,
-                hours: Math.round(((updated.rounded_quantity || updated.quantity) / 3600) * 100) / 100,
-                rate: updated.price,
-              },
+              status,
+              message: err.message,
+              clio_error: err.response?.data || err.body,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // find_line_item_for_activity — resolve the line_item record (if any) that
+  // shadows a given activity on a bill. Diagnostic helper for the line_items
+  // PATCH path.
+  server.tool(
+    "find_line_item_for_activity",
+    "Find the line_item record that shadows a time entry once it's been added to a bill. Returns the line_item ID and current fields, or null if the entry is unbilled. Activities on bills (even draft) are locked by Clio's API for direct PATCH /activities/{id}; the line_item is the editable surface.",
+    {
+      activity_id: z.coerce.number().describe("The Clio activity (time entry) ID"),
+    },
+    async (params) => {
+      try {
+        const routing = await resolveActivityRouting(params.activity_id);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              activity_id: routing.activity.id,
+              billed_flag: routing.activity.billed,
+              bill: routing.bill,
+              line_item: routing.line_item,
+              edit_path: routing.bill
+                ? (routing.line_item
+                  ? `PATCH /line_items/${routing.line_item.id} — use update_billed_time_entry or test_update_line_item`
+                  : "Activity is on a bill but no matching line_item was found — investigate")
+                : "PATCH /activities/{id} — entry is unbilled, direct activity edits work",
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              status: err.response?.status,
+              message: err.message,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // test_update_line_item — diagnostic: PATCH a single line_item with the
+  // fields you specify and report Clio's response verbatim. Used to discover
+  // which fields are writable on /line_items (the API reference is
+  // auth-walled, so empirical probing is the practical path).
+  server.tool(
+    "test_update_line_item",
+    "Diagnostic: PATCH a single line_item directly with the fields you specify and report Clio's response verbatim. Use this to discover which fields are writable on the /line_items endpoint (note, description, quantity, price, total, discount_total) when an entry is on a draft bill. Pass dry_run=true to just read the line_item.",
+    {
+      line_item_id: z.coerce.number().describe("The line_item ID (use find_line_item_for_activity to resolve from an activity_id)"),
+      new_note: z.string().optional().describe("Try writing to the 'note' field"),
+      new_description: z.string().optional().describe("Try writing to the 'description' field"),
+      new_quantity_hours: z.coerce.number().optional().describe("Try writing 'quantity' as hours (sent as seconds)"),
+      new_price: z.coerce.number().optional().describe("Try writing 'price' (hourly rate)"),
+      new_total: z.coerce.number().optional().describe("Try writing 'total' (line total in dollars)"),
+      new_discount_total: z.coerce.number().optional().describe("Try writing 'discount_total' (write-down amount)"),
+      dry_run: z.enum(["true", "false"]).optional().default("false").describe("If true, just reads the line_item"),
+    },
+    async (params) => {
+      const readFields =
+        "id,description,note,quantity,rounded_quantity,price,total,discount_total,activity{id,note},bill{id,state,number}";
+      try {
+        const before = await rawGetSingle(`/line_items/${params.line_item_id}`, { fields: readFields });
+        if (params.dry_run === "true") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ dry_run: true, current: before.data }, null, 2),
+            }],
+          };
+        }
+
+        const body: Record<string, any> = {};
+        if (params.new_note !== undefined) body.note = params.new_note;
+        if (params.new_description !== undefined) body.description = params.new_description;
+        if (params.new_quantity_hours !== undefined) body.quantity = Math.round(params.new_quantity_hours * 3600);
+        if (params.new_price !== undefined) body.price = params.new_price;
+        if (params.new_total !== undefined) body.total = params.new_total;
+        if (params.new_discount_total !== undefined) body.discount_total = params.new_discount_total;
+
+        if (Object.keys(body).length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: "Provide at least one new_* field, or set dry_run=true." }),
+            }],
+            isError: true,
+          };
+        }
+
+        await rawPatchSingle(`/line_items/${params.line_item_id}`, { data: body });
+        const after = await rawGetSingle(`/line_items/${params.line_item_id}`, { fields: readFields });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              line_item_id: params.line_item_id,
+              fields_attempted: body,
+              before: before.data,
+              after: after.data,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        let interpretation = "Unknown error";
+        if (status === 422) interpretation = "Clio rejected one or more fields — check clio_error for which.";
+        else if (status === 403) interpretation = "Forbidden — line_item may be locked (bill issued/finalized) or insufficient permissions.";
+        else if (status === 404) interpretation = "Line item not found.";
+        else if (status === 400) interpretation = "Bad request — field shape may be wrong.";
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              line_item_id: params.line_item_id,
+              status,
+              interpretation,
+              message: err.message,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // update_billed_time_entry — production tool with smart routing. Use this
+  // anywhere we'd previously have called apply_entry_revision; it's the same
+  // helper but with a name that signals it handles the billed case.
+  server.tool(
+    "update_billed_time_entry",
+    "Update a time entry's note/rate/hours regardless of whether it's on a bill. If unbilled, PATCHes /activities/{id}. If on a draft (or any) bill, finds the corresponding line_item and PATCHes /line_items/{id} — the only path Clio allows for entries already added to a bill. Returns which path was used so you can audit.",
+    {
+      activity_id: z.coerce.number().describe("The Clio activity (time entry) ID"),
+      new_note: z.string().optional().describe("Revised description/note"),
+      new_rate: z.coerce.number().optional().describe("Hourly rate (dollars)"),
+      new_hours: z.coerce.number().optional().describe("Hours (will be converted to seconds)"),
+    },
+    async (params) => {
+      if (params.new_note === undefined && params.new_rate === undefined && params.new_hours === undefined) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: "Provide at least one of: new_note, new_rate, new_hours" }),
+          }],
+          isError: true,
+        };
+      }
+
+      const patch: Record<string, any> = {};
+      if (params.new_note !== undefined) patch.note = params.new_note;
+      if (params.new_rate !== undefined) patch.price = params.new_rate;
+      if (params.new_hours !== undefined) patch.quantity = Math.round(params.new_hours * 3600);
+
+      try {
+        const result = await patchTimeEntrySmart(params.activity_id, patch);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              path: result.path,
+              activity_id: result.activity_id,
+              line_item_id: result.line_item_id,
+              bill: result.bill,
+              before: result.before,
+              after: result.after,
             }, null, 2),
           }],
         };
