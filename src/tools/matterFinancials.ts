@@ -5,8 +5,11 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
 
-// trust_line_items has limited fields per Clio — id/date/total only, no description/type
-const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
+// Per Clio's API: trust_line_items return signed totals — positive for
+// deposits, negative for disbursements. Including `type` ensures all entry
+// kinds are returned and lets us bucket the diagnostics by transaction
+// direction.
+const TRUST_FIELDS = "id,date,total,type,matter{id,display_number,client}";
 
 // bill{id,state} lets us bucket activities into truly unbilled vs. draft-billed.
 // Clio leaves activities flagged billed=false until a bill is *issued*, so an
@@ -209,17 +212,50 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             ? contactData.funds_in_trust
             : null;
 
-        // Priority order:
-        //   1. matter.pending_funds_in_trust / matter.funds_in_trust  — if
-        //      the matter resource exposes the per-matter UI value directly
-        //   2. cross-referenced ledger — but only when subject expansion
-        //      actually returned linkage data (otherwise it just equals the
-        //      matter-tagged sum and is misleading)
-        //   3. contact-level fields (in case any account populates them)
-        //   4. matter-tagged ledger sum — deposits only, last resort
+        // Type/sign distribution across the matter-scoped ledger — useful
+        // for diagnosing whether Clio is actually returning disbursements
+        // (negative totals) for this matter.
+        const typeDistribution: Record<
+          string,
+          { count: number; sum: number; positive: number; negative: number }
+        > = {};
+        for (const e of trustEntries) {
+          const t = (e?.type as string) || "unknown";
+          if (!typeDistribution[t]) {
+            typeDistribution[t] = { count: 0, sum: 0, positive: 0, negative: 0 };
+          }
+          const total = (e?.total as number) || 0;
+          typeDistribution[t].count++;
+          typeDistribution[t].sum += total;
+          if (total >= 0) typeDistribution[t].positive++;
+          else typeDistribution[t].negative++;
+        }
+        const typeDistributionRounded: Record<string, any> = {};
+        for (const [k, v] of Object.entries(typeDistribution)) {
+          typeDistributionRounded[k] = {
+            count: v.count,
+            sum: round2(v.sum),
+            positive_entries: v.positive,
+            negative_entries: v.negative,
+          };
+        }
+        const matterLedgerHasNegatives = Object.values(typeDistribution).some(
+          (v) => v.negative > 0
+        );
+
+        // Priority order (per the firm's guidance: matter-scoped signed sum
+        // is the canonical Clio source; everything else is a fallback for
+        // when that returns an obviously incomplete picture):
+        //   1. matter-scoped trust_line_items sum — primary
+        //   2. matter.pending_funds_in_trust / funds_in_trust on the matter
+        //   3. cross-referenced ledger (subject-tagged bill payments)
+        //   4. contact-level fields
         let clientFundsInTrust: number | null = null;
         let trustBalanceSource: string | null = null;
-        if (matterPendingTrust !== null) {
+        if (matterTaggedSum !== null) {
+          clientFundsInTrust = matterTaggedSum;
+          trustBalanceSource = "trust_line_items.sum_by_matter_id";
+        } else if (matterPendingTrust !== null) {
           clientFundsInTrust = matterPendingTrust;
           trustBalanceSource = "matters.pending_funds_in_trust";
         } else if (matterFundsInTrust !== null) {
@@ -234,9 +270,6 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         } else if (fundsInTrust !== null) {
           clientFundsInTrust = fundsInTrust;
           trustBalanceSource = "contacts.funds_in_trust";
-        } else if (matterTaggedSum !== null) {
-          clientFundsInTrust = matterTaggedSum;
-          trustBalanceSource = "trust_line_items.sum_by_matter_id";
         }
 
         let lastDeposit: string | null = null;
@@ -421,6 +454,8 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             client_id: clientId ?? null,
             matter_bill_count: matterBillIds.size,
             matter_tagged_entry_count: trustEntries.length,
+            matter_ledger_has_negatives: matterLedgerHasNegatives,
+            matter_ledger_type_distribution: typeDistributionRounded,
             cross_referenced_entry_count: matterRelatedTrustEntries.length,
             contact_ledger_entry_count: contactTrustEntries.length,
             subject_expansion_returned_data: anySubjectPresent,
