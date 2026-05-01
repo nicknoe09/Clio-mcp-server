@@ -69,7 +69,12 @@ export interface SmartPatchResult {
 // (notably rounded_quantity, total, billed, type). Construct the wire body
 // from a strict whitelist so that callers passing in spread/typed-as-any
 // objects can't accidentally leak extra keys onto the request.
-const ACTIVITY_PATCH_FIELDS = ["note", "price", "quantity"] as const;
+//
+// Per domain testing: /line_items PATCH accepts the same activity-shape
+// fields (note, price, quantity, date), not the read-side `description`
+// field. Read and write field names diverge on this endpoint.
+const ACTIVITY_PATCH_FIELDS = ["note", "price", "quantity", "date"] as const;
+const LINE_ITEM_PATCH_FIELDS = ["note", "price", "quantity", "date"] as const;
 
 function pickActivityPatch(patch: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
@@ -79,23 +84,11 @@ function pickActivityPatch(patch: Record<string, any>): Record<string, any> {
   return out;
 }
 
-// Translate a SmartPatch (activity-shape) into the line_item PATCH shape.
-// Line items don't have a top-level `note` — they have `description` (the
-// bill-line text). The activity has `note` (the underlying narrative).
-// They're separate fields: editing the line_item description changes what
-// prints on the bill but does not propagate back to the underlying activity.
-//
-// Quantity is intentionally dropped: billed quantity on a line_item is
-// derived from the activity and is not directly writable on draft bills via
-// /line_items PATCH (Clio rejects it, sometimes with a misleading
-// "rounded_quantity is not a valid field" 422). To change billed hours,
-// callers should remove_from_draft_bill, edit the activity, then re-add.
-function buildLineItemPatch(patch: Record<string, any>): Record<string, any> {
+function pickLineItemPatch(patch: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
-  if (patch.note !== undefined) out.description = patch.note;
-  if (patch.description !== undefined) out.description = patch.description;
-  if (patch.price !== undefined) out.price = patch.price;
-  if (patch.discount_total !== undefined) out.discount_total = patch.discount_total;
+  for (const k of LINE_ITEM_PATCH_FIELDS) {
+    if (patch[k] !== undefined) out[k] = patch[k];
+  }
   return out;
 }
 
@@ -145,23 +138,17 @@ export async function patchTimeEntrySmart(
   }
 
   const lineItemId = routing.line_item.id;
-  if (patch.quantity !== undefined) {
-    const err: any = new Error(
-      `Activity ${activityId} is on bill ${routing.bill.id} (state=${routing.bill.state}). Hour edits aren't directly writable on /line_items/{id}. Use remove_from_draft_bill (if state=draft), then edit the activity's hours, then re-add to the bill.`,
-    );
-    err.response = { status: 409, data: { context: "hour_edit_on_billed_entry", line_item_id: lineItemId, bill: routing.bill } };
-    throw err;
-  }
   const before = {
     description: routing.line_item.description,
+    note: routing.line_item.note,
     price: routing.line_item.price,
     quantity: routing.line_item.quantity,
     total: routing.line_item.total,
   };
-  const body = buildLineItemPatch(patch as Record<string, any>);
+  const body = pickLineItemPatch(patch as Record<string, any>);
   if (Object.keys(body).length === 0) {
     const err: any = new Error(
-      `patchTimeEntrySmart: nothing to write to line_item ${lineItemId} from patch ${JSON.stringify(patch)}.`,
+      `patchTimeEntrySmart: nothing to write to line_item ${lineItemId} from patch ${JSON.stringify(patch)}. Allowed fields: ${LINE_ITEM_PATCH_FIELDS.join(", ")}.`,
     );
     err.response = { status: 400, data: { context: "no_writable_line_item_fields", original_patch: patch } };
     throw err;

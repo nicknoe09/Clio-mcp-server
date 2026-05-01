@@ -451,15 +451,16 @@ export function registerTimeTools(server: McpServer): void {
   // auth-walled, so empirical probing is the practical path).
   server.tool(
     "test_update_line_item",
-    "Diagnostic: PATCH a single line_item directly with the fields you specify and report Clio's response verbatim. Note: line_items do NOT have a writable 'note' field (that's on the underlying activity); the bill-line text is 'description'. Hour edits on line_items are not directly writable — remove from draft bill, edit the activity, re-add. Use this tool to probe which other fields (price, total, discount_total) Clio accepts. Pass dry_run=true to just read the line_item.",
+    "Diagnostic: PATCH a single line_item directly with the fields you specify and report Clio's response verbatim. Confirmed-writable fields: note, price, quantity, date. Read-only / computed (Clio rejects with 422): rounded_quantity, total, type, billed. Pass dry_run=true to just read the line_item.",
     {
       line_item_id: z.coerce.number().describe("The line_item ID (use find_line_item_for_activity to resolve from an activity_id)"),
-      new_description: z.string().optional().describe("Bill-line description text (line_item's 'description' field — editable on draft bills)"),
-      new_note: z.string().optional().describe("Probe-only: try writing to 'note' (line_items don't have this field; expect 422)"),
-      new_quantity_hours: z.coerce.number().optional().describe("Probe-only: try writing 'quantity' as hours (line_items don't accept quantity edits; expect 422)"),
-      new_price: z.coerce.number().optional().describe("Try writing 'price' (hourly rate). Writability uncertain."),
-      new_total: z.coerce.number().optional().describe("Probe-only: try writing 'total' (likely read-only / computed)"),
-      new_discount_total: z.coerce.number().optional().describe("Try writing 'discount_total' (write-down amount). Writability uncertain."),
+      new_note: z.string().optional().describe("Activity narrative / line text (writable)"),
+      new_description: z.string().optional().describe("Probe-only: try writing 'description' (read field name; may not be writable)"),
+      new_quantity_hours: z.coerce.number().optional().describe("Hours (sent as seconds) (writable)"),
+      new_price: z.coerce.number().optional().describe("Hourly rate (writable)"),
+      new_date: z.string().optional().describe("Date YYYY-MM-DD (writable)"),
+      new_total: z.coerce.number().optional().describe("Probe-only: try 'total' (likely read-only)"),
+      new_discount_total: z.coerce.number().optional().describe("Probe-only: try 'discount_total' (writability uncertain)"),
       dry_run: z.enum(["true", "false"]).optional().default("false").describe("If true, just reads the line_item"),
     },
     async (params) => {
@@ -481,6 +482,7 @@ export function registerTimeTools(server: McpServer): void {
         if (params.new_description !== undefined) body.description = params.new_description;
         if (params.new_quantity_hours !== undefined) body.quantity = Math.round(params.new_quantity_hours * 3600);
         if (params.new_price !== undefined) body.price = params.new_price;
+        if (params.new_date !== undefined) body.date = params.new_date;
         if (params.new_total !== undefined) body.total = params.new_total;
         if (params.new_discount_total !== undefined) body.discount_total = params.new_discount_total;
 
