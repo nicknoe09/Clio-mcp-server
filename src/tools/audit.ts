@@ -2,6 +2,14 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 
+// Stable per-entry key for cross-entry detection (duplicates, spikes,
+// combinables). Prefers activity_id (always set) and falls back to
+// line_item_id (set only for entries sourced from /line_items in the
+// draft-bill audit). Both are unique within a Clio account.
+function entryUid(e: any): number {
+  return e["activity_id"] ?? e["line_item_id"];
+}
+
 
 // Harris County Probate Court picklist IDs
 export const HC_COURT_IDS = new Set([
@@ -334,7 +342,7 @@ export function detectDuplicates(entries: any[]): Map<number, string> {
   for (const e of entries) {
     const key = `${e.date}|${e.user_id}|${(e.note || "").trim().toLowerCase()}`;
     if (!seen.has(key)) seen.set(key, []);
-    seen.get(key)!.push(e.line_item_id);
+    seen.get(key)!.push(entryUid(e));
   }
 
   for (const [key, ids] of seen) {
@@ -360,7 +368,7 @@ export function detectBillingSpikes(entries: any[]): Map<number, string> {
     if (!weeklyHours.has(key)) weeklyHours.set(key, { total: 0, ids: [] });
     const w = weeklyHours.get(key)!;
     w.total += e.hours;
-    w.ids.push(e.line_item_id);
+    w.ids.push(entryUid(e));
   }
 
   // Flag weeks with >50 hours from a single timekeeper as a spike
@@ -421,12 +429,12 @@ export function detectCombinables(entries: any[]): { flags: Map<number, string>;
     if (draftEntries.length >= 2) clusters.push(draftEntries);
 
     // Catch remaining short entries not in any category
-    const categorized = new Set([...commEntries, ...reviewEntries, ...draftEntries].map(e => e.activity_id || e.line_item_id));
-    const uncategorized = shortEntries.filter(e => !categorized.has(e.activity_id || e.line_item_id));
+    const categorized = new Set([...commEntries, ...reviewEntries, ...draftEntries].map(e => entryUid(e)));
+    const uncategorized = shortEntries.filter(e => !categorized.has(entryUid(e)));
     if (uncategorized.length >= 3) clusters.push(uncategorized);
 
     for (const cluster of clusters) {
-      const ids = cluster.map(e => e.activity_id || e.line_item_id);
+      const ids = cluster.map(e => entryUid(e));
       const totalHours = Math.round(cluster.reduce((s, e) => s + e.hours, 0) * 100) / 100;
       const descriptions = cluster.map(e => (e.note || "").trim());
 
@@ -480,7 +488,7 @@ export function detectOverstaffing(entries: any[]): Map<number, string> {
 
     for (const e of attorneys) {
       overstaffingFlags.set(
-        e.line_item_id,
+        entryUid(e),
         `Overstaffing — ${uniqueAttorneyIds.length} attorneys billed same matter on same date (${totalHours.toFixed(1)} hrs: ${names}). Verify each attorney's contribution was distinct and necessary.`
       );
     }
@@ -511,7 +519,7 @@ export function detectRepeatedShortComms(entries: any[]): Map<number, string> {
     const totalHours = Math.round(shortComms.reduce((s, e) => s + e.hours, 0) * 100) / 100;
     const msg = `Repeated short comm entries — ${shortComms.length} entries ≤ 0.3 hrs on this matter (${totalHours} hrs total). HC pattern flag: excessive fragmented communications. Consider bundling or reducing.`;
     for (const e of shortComms) {
-      repeatFlags.set(e.line_item_id, msg);
+      repeatFlags.set(entryUid(e), msg);
     }
   }
 
@@ -659,20 +667,20 @@ export function registerAuditTools(server: McpServer): void {
         const { flags: combineFlags } = detectCombinables(allEntries);
 
         for (const e of allEntries) {
-          if (dupeFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(e.line_item_id) });
+          if (dupeFlags.has(entryUid(e))) {
+            e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(entryUid(e)) });
           }
-          if (spikeFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.line_item_id) });
+          if (spikeFlags.has(entryUid(e))) {
+            e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(entryUid(e)) });
           }
-          if (overstaffFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(e.line_item_id) });
+          if (overstaffFlags.has(entryUid(e))) {
+            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(entryUid(e)) });
           }
-          if (repeatCommFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(e.line_item_id) });
+          if (repeatCommFlags.has(entryUid(e))) {
+            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(entryUid(e)) });
           }
-          if (combineFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(e.line_item_id) });
+          if (combineFlags.has(entryUid(e))) {
+            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(entryUid(e)) });
           }
         }
 
@@ -919,20 +927,20 @@ export function registerAuditTools(server: McpServer): void {
         const { flags: combineFlags } = detectCombinables(allEntries);
 
         for (const e of allEntries) {
-          if (dupeFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(e.line_item_id) });
+          if (dupeFlags.has(entryUid(e))) {
+            e.flags.push({ code: "DUPLICATE", severity: "strike", message: dupeFlags.get(entryUid(e)) });
           }
-          if (spikeFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(e.line_item_id) });
+          if (spikeFlags.has(entryUid(e))) {
+            e.flags.push({ code: "BILLING_SPIKE", severity: "review", message: spikeFlags.get(entryUid(e)) });
           }
-          if (overstaffFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(e.line_item_id) });
+          if (overstaffFlags.has(entryUid(e))) {
+            e.flags.push({ code: "OVERSTAFFING", severity: "review", message: overstaffFlags.get(entryUid(e)) });
           }
-          if (repeatCommFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(e.line_item_id) });
+          if (repeatCommFlags.has(entryUid(e))) {
+            e.flags.push({ code: "REPEATED_SHORT_COMMS", severity: "review", message: repeatCommFlags.get(entryUid(e)) });
           }
-          if (combineFlags.has(e.line_item_id)) {
-            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(e.line_item_id) });
+          if (combineFlags.has(entryUid(e))) {
+            e.flags.push({ code: "COMBINABLE", severity: "rephrase", message: combineFlags.get(entryUid(e)) });
           }
         }
 

@@ -1,4 +1,4 @@
-import { fetchAllPages, rawGetSingle, rawPatchSingle } from "./pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawDeleteSingle } from "./pagination";
 
 export interface LineItemSummary {
   id: number;
@@ -65,6 +65,29 @@ export interface SmartPatchResult {
   after: any;
 }
 
+// Clio rejects PATCH bodies that include read-only or computed fields
+// (notably rounded_quantity, total, billed, type). Construct the wire body
+// from a strict whitelist so that callers passing in spread/typed-as-any
+// objects can't accidentally leak extra keys onto the request.
+const ACTIVITY_PATCH_FIELDS = ["note", "price", "quantity"] as const;
+const LINE_ITEM_PATCH_FIELDS = ["note", "description", "price", "quantity", "discount_total"] as const;
+
+function pickActivityPatch(patch: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const k of ACTIVITY_PATCH_FIELDS) {
+    if (patch[k] !== undefined) out[k] = patch[k];
+  }
+  return out;
+}
+
+function pickLineItemPatch(patch: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const k of LINE_ITEM_PATCH_FIELDS) {
+    if (patch[k] !== undefined) out[k] = patch[k];
+  }
+  return out;
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -83,7 +106,14 @@ export async function patchTimeEntrySmart(
       price: routing.activity.price,
       quantity: routing.activity.quantity,
     };
-    await rawPatchSingle(`/activities/${activityId}`, { data: patch });
+    const body = pickActivityPatch(patch as Record<string, any>);
+    try {
+      await rawPatchSingle(`/activities/${activityId}`, { data: body });
+    } catch (err: any) {
+      console.error(`[patchTimeEntrySmart] PATCH /activities/${activityId} failed status=${err.response?.status} body=${JSON.stringify(body)} clio_error=${JSON.stringify(err.response?.data || {}).slice(0, 400)}`);
+      if (err.response) err.response.request_body = body;
+      throw err;
+    }
     const afterResp = await rawGetSingle(`/activities/${activityId}`, {
       fields: "id,note,price,quantity,rounded_quantity",
     });
@@ -111,7 +141,14 @@ export async function patchTimeEntrySmart(
     quantity: routing.line_item.quantity,
     total: routing.line_item.total,
   };
-  await rawPatchSingle(`/line_items/${lineItemId}`, { data: patch });
+  const body = pickLineItemPatch(patch as Record<string, any>);
+  try {
+    await rawPatchSingle(`/line_items/${lineItemId}`, { data: body });
+  } catch (err: any) {
+    console.error(`[patchTimeEntrySmart] PATCH /line_items/${lineItemId} failed status=${err.response?.status} body=${JSON.stringify(body)} clio_error=${JSON.stringify(err.response?.data || {}).slice(0, 400)}`);
+    if (err.response) err.response.request_body = body;
+    throw err;
+  }
   const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS });
   return {
     path: "line_item",
@@ -121,4 +158,62 @@ export async function patchTimeEntrySmart(
     before,
     after: afterResp.data,
   };
+}
+
+export interface RemoveFromBillResult {
+  line_item_id: number;
+  activity_id?: number;
+  bill: { id: number; state?: string; number?: string };
+}
+
+// Remove a line_item from a DRAFT bill. Refuses if the bill is in any other
+// state (issued / awaiting_payment / paid / void) — those edits are
+// considered destructive and require manual intervention. The underlying
+// activity is preserved; only the bill association is removed.
+export async function removeFromDraftBill(
+  args: { line_item_id?: number; activity_id?: number },
+): Promise<RemoveFromBillResult> {
+  let lineItemId = args.line_item_id;
+  let bill: { id: number; state?: string; number?: string } | null = null;
+  let activityId = args.activity_id;
+
+  if (lineItemId) {
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS });
+    const li = liResp.data;
+    if (!li) {
+      const err: any = new Error(`Line item ${lineItemId} not found`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    bill = li.bill ? { id: li.bill.id, state: li.bill.state, number: li.bill.number } : null;
+    activityId = activityId ?? li.activity?.id;
+  } else if (activityId) {
+    const routing = await resolveActivityRouting(activityId);
+    if (!routing.bill || !routing.line_item) {
+      const err: any = new Error(`Activity ${activityId} is not on a bill — nothing to remove.`);
+      err.response = { status: 409, data: { context: "activity_not_on_bill" } };
+      throw err;
+    }
+    lineItemId = routing.line_item.id;
+    bill = routing.bill;
+  } else {
+    throw new Error("removeFromDraftBill: provide line_item_id or activity_id");
+  }
+
+  if (!bill) {
+    const err: any = new Error(`Line item ${lineItemId} has no bill association.`);
+    err.response = { status: 409, data: { context: "no_bill_association" } };
+    throw err;
+  }
+
+  if (bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to remove line_item ${lineItemId} from bill ${bill.id}: bill state is "${bill.state}", not "draft". Removing line items from issued/finalized bills can corrupt accounting and is not supported here.`,
+    );
+    err.response = { status: 409, data: { context: "bill_not_draft", bill_state: bill.state } };
+    throw err;
+  }
+
+  await rawDeleteSingle(`/line_items/${lineItemId}`);
+  return { line_item_id: lineItemId, activity_id: activityId, bill };
 }

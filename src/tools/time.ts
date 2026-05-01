@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -391,6 +391,7 @@ export function registerTimeTools(server: McpServer): void {
               status,
               message: err.message,
               clio_error: err.response?.data || err.body,
+              request_body: err.response?.request_body,
             }, null, 2),
           }],
           isError: true,
@@ -587,6 +588,67 @@ export function registerTimeTools(server: McpServer): void {
               status,
               message: err.message,
               clio_error: err.response?.data || err.body,
+              request_body: err.response?.request_body,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // remove_from_draft_bill — DELETE /line_items/{id} for a draft bill only.
+  // Refuses if the bill is in any non-draft state (issued, awaiting_payment,
+  // paid, void) — those edits can corrupt accounting. Use this before split
+  // or combine when the source entry is on a draft bill.
+  server.tool(
+    "remove_from_draft_bill",
+    "Remove a time entry from a DRAFT bill (unbills it). The underlying activity is preserved — only the bill association is removed. Refuses if the bill is not in 'draft' state. Accepts either line_item_id or activity_id (the line_item is resolved automatically for activity_id). Use this before split/combine when the source entry is on a draft bill.",
+    {
+      line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known). Use find_line_item_for_activity to resolve from an activity."),
+      activity_id: z.coerce.number().optional().describe("Activity ID. Will be resolved to the line_item on its draft bill."),
+    },
+    async (params) => {
+      if (params.line_item_id === undefined && params.activity_id === undefined) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: "Provide line_item_id or activity_id." }),
+          }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await removeFromDraftBill({
+          line_item_id: params.line_item_id,
+          activity_id: params.activity_id,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              removed: {
+                line_item_id: result.line_item_id,
+                activity_id: result.activity_id,
+                bill: result.bill,
+              },
+              note: "Activity preserved; only the bill association was removed. The entry now reads as unbilled and can be edited via PATCH /activities or re-added to a bill.",
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              bill_state: err.response?.data?.bill_state,
+              clio_error: err.response?.data,
             }, null, 2),
           }],
           isError: true,
@@ -659,6 +721,7 @@ export function registerTimeTools(server: McpServer): void {
               message: err.message,
               status: err.response?.status || err.statusCode,
               clio_error: err.response?.data || err.body,
+              request_body: err.response?.request_body,
             }),
           }],
           isError: true,

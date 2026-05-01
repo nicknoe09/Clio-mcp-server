@@ -334,11 +334,8 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
     }
   }
 
-  // Detect combinable entries
-  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
+  // Detect combinable entries — detector keys by entryUid (activity_id here).
+  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries);
   for (const e of allEntries) {
     if (combineFlags.has(e.activity_id)) {
       const group = combineGroups.find(g => g.activityIds.includes(e.activity_id));
@@ -558,6 +555,7 @@ router.post("/pending/fix-rate", async (req: Request, res: Response) => {
       error: detail,
       clio_status: status,
       clio_error: err.response?.data,
+      request_body: err.response?.request_body,
     });
   }
 });
@@ -627,6 +625,7 @@ router.post("/pending/patch-clio", async (req: Request, res: Response) => {
       error: detail,
       clio_status: status,
       clio_error: err.response?.data,
+      request_body: err.response?.request_body,
     });
   }
 });
