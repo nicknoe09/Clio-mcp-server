@@ -87,6 +87,7 @@ curl http://localhost:3000/health
 |------|-------------|
 | `get_matters` | List matters with status/attorney/client filters |
 | `get_matter` | Get single matter by ID or search query |
+| `get_matter_financial_summary` | Per-matter snapshot: trust balance, WIP, outstanding AR |
 | `get_stale_matters` | Find open matters with no recent activity |
 | `get_billing_gaps` | Matters with WIP but no recent bill issued |
 | `get_time_entries` | Time entries with date/user/matter/billed filters |
