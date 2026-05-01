@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -362,7 +362,7 @@ export function registerTimeTools(server: McpServer): void {
       const patch: Record<string, any> = {};
       if (params.new_note) patch.note = params.new_note;
       if (params.new_rate !== undefined) patch.price = params.new_rate;
-      if (params.new_hours !== undefined) patch.quantity = Math.round(params.new_hours * 3600);
+      if (params.new_hours !== undefined) patch.hours = params.new_hours;
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
@@ -480,7 +480,7 @@ export function registerTimeTools(server: McpServer): void {
         const body: Record<string, any> = {};
         if (params.new_note !== undefined) body.note = params.new_note;
         if (params.new_description !== undefined) body.description = params.new_description;
-        if (params.new_quantity_hours !== undefined) body.quantity = Math.round(params.new_quantity_hours * 3600);
+        if (params.new_quantity_hours !== undefined) body.quantity = params.new_quantity_hours;
         if (params.new_price !== undefined) body.price = params.new_price;
         if (params.new_date !== undefined) body.date = params.new_date;
         if (params.new_total !== undefined) body.total = params.new_total;
@@ -561,7 +561,7 @@ export function registerTimeTools(server: McpServer): void {
       const patch: Record<string, any> = {};
       if (params.new_note !== undefined) patch.note = params.new_note;
       if (params.new_rate !== undefined) patch.price = params.new_rate;
-      if (params.new_hours !== undefined) patch.quantity = Math.round(params.new_hours * 3600);
+      if (params.new_hours !== undefined) patch.hours = params.new_hours;
 
       try {
         const result = await patchTimeEntrySmart(params.activity_id, patch);
@@ -650,6 +650,104 @@ export function registerTimeTools(server: McpServer): void {
               message: err.message,
               context: err.response?.data?.context,
               bill_state: err.response?.data?.bill_state,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // delete_activity — DELETE /activities/{id}. If the activity is on a
+  // draft bill, automatically removes the line_item first (per user
+  // direction: "if the user asks to delete rather than remove, you can
+  // remove then delete without asking"). Refuses for non-draft bills.
+  server.tool(
+    "delete_activity",
+    "Delete a time entry (activity) from Clio. If the entry is on a DRAFT bill, automatically removes the line_item first, then deletes the activity. Refuses if the entry is on a non-draft bill (issued/awaiting_payment/paid/void) — those touch accounting and require manual handling. Use this for junk-entry cleanup; the line_item removal and activity deletion are reported separately so you can audit.",
+    {
+      activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to delete"),
+    },
+    async (params) => {
+      try {
+        const result = await deleteActivity(params.activity_id);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              activity_id: result.activity_id,
+              removed_from_bill: result.removed_from_bill,
+              deleted_activity: result.deleted_activity,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              activity_id: params.activity_id,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // discount_line_item — apply a percentage or dollar discount to a
+  // line_item on a DRAFT bill. Preserves the original rate; reduces total
+  // via discount_total. Caller picks discount_amount OR discount_pct.
+  server.tool(
+    "discount_line_item",
+    "Apply a discount to a billed line_item on a DRAFT bill. Preserves the original rate (the bill still shows '$X/hr × Y hr = $Z less discount $D = $E') instead of zeroing the rate. Provide exactly one of discount_amount (dollars off) or discount_pct (percentage of current line total, e.g. 25 = 25%). Accepts either line_item_id or activity_id; if activity_id is given, the line_item is resolved automatically. Refuses if the bill is not in draft state.",
+    {
+      line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known)"),
+      activity_id: z.coerce.number().optional().describe("Activity ID; resolved to line_item on its draft bill"),
+      discount_amount: z.coerce.number().optional().describe("Dollars off the line (e.g. 50 for $50 off). Provide this OR discount_pct, not both."),
+      discount_pct: z.coerce.number().optional().describe("Percentage discount (e.g. 25 for 25% off). Computed against current line total."),
+    },
+    async (params) => {
+      try {
+        const result = await discountLineItem({
+          line_item_id: params.line_item_id,
+          activity_id: params.activity_id,
+          discount_amount: params.discount_amount,
+          discount_pct: params.discount_pct,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              line_item_id: result.line_item_id,
+              activity_id: result.activity_id,
+              bill: result.bill,
+              discount_amount_applied: result.discount_amount_applied,
+              discount_pct_applied: result.discount_pct_applied,
+              before: result.before,
+              after: result.after,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
               clio_error: err.response?.data,
             }, null, 2),
           }],
