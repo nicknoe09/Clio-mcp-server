@@ -334,11 +334,8 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
     }
   }
 
-  // Detect combinable entries
-  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries.map(e => ({
-    ...e,
-    line_item_id: e.activity_id,
-  })));
+  // Detect combinable entries — detector keys by entryUid (activity_id here).
+  const { flags: combineFlags, groups: combineGroups } = detectCombinables(allEntries);
   for (const e of allEntries) {
     if (combineFlags.has(e.activity_id)) {
       const group = combineGroups.find(g => g.activityIds.includes(e.activity_id));
