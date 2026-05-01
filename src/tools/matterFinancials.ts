@@ -5,11 +5,10 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
 
-// Per Clio's API: trust_line_items return signed totals — positive for
-// deposits, negative for disbursements. Including `type` ensures all entry
-// kinds are returned and lets us bucket the diagnostics by transaction
-// direction.
-const TRUST_FIELDS = "id,date,total,type,matter{id,display_number,client}";
+// trust_line_items has limited fields per Clio. `type` is reserved (JSON-API
+// resource-type identifier) and `description` isn't supported either. Stick
+// to what the endpoint actually accepts.
+const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
 
 // bill{id,state} lets us bucket activities into truly unbilled vs. draft-billed.
 // Clio leaves activities flagged billed=false until a bill is *issued*, so an
@@ -142,6 +141,16 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: "id,state",
         });
 
+        // Diagnostic probe — request a single page of trust_line_items for
+        // this matter with NO `fields` parameter so Clio returns its default
+        // field set. Used to discover which linkage fields (subject, bill,
+        // subject_id, etc.) actually exist on a real entry without guessing.
+        const trustProbePromise: Promise<any[]> = fetchAllPages<any>(
+          "/trust_line_items",
+          { matter_id: matterId },
+          1
+        ).catch(() => []);
+
         const [
           clientRes,
           trustEntries,
@@ -151,6 +160,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           draftBills,
           outstandingBills,
           allMatterBills,
+          trustProbe,
         ] = await Promise.all([
           clientPromise,
           trustPromise,
@@ -160,7 +170,11 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           draftBillsPromise,
           outstandingBillsPromise,
           allMatterBillsPromise,
+          trustProbePromise,
         ]);
+
+        // Capture the first probe entry as a raw sample for diagnostics.
+        const rawTrustSample = trustProbe?.[0] ?? null;
 
         const today = new Date();
 
@@ -214,48 +228,31 @@ export function registerMatterFinancialsTools(server: McpServer): void {
 
         // Type/sign distribution across the matter-scoped ledger — useful
         // for diagnosing whether Clio is actually returning disbursements
-        // (negative totals) for this matter.
-        const typeDistribution: Record<
-          string,
-          { count: number; sum: number; positive: number; negative: number }
-        > = {};
+        // (negative totals) for this matter. type isn't requestable so we
+        // bucket by sign instead.
+        let positiveCount = 0;
+        let negativeCount = 0;
+        let positiveSum = 0;
+        let negativeSum = 0;
         for (const e of trustEntries) {
-          const t = (e?.type as string) || "unknown";
-          if (!typeDistribution[t]) {
-            typeDistribution[t] = { count: 0, sum: 0, positive: 0, negative: 0 };
-          }
           const total = (e?.total as number) || 0;
-          typeDistribution[t].count++;
-          typeDistribution[t].sum += total;
-          if (total >= 0) typeDistribution[t].positive++;
-          else typeDistribution[t].negative++;
+          if (total >= 0) {
+            positiveCount++;
+            positiveSum += total;
+          } else {
+            negativeCount++;
+            negativeSum += total;
+          }
         }
-        const typeDistributionRounded: Record<string, any> = {};
-        for (const [k, v] of Object.entries(typeDistribution)) {
-          typeDistributionRounded[k] = {
-            count: v.count,
-            sum: round2(v.sum),
-            positive_entries: v.positive,
-            negative_entries: v.negative,
-          };
-        }
-        const matterLedgerHasNegatives = Object.values(typeDistribution).some(
-          (v) => v.negative > 0
-        );
+        const matterLedgerHasNegatives = negativeCount > 0;
 
-        // Priority order (per the firm's guidance: matter-scoped signed sum
-        // is the canonical Clio source; everything else is a fallback for
-        // when that returns an obviously incomplete picture):
-        //   1. matter-scoped trust_line_items sum — primary
-        //   2. matter.pending_funds_in_trust / funds_in_trust on the matter
-        //   3. cross-referenced ledger (subject-tagged bill payments)
-        //   4. contact-level fields
+        // Priority order — matter-scoped sum is the cleanest answer when
+        // Clio actually tags disbursements with matter_id, but on this
+        // firm's account it tends to only see deposits. Fall through to the
+        // matter-resource probe and cross-ref strategies.
         let clientFundsInTrust: number | null = null;
         let trustBalanceSource: string | null = null;
-        if (matterTaggedSum !== null) {
-          clientFundsInTrust = matterTaggedSum;
-          trustBalanceSource = "trust_line_items.sum_by_matter_id";
-        } else if (matterPendingTrust !== null) {
+        if (matterPendingTrust !== null) {
           clientFundsInTrust = matterPendingTrust;
           trustBalanceSource = "matters.pending_funds_in_trust";
         } else if (matterFundsInTrust !== null) {
@@ -264,12 +261,23 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         } else if (crossRefSum !== null && anySubjectPresent) {
           clientFundsInTrust = crossRefSum;
           trustBalanceSource = "trust_line_items.cross_referenced_by_matter_bills";
+        } else if (matterTaggedSum !== null && matterLedgerHasNegatives) {
+          // Only trust the matter-scoped sum when it actually contains
+          // disbursements; deposits-only is a known wrong answer.
+          clientFundsInTrust = matterTaggedSum;
+          trustBalanceSource = "trust_line_items.sum_by_matter_id";
         } else if (pendingFunds !== null) {
           clientFundsInTrust = pendingFunds;
           trustBalanceSource = "contacts.pending_funds_in_trust";
         } else if (fundsInTrust !== null) {
           clientFundsInTrust = fundsInTrust;
           trustBalanceSource = "contacts.funds_in_trust";
+        } else if (matterTaggedSum !== null) {
+          // Last resort — matter-tagged sum without disbursements (likely
+          // overstates the balance). Flagged via balance_source so callers
+          // know to be skeptical.
+          clientFundsInTrust = matterTaggedSum;
+          trustBalanceSource = "trust_line_items.sum_by_matter_id (deposits_only)";
         }
 
         let lastDeposit: string | null = null;
@@ -455,10 +463,20 @@ export function registerMatterFinancialsTools(server: McpServer): void {
             matter_bill_count: matterBillIds.size,
             matter_tagged_entry_count: trustEntries.length,
             matter_ledger_has_negatives: matterLedgerHasNegatives,
-            matter_ledger_type_distribution: typeDistributionRounded,
+            matter_ledger_sign_distribution: {
+              positive_entries: positiveCount,
+              negative_entries: negativeCount,
+              positive_sum: round2(positiveSum),
+              negative_sum: round2(negativeSum),
+            },
             cross_referenced_entry_count: matterRelatedTrustEntries.length,
             contact_ledger_entry_count: contactTrustEntries.length,
             subject_expansion_returned_data: anySubjectPresent,
+            // Sample of the raw default field shape, included so we can
+            // discover what linkage fields Clio actually exposes (subject?
+            // bill? subject_id flat? something else). Lets us pick the
+            // right expansion for the cross-ref filter without guessing.
+            sample_raw_entry: rawTrustSample,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
             last_activity_date: lastTrustActivity,
