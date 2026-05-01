@@ -5,10 +5,14 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
 
-// Per Clio's documented trust_line_item resource: id, etag, date, total,
-// note, created_at, updated_at, plus relations bill / matter / client.
-// (No `description`, no `type`, no `subject`, no `transaction`.)
-const TRUST_FIELDS =
+// Per Clio docs, BankTransaction fields are well-defined: id, date, amount
+// (signed), description, transaction_type, funds_in, funds_out, plus
+// matter, bank_account, bill, client, allocation relations.
+const BANK_TX_FIELDS =
+  "id,date,amount,funds_in,funds_out,description,transaction_type,source,matter{id},bank_account{id,name,type},bill{id}";
+
+// trust_line_items resource fields per Clio docs.
+const TRUST_LINE_FIELDS =
   "id,date,total,note,bill{id},matter{id,display_number,client}";
 
 const TIME_FIELDS =
@@ -29,14 +33,14 @@ function daysBetween(a: Date, b: Date): number {
 export function registerMatterFinancialsTools(server: McpServer): void {
   server.tool(
     "get_matter_financial_summary",
-    "Per-matter financial snapshot: trust balance (matter-tagged deposits net of bill-tagged disbursements), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR). Matches the Clio matter dashboard.",
+    "Per-matter financial snapshot: trust balance from bank_transactions on the IOLTA account (matches Clio UI), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR).",
     {
       matter_id: z.coerce.number().describe("Clio matter ID"),
       trust_history_limit: z
         .number()
         .optional()
         .default(10)
-        .describe("Max number of recent trust ledger entries to include (default 10)"),
+        .describe("Max number of recent trust transactions to include (default 10)"),
       include_unbilled_detail: z
         .boolean()
         .optional()
@@ -53,33 +57,26 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         const matter = matterRes.data;
         const clientId = matter?.client?.id;
 
-        // Fetch the matter's bills first because the per-matter trust
-        // balance is computed from matter-tagged deposits PLUS bill-tagged
-        // disbursements — we need the full bill list to fan out trust
-        // queries by bill_id (the only documented bill linkage filter on
-        // /trust_line_items).
-        const allMatterBills = await fetchAllPages<any>("/bills", {
-          matter_id: matterId,
-          fields: "id,state",
-        });
-        const matterBillIds: number[] = allMatterBills
-          .map((b: any) => b.id)
-          .filter((id: any): id is number => typeof id === "number");
+        // Per Clio's BankTransaction docs: list endpoint is
+        // /bank_transactions, supports matter_id and bank_account_id
+        // filters. Pull all matter-scoped bank transactions; we'll filter
+        // to trust accounts after we know which bank_account ids are trust.
+        const bankAccountsPromise = fetchAllPages<any>("/bank_accounts", {
+          fields: "id,name,type",
+        }).catch(() => [] as any[]);
 
-        const trustByMatterPromise = fetchAllPages<any>("/trust_line_items", {
+        const bankTransactionsPromise = fetchAllPages<any>("/bank_transactions", {
           matter_id: matterId,
-          fields: TRUST_FIELDS,
-        });
+          fields: BANK_TX_FIELDS,
+        }).catch(() => [] as any[]);
 
-        // One query per bill — Clio's documented filter is bill_id (single
-        // value), so we fan out and dedupe on the way back. .catch returns
-        // [] so a single bad bill doesn't drop the whole report.
-        const trustByBillPromises = matterBillIds.map((billId) =>
-          fetchAllPages<any>("/trust_line_items", {
-            bill_id: billId,
-            fields: TRUST_FIELDS,
-          }).catch(() => [] as any[])
-        );
+        // trust_line_items kept as a secondary source / for the recent
+        // ledger history (deposits with notes and bill_ids — useful detail
+        // even though the balance comes from bank_transactions).
+        const trustLineItemsPromise = fetchAllPages<any>("/trust_line_items", {
+          matter_id: matterId,
+          fields: TRUST_LINE_FIELDS,
+        }).catch(() => [] as any[]);
 
         const timePromise = fetchAllPages<any>("/activities", {
           type: "TimeEntry",
@@ -107,168 +104,73 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           fields: BILL_FIELDS,
         });
 
-        // Per the firm: the Clio UI computes per-matter trust balance from
-        // transactions on the IOLTA (trust) bank account, not from
-        // /trust_line_items. Pull bank accounts to identify the trust
-        // account IDs and matter-scoped transactions to net deposits and
-        // disbursements.
-        const bankAccountsPromise = fetchAllPages<any>("/bank_accounts", {
-          fields: "id,name,type",
-        }).catch(() => [] as any[]);
-
-        const matterTransactionsPromise = fetchAllPages<any>("/transactions", {
-          matter_id: matterId,
-          fields:
-            "id,date,description,type,amount,total,matter{id},bank_account{id,name,type}",
-        }).catch(() =>
-          // Retry with a smaller field list in case description/type/amount
-          // aren't accepted on /transactions either.
-          fetchAllPages<any>("/transactions", {
-            matter_id: matterId,
-            fields: "id,date,total,matter{id},bank_account{id,name,type}",
-          }).catch(() => [] as any[])
-        );
-
-        // Diagnostic: trust_requests by matter and by client. The CREATE
-        // docs imply this is the withdrawal/refund resource.
-        const trustRequestsByMatterPromise = fetchAllPages<any>(
-          "/trust_requests",
-          {
-            matter_id: matterId,
-            fields: "id,issue_date,due_date,trust_amount,note,approved,trust_type",
-          }
-        ).catch(() => [] as any[]);
-
-        const trustRequestsByClientPromise: Promise<any[]> = clientId
-          ? fetchAllPages<any>("/trust_requests", {
-              client_id: clientId,
-              fields: "id,issue_date,due_date,trust_amount,note,approved,trust_type",
-            }).catch(() => [] as any[])
-          : Promise.resolve([]);
-
         const [
-          trustByMatterEntries,
-          trustByBillResults,
+          bankAccounts,
+          bankTransactions,
+          trustLineItems,
           timeEntries,
           expenseEntries,
           draftBills,
           outstandingBills,
-          bankAccounts,
-          matterTransactions,
-          trustRequestsByMatter,
-          trustRequestsByClient,
         ] = await Promise.all([
-          trustByMatterPromise,
-          Promise.all(trustByBillPromises),
+          bankAccountsPromise,
+          bankTransactionsPromise,
+          trustLineItemsPromise,
           timePromise,
           expensePromise,
           draftBillsPromise,
           outstandingBillsPromise,
-          bankAccountsPromise,
-          matterTransactionsPromise,
-          trustRequestsByMatterPromise,
-          trustRequestsByClientPromise,
         ]);
 
-        // Identify trust accounts so we can scope transactions to IOLTA only.
+        const today = new Date();
+
+        // --- Trust ---
         const trustBankAccountIds = new Set<number>(
           bankAccounts
             .filter((a: any) => {
               const t = (a?.type || "").toLowerCase();
-              return t === "trust" || t.includes("iolta");
+              const n = (a?.name || "").toLowerCase();
+              return t === "trust" || n.includes("iolta") || n.includes("trust");
             })
             .map((a: any) => a.id)
             .filter((id: any): id is number => typeof id === "number")
         );
 
-        // Trust transactions = matter transactions whose bank_account is a
-        // trust account. Sum the signed amount/total to get the net balance.
-        const trustTransactions = matterTransactions.filter((t: any) =>
+        const trustTransactions = bankTransactions.filter((t: any) =>
           t?.bank_account?.id != null
             ? trustBankAccountIds.has(t.bank_account.id)
             : false
         );
-        const trustTransactionsBalance = trustTransactions.reduce(
-          (s: number, t: any) =>
-            s + (typeof t.total === "number" ? t.total : t.amount || 0),
+
+        // amount is signed per Clio docs. Sum it directly.
+        const trustBalance = trustTransactions.reduce(
+          (s: number, t: any) => s + (typeof t.amount === "number" ? t.amount : 0),
           0
         );
 
-        // Probe one of the bills referenced by a trust deposit. The
-        // matter-scoped trust query showed deposits carrying bill_ids that
-        // are NOT in the matter's bills list — fetching one of those bills
-        // tells us what kind of entity it is (a contact-level "deposit
-        // slip"? something else?) and may reveal where disbursements live.
-        const probeBillId = trustByMatterEntries[0]?.bill?.id ?? null;
-        const trustDepositBillProbe = probeBillId
-          ? await rawGetSingle(`/bills/${probeBillId}`, {
-              fields:
-                "id,number,total,balance,paid_amount,state,issued_at,matter{id,display_number},client{id,name}",
-            })
-              .then((r: any) => r?.data ?? null)
-              .catch((e: any) => ({ error: true, status: e?.response?.status }))
-          : null;
-
-        const today = new Date();
-
-        // --- Trust ---
-        // Union the matter-tagged ledger (deposits and any matter-direct
-        // disbursements) with bill-tagged entries (disbursements paid from
-        // trust against this matter's bills). Dedupe by id since an entry
-        // could in theory carry both linkages.
-        const seenTrustIds = new Set<number>();
-        const allTrustEntries: any[] = [];
-        for (const e of [...trustByMatterEntries, ...trustByBillResults.flat()]) {
-          if (e?.id != null && !seenTrustIds.has(e.id)) {
-            seenTrustIds.add(e.id);
-            allTrustEntries.push(e);
-          }
-        }
-
-        const trustLineItemsBalance = allTrustEntries.reduce(
-          (s: number, e: any) => s + (e.total || 0),
+        // Funds-in / funds-out totals, since the docs expose them as
+        // direction-specific amounts. Useful diagnostic.
+        const fundsInTotal = trustTransactions.reduce(
+          (s: number, t: any) => s + (t.funds_in || 0),
+          0
+        );
+        const fundsOutTotal = trustTransactions.reduce(
+          (s: number, t: any) => s + (t.funds_out || 0),
           0
         );
 
-        // Primary balance source: signed sum of matter-scoped transactions
-        // on trust bank accounts (matches what the Clio UI shows). Falls
-        // back to the trust_line_items union when /transactions returns
-        // nothing (e.g. endpoint not authorized, account uses a different
-        // ledger structure).
-        let trustBalance: number;
-        let trustBalanceSource: string;
-        if (trustTransactions.length > 0) {
-          trustBalance = trustTransactionsBalance;
-          trustBalanceSource = "transactions.matter_id_on_trust_bank_account";
-        } else {
-          trustBalance = trustLineItemsBalance;
-          trustBalanceSource = "trust_line_items.matter_id_union_bill_id";
-        }
-
-        const matterTaggedSum = trustByMatterEntries.reduce(
-          (s: number, e: any) => s + (e.total || 0),
-          0
-        );
-        const billTaggedEntries = trustByBillResults
-          .flat()
-          .filter((e: any) => !trustByMatterEntries.some((m: any) => m.id === e.id));
-        const billTaggedSum = billTaggedEntries.reduce(
-          (s: number, e: any) => s + (e.total || 0),
-          0
-        );
-
-        const sortedTrust = [...allTrustEntries].sort((a: any, b: any) =>
+        const sortedTrustTransactions = [...trustTransactions].sort((a: any, b: any) =>
           (b.date || "").localeCompare(a.date || "")
         );
 
         let lastDeposit: string | null = null;
         let lastDisbursement: string | null = null;
-        for (const entry of sortedTrust) {
-          const amount = entry.total || 0;
-          if (amount > 0 && !lastDeposit) lastDeposit = entry.date;
-          if (amount < 0 && !lastDisbursement) lastDisbursement = entry.date;
+        for (const t of sortedTrustTransactions) {
+          const a = t.amount || 0;
+          if (a > 0 && !lastDeposit) lastDeposit = t.date;
+          if (a < 0 && !lastDisbursement) lastDisbursement = t.date;
         }
-        const lastTrustActivity = sortedTrust[0]?.date ?? null;
+        const lastTrustActivity = sortedTrustTransactions[0]?.date ?? null;
         const trustDormancyDays = lastTrustActivity
           ? daysBetween(today, new Date(lastTrustActivity))
           : null;
@@ -280,19 +182,23 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         }
 
         const limit = Math.max(0, params.trust_history_limit ?? 10);
-        const recentTrust = sortedTrust.slice(0, limit).map((e: any) => ({
-          id: e.id,
-          date: e.date,
-          amount: round2(e.total || 0),
-          note: e.note ?? null,
-          bill_id: e.bill?.id ?? null,
+        const recentTrust = sortedTrustTransactions.slice(0, limit).map((t: any) => ({
+          id: t.id,
+          date: t.date,
+          amount: round2(t.amount || 0),
+          description: t.description ?? null,
+          transaction_type: t.transaction_type ?? null,
+          source: t.source ?? null,
+          bank_account: t.bank_account?.name ?? null,
+          bill_id: t.bill?.id ?? null,
         }));
 
+        const trustLineItemsBalance = trustLineItems.reduce(
+          (s: number, e: any) => s + (e.total || 0),
+          0
+        );
+
         // --- WIP buckets ---
-        // bill === null → truly unbilled; bill.state === "draft" → on a
-        // draft bill (Clio's "Draft" total reflects the bill total post-
-        // write-down, not the raw activity sum, so we fetch draft bills
-        // separately and use their `total` instead of summing activities).
         let unbilledHours = 0;
         let unbilledTimeValue = 0;
         let oldestUnbilledDate: string | null = null;
@@ -414,63 +320,26 @@ export function registerMatterFinancialsTools(server: McpServer): void {
           trust: {
             balance: round2(trustBalance),
             balance_scope: "matter",
-            balance_source: trustBalanceSource,
-            balance_candidates: {
-              transactions_sum: round2(trustTransactionsBalance),
-              trust_line_items_sum: round2(trustLineItemsBalance),
-            },
+            balance_source: "bank_transactions.matter_id_on_trust_accounts",
+            funds_in_total: round2(fundsInTotal),
+            funds_out_total: round2(fundsOutTotal),
+            client_id: clientId ?? null,
             trust_bank_account_ids: Array.from(trustBankAccountIds),
             trust_bank_account_names: bankAccounts
               .filter((a: any) => trustBankAccountIds.has(a.id))
               .map((a: any) => a.name),
-            transactions_count: matterTransactions.length,
+            matter_bank_transactions_count: bankTransactions.length,
             trust_transactions_count: trustTransactions.length,
-            client_id: clientId ?? null,
-            matter_bill_count: matterBillIds.length,
-            matter_tagged_entry_count: trustByMatterEntries.length,
-            matter_tagged_sum: round2(matterTaggedSum),
-            bill_tagged_entry_count: billTaggedEntries.length,
-            bill_tagged_sum: round2(billTaggedSum),
-            total_entry_count: allTrustEntries.length,
+            // Diagnostic: trust_line_items sum is the deposits-only legacy
+            // view (Clio's UI uses bank_transactions for the actual balance).
+            trust_line_items_sum: round2(trustLineItemsBalance),
+            trust_line_items_count: trustLineItems.length,
             last_deposit_date: lastDeposit,
             last_disbursement_date: lastDisbursement,
             last_activity_date: lastTrustActivity,
             days_since_last_activity: trustDormancyDays,
             flags: trustFlags,
-            recent_entries: recentTrust,
-            // Diagnostics: where might disbursements live?
-            // The matter-scoped trust ledger has only 4 deposits totaling
-            // $2,000 but the UI shows $847 — $1,153 is unaccounted for.
-            // The deposits' bill_id values point to bills NOT in this
-            // matter's bill list. Surface trust_requests results and a
-            // probe of one deposit's bill to see what entity it is.
-            trust_requests_by_matter: {
-              count: trustRequestsByMatter.length,
-              sum_trust_amount: round2(
-                trustRequestsByMatter.reduce(
-                  (s: number, r: any) => s + (r.trust_amount || 0),
-                  0
-                )
-              ),
-              entries: trustRequestsByMatter.slice(0, 5).map((r: any) => ({
-                id: r.id,
-                issue_date: r.issue_date,
-                trust_amount: r.trust_amount,
-                approved: r.approved,
-                trust_type: r.trust_type,
-                note: r.note,
-              })),
-            },
-            trust_requests_by_client: {
-              count: trustRequestsByClient.length,
-              sum_trust_amount: round2(
-                trustRequestsByClient.reduce(
-                  (s: number, r: any) => s + (r.trust_amount || 0),
-                  0
-                )
-              ),
-            },
-            trust_deposit_bill_probe: trustDepositBillProbe,
+            recent_transactions: recentTrust,
           },
           wip: {
             unbilled_hours: round2(unbilledHours),
