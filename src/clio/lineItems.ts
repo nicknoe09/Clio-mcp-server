@@ -65,6 +65,29 @@ export interface SmartPatchResult {
   after: any;
 }
 
+// Clio rejects PATCH bodies that include read-only or computed fields
+// (notably rounded_quantity, total, billed, type). Construct the wire body
+// from a strict whitelist so that callers passing in spread/typed-as-any
+// objects can't accidentally leak extra keys onto the request.
+const ACTIVITY_PATCH_FIELDS = ["note", "price", "quantity"] as const;
+const LINE_ITEM_PATCH_FIELDS = ["note", "description", "price", "quantity", "discount_total"] as const;
+
+function pickActivityPatch(patch: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const k of ACTIVITY_PATCH_FIELDS) {
+    if (patch[k] !== undefined) out[k] = patch[k];
+  }
+  return out;
+}
+
+function pickLineItemPatch(patch: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const k of LINE_ITEM_PATCH_FIELDS) {
+    if (patch[k] !== undefined) out[k] = patch[k];
+  }
+  return out;
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -83,7 +106,14 @@ export async function patchTimeEntrySmart(
       price: routing.activity.price,
       quantity: routing.activity.quantity,
     };
-    await rawPatchSingle(`/activities/${activityId}`, { data: patch });
+    const body = pickActivityPatch(patch as Record<string, any>);
+    try {
+      await rawPatchSingle(`/activities/${activityId}`, { data: body });
+    } catch (err: any) {
+      console.error(`[patchTimeEntrySmart] PATCH /activities/${activityId} failed status=${err.response?.status} body=${JSON.stringify(body)} clio_error=${JSON.stringify(err.response?.data || {}).slice(0, 400)}`);
+      if (err.response) err.response.request_body = body;
+      throw err;
+    }
     const afterResp = await rawGetSingle(`/activities/${activityId}`, {
       fields: "id,note,price,quantity,rounded_quantity",
     });
@@ -111,7 +141,14 @@ export async function patchTimeEntrySmart(
     quantity: routing.line_item.quantity,
     total: routing.line_item.total,
   };
-  await rawPatchSingle(`/line_items/${lineItemId}`, { data: patch });
+  const body = pickLineItemPatch(patch as Record<string, any>);
+  try {
+    await rawPatchSingle(`/line_items/${lineItemId}`, { data: body });
+  } catch (err: any) {
+    console.error(`[patchTimeEntrySmart] PATCH /line_items/${lineItemId} failed status=${err.response?.status} body=${JSON.stringify(body)} clio_error=${JSON.stringify(err.response?.data || {}).slice(0, 400)}`);
+    if (err.response) err.response.request_body = body;
+    throw err;
+  }
   const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS });
   return {
     path: "line_item",
