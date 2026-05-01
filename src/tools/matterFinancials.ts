@@ -5,7 +5,8 @@ import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
 
-const TRUST_FIELDS = "id,date,description,total,type,matter{id,display_number,client}";
+// trust_line_items has limited fields per Clio — id/date/total only, no description/type
+const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
 
 const TIME_FIELDS =
   "id,date,quantity,rounded_quantity,price,note,user{id,name}";
@@ -201,9 +202,7 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         const recentTrust = sortedTrust.slice(0, limit).map((e: any) => ({
           id: e.id,
           date: e.date,
-          description: e.description,
           amount: round2(e.total || 0),
-          type: e.type,
         }));
 
         const totalExposure = round2(combinedWip + arBalance);
