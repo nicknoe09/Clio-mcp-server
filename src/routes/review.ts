@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, deleteActivity } from "../clio/lineItems";
 import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
 import { detectFlags, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
@@ -590,6 +590,49 @@ router.get("/review/history", (req: Request, res: Response) => {
   const history = readHistory();
   res.setHeader("Content-Type", "text/html");
   res.send(buildHistoryHTML(history));
+});
+
+// ---------------------------------------------------------------------------
+//  POST /pending/delete — delete an activity (auto-unbills if on draft bill)
+// ---------------------------------------------------------------------------
+router.post("/pending/delete", async (req: Request, res: Response) => {
+  if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
+
+  const { activity_id } = req.body || {};
+  if (!activity_id) {
+    res.status(400).json({ ok: false, error: "activity_id required" });
+    return;
+  }
+
+  try {
+    const result = await deleteActivity(Number(activity_id));
+
+    // Mark CSV row as accepted with the delete action recorded.
+    const rows = readCSV();
+    const row = rows.find((r) => r.activity_id === String(activity_id));
+    if (row) {
+      row.status = "accepted";
+      row.selected_note = "[deleted]";
+      writeCSV(rows);
+    }
+
+    res.json({
+      ok: true,
+      activity_id: result.activity_id,
+      removed_from_bill: result.removed_from_bill,
+      deleted_activity: result.deleted_activity,
+    });
+  } catch (err: any) {
+    const status = err.response?.status;
+    const detail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
+    console.error("[Review] Delete error:", detail, status);
+    res.status(status && status < 500 ? status : 500).json({
+      ok: false,
+      error: detail,
+      clio_status: status,
+      context: err.response?.data?.context,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1876,22 +1919,272 @@ function retrySave(id) {
   patchClio(id, note);
 }
 
-function accept(id) {
+// Flag codes whose remediation is to delete the activity (with
+// auto-unbill if on a draft bill, handled server-side by deleteActivity).
+const DELETE_FLAG_CODES = new Set([
+  'NO_DESC',          // strike: no description
+  'CLERICAL',         // strike: non-compensable clerical work
+  'EFILING_HC',       // strike: e-filing under HC standards
+  'COURT_STAFF',      // strike: court staff communication under HC standards
+  'TRAVEL_HC',        // strike: travel within Harris County
+  'DUPLICATE',        // strike: duplicate of another entry
+  'BILLING_SPIKE',    // review: per user direction
+  'OVERSTAFFING',     // review: per user direction
+]);
+
+// Determine which action Accept should take given an entry's flags.
+// Highest-impact action wins (delete > combine > rate cap > 100% discount
+// > description revision > no-op).
+function getAcceptAction(flags) {
+  if (flags.some(f => DELETE_FLAG_CODES.has(f.code))) return 'delete';
+  if (flags.some(f => f.code === 'COMBINABLE')) return 'combine';
+  if (flags.some(f => f.code === 'RATE_EXCEEDS_CAP')) return 'fix-rate';
+  if (flags.some(f => f.code === 'FEE_PETITION' && f.severity === 'reduce')) return 'discount-100';
+  if (flags.some(f => f.suggested_description)) return 'patch';
+  return 'noop';
+}
+
+function originalAmount(entry) {
+  return parseFloat(entry.hours) * parseFloat(entry.rate);
+}
+
+async function accept(id) {
   const entry = entries.find(e => e.activity_id === id);
-  state[id] = { status: 'accepted', selected_note: entry.suggested_note };
+  if (!entry) return;
+  const flags = entry.flags_json ? JSON.parse(entry.flags_json) : [];
+  const action = getAcceptAction(flags);
+
+  switch (action) {
+    case 'delete': return await acceptDelete(id, entry);
+    case 'combine': return acceptCombine(id);
+    case 'fix-rate': return await acceptFixRate(id, entry, flags);
+    case 'discount-100': return await acceptDiscount100(id, entry);
+    case 'patch': return acceptPatch(id, entry);
+    case 'noop':
+    default: return acceptNoop(id, entry);
+  }
+}
+
+async function acceptDelete(id, entry) {
+  state[id] = {
+    status: 'accepted',
+    selected_note: '[deleted]',
+    action: 'delete',
+    final_amount: 0,
+    save_in_flight: true,
+  };
+  postUpdate(id, '[deleted]', 'accepted');
+  render();
+  updateProgress();
+  try {
+    const res = await fetch('/pending/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id }),
+    });
+    const data = await res.json();
+    state[id].save_in_flight = false;
+    if (!data.ok) {
+      state[id].save_failed = true;
+      state[id].save_error = data.error || 'Delete failed';
+    }
+    render();
+    updateProgress();
+  } catch (err) {
+    state[id].save_in_flight = false;
+    state[id].save_failed = true;
+    state[id].save_error = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+    render();
+    updateProgress();
+  }
+}
+
+function acceptCombine(id) {
+  const group = combineGroups.find(g => g.activityIds.map(String).includes(String(id)));
+  if (!group) {
+    alert('No combine group found for this entry');
+    return;
+  }
+  applyCombineDirect(group);
+}
+
+async function applyCombineDirect(group) {
+  const groupEntries = group.activityIds
+    .map(aid => entries.find(e => String(e.activity_id) === String(aid)))
+    .filter(Boolean);
+  const totalHrs = groupEntries.reduce((s, e) => s + parseFloat(e.hours), 0);
+  const desc = group.suggestedCombined;
+  const firstEntry = groupEntries[0];
+  const rate = parseFloat(firstEntry?.rate || 0);
+  const combinedAmount = totalHrs * rate;
+
+  // Optimistic state update so the UI doesn't lag while combine runs.
+  group.activityIds.forEach((aid, i) => {
+    const sId = String(aid);
+    state[sId] = {
+      status: 'accepted',
+      selected_note: i === 0 ? 'Combined ' + group.activityIds.length + ' entries' : 'Combined into new entry',
+      action: 'combine',
+      final_amount: i === 0 ? combinedAmount : 0,
+      save_in_flight: true,
+    };
+  });
+  render();
+  updateProgress();
+
+  try {
+    const res = await fetch('/pending/combine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_ids: group.activityIds, combined_description: desc, combined_hours: totalHrs }),
+    });
+    const data = await res.json();
+    group.activityIds.forEach(aid => {
+      const sId = String(aid);
+      if (state[sId]) state[sId].save_in_flight = false;
+    });
+    if (!data.ok) {
+      group.activityIds.forEach(aid => {
+        const sId = String(aid);
+        if (state[sId]) {
+          state[sId].save_failed = true;
+          state[sId].save_error = data.error || 'Combine failed';
+        }
+      });
+    }
+    render();
+    updateProgress();
+  } catch (err) {
+    group.activityIds.forEach(aid => {
+      const sId = String(aid);
+      if (state[sId]) {
+        state[sId].save_in_flight = false;
+        state[sId].save_failed = true;
+        state[sId].save_error = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+      }
+    });
+    render();
+    updateProgress();
+  }
+}
+
+async function acceptFixRate(id, entry, flags) {
+  const rcFlag = flags.find(f => f.code === 'RATE_EXCEEDS_CAP');
+  const match = rcFlag && rcFlag.message.match(/Reduce to \\\$(\d+)/);
+  if (!match) {
+    state[id] = { status: 'accepted', selected_note: '[rate cap parse failed]', save_failed: true, save_error: 'Could not parse cap rate' };
+    render();
+    return;
+  }
+  const capRate = parseFloat(match[1]);
+  state[id] = {
+    status: 'accepted',
+    selected_note: 'Rate reduced to $' + capRate + '/hr',
+    action: 'fix-rate',
+    final_amount: parseFloat(entry.hours) * capRate,
+    save_in_flight: true,
+  };
+  postUpdate(id, state[id].selected_note, 'accepted');
+  render();
+  updateProgress();
+  try {
+    const res = await fetch('/pending/fix-rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, new_rate: capRate }),
+    });
+    const data = await res.json();
+    state[id].save_in_flight = false;
+    if (!data.ok) {
+      state[id].save_failed = true;
+      state[id].save_error = data.error || 'Rate fix failed';
+    }
+    render();
+    updateProgress();
+  } catch (err) {
+    state[id].save_in_flight = false;
+    state[id].save_failed = true;
+    state[id].save_error = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+    render();
+    updateProgress();
+  }
+}
+
+async function acceptDiscount100(id, entry) {
+  state[id] = {
+    status: 'accepted',
+    selected_note: 'Discounted 100% — kept on bill at $0',
+    action: 'discount-100',
+    final_amount: 0,
+    save_in_flight: true,
+  };
+  postUpdate(id, state[id].selected_note, 'accepted');
+  render();
+  updateProgress();
+  try {
+    const res = await fetch('/pending/fix-rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_id: id, new_rate: 0 }),
+    });
+    const data = await res.json();
+    state[id].save_in_flight = false;
+    if (!data.ok) {
+      state[id].save_failed = true;
+      state[id].save_error = data.error || 'Discount failed';
+    }
+    render();
+    updateProgress();
+  } catch (err) {
+    state[id].save_in_flight = false;
+    state[id].save_failed = true;
+    state[id].save_error = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+    render();
+    updateProgress();
+  }
+}
+
+function acceptPatch(id, entry) {
+  state[id] = {
+    status: 'accepted',
+    selected_note: entry.suggested_note,
+    action: 'patch',
+    final_amount: originalAmount(entry),
+  };
   postUpdate(id, entry.suggested_note, 'accepted');
   render();
   updateProgress();
-  // Fire Clio PATCH in background
   patchClio(id, entry.suggested_note);
 }
 
+function acceptNoop(id, entry) {
+  // No automated remediation for these flags; mark accepted as a tracking
+  // signal but make no Clio change. Final amount unchanged.
+  state[id] = {
+    status: 'accepted',
+    selected_note: '[review noted; no automated change]',
+    action: 'noop',
+    final_amount: originalAmount(entry),
+  };
+  postUpdate(id, state[id].selected_note, 'accepted');
+  render();
+  updateProgress();
+}
+
 function skip(id) {
-  state[id] = { status: 'skipped', selected_note: '' };
+  // Skipped entries are intentionally untouched — they remain on the bill
+  // at their original amount. Do NOT subtract them from the totals (that
+  // was the bug in the prior summary calc).
+  const entry = entries.find(e => e.activity_id === id);
+  state[id] = {
+    status: 'skipped',
+    selected_note: '',
+    final_amount: entry ? originalAmount(entry) : undefined,
+  };
   postUpdate(id, '', 'skipped');
   render();
   updateProgress();
-  // No Clio action for skips — handled at apply time
+  // No Clio action for skips
 }
 
 function startEdit(id) {
@@ -1908,7 +2201,13 @@ function cancelEdit(id) {
 function saveEdit(id) {
   const text = document.getElementById('textarea-' + id).value.trim();
   if (!text) return;
-  state[id] = { status: 'edited', selected_note: text };
+  const entry = entries.find(e => e.activity_id === id);
+  state[id] = {
+    status: 'edited',
+    selected_note: text,
+    action: 'patch',
+    final_amount: entry ? originalAmount(entry) : undefined,
+  };
   postUpdate(id, text, 'edited');
   render();
   updateProgress();
@@ -1920,12 +2219,19 @@ function finishReview() {
   // Changes are already saved to Clio in real-time.
   // This just shows the summary.
 
+  // Sum entries by what they're worth after the action ran:
+  //  - state[id].final_amount is set by every action handler
+  //  - if absent (e.g. pending or unhandled state), entry stays at original
+  // Skipped entries explicitly retain their original amount — they are NOT
+  // removed (the previous calc inverted this and counted skips as removed).
   const totalBefore = entries.reduce((s, e) => s + parseFloat(e.hours) * parseFloat(e.rate), 0);
-  let removed = 0;
-  entries.forEach(e => {
-    if (state[e.activity_id].status === 'skipped') removed += parseFloat(e.hours) * parseFloat(e.rate);
-  });
-  const totalAfter = totalBefore - removed;
+  const totalAfter = entries.reduce((s, e) => {
+    const st = state[e.activity_id] || {};
+    const original = parseFloat(e.hours) * parseFloat(e.rate);
+    const finalAmt = (typeof st.final_amount === 'number') ? st.final_amount : original;
+    return s + finalAmt;
+  }, 0);
+  const removed = totalBefore - totalAfter;
   const pctReduction = totalBefore > 0 ? ((removed / totalBefore) * 100).toFixed(1) : '0.0';
   const fmtD = (n) => '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
 
@@ -2108,9 +2414,19 @@ async function applyCombine(activityIds) {
     });
     const data = await res.json();
     if (data.ok) {
-      // Mark all combined entries as accepted
-      activityIds.forEach(id => {
-        state[String(id)] = { status: 'accepted', selected_note: 'Combined into new entry' };
+      // First entry carries the full combined amount in final_amount; the
+      // rest are zeroed. Sum across the group then equals the new combined
+      // line's amount, which is what the summary should reflect.
+      const firstEntry = entries.find(e => String(e.activity_id) === String(activityIds[0]));
+      const rate = parseFloat(firstEntry?.rate || 0);
+      const combinedAmount = hrs * rate;
+      activityIds.forEach((id, i) => {
+        state[String(id)] = {
+          status: 'accepted',
+          selected_note: i === 0 ? 'Combined ' + activityIds.length + ' entries' : 'Combined into new entry',
+          action: 'combine',
+          final_amount: i === 0 ? combinedAmount : 0,
+        };
       });
       document.getElementById('resultOverlay').classList.remove('show');
       render();
@@ -2133,6 +2449,7 @@ function hasFeePetition(flags) {
 }
 
 async function discount100(id) {
+  const entry = entries.find(e => e.activity_id === id);
   try {
     const res = await fetch('/pending/fix-rate', {
       method: 'POST',
@@ -2141,7 +2458,12 @@ async function discount100(id) {
     });
     const data = await res.json();
     if (data.ok) {
-      state[id] = { status: 'accepted', selected_note: 'Discounted 100% — kept on bill at $0' };
+      state[id] = {
+        status: 'accepted',
+        selected_note: 'Discounted 100% — kept on bill at $0',
+        action: 'discount-100',
+        final_amount: 0,
+      };
       render();
       updateProgress();
     } else {
@@ -2176,7 +2498,12 @@ async function fixRate(id) {
     });
     const data = await res.json();
     if (data.ok) {
-      state[id] = { status: 'accepted', selected_note: 'Rate reduced to $' + capRate + '/hr' };
+      state[id] = {
+        status: 'accepted',
+        selected_note: 'Rate reduced to $' + capRate + '/hr',
+        action: 'fix-rate',
+        final_amount: parseFloat(entry.hours) * capRate,
+      };
       render();
       updateProgress();
     } else {
@@ -2330,16 +2657,20 @@ function toggleBillComparison() {
 }
 
 function renderBillComparison() {
-  // Group by matter, calculate before/after
+  // Group by matter, calculate before/after. "Removed" is the difference
+  // between original and final_amount per entry (set by the action
+  // handlers); skipped entries retain their original amount and contribute
+  // 0 to removed.
   const matters = {};
   entries.forEach(e => {
     const key = e.matter_name || 'Unknown';
     if (!matters[key]) matters[key] = { before: 0, removed: 0, revised: 0 };
     const m = matters[key];
     const amt = parseFloat(e.hours) * parseFloat(e.rate);
+    const s = state[e.activity_id] || {};
+    const finalAmt = (typeof s.final_amount === 'number') ? s.final_amount : amt;
     m.before += amt;
-    const s = state[e.activity_id];
-    if (s.status === 'skipped') m.removed += amt;
+    m.removed += amt - finalAmt;
     if (s.status === 'accepted' || s.status === 'edited') m.revised++;
   });
 
