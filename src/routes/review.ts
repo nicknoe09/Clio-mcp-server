@@ -44,7 +44,7 @@ function appendHistory(session: ReviewSession): void {
   fs.writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2), "utf-8");
 }
 
-const CSV_HEADERS = "activity_id,matter_id,matter_name,date,hours,rate,current_note,suggested_note,selected_note,status";
+const CSV_HEADERS = "activity_id,matter_id,matter_name,date,hours,rate,current_note,suggested_note,selected_note,status,action";
 
 // ---------------------------------------------------------------------------
 //  CSV helpers
@@ -61,6 +61,12 @@ interface PendingRow {
   suggested_note: string;
   selected_note: string;
   status: string; // pending | accepted | edited | skipped
+  // What kind of remediation was applied. Drives /pending/apply dispatch:
+  //   "" | "patch" | undefined → PATCH the note (legacy + edited entries)
+  //   "delete" | "combine" | "fix-rate" | "discount-100" | "noop"
+  //     → action already ran at real-time when the user clicked Accept;
+  //       /pending/apply skips these to avoid duplicating or breaking them.
+  action?: string;
   flags_json?: string; // JSON-encoded flags for the UI (not persisted to CSV)
 }
 
@@ -117,6 +123,8 @@ function readCSV(): PendingRow[] {
   if (lines.length <= 1) return [];
   return lines.slice(1).map((line) => {
     const f = parseCSVLine(line);
+    // Field 10 (action) is new — older CSVs don't have it. Treat missing
+    // as "" which falls through to legacy patch behavior in /pending/apply.
     return {
       activity_id: f[0] || "",
       matter_id: f[1] || "",
@@ -128,7 +136,8 @@ function readCSV(): PendingRow[] {
       suggested_note: f[7] || "",
       selected_note: f[8] || "",
       status: f[9] || "pending",
-    };
+      action: f[10] || "",
+    } as PendingRow;
   });
 }
 
@@ -147,6 +156,7 @@ function writeCSV(rows: PendingRow[]): void {
         csvEscape(r.suggested_note),
         csvEscape(r.selected_note),
         csvEscape(r.status),
+        csvEscape(r.action || ""),
       ].join(",")
     );
   }
@@ -501,7 +511,7 @@ router.get("/review", async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 router.post("/pending", (req: Request, res: Response) => {
   if (!isAuthenticated(req)) { res.status(401).json({ ok: false, error: "Not authenticated" }); return; }
-  const { activity_id, selected_note, status } = req.body || {};
+  const { activity_id, selected_note, status, action } = req.body || {};
   if (!activity_id || !status) {
     res.status(400).json({ ok: false, error: "activity_id and status required" });
     return;
@@ -516,6 +526,7 @@ router.post("/pending", (req: Request, res: Response) => {
 
   row.status = status;
   row.selected_note = selected_note || "";
+  if (action !== undefined) row.action = action;
   writeCSV(rows);
   res.json({ ok: true });
 });
@@ -905,15 +916,29 @@ router.post("/pending/apply", async (_req: Request, res: Response) => {
     const skipped = rows.filter((r) => r.status === "skipped" || r.status === "pending").length;
 
     let patched = 0;
+    let skippedByAction = 0;
     const errors: string[] = [];
+    const actionBreakdown: Record<string, number> = {};
 
     for (const row of toApply) {
-      try {
-        await patchTimeEntrySmart(Number(row.activity_id), { note: row.selected_note });
-        patched++;
-      } catch (err: any) {
-        const detail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
-        errors.push(`Activity ${row.activity_id}: ${detail}`);
+      // Treat empty action and "patch" the same (legacy CSVs + edited
+      // entries). All other actions ran in real-time when the user clicked
+      // Accept; re-running them here would duplicate work or 404 on
+      // already-deleted activities. Count them in the breakdown so callers
+      // can see what was already applied.
+      const action = (row.action || "patch").toLowerCase();
+      actionBreakdown[action] = (actionBreakdown[action] || 0) + 1;
+
+      if (action === "patch") {
+        try {
+          await patchTimeEntrySmart(Number(row.activity_id), { note: row.selected_note });
+          patched++;
+        } catch (err: any) {
+          const detail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
+          errors.push(`Activity ${row.activity_id} (patch): ${detail}`);
+        }
+      } else {
+        skippedByAction++;
       }
     }
 
@@ -922,7 +947,13 @@ router.post("/pending/apply", async (_req: Request, res: Response) => {
       writeCSV([]);
     }
 
-    res.json({ patched, skipped, errors });
+    res.json({
+      patched,
+      skipped,
+      skipped_by_action: skippedByAction,
+      action_breakdown: actionBreakdown,
+      errors,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1859,11 +1890,11 @@ function updateProgress() {
   }
 }
 
-async function postUpdate(activityId, selectedNote, status) {
+async function postUpdate(activityId, selectedNote, status, action) {
   await fetch('/pending', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ activity_id: activityId, selected_note: selectedNote, status }),
+    body: JSON.stringify({ activity_id: activityId, selected_note: selectedNote, status, action: action || '' }),
   });
 }
 
@@ -1973,7 +2004,7 @@ async function acceptDelete(id, entry) {
     final_amount: 0,
     save_in_flight: true,
   };
-  postUpdate(id, '[deleted]', 'accepted');
+  postUpdate(id, '[deleted]', 'accepted', 'delete');
   render();
   updateProgress();
   try {
@@ -2051,6 +2082,13 @@ async function applyCombineDirect(group) {
           state[sId].save_error = data.error || 'Combine failed';
         }
       });
+    } else {
+      // Persist combine result to CSV so the batch path can see it (and skip).
+      group.activityIds.forEach(aid => {
+        const sId = String(aid);
+        const note = state[sId]?.selected_note || 'Combined into new entry';
+        postUpdate(sId, note, 'accepted', 'combine');
+      });
     }
     render();
     updateProgress();
@@ -2084,7 +2122,7 @@ async function acceptFixRate(id, entry, flags) {
     final_amount: parseFloat(entry.hours) * capRate,
     save_in_flight: true,
   };
-  postUpdate(id, state[id].selected_note, 'accepted');
+  postUpdate(id, state[id].selected_note, 'accepted', 'fix-rate');
   render();
   updateProgress();
   try {
@@ -2118,7 +2156,7 @@ async function acceptDiscount100(id, entry) {
     final_amount: 0,
     save_in_flight: true,
   };
-  postUpdate(id, state[id].selected_note, 'accepted');
+  postUpdate(id, state[id].selected_note, 'accepted', 'discount-100');
   render();
   updateProgress();
   try {
@@ -2151,7 +2189,7 @@ function acceptPatch(id, entry) {
     action: 'patch',
     final_amount: originalAmount(entry),
   };
-  postUpdate(id, entry.suggested_note, 'accepted');
+  postUpdate(id, entry.suggested_note, 'accepted', 'patch');
   render();
   updateProgress();
   patchClio(id, entry.suggested_note);
@@ -2166,7 +2204,7 @@ function acceptNoop(id, entry) {
     action: 'noop',
     final_amount: originalAmount(entry),
   };
-  postUpdate(id, state[id].selected_note, 'accepted');
+  postUpdate(id, state[id].selected_note, 'accepted', 'noop');
   render();
   updateProgress();
 }
@@ -2208,7 +2246,7 @@ function saveEdit(id) {
     action: 'patch',
     final_amount: entry ? originalAmount(entry) : undefined,
   };
-  postUpdate(id, text, 'edited');
+  postUpdate(id, text, 'edited', 'patch');
   render();
   updateProgress();
   // Fire Clio PATCH in background
@@ -2421,12 +2459,15 @@ async function applyCombine(activityIds) {
       const rate = parseFloat(firstEntry?.rate || 0);
       const combinedAmount = hrs * rate;
       activityIds.forEach((id, i) => {
-        state[String(id)] = {
+        const sId = String(id);
+        const note = i === 0 ? 'Combined ' + activityIds.length + ' entries' : 'Combined into new entry';
+        state[sId] = {
           status: 'accepted',
-          selected_note: i === 0 ? 'Combined ' + activityIds.length + ' entries' : 'Combined into new entry',
+          selected_note: note,
           action: 'combine',
           final_amount: i === 0 ? combinedAmount : 0,
         };
+        postUpdate(sId, note, 'accepted', 'combine');
       });
       document.getElementById('resultOverlay').classList.remove('show');
       render();
@@ -2464,6 +2505,7 @@ async function discount100(id) {
         action: 'discount-100',
         final_amount: 0,
       };
+      postUpdate(id, state[id].selected_note, 'accepted', 'discount-100');
       render();
       updateProgress();
     } else {
@@ -2504,6 +2546,7 @@ async function fixRate(id) {
         action: 'fix-rate',
         final_amount: parseFloat(entry.hours) * capRate,
       };
+      postUpdate(id, state[id].selected_note, 'accepted', 'fix-rate');
       render();
       updateProgress();
     } else {
