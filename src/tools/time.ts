@@ -460,7 +460,7 @@ export function registerTimeTools(server: McpServer): void {
       line_item_id: z.coerce.number().describe("The line_item ID (use find_line_item_for_activity to resolve from an activity_id)"),
       new_note: z.string().optional().describe("Activity narrative / line text (writable)"),
       new_description: z.string().optional().describe("Probe-only: try writing 'description' (read field name; may not be writable)"),
-      new_quantity_hours: z.coerce.number().optional().describe("Hours (sent as seconds) (writable)"),
+      new_quantity_hours: z.coerce.number().optional().describe("Decimal hours, written directly to /line_items.quantity (no unit conversion — Clio's /line_items endpoint takes hours, unlike /activities which takes seconds)."),
       new_price: z.coerce.number().optional().describe("Hourly rate (writable)"),
       new_date: z.string().optional().describe("Date YYYY-MM-DD (writable)"),
       new_total: z.coerce.number().optional().describe("Probe-only: try 'total' (likely read-only)"),
