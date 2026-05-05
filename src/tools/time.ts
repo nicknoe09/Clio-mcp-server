@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -907,6 +907,136 @@ export function registerTimeTools(server: McpServer): void {
               success: true,
               ...result,
             }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // prepare_hour_change — workaround for Clio's silent-noop on
+  // /line_items.quantity. Removes the line from the draft (unbilling
+  // the activity) and PATCHes /activities/{id} with the new quantity.
+  // Caller must click "Regenerate Draft" in Clio UI to put the line
+  // back on the bill at the new hours.
+  server.tool(
+    "prepare_hour_change",
+    "Change the hours (and optionally the note) on a line item that's on a DRAFT bill. Workaround for Clio's silent-noop on PATCH /line_items.quantity for ActivityLineItem (Clio accepts the field but doesn't apply it). Sequence: (1) remove_from_draft_bill — unbills the activity, /activities is now editable; (2) PATCH /activities/{id} with the new quantity (and optionally new note). The line is GONE from the bill until you click 'Regenerate Draft' on the bill in Clio UI — Clio rebuilds the draft and the activity reappears with its new hours. Multiple prepare_hour_change calls can be batched before a single regenerate-draft click. Refuses if the bill is not in draft state. Use case: invoice review hour reductions (e.g., 0.6h → 0.4h, 1.6h → 0.4h) before issuing the bill.",
+    {
+      line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known)"),
+      activity_id: z.coerce.number().optional().describe("Activity ID; resolved to its line_item on a draft bill"),
+      new_hours: z.coerce.number().describe("New decimal hours for the activity. Must be > 0. Both increases and decreases are supported."),
+      new_note: z.string().optional().describe("Optional new note. If provided, replaces the activity's existing note. If omitted, the note is left unchanged."),
+    },
+    async (params) => {
+      try {
+        const result = await prepareHourChange({
+          line_item_id: params.line_item_id,
+          activity_id: params.activity_id,
+          new_hours: params.new_hours,
+          new_note: params.new_note,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, ...result }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // prepare_hard_combine — hard-combine multiple secondary lines into the
+  // primary by setting new hours on the primary and deleting (or 100%-
+  // discounting) the secondaries. Companion to merge_line_items (which is
+  // soft-combine; preserves all hours but zeroes secondaries' dollars).
+  server.tool(
+    "prepare_hard_combine",
+    "Hard-combine: roll the hours from secondary line items into the primary, then delete (or 100%-discount) the secondaries. Used during invoice review to consolidate same-day work into a single line on the bill (e.g., 4/14 work currently spread across two lines becomes one line at 1.4h with a merged narrative). All lines must be on the same DRAFT bill. Composition: (1) prepare_hour_change on the primary (sets new_primary_hours, optional new_note); (2) per secondary: delete_activity (default) or discount_line_item(100%) per secondary_treatment. Per-secondary errors are isolated. Single Clio UI 'Regenerate Draft' click finalizes everything. Use merge_line_items instead when you want soft-combine (preserve secondaries' hours, just zero their $ contribution per the firm rule).",
+    {
+      primary_line_item_id: z.coerce.number().describe("Line item ID of the primary line. Its hours will be set to new_primary_hours; its note may optionally be replaced."),
+      secondary_line_item_ids_csv: z.string().describe("Comma-separated line_item IDs to combine into the primary, e.g. '8309925665,8261110372'. All must be on the same DRAFT bill as the primary. Cannot include the primary's own ID. Cannot contain duplicates."),
+      new_primary_hours: z.coerce.number().describe("New decimal hours for the primary line. Typically equals the sum of original primary hours + the secondaries' hours that are being rolled in."),
+      new_note: z.string().optional().describe("Optional new merged narrative for the primary line."),
+      secondary_treatment: z.enum(["delete", "discount_100pct"]).optional().describe("How to handle the secondaries. 'delete' (default) removes the activities entirely. 'discount_100pct' keeps them visible at $0 (firm-rule-friendly when audit trail matters)."),
+    },
+    async (params) => {
+      try {
+        // Parse CSV → number[]
+        const idsRaw = params.secondary_line_item_ids_csv
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        const secondaryIds: number[] = [];
+        for (const raw of idsRaw) {
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  message: `secondary_line_item_ids_csv contains invalid ID: "${raw}".`,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          secondaryIds.push(n);
+        }
+        if (secondaryIds.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                message: `secondary_line_item_ids_csv was empty after parsing.`,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        const result = await prepareHardCombine({
+          primary_line_item_id: params.primary_line_item_id,
+          secondary_line_item_ids: secondaryIds,
+          new_primary_hours: params.new_primary_hours,
+          new_note: params.new_note,
+          secondary_treatment: params.secondary_treatment,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, ...result }, null, 2),
           }],
         };
       } catch (err: any) {
