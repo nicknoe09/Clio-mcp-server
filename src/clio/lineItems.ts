@@ -220,6 +220,51 @@ export async function patchTimeEntrySmart(
     throw err;
   }
 
+  // Silent-noop guard. Clio's PATCH /line_items accepts the `quantity` field
+  // in the request body for ActivityLineItem types but **silently ignores
+  // it** — the line's quantity is sourced from the underlying activity, and
+  // the activity is locked while billed (PATCH /activities/{id} returns 422).
+  // Result: hour-change requests via this helper return 200 OK and look
+  // successful but the line's quantity is unchanged. Detected empirically
+  // 2026-05-04 via direct probe on bill 22263. Surfacing as a loud failure
+  // here (so callers don't silently overcharge or under-bill) and rolling
+  // back any sibling fields (note/price) that DID apply, so the line returns
+  // to its pre-patch state.
+  if (patch.hours !== undefined && typeof after?.quantity === "number") {
+    const requested = patch.hours;
+    const actual = after.quantity;
+    if (Math.abs(actual - requested) > 0.005) {
+      const noteChanged = patch.note !== undefined && after.note !== before.note;
+      const priceChanged = patch.price !== undefined && after.price !== before.price;
+      if (noteChanged || priceChanged) {
+        const rollback = buildLineItemBody({
+          note: noteChanged ? (before.note as string | undefined) : undefined,
+          price: priceChanged ? (before.price as number | undefined) : undefined,
+        });
+        try {
+          await rawPatchSingle(`/line_items/${lineItemId}`, { data: rollback });
+        } catch (rbErr: any) {
+          console.error(`[patchTimeEntrySmart] silent-noop rollback failed on line_item ${lineItemId}: ${rbErr.message}. Note/price may be partially applied; manual fix may be needed.`);
+        }
+      }
+      const err: any = new Error(
+        `Refused: PATCH /line_items/${lineItemId} appeared to succeed (HTTP 200) but Clio silently ignored the quantity change (requested ${requested}h, line is still ${actual}h). Clio's /line_items endpoint does not allow quantity edits for ActivityLineItem types — the quantity is sourced from the underlying activity, which is locked while billed. To change hours on a billed entry: (a) for the split workflow, use prepare_line_split (it deletes the original and creates new activities); (b) for ad-hoc hour fixes, remove_from_draft_bill first (which unbills the activity and unlocks /activities), then PATCH /activities, then regenerate the draft in Clio UI. Any sibling field changes (note/price) have been rolled back to keep the line atomic.`,
+      );
+      err.response = {
+        status: 422,
+        data: {
+          context: "billed_quantity_silently_ignored",
+          requested_hours: requested,
+          actual_hours: actual,
+          rolled_back_fields: { note: noteChanged, price: priceChanged },
+          request_body: body,
+        },
+        request_body: body,
+      };
+      throw err;
+    }
+  }
+
   return {
     path: "line_item",
     activity_id: activityId,
@@ -577,11 +622,13 @@ export async function prepareLineSplit(args: {
     );
   }
 
-  // --- Step 1: Create new activities for splits[1..N], with rollback on failure ---
+  // --- Step 1: Create new activities for ALL splits (splits[0..N-1]),
+  // with rollback on failure. We do creates BEFORE deleting the original so
+  // a partial failure here is recoverable (just delete the partials).
   const createdActivityIds: number[] = [];
   const newActivities: Array<{ activity_id: number; hours: number; note: string }> = [];
   try {
-    for (let i = 1; i < args.splits.length; i++) {
+    for (let i = 0; i < args.splits.length; i++) {
       const split = args.splits[i];
       const body: any = {
         data: {
@@ -616,15 +663,23 @@ export async function prepareLineSplit(args: {
     throw err;
   }
 
-  // --- Step 2: Edit existing line to splits[0] via patchTimeEntrySmart
-  // (which correctly routes through /line_items for billed activities).
+  // --- Step 2: Delete the ORIGINAL activity, which auto-removes its
+  // line_item from the draft bill (per delete_activity semantics). We can't
+  // edit the original line's quantity in place — Clio's PATCH /line_items
+  // silently ignores quantity for ActivityLineItem (see patchTimeEntrySmart's
+  // silent-noop guard), and PATCH /activities is locked while billed. The
+  // delete approach bypasses both constraints. Audit trail: Clio retains a
+  // deletion record for the original activity.
   try {
-    await patchTimeEntrySmart(activityId!, {
-      hours: args.splits[0].hours,
-      note: args.splits[0].note,
-    });
+    await deleteActivity(activityId!);
   } catch (err: any) {
-    // Rollback the new-activity creates so we leave the system in the original state.
+    // Best-effort rollback: delete the new activities so the matter is left
+    // in its original state. If deleteActivity partially completed (line
+    // removed but activity not deleted), the original is now an unbilled
+    // activity on the matter; re-attaching to the draft via API is
+    // impossible (Clio has no POST /line_items), so user must regenerate
+    // the draft in Clio UI to recover. Surface the partial state in the
+    // error so the user knows.
     for (const id of createdActivityIds) {
       try {
         await rawDeleteSingle(`/activities/${id}`);
@@ -649,10 +704,13 @@ export async function prepareLineSplit(args: {
       rate,
     },
     edited_line: {
-      hours: args.splits[0].hours,
-      note: args.splits[0].note,
+      // The original line was deleted, not edited — surfacing the deletion
+      // here so the response shape stays consistent with previous versions
+      // while making the actual semantics clear.
+      hours: 0,
+      note: "(original line deleted; replaced by new_activities below)",
     },
     new_activities: newActivities,
-    ui_instruction: `Existing line on bill ${bill.number} has been edited to the first sub-entry. ${newActivities.length} new activit${newActivities.length === 1 ? "y has" : "ies have"} been created on matter ${matter.display_number || matter.id} (currently unbilled). To pull the new activit${newActivities.length === 1 ? "y" : "ies"} onto bill ${bill.number}, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. The regenerated draft will include all ${args.splits.length} sub-entries.`,
+    ui_instruction: `Original activity ${activityId} (line on bill ${bill.number}) has been deleted. ${newActivities.length} new activities have been created on matter ${matter.display_number || matter.id}, all currently unbilled. To pull the new sub-entries onto bill ${bill.number}, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. The regenerated draft will replace the (now-empty) bill with ${args.splits.length} new sub-entry lines.`,
   };
 }
