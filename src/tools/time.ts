@@ -776,22 +776,39 @@ export function registerTimeTools(server: McpServer): void {
     {
       line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known)"),
       activity_id: z.coerce.number().optional().describe("Activity ID; resolved to its line_item on a draft bill"),
-      splits: z
-        .array(
-          z.object({
-            hours: z.coerce.number().describe("Decimal hours for this sub-entry"),
-            note: z.string().describe("Narrative for this sub-entry (line text on the bill)"),
-          }),
-        )
-        .min(2)
-        .describe("At least 2 sub-entries. Sum of hours must equal the original line's hours."),
+      splits_json: z
+        .string()
+        .describe(
+          "JSON-encoded array of at least 2 sub-entries, each an object with `hours` (decimal) and `note` (string). Example: '[{\"hours\":0.2,\"note\":\"Subtask A\"},{\"hours\":0.2,\"note\":\"Subtask B\"},{\"hours\":0.2,\"note\":\"Subtask C\"}]'. Sum of hours must equal the original line's hours. (Encoded as a JSON string because the MCP SDK's tool-list serialization rejects nested array-of-object zod schemas in some clients.)",
+        ),
     },
     async (params) => {
       try {
+        let splits: Array<{ hours: number; note: string }>;
+        try {
+          const parsed = JSON.parse(params.splits_json);
+          if (!Array.isArray(parsed)) {
+            throw new Error("splits_json must decode to an array");
+          }
+          splits = parsed;
+        } catch (parseErr: any) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                message: `splits_json could not be parsed as JSON: ${parseErr.message}`,
+                hint: "Provide a JSON-encoded array, e.g. '[{\"hours\":0.1,\"note\":\"A\"},{\"hours\":0.1,\"note\":\"B\"}]'",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
         const result = await prepareLineSplit({
           line_item_id: params.line_item_id,
           activity_id: params.activity_id,
-          splits: params.splits,
+          splits,
         });
         return {
           content: [{
