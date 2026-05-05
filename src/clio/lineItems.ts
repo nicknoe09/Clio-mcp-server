@@ -360,7 +360,7 @@ export async function discountLineItem(args: {
   let beforeLineItem: any;
 
   if (lineItemId) {
-    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{rate,type}" });
     beforeLineItem = liResp.data;
     if (!beforeLineItem) {
       const err: any = new Error(`Line item ${lineItemId} not found`);
@@ -378,7 +378,7 @@ export async function discountLineItem(args: {
     }
     lineItemId = routing.line_item.id;
     bill = routing.bill;
-    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{rate,type}" });
     beforeLineItem = liResp.data;
   }
 
@@ -429,7 +429,7 @@ export async function discountLineItem(args: {
     if (err.response) err.response.request_body = body;
     throw err;
   }
-  const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{total,kind,type}" });
+  const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{rate,type}" });
 
   return {
     line_item_id: lineItemId!,
