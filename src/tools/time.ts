@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -763,6 +763,69 @@ export function registerTimeTools(server: McpServer): void {
         };
       }
     }
+  );
+
+  // prepare_line_split — split a line on a draft bill into multiple
+  // sub-entries. API does the prep; user finishes the workflow by
+  // clicking "Regenerate Draft" in Clio UI to pull the new activities
+  // onto the bill (Clio's API doesn't support adding line items to an
+  // existing bill — verified against their full OpenAPI).
+  server.tool(
+    "prepare_line_split",
+    "Split a line item on a DRAFT bill into multiple sub-entries with allocated hours and distinct narratives. Edits the existing line to the FIRST sub-entry, then creates new activities on the matter for the remaining sub-entries (the new activities sit unbilled — Clio's API does NOT support adding line items to an existing bill, so the caller must click 'Regenerate Draft' in Clio UI to pull the new activities onto the bill). Strict total: split hours must sum to the original line's hours. Refuses if the bill is not in draft state. Inherits date, user (timekeeper), and rate from the original activity. Use case: splitting a block-billed entry like 0.6h into [0.2h Subtask A, 0.2h Subtask B, 0.2h Subtask C].",
+    {
+      line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known)"),
+      activity_id: z.coerce.number().optional().describe("Activity ID; resolved to its line_item on a draft bill"),
+      splits: z
+        .array(
+          z.object({
+            hours: z.coerce.number().describe("Decimal hours for this sub-entry"),
+            note: z.string().describe("Narrative for this sub-entry (line text on the bill)"),
+          }),
+        )
+        .min(2)
+        .describe("At least 2 sub-entries. Sum of hours must equal the original line's hours."),
+    },
+    async (params) => {
+      try {
+        const result = await prepareLineSplit({
+          line_item_id: params.line_item_id,
+          activity_id: params.activity_id,
+          splits: params.splits,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              line_item_id: result.line_item_id,
+              activity_id: result.activity_id,
+              bill: result.bill,
+              matter: result.matter,
+              original: result.original,
+              edited_line: result.edited_line,
+              new_activities: result.new_activities,
+              ui_instruction: result.ui_instruction,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
   );
 
   // create_time_entry

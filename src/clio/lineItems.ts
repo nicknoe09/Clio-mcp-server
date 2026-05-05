@@ -1,4 +1,4 @@
-import { fetchAllPages, rawGetSingle, rawPatchSingle, rawDeleteSingle } from "./pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle, rawDeleteSingle } from "./pagination";
 
 export interface LineItemSummary {
   id: number;
@@ -444,5 +444,215 @@ export async function discountLineItem(args: {
     after: afterResp.data,
     discount_amount_applied: discountAmount,
     discount_pct_applied: Math.round(discountPct * 100) / 100,
+  };
+}
+
+export interface LineSplit {
+  hours: number;
+  note: string;
+}
+
+export interface PrepareLineSplitResult {
+  line_item_id: number;
+  activity_id: number;
+  bill: { id: number; state?: string; number?: string };
+  matter: { id: number; display_number?: string };
+  original: { hours: number; note: string; date: string; rate: number };
+  edited_line: { hours: number; note: string };
+  new_activities: Array<{ activity_id: number; hours: number; note: string }>;
+  ui_instruction: string;
+}
+
+// Split a single line on a DRAFT bill into multiple sub-entries with
+// allocated hours and distinct narratives.
+//
+// The hard constraint: Clio's API does NOT support adding line items to
+// an existing bill (no POST /line_items, no POST /bills, no refresh
+// endpoint — verified against Clio's full OpenAPI). So this helper does
+// the API-side prep:
+//   1. Edits the existing line to splits[0]'s hours+note (via
+//      patchTimeEntrySmart, which routes through /line_items since the
+//      activity is on a draft).
+//   2. Creates new activities on the matter for splits[1..N] (POST
+//      /activities), inheriting the original activity's date, user, and
+//      rate. These new activities sit unbilled until the user clicks
+//      "Regenerate Draft" in Clio UI for the matter.
+//
+// Strict-total contract: sum of split hours must equal the original
+// line's hours (within 0.005h tolerance). Prevents accidental
+// over/under-billing during a "split". Use update_billed_time_entry
+// separately if you want to change the total billable hours.
+//
+// Rollback: if any new-activity create fails after earlier creates
+// succeeded, deletes the partials before throwing. If the existing-line
+// edit fails after all creates succeeded, deletes the new activities
+// before throwing.
+export async function prepareLineSplit(args: {
+  line_item_id?: number;
+  activity_id?: number;
+  splits: LineSplit[];
+}): Promise<PrepareLineSplitResult> {
+  // --- Validate splits shape ---
+  if (!Array.isArray(args.splits) || args.splits.length < 2) {
+    throw new Error("prepareLineSplit: splits must be an array of at least 2 entries.");
+  }
+  for (const s of args.splits) {
+    if (typeof s.hours !== "number" || !(s.hours > 0)) {
+      throw new Error(
+        `prepareLineSplit: each split must have hours > 0 (got ${JSON.stringify(s)}).`,
+      );
+    }
+    if (typeof s.note !== "string" || s.note.trim().length === 0) {
+      throw new Error(`prepareLineSplit: each split must have a non-empty note.`);
+    }
+  }
+
+  // --- Resolve activity_id and line_item_id ---
+  let activityId = args.activity_id;
+  let lineItemId = args.line_item_id;
+  if (!activityId && !lineItemId) {
+    throw new Error("prepareLineSplit: provide line_item_id or activity_id.");
+  }
+  if (!activityId && lineItemId) {
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, {
+      fields: LINE_ITEM_FIELDS,
+    });
+    if (!liResp.data) {
+      const err: any = new Error(`Line item ${lineItemId} not found.`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    activityId = liResp.data.activity?.id;
+    if (!activityId) {
+      throw new Error(`Line item ${lineItemId} has no associated activity.`);
+    }
+  }
+
+  const routing = await resolveActivityRouting(activityId!);
+  if (!routing.bill || !routing.line_item) {
+    const err: any = new Error(
+      `Activity ${activityId} is not on a bill — nothing to split.`,
+    );
+    err.response = { status: 409, data: { context: "activity_not_on_bill" } };
+    throw err;
+  }
+  if (routing.bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to split: bill state is "${routing.bill.state}", not "draft". Splits can only be performed on draft bills.`,
+    );
+    err.response = {
+      status: 409,
+      data: { context: "bill_not_draft", bill_state: routing.bill.state },
+    };
+    throw err;
+  }
+
+  const bill = routing.bill;
+  const matter = routing.activity.matter;
+  if (!matter?.id) {
+    throw new Error(`Could not resolve matter for activity ${activityId}.`);
+  }
+  const userId = routing.activity.user?.id;
+  if (!userId) {
+    throw new Error(
+      `Could not resolve timekeeper (user) for activity ${activityId}.`,
+    );
+  }
+  const date = routing.activity.date;
+  const rate = routing.activity.price;
+  // Activity quantity is in seconds on /activities; convert to decimal hours
+  // for the strict-total comparison.
+  const originalHours =
+    Math.round((routing.activity.quantity / 3600) * 1000) / 1000;
+  const originalNote = routing.activity.note || "";
+
+  lineItemId = routing.line_item.id;
+
+  // --- Strict-total check ---
+  const splitTotal =
+    Math.round(args.splits.reduce((acc, s) => acc + s.hours, 0) * 1000) / 1000;
+  if (Math.abs(splitTotal - originalHours) > 0.005) {
+    throw new Error(
+      `prepareLineSplit: split total ${splitTotal}h must equal original line hours ${originalHours}h. Use update_billed_time_entry separately if you want to change the total billable hours.`,
+    );
+  }
+
+  // --- Step 1: Create new activities for splits[1..N], with rollback on failure ---
+  const createdActivityIds: number[] = [];
+  const newActivities: Array<{ activity_id: number; hours: number; note: string }> = [];
+  try {
+    for (let i = 1; i < args.splits.length; i++) {
+      const split = args.splits[i];
+      const body: any = {
+        data: {
+          type: "TimeEntry",
+          date,
+          quantity: Math.round(split.hours * 3600), // /activities expects seconds
+          user: { id: userId },
+          matter: { id: matter.id },
+          note: split.note,
+        },
+      };
+      if (rate !== undefined && rate !== null) body.data.price = rate;
+      const resp = await rawPostSingle("/activities", body);
+      const newId = resp.data?.id;
+      if (!newId) {
+        throw new Error(`Failed to create activity for split ${i + 1}: no ID returned.`);
+      }
+      createdActivityIds.push(newId);
+      newActivities.push({ activity_id: newId, hours: split.hours, note: split.note });
+    }
+  } catch (err: any) {
+    // Rollback any partial creates.
+    for (const id of createdActivityIds) {
+      try {
+        await rawDeleteSingle(`/activities/${id}`);
+      } catch (rbErr: any) {
+        console.error(
+          `[prepareLineSplit] rollback delete /activities/${id} failed: ${rbErr.message}`,
+        );
+      }
+    }
+    throw err;
+  }
+
+  // --- Step 2: Edit existing line to splits[0] via patchTimeEntrySmart
+  // (which correctly routes through /line_items for billed activities).
+  try {
+    await patchTimeEntrySmart(activityId!, {
+      hours: args.splits[0].hours,
+      note: args.splits[0].note,
+    });
+  } catch (err: any) {
+    // Rollback the new-activity creates so we leave the system in the original state.
+    for (const id of createdActivityIds) {
+      try {
+        await rawDeleteSingle(`/activities/${id}`);
+      } catch (rbErr: any) {
+        console.error(
+          `[prepareLineSplit] rollback delete /activities/${id} failed: ${rbErr.message}`,
+        );
+      }
+    }
+    throw err;
+  }
+
+  return {
+    line_item_id: lineItemId,
+    activity_id: activityId!,
+    bill,
+    matter: { id: matter.id, display_number: matter.display_number },
+    original: {
+      hours: originalHours,
+      note: originalNote,
+      date,
+      rate,
+    },
+    edited_line: {
+      hours: args.splits[0].hours,
+      note: args.splits[0].note,
+    },
+    new_activities: newActivities,
+    ui_instruction: `Existing line on bill ${bill.number} has been edited to the first sub-entry. ${newActivities.length} new activit${newActivities.length === 1 ? "y has" : "ies have"} been created on matter ${matter.display_number || matter.id} (currently unbilled). To pull the new activit${newActivities.length === 1 ? "y" : "ies"} onto bill ${bill.number}, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. The regenerated draft will include all ${args.splits.length} sub-entries.`,
   };
 }
