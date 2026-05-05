@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -823,6 +823,89 @@ export function registerTimeTools(server: McpServer): void {
               edited_line: result.edited_line,
               new_activities: result.new_activities,
               ui_instruction: result.ui_instruction,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              status,
+              message: err.message,
+              context: err.response?.data?.context,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // merge_line_items — soft-merge multiple secondary lines into a primary
+  // line on a draft bill. Updates the primary's note (optional), then
+  // applies a 100% discount to each secondary so they stay visible at $0
+  // on the bill (firm rule: preserve audit trail by discounting rather
+  // than deleting). Per-secondary errors are isolated.
+  server.tool(
+    "merge_line_items",
+    "Merge multiple secondary line items into a primary line on a DRAFT bill, per the firm rule (don't delete; discount-to-100% so secondaries stay visible at $0). Optionally updates the primary's note with a merged narrative. Hours roll-up to the primary is NOT supported (Clio's PATCH /line_items silently ignores quantity for ActivityLineItem) — this is the soft-combine path that preserves each secondary's hours but zeroes their dollar contribution. All line items must be on the same draft bill. Per-secondary errors are isolated: a failure on one secondary doesn't abort the others.",
+    {
+      primary_line_item_id: z.coerce.number().describe("Line item ID of the primary line that absorbs the merge (its note may optionally be updated; its hours and rate are preserved)."),
+      secondary_line_item_ids_csv: z.string().describe("Comma-separated line_item IDs to merge into the primary, e.g. '8261110371,8261110372'. Each must be on the same DRAFT bill as the primary. Cannot include the primary's own ID. Cannot contain duplicates."),
+      new_note: z.string().optional().describe("Optional. New narrative to set on the primary line (replaces the existing note). Typical use: a merged narrative combining the primary's and secondaries' work descriptions. If omitted, the primary's note is left unchanged."),
+    },
+    async (params) => {
+      try {
+        // Parse CSV → number[]
+        const idsRaw = params.secondary_line_item_ids_csv
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        const secondaryIds: number[] = [];
+        for (const raw of idsRaw) {
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  message: `secondary_line_item_ids_csv contains invalid ID: "${raw}". Provide a comma-separated list of positive integer IDs.`,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          secondaryIds.push(n);
+        }
+        if (secondaryIds.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                message: `secondary_line_item_ids_csv was empty after parsing.`,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        const result = await mergeLineItems({
+          primary_line_item_id: params.primary_line_item_id,
+          secondary_line_item_ids: secondaryIds,
+          new_note: params.new_note,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...result,
             }, null, 2),
           }],
         };

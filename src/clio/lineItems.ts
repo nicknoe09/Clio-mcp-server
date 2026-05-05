@@ -714,3 +714,210 @@ export async function prepareLineSplit(args: {
     ui_instruction: `Original activity ${activityId} (line on bill ${bill.number}) has been deleted. ${newActivities.length} new activities have been created on matter ${matter.display_number || matter.id}, all currently unbilled. To pull the new sub-entries onto bill ${bill.number}, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. The regenerated draft will replace the (now-empty) bill with ${args.splits.length} new sub-entry lines.`,
   };
 }
+
+export interface MergeLineItemsResult {
+  bill: { id: number; state?: string; number?: string };
+  primary: {
+    line_item_id: number;
+    activity_id: number;
+    note_updated: boolean;
+    new_note?: string;
+  };
+  secondaries: Array<{
+    line_item_id: number;
+    activity_id?: number;
+    status: "discounted_100pct" | "failed";
+    before_total?: number;
+    error?: string;
+  }>;
+  summary: {
+    secondaries_total: number;
+    secondaries_succeeded: number;
+    secondaries_failed: number;
+  };
+}
+
+// Merge multiple secondary line items on a DRAFT bill into a primary line.
+// Implements the firm's stated rule: "don't delete the secondary entries —
+// discount them to 100% so they stay visible at $0." Result on the bill:
+//   - Primary line keeps its hours and (optionally) gets a new merged note.
+//   - Each secondary line stays visible but at $0 via 100% discount.
+//   - Net billable equals the primary's hours × rate.
+//
+// Why no quantity-roll-up to the primary: Clio's PATCH /line_items
+// silently ignores `quantity` for ActivityLineItem (see patchTimeEntrySmart's
+// silent-noop guard). Hard-combining hours into one line isn't possible via
+// API. Soft-combining (preserve hours, zero out secondaries) is the working
+// pattern — and it's what the firm rule prefers anyway because the audit
+// trail is preserved.
+//
+// Per-secondary errors are isolated: if discount on secondary B fails, A
+// stays discounted, B is reported as failed, C is still attempted. The
+// caller decides how to handle partial-success.
+export async function mergeLineItems(args: {
+  primary_line_item_id: number;
+  secondary_line_item_ids: number[];
+  new_note?: string;
+}): Promise<MergeLineItemsResult> {
+  // --- Validate ---
+  if (!Number.isFinite(args.primary_line_item_id)) {
+    throw new Error("mergeLineItems: primary_line_item_id is required.");
+  }
+  if (!Array.isArray(args.secondary_line_item_ids) || args.secondary_line_item_ids.length === 0) {
+    throw new Error("mergeLineItems: secondary_line_item_ids must be a non-empty array.");
+  }
+  for (const sid of args.secondary_line_item_ids) {
+    if (!Number.isFinite(sid)) {
+      throw new Error(`mergeLineItems: invalid secondary_line_item_id: ${sid}`);
+    }
+    if (sid === args.primary_line_item_id) {
+      throw new Error(
+        `mergeLineItems: primary_line_item_id (${args.primary_line_item_id}) cannot also be a secondary.`,
+      );
+    }
+  }
+  // Dedupe secondaries (caller intent unclear if duplicates were sent).
+  const dedupedSecondaries = Array.from(new Set(args.secondary_line_item_ids));
+  if (dedupedSecondaries.length !== args.secondary_line_item_ids.length) {
+    throw new Error(
+      `mergeLineItems: duplicate IDs in secondary_line_item_ids. Dedupe before calling.`,
+    );
+  }
+
+  // --- Read primary, verify on a draft bill ---
+  const primaryResp = await rawGetSingle(`/line_items/${args.primary_line_item_id}`, {
+    fields: LINE_ITEM_FIELDS,
+  });
+  const primary = primaryResp.data;
+  if (!primary) {
+    const err: any = new Error(`Primary line item ${args.primary_line_item_id} not found.`);
+    err.response = { status: 404 };
+    throw err;
+  }
+  if (!primary.bill || primary.bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to merge: primary line item ${args.primary_line_item_id} is on bill state "${primary.bill?.state ?? "none"}", not "draft".`,
+    );
+    err.response = {
+      status: 409,
+      data: { context: "primary_not_on_draft", bill_state: primary.bill?.state },
+    };
+    throw err;
+  }
+  const billId = primary.bill.id;
+  const primaryActivityId = primary.activity?.id;
+  if (!primaryActivityId) {
+    throw new Error(
+      `Primary line item ${args.primary_line_item_id} has no associated activity.`,
+    );
+  }
+
+  // --- Read each secondary, verify same bill ---
+  const secondaryReads: Array<{ id: number; activity_id?: number; total: number }> = [];
+  for (const sid of dedupedSecondaries) {
+    const resp = await rawGetSingle(`/line_items/${sid}`, { fields: LINE_ITEM_FIELDS });
+    const li = resp.data;
+    if (!li) {
+      const err: any = new Error(`Secondary line item ${sid} not found.`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    if (li.bill?.id !== billId) {
+      const err: any = new Error(
+        `Secondary line item ${sid} is on bill ${li.bill?.id ?? "none"}, but primary is on bill ${billId}. All secondaries must be on the same bill as the primary.`,
+      );
+      err.response = {
+        status: 409,
+        data: {
+          context: "cross_bill_merge",
+          primary_bill: billId,
+          secondary_line_item_id: sid,
+          secondary_bill: li.bill?.id,
+        },
+      };
+      throw err;
+    }
+    if (li.bill?.state !== "draft") {
+      const err: any = new Error(
+        `Secondary line item ${sid} is on bill state "${li.bill?.state ?? "none"}", not "draft".`,
+      );
+      err.response = {
+        status: 409,
+        data: { context: "secondary_not_on_draft", bill_state: li.bill?.state },
+      };
+      throw err;
+    }
+    secondaryReads.push({
+      id: sid,
+      activity_id: li.activity?.id,
+      total: typeof li.total === "number" ? li.total : 0,
+    });
+  }
+
+  // --- Step 1: Optionally update primary's note ---
+  let noteUpdated = false;
+  if (args.new_note !== undefined) {
+    if (typeof args.new_note !== "string" || args.new_note.length === 0) {
+      throw new Error("mergeLineItems: new_note must be a non-empty string when provided.");
+    }
+    // patchTimeEntrySmart routes through /line_items since the activity is
+    // on a draft. Only updating note (no hours change), so the silent-noop
+    // guard for quantity won't fire.
+    await patchTimeEntrySmart(primaryActivityId, { note: args.new_note });
+    noteUpdated = true;
+  }
+
+  // --- Step 2: 100%-discount each secondary, isolating per-item failures ---
+  const secondaryResults: MergeLineItemsResult["secondaries"] = [];
+  for (const sec of secondaryReads) {
+    try {
+      // Skip if total is already 0 (already discounted or empty); just record.
+      if (sec.total === 0) {
+        secondaryResults.push({
+          line_item_id: sec.id,
+          activity_id: sec.activity_id,
+          status: "discounted_100pct",
+          before_total: 0,
+        });
+        continue;
+      }
+      await discountLineItem({
+        line_item_id: sec.id,
+        discount_pct: 100,
+      });
+      secondaryResults.push({
+        line_item_id: sec.id,
+        activity_id: sec.activity_id,
+        status: "discounted_100pct",
+        before_total: sec.total,
+      });
+    } catch (err: any) {
+      secondaryResults.push({
+        line_item_id: sec.id,
+        activity_id: sec.activity_id,
+        status: "failed",
+        before_total: sec.total,
+        error: err.message,
+      });
+    }
+  }
+
+  const succeeded = secondaryResults.filter((r) => r.status === "discounted_100pct").length;
+  const failed = secondaryResults.filter((r) => r.status === "failed").length;
+
+  return {
+    bill: { id: billId, state: primary.bill.state, number: primary.bill.number },
+    primary: {
+      line_item_id: args.primary_line_item_id,
+      activity_id: primaryActivityId,
+      note_updated: noteUpdated,
+      new_note: args.new_note,
+    },
+    secondaries: secondaryResults,
+    summary: {
+      secondaries_total: secondaryResults.length,
+      secondaries_succeeded: succeeded,
+      secondaries_failed: failed,
+    },
+  };
+}
