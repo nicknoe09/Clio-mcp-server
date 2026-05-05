@@ -921,3 +921,369 @@ export async function mergeLineItems(args: {
     },
   };
 }
+
+export interface PrepareHourChangeResult {
+  bill: { id: number; state?: string; number?: string };
+  matter: { id: number; display_number?: string };
+  activity_id: number;
+  line_item_id: number;
+  before: { hours: number; note: string };
+  after: { hours: number; note: string };
+  ui_instruction: string;
+}
+
+// Workaround for Clio's silent-noop on PATCH /line_items.quantity (see
+// patchTimeEntrySmart's silent-noop guard). Sequence:
+//   1. remove_from_draft_bill — unbills the activity, /activities is now editable
+//   2. PATCH /activities/{id} — set new quantity (and optionally new note)
+//   3. Caller clicks "Regenerate Draft" in Clio UI to put the activity back
+//      on the bill at the new hours.
+//
+// Multiple prepareHourChange calls can be batched before a single regenerate-
+// draft click; Clio's regenerate pulls in ALL unbilled activities for the
+// matter at once. Use case: invoice review with several hour reductions
+// across the same draft bill.
+//
+// Failure modes:
+//   - Step 1 fails: nothing changed, throw.
+//   - Step 2 fails after Step 1: activity is unbilled but un-edited. Surface
+//     the partial state in the error so the caller knows. Recovery: click
+//     Regenerate Draft (line returns at original hours), or retry.
+export async function prepareHourChange(args: {
+  line_item_id?: number;
+  activity_id?: number;
+  new_hours: number;
+  new_note?: string;
+}): Promise<PrepareHourChangeResult> {
+  if (typeof args.new_hours !== "number" || !(args.new_hours > 0)) {
+    throw new Error(
+      `prepareHourChange: new_hours must be a positive number (got ${args.new_hours}).`,
+    );
+  }
+  if (args.line_item_id === undefined && args.activity_id === undefined) {
+    throw new Error("prepareHourChange: provide line_item_id or activity_id.");
+  }
+
+  // Resolve activity_id from line_item_id if needed.
+  let activityId = args.activity_id;
+  let lineItemId = args.line_item_id;
+  if (!activityId && lineItemId) {
+    const liResp = await rawGetSingle(`/line_items/${lineItemId}`, {
+      fields: LINE_ITEM_FIELDS,
+    });
+    if (!liResp.data) {
+      const err: any = new Error(`Line item ${lineItemId} not found.`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    activityId = liResp.data.activity?.id;
+    if (!activityId) {
+      throw new Error(`Line item ${lineItemId} has no associated activity.`);
+    }
+  }
+
+  // Get full routing (activity, bill, line_item, matter) for a single source of truth.
+  const routing = await resolveActivityRouting(activityId!);
+  if (!routing.bill || !routing.line_item) {
+    const err: any = new Error(
+      `Activity ${activityId} is not on a bill — nothing to change.`,
+    );
+    err.response = { status: 409, data: { context: "activity_not_on_bill" } };
+    throw err;
+  }
+  if (routing.bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to change hours: bill state is "${routing.bill.state}", not "draft".`,
+    );
+    err.response = {
+      status: 409,
+      data: { context: "bill_not_draft", bill_state: routing.bill.state },
+    };
+    throw err;
+  }
+
+  const bill = routing.bill;
+  const matter = routing.activity.matter;
+  const originalHours =
+    Math.round((routing.activity.quantity / 3600) * 1000) / 1000;
+  const originalNote = routing.activity.note || "";
+  lineItemId = routing.line_item.id;
+
+  // --- Step 1: Remove from draft bill (unbills the activity) ---
+  await removeFromDraftBill({ line_item_id: lineItemId });
+
+  // --- Step 2: PATCH /activities/{id} with new quantity (and optional note) ---
+  const patchBody: any = {
+    data: {
+      quantity: Math.round(args.new_hours * 3600), // /activities expects seconds
+    },
+  };
+  if (args.new_note !== undefined) patchBody.data.note = args.new_note;
+
+  try {
+    await rawPatchSingle(`/activities/${activityId}`, patchBody);
+  } catch (err: any) {
+    // Activity is unbilled but un-edited. Recovery options for the caller:
+    // (a) regenerate draft → original line returns at original hours;
+    // (b) retry prepare_hour_change → unbilled state allows a second attempt.
+    const richErr: any = new Error(
+      `Step 2 failed: PATCH /activities/${activityId} returned ${err.response?.status ?? "unknown status"}. The line was already removed from bill ${bill.number} (Step 1), but the hour change didn't apply. To recover: click "Regenerate Draft" on bill ${bill.number} in Clio UI to restore the line at its original ${originalHours}h, OR retry prepare_hour_change with the desired hours. Underlying Clio error: ${err.message}`,
+    );
+    richErr.response = {
+      status: err.response?.status || 500,
+      data: {
+        context: "step2_patch_failed_after_remove",
+        bill_id: bill.id,
+        bill_number: bill.number,
+        activity_id: activityId,
+        original_hours: originalHours,
+        clio_error: err.response?.data,
+      },
+    };
+    throw richErr;
+  }
+
+  return {
+    bill,
+    matter: { id: matter.id, display_number: matter.display_number },
+    activity_id: activityId!,
+    line_item_id: lineItemId,
+    before: { hours: originalHours, note: originalNote },
+    after: { hours: args.new_hours, note: args.new_note ?? originalNote },
+    ui_instruction: `Activity ${activityId} has been removed from bill ${bill.number} and edited to ${args.new_hours}h${args.new_note !== undefined ? " with new note" : ""}. To pull it back onto bill ${bill.number} at the new hours, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. Multiple prepare_hour_change calls can be batched before a single regenerate-draft click.`,
+  };
+}
+
+export interface PrepareHardCombineResult {
+  bill: { id: number; state?: string; number?: string };
+  matter: { id: number; display_number?: string };
+  primary: {
+    activity_id: number;
+    line_item_id: number;
+    before: { hours: number; note: string };
+    after: { hours: number; note: string };
+  };
+  secondaries: Array<{
+    line_item_id: number;
+    activity_id?: number;
+    treatment: "deleted" | "discounted_100pct";
+    status: "succeeded" | "failed";
+    before_total?: number;
+    error?: string;
+  }>;
+  summary: {
+    secondaries_total: number;
+    secondaries_succeeded: number;
+    secondaries_failed: number;
+  };
+  ui_instruction: string;
+}
+
+// Hard-combine: roll the hours from secondary lines into the primary, then
+// delete (or 100%-discount) the secondaries. Used during invoice review to
+// consolidate same-day work into a single line.
+//
+// Composition over existing primitives:
+//   1. prepareHourChange on the primary (sets new hours, optional new note).
+//   2. For each secondary: deleteActivity (default) or discountLineItem(100%)
+//      per `secondary_treatment`. Per-item errors are isolated.
+//
+// Use merge_line_items instead when the firm rule prefers preserving the
+// audit trail (don't delete; discount-100%); merge_line_items is the soft-
+// combine path that doesn't try to roll up hours.
+export async function prepareHardCombine(args: {
+  primary_line_item_id: number;
+  secondary_line_item_ids: number[];
+  new_primary_hours: number;
+  new_note?: string;
+  secondary_treatment?: "delete" | "discount_100pct";
+}): Promise<PrepareHardCombineResult> {
+  const treatment = args.secondary_treatment ?? "delete";
+
+  if (typeof args.new_primary_hours !== "number" || !(args.new_primary_hours > 0)) {
+    throw new Error(
+      `prepareHardCombine: new_primary_hours must be a positive number (got ${args.new_primary_hours}).`,
+    );
+  }
+  if (!Number.isFinite(args.primary_line_item_id)) {
+    throw new Error("prepareHardCombine: primary_line_item_id is required.");
+  }
+  if (!Array.isArray(args.secondary_line_item_ids) || args.secondary_line_item_ids.length === 0) {
+    throw new Error(
+      "prepareHardCombine: secondary_line_item_ids must be a non-empty array.",
+    );
+  }
+  for (const sid of args.secondary_line_item_ids) {
+    if (!Number.isFinite(sid)) {
+      throw new Error(`prepareHardCombine: invalid secondary_line_item_id: ${sid}`);
+    }
+    if (sid === args.primary_line_item_id) {
+      throw new Error(
+        `prepareHardCombine: primary cannot also be a secondary (id ${sid}).`,
+      );
+    }
+  }
+  const dedupedSecondaries = Array.from(new Set(args.secondary_line_item_ids));
+  if (dedupedSecondaries.length !== args.secondary_line_item_ids.length) {
+    throw new Error(
+      "prepareHardCombine: duplicate IDs in secondary_line_item_ids. Dedupe before calling.",
+    );
+  }
+
+  // Read primary, verify on a draft bill.
+  const primaryResp = await rawGetSingle(`/line_items/${args.primary_line_item_id}`, {
+    fields: LINE_ITEM_FIELDS,
+  });
+  const primary = primaryResp.data;
+  if (!primary) {
+    const err: any = new Error(`Primary line item ${args.primary_line_item_id} not found.`);
+    err.response = { status: 404 };
+    throw err;
+  }
+  if (!primary.bill || primary.bill.state !== "draft") {
+    const err: any = new Error(
+      `Refusing to combine: primary line on bill state "${primary.bill?.state ?? "none"}", not "draft".`,
+    );
+    err.response = {
+      status: 409,
+      data: { context: "primary_not_on_draft", bill_state: primary.bill?.state },
+    };
+    throw err;
+  }
+  const billId = primary.bill.id;
+
+  // Read each secondary, verify same bill, draft state.
+  const secondaryReads: Array<{ id: number; activity_id?: number; total: number }> = [];
+  for (const sid of dedupedSecondaries) {
+    const resp = await rawGetSingle(`/line_items/${sid}`, { fields: LINE_ITEM_FIELDS });
+    const li = resp.data;
+    if (!li) {
+      const err: any = new Error(`Secondary line item ${sid} not found.`);
+      err.response = { status: 404 };
+      throw err;
+    }
+    if (li.bill?.id !== billId) {
+      const err: any = new Error(
+        `Secondary ${sid} is on bill ${li.bill?.id ?? "none"}, but primary is on bill ${billId}.`,
+      );
+      err.response = {
+        status: 409,
+        data: {
+          context: "cross_bill_combine",
+          primary_bill: billId,
+          secondary_bill: li.bill?.id,
+          secondary_line_item_id: sid,
+        },
+      };
+      throw err;
+    }
+    if (li.bill?.state !== "draft") {
+      const err: any = new Error(
+        `Secondary ${sid} on bill state "${li.bill?.state ?? "none"}", not "draft".`,
+      );
+      err.response = {
+        status: 409,
+        data: { context: "secondary_not_on_draft", bill_state: li.bill?.state },
+      };
+      throw err;
+    }
+    secondaryReads.push({
+      id: sid,
+      activity_id: li.activity?.id,
+      total: typeof li.total === "number" ? li.total : 0,
+    });
+  }
+
+  // --- Step 1: prepareHourChange on primary ---
+  const primaryResult = await prepareHourChange({
+    line_item_id: args.primary_line_item_id,
+    new_hours: args.new_primary_hours,
+    new_note: args.new_note,
+  });
+
+  // --- Step 2: handle secondaries (per-item isolation) ---
+  const secondaryResults: PrepareHardCombineResult["secondaries"] = [];
+  for (const sec of secondaryReads) {
+    if (treatment === "delete") {
+      try {
+        if (!sec.activity_id) {
+          throw new Error(`Secondary ${sec.id} has no activity_id; cannot delete.`);
+        }
+        await deleteActivity(sec.activity_id);
+        secondaryResults.push({
+          line_item_id: sec.id,
+          activity_id: sec.activity_id,
+          treatment: "deleted",
+          status: "succeeded",
+          before_total: sec.total,
+        });
+      } catch (err: any) {
+        secondaryResults.push({
+          line_item_id: sec.id,
+          activity_id: sec.activity_id,
+          treatment: "deleted",
+          status: "failed",
+          before_total: sec.total,
+          error: err.message,
+        });
+      }
+    } else {
+      // discount_100pct
+      try {
+        if (sec.total === 0) {
+          // Already at $0; record as success without re-discounting.
+          secondaryResults.push({
+            line_item_id: sec.id,
+            activity_id: sec.activity_id,
+            treatment: "discounted_100pct",
+            status: "succeeded",
+            before_total: 0,
+          });
+          continue;
+        }
+        await discountLineItem({
+          line_item_id: sec.id,
+          discount_pct: 100,
+        });
+        secondaryResults.push({
+          line_item_id: sec.id,
+          activity_id: sec.activity_id,
+          treatment: "discounted_100pct",
+          status: "succeeded",
+          before_total: sec.total,
+        });
+      } catch (err: any) {
+        secondaryResults.push({
+          line_item_id: sec.id,
+          activity_id: sec.activity_id,
+          treatment: "discounted_100pct",
+          status: "failed",
+          before_total: sec.total,
+          error: err.message,
+        });
+      }
+    }
+  }
+
+  const succeeded = secondaryResults.filter((r) => r.status === "succeeded").length;
+  const failed = secondaryResults.filter((r) => r.status === "failed").length;
+
+  return {
+    bill: primaryResult.bill,
+    matter: primaryResult.matter,
+    primary: {
+      activity_id: primaryResult.activity_id,
+      line_item_id: primaryResult.line_item_id,
+      before: primaryResult.before,
+      after: primaryResult.after,
+    },
+    secondaries: secondaryResults,
+    summary: {
+      secondaries_total: secondaryResults.length,
+      secondaries_succeeded: succeeded,
+      secondaries_failed: failed,
+    },
+    ui_instruction: `Hard-combine prep complete on bill ${primaryResult.bill.number}. Primary activity ${primaryResult.activity_id} unbilled and re-edited to ${args.new_primary_hours}h${args.new_note !== undefined ? " with new note" : ""}. ${succeeded} ${treatment === "delete" ? "secondary activit" + (succeeded === 1 ? "y was" : "ies were") + " deleted" : "secondary line" + (succeeded === 1 ? " was" : "s were") + " discounted to 100%"}${failed > 0 ? ` (${failed} failed — see secondaries[] for details)` : ""}. To finalize, click "Regenerate Draft" on bill ${primaryResult.bill.number} in Clio UI. Primary returns to bill at new hours, secondaries are ${treatment === "delete" ? "gone" : "still on the bill at $0"}.`,
+  };
+}
+
