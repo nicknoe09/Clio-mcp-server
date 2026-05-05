@@ -113,7 +113,8 @@ curl http://localhost:3000/health
 | **Wrong redirect URI** | Must match Clio app registration exactly — no trailing slash |
 | **Empty/null nested data** | Every API call must include explicit `fields` parameter |
 | **Missing records** | Pagination is required — without it, only first 200 records return |
-| **Hours look wrong** | Clio stores time as seconds in `quantity` — divide by 3600 |
+| **Hours look wrong** | Clio stores time on `/activities` as seconds, but on `/line_items` as decimal hours — see `lineItems.ts:88-107` for the routing-aware conversion. `test_update_line_item` writes hours directly. |
+| **Need to add a line to an existing draft bill** | Clio's API does not support `POST /line_items` (this was attempted in #28–#29 and removed in #30 after Clio rejected every shape). Line items are auto-generated when an activity is billed. To add work to an existing draft, log a new time entry via `create_time_entry` (it will appear on the matter's *next* draft, not the current one), or void the current draft via `set_bill_state(target_state="void")` and re-create it once the new activity is logged. |
 | **Claude.ai won't connect** | Must use SSE transport (`/sse` endpoint), not plain REST |
 | **Token not refreshing** | Verify `CLIO_REFRESH_TOKEN` is set; check Clio app credentials |
 | **SSE connection drops** | Check Railway logs; ensure no proxy/firewall is terminating SSE connections |

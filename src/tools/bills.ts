@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawGetBinarySingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle } from "../clio/pagination";
 import JSZip from "jszip";
 
 const BILL_FIELDS =
@@ -179,6 +179,138 @@ export function registerBillTools(server: McpServer): void {
         };
       }
     }
+  );
+
+  // ============================================================
+  //  set_bill_state — change a bill's state (e.g. void, back to draft)
+  // ============================================================
+  // Wraps PATCH /bills/{id} with a target state. Common use cases:
+  //   awaiting_payment → void   (firm-error fix; client won't be billed)
+  //   awaiting_payment → draft  (move back for further editing)
+  // Some transitions are restricted by Clio (e.g. you can't un-pay a paid
+  // bill, and voiding may require additional fields like voided_at). Errors
+  // are surfaced verbatim so the caller sees exactly what Clio rejected.
+  server.tool(
+    "set_bill_state",
+    "Change a bill's state. Useful for voiding a bill that won't be issued, or moving an issued bill back to draft for editing. Wraps PATCH /bills/{id} with the target state. Reads before/after for audit. Some transitions may be restricted by Clio (e.g. paid → anything-else); Clio errors are surfaced verbatim. If the bill is already in the target state, no PATCH is sent.",
+    {
+      bill_id: z.coerce.number().describe("Clio bill ID"),
+      target_state: z
+        .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void"])
+        .describe(
+          "Target state. Common transitions: awaiting_payment → void (firm-error fix), awaiting_payment → draft (re-edit), draft → awaiting_payment (issue).",
+        ),
+    },
+    async (params) => {
+      try {
+        // Step 1: Read current state.
+        const beforeResp = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: BILL_FIELDS,
+        });
+        const beforeBill = beforeResp.data;
+        if (!beforeBill) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ success: false, message: `Bill ${params.bill_id} not found` }),
+            }],
+            isError: true,
+          };
+        }
+
+        const before = {
+          state: beforeBill.state,
+          total: beforeBill.total,
+          balance: beforeBill.balance,
+          number: beforeBill.number,
+        };
+
+        // No-op shortcut: don't bother PATCHing if already in target state.
+        if (before.state === params.target_state) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                no_change: true,
+                bill_id: params.bill_id,
+                message: `Bill ${beforeBill.number || params.bill_id} already in state "${params.target_state}" — no PATCH sent.`,
+                state: before.state,
+              }, null, 2),
+            }],
+          };
+        }
+
+        // Step 2: Attempt the PATCH.
+        const patchBody = { data: { state: params.target_state } };
+        try {
+          await rawPatchSingle(`/bills/${params.bill_id}`, patchBody);
+        } catch (err: any) {
+          const status = err.response?.status || err.statusCode;
+          let interpretation = "Unknown error";
+          if (status === 422) interpretation = "Clio rejected the state transition — the requested change may not be allowed from the current state, or additional fields (e.g. voided_at, voided_reason) may be required.";
+          else if (status === 403) interpretation = "Forbidden — insufficient permissions for this state change.";
+          else if (status === 404) interpretation = "Bill not found.";
+          else if (status === 400) interpretation = "Bad request — check the field shape Clio expects.";
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                bill_id: params.bill_id,
+                attempted_transition: `${before.state} → ${params.target_state}`,
+                status,
+                interpretation,
+                message: err.message,
+                clio_error: err.response?.data,
+                request_body: patchBody,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Step 3: Read again to confirm.
+        const afterResp = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: BILL_FIELDS,
+        });
+        const afterBill = afterResp.data;
+        const after = {
+          state: afterBill?.state,
+          total: afterBill?.total,
+          balance: afterBill?.balance,
+          number: afterBill?.number,
+        };
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              bill_id: params.bill_id,
+              transition: `${before.state} → ${after.state}`,
+              before,
+              after,
+              message: `Bill ${afterBill?.number || params.bill_id} state changed: ${before.state} → ${after.state}.`,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              bill_id: params.bill_id,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
   );
 
   // ============================================================

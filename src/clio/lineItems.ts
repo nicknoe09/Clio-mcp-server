@@ -410,12 +410,18 @@ export async function discountLineItem(args: {
     );
   }
 
-  // Per Clio's PATCH /line_items docs, `discount` is an object (Discount_base
-  // schema), not a `discount_total` scalar. The inner field set isn't fully
-  // documented, so this is a best-evidence guess at the shape; if Clio
-  // rejects it, the request_body and clio_error logging will surface what
-  // the real shape should be.
-  const body = { discount: { total: discountAmount } };
+  // Per Clio's OpenAPI spec (https://docs.developers.clio.com/openapi.json),
+  // the PATCH /line_items.discount object is shaped as
+  //   { rate: number, type: "percentage" | "money" }
+  // — see the Discount_base schema. (The spec has a "type: boolean" typo on
+  // the inner `type` field, but the description and the Discount_base schema
+  // both confirm it's a string enum.) Clio computes the line-total reduction
+  // itself from rate+type, so we send rate matching the caller's input mode
+  // and don't compute a discount_total scalar client-side.
+  const body =
+    args.discount_pct !== undefined
+      ? { discount: { rate: args.discount_pct, type: "percentage" } }
+      : { discount: { rate: args.discount_amount as number, type: "money" } };
   try {
     await rawPatchSingle(`/line_items/${lineItemId}`, { data: body });
   } catch (err: any) {
