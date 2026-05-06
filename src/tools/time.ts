@@ -32,9 +32,22 @@ export function registerTimeTools(server: McpServer): void {
         if (params.user_id) queryParams.user_id = params.user_id;
         // Clio ignores date_from/date_to — use created_since for server-side filtering
         if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
-        if (params.billed !== "all") queryParams.billed = params.billed === "true";
+        // Clio's GET /activities does NOT have a `billed` query param (verified
+        // 2026-05-05 via OpenAPI). The documented filter is `status` with enum
+        // {billed, draft, unbilled, non_billable, billable, written_off}. Map our
+        // boolean billed→status only for the cases where there's a clean 1:1
+        // mapping; otherwise rely on the client-side filter below for correctness.
+        if (params.billed === "false") queryParams.status = "unbilled";
+        // Note: billed="true" is NOT mapped to status="billed" because that misses
+        // entries on draft bills (which the response.billed field still marks true).
+        // Client-side filter handles that case.
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
+
+        // Client-side billed filter — authoritative source of truth, since
+        // Clio's status filter has gaps (see comment above).
+        if (params.billed === "true") entries = entries.filter((e: any) => e.billed === true);
+        else if (params.billed === "false") entries = entries.filter((e: any) => e.billed !== true);
 
         // Client-side date filtering (created_since filters by creation, not activity date)
         if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
@@ -123,7 +136,14 @@ export function registerTimeTools(server: McpServer): void {
 
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
-          billed: false,
+          // Clio's GET /activities has no `billed` query param (verified
+          // 2026-05-05 via OpenAPI). The documented filter is `status` with
+          // enum value "unbilled". The previous `billed: false` here was
+          // silently dropped by Clio, so this tool was returning ALL entries
+          // for the matter — including ones marked billed=true on prior
+          // periods' bills. Reported on matter 1780206739 (Hlavinka Gift
+          // Planning): 109 entries returned, 30 of them billed=true.
+          status: "unbilled",
           fields: TIME_ENTRY_FIELDS,
         };
         if (params.matter_id) queryParams.matter_id = params.matter_id;
@@ -133,6 +153,10 @@ export function registerTimeTools(server: McpServer): void {
         queryParams.created_since = `${effectiveStart}T00:00:00+00:00`;
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
+        // Defensive client-side filter — status="unbilled" should already
+        // exclude billed entries, but belt-and-suspenders against any future
+        // Clio behavior change.
+        entries = entries.filter((e: any) => e.billed !== true);
         entries = entries.filter((e: any) => e.date >= effectiveStart);
 
         // Group by matter
