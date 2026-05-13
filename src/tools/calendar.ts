@@ -5,7 +5,11 @@ import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from ".
 const CALENDAR_FIELDS =
   "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color}";
 
-const CALENDAR_LIST_FIELDS = "id,name,color,creator{id,name},visible,writeable";
+// Per Clio's Calendar schema (OpenAPI Calendar_base): `visible` is a valid
+// response field, but `writeable` is NOT — `writeable` is only a query-filter
+// param on GET /calendars, not a returned property. Use `permission` for
+// read-side write-ability info if needed.
+const CALENDAR_LIST_FIELDS = "id,name,color,creator{id,name},visible,permission,type";
 
 // Find the primary Calendar resource owned by a given user. Clio's Calendar
 // and User are separate resources — calendar_owner on a CalendarEntry refers
@@ -79,8 +83,9 @@ export function registerCalendarTools(server: McpServer): void {
           id: c.id,
           name: c.name,
           color: c.color,
+          type: c.type,
           visible: c.visible,
-          writeable: c.writeable,
+          permission: c.permission,
           creator: c.creator ? { id: c.creator.id, name: c.creator.name } : null,
         }));
         return {
