@@ -53,9 +53,6 @@ const NRN_CALENDARS = {
   NICHOLAS_NOE: 2882209,      // Nicholas Noe (user calendar)
 };
 
-// Patterns to auto-detect hard scheduled events
-const HARD_SCHEDULED_PATTERNS = /\b(hearing|trial|deposition|mediation|conference|call|phone|zoom|teams|meeting|oral argument|docket|status conference|pretrial|scheduling)\b/i;
-
 export function registerCalendarTools(server: McpServer): void {
   // list_calendars — lookup utility for resolving Calendar IDs.
   // Clio's CalendarEntry.calendar_owner is a Calendar ID, not a User ID.
@@ -192,17 +189,15 @@ export function registerCalendarTools(server: McpServer): void {
   // create_calendar_entry
   server.tool(
     "create_calendar_entry",
-    `Create a calendar entry in Clio. Supports event types for color-coding and calendar assignment.
+    `Create a calendar entry in Clio. Event type is OPT-IN — if you don't pass event_type or event_type_id, the entry is created with NO event type (the bare calendar entry). Pass an explicit event_type only if the caller asked for one.
 
 Event types (use event_type_id or event_type name):
 - "hard_scheduled" (ID ${EVENT_TYPES.HARD_SCHEDULED}) — hearings, trials, depositions, mediations, calls, conferences
-- "nrn_claude" (ID ${EVENT_TYPES.NRN_CLAUDE}) — default for all Claude-created events
+- "nrn_claude" (ID ${EVENT_TYPES.NRN_CLAUDE}) — NRN Claude Events tag
 - "trial_hearing" (ID ${EVENT_TYPES.TRIAL_HEARING}) — Trial/Hearing/Depositions/Mediations
 - "deadline" (ID ${EVENT_TYPES.DEADLINE}) — Deadlines
 - "admin" (ID ${EVENT_TYPES.ADMIN}) — Admin events
-- "personal" (ID ${EVENT_TYPES.OUT_PERSONAL}) — Out for Personal
-
-If no event type is specified, Claude-created events default to "nrn_claude". If the summary matches a hard-scheduled pattern (hearing, trial, deposition, etc.), it auto-sets to "hard_scheduled".`,
+- "personal" (ID ${EVENT_TYPES.OUT_PERSONAL}) — Out for Personal`,
     {
       summary: z.string().describe("Event title/summary"),
       start_at: z.string().describe("Start datetime (ISO 8601, e.g. 2026-03-25T14:00:00-05:00)"),
@@ -264,9 +259,13 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
         body.data.calendar_owner = { id: calendarOwnerId };
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;
 
-        // Determine event type
+        // Event type is opt-in. Do NOT auto-detect or default; user-side
+        // policy is "only set an event type when explicitly asked."
+        // The previous version auto-set NRN_CLAUDE (or HARD_SCHEDULED for
+        // pattern-matching summaries) — that ran against the user's intent
+        // and ended up tagging every Claude-created event with a type the
+        // user didn't choose.
         let eventTypeId: number | null = null;
-
         if (params.event_type_id) {
           eventTypeId = params.event_type_id;
         } else if (params.event_type) {
@@ -279,15 +278,7 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
             personal: EVENT_TYPES.OUT_PERSONAL,
           };
           eventTypeId = typeMap[params.event_type.toLowerCase()] || null;
-        } else {
-          // Auto-detect: hard scheduled events by summary, otherwise default to NRN Claude
-          if (HARD_SCHEDULED_PATTERNS.test(params.summary)) {
-            eventTypeId = EVENT_TYPES.HARD_SCHEDULED;
-          } else {
-            eventTypeId = EVENT_TYPES.NRN_CLAUDE;
-          }
         }
-
         if (eventTypeId) {
           body.data.calendar_entry_event_type = { id: eventTypeId };
         }
