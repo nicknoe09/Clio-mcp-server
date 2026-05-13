@@ -5,6 +5,31 @@ import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from ".
 const CALENDAR_FIELDS =
   "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color}";
 
+const CALENDAR_LIST_FIELDS = "id,name,color,creator{id,name},visible,writeable";
+
+// Find the primary Calendar resource owned by a given user. Clio's Calendar
+// and User are separate resources — calendar_owner on a CalendarEntry refers
+// to a Calendar ID, not a User ID. Each user has at least one Calendar
+// (their personal calendar) whose `creator.id` matches their user_id.
+// Returns null if none found. If the user has multiple, returns the first
+// (Clio orders by id ascending by default; oldest = personal calendar in
+// most cases).
+async function findUserPrimaryCalendarId(userId: number): Promise<number | null> {
+  const calendars = await fetchAllPages<any>("/calendars", {
+    fields: "id,name,creator{id,name}",
+  });
+  const userCalendars = calendars.filter((c: any) => c.creator?.id === userId);
+  if (userCalendars.length === 0) return null;
+  // Heuristic: prefer a calendar whose name contains the user's name (matches
+  // Clio's "John Smith" naming convention for personal calendars). Otherwise
+  // return the first (oldest by id) calendar created by this user.
+  const creatorName = userCalendars[0].creator?.name || "";
+  const named = userCalendars.find((c: any) =>
+    creatorName && c.name && c.name.toLowerCase().includes(creatorName.toLowerCase()),
+  );
+  return (named ?? userCalendars[0]).id;
+}
+
 // RomSum event type IDs (from /calendar_entry_event_types)
 const EVENT_TYPES = {
   HARD_SCHEDULED: 738410,     // NRN Hard Scheduled Event — hearings, trials, depositions, mediations, calls
@@ -28,6 +53,65 @@ const NRN_CALENDARS = {
 const HARD_SCHEDULED_PATTERNS = /\b(hearing|trial|deposition|mediation|conference|call|phone|zoom|teams|meeting|oral argument|docket|status conference|pretrial|scheduling)\b/i;
 
 export function registerCalendarTools(server: McpServer): void {
+  // list_calendars — lookup utility for resolving Calendar IDs.
+  // Clio's CalendarEntry.calendar_owner is a Calendar ID, not a User ID.
+  // Use this tool to find the right ID before calling create_calendar_entry
+  // or update_calendar_entry (or use assign_to_user_id which calls this
+  // internally).
+  server.tool(
+    "list_calendars",
+    "List all Clio Calendar resources visible to the firm OAuth user. Each Calendar has a numeric `id` (used as calendar_owner on CalendarEntry) and a `creator` (the User who owns the calendar). Use this to find the right calendar_id to assign events to — passing a User ID where Clio expects a Calendar ID returns 404. Filter results by creator_user_id to find a user's personal calendar.",
+    {
+      creator_user_id: z.coerce.number().optional().describe("Optional: filter to calendars created by a specific Clio user (e.g. find a user's personal calendar). If omitted, returns ALL calendars visible to the firm OAuth user (firm calendars, deadlines, all user calendars)."),
+      writeable_only: z.boolean().optional().default(false).describe("If true, return only calendars the firm OAuth user can write to."),
+    },
+    async (params) => {
+      try {
+        const queryParams: Record<string, any> = {
+          fields: CALENDAR_LIST_FIELDS,
+        };
+        if (params.writeable_only) queryParams.writeable = true;
+        const calendars = await fetchAllPages<any>("/calendars", queryParams);
+        const filtered = params.creator_user_id !== undefined
+          ? calendars.filter((c: any) => c.creator?.id === params.creator_user_id)
+          : calendars;
+        const formatted = filtered.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          color: c.color,
+          visible: c.visible,
+          writeable: c.writeable,
+          creator: c.creator ? { id: c.creator.id, name: c.creator.name } : null,
+        }));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              count: formatted.length,
+              filter: params.creator_user_id !== undefined
+                ? `creator_user_id=${params.creator_user_id}`
+                : "none",
+              calendars: formatted,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
   // get_calendar_entries
   server.tool(
     "get_calendar_entries",
@@ -122,7 +206,8 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
       location: z.string().optional().describe("Event location"),
       all_day: z.boolean().optional().default(false).describe("Whether this is an all-day event"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.coerce.number().optional().describe("Assign to a specific user or calendar. Defaults to NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + "). Pass a user ID to put it on their personal calendar instead."),
+      calendar_owner_id: z.coerce.number().optional().describe("**Calendar ID** (NOT user ID) — Clio's calendar_owner field expects the numeric ID of a Calendar resource. Use list_calendars to discover IDs. To assign to a user's personal calendar, prefer assign_to_user_id (next param) which looks the right calendar up automatically. If neither is provided, defaults to the NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + ")."),
+      assign_to_user_id: z.coerce.number().optional().describe("Convenience: provide a Clio User ID, and the tool will look up that user's personal calendar (via list_calendars / creator filter) and use its calendar_id automatically. Overrides calendar_owner_id when both are set. If the user has no calendar visible to the firm OAuth user, the call fails before any event is created (with a clear error) rather than silently falling back to the NRN Claude default."),
       recurrence_rule: z.string().optional().describe(
         "RRULE for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=MONTHLY;BYMONTHDAY=15')"
       ),
@@ -144,8 +229,34 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
         if (params.description) body.data.description = params.description;
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
-        // Default to NRN Claude calendar if no calendar specified
-        body.data.calendar_owner = { id: params.calendar_owner_id || NRN_CALENDARS.NRN_CLAUDE };
+        // Resolve calendar_owner. Priority:
+        //   1. assign_to_user_id (look up user's primary calendar; fail loudly if not found)
+        //   2. calendar_owner_id (explicit Calendar ID)
+        //   3. NRN_CALENDARS.NRN_CLAUDE (default fallback)
+        let calendarOwnerId: number;
+        if (params.assign_to_user_id !== undefined) {
+          const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
+          if (resolved === null) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `No calendar found for user ${params.assign_to_user_id}. The firm OAuth user may not have visibility to that user's calendar, or the user has no Calendar resource yet. Use list_calendars to inspect what's available, or pass calendar_owner_id directly with the desired Calendar ID.`,
+                  context: "user_calendar_not_found",
+                  assign_to_user_id: params.assign_to_user_id,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          calendarOwnerId = resolved;
+        } else if (params.calendar_owner_id !== undefined) {
+          calendarOwnerId = params.calendar_owner_id;
+        } else {
+          calendarOwnerId = NRN_CALENDARS.NRN_CLAUDE;
+        }
+        body.data.calendar_owner = { id: calendarOwnerId };
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;
 
         // Determine event type
@@ -225,7 +336,8 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
       location: z.string().optional().describe("Updated event location"),
       all_day: z.boolean().optional().describe("Whether this is an all-day event"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.coerce.number().optional().describe("Reassign to a specific user"),
+      calendar_owner_id: z.coerce.number().optional().describe("**Calendar ID** (NOT user ID) to reassign the entry to. Use list_calendars to discover IDs. To reassign to a user's personal calendar, prefer assign_to_user_id (next param)."),
+      assign_to_user_id: z.coerce.number().optional().describe("Convenience: provide a Clio User ID, and the tool will look up that user's personal calendar and reassign to it. Overrides calendar_owner_id when both are set. Fails loudly with a clear error if the user has no calendar visible to the firm OAuth user."),
       recurrence_rule: z.string().optional().describe(
         "RRULE for recurring events. Set to empty string to remove recurrence."
       ),
@@ -244,7 +356,27 @@ If no event type is specified, Claude-created events default to "nrn_claude". If
         if (params.location !== undefined) body.data.location = params.location;
         if (params.all_day !== undefined) body.data.all_day = params.all_day;
         if (params.matter_id !== undefined) body.data.matter = { id: params.matter_id };
-        if (params.calendar_owner_id !== undefined) body.data.calendar_owner = { id: params.calendar_owner_id };
+        // Resolve calendar_owner reassignment. assign_to_user_id takes priority.
+        if (params.assign_to_user_id !== undefined) {
+          const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
+          if (resolved === null) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `No calendar found for user ${params.assign_to_user_id}. Use list_calendars to inspect what's available, or pass calendar_owner_id directly with the desired Calendar ID.`,
+                  context: "user_calendar_not_found",
+                  assign_to_user_id: params.assign_to_user_id,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          body.data.calendar_owner = { id: resolved };
+        } else if (params.calendar_owner_id !== undefined) {
+          body.data.calendar_owner = { id: params.calendar_owner_id };
+        }
         if (params.recurrence_rule !== undefined) {
           body.data.recurrence_rule = params.recurrence_rule === "" ? null : params.recurrence_rule;
         }

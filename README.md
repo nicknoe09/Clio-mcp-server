@@ -110,6 +110,7 @@ curl http://localhost:3000/health
 
 | Problem | Solution |
 |---------|----------|
+| **Calendar entries land on "NRN - Claude Created" instead of a user's personal calendar** | `calendar_owner` on a CalendarEntry is a **Calendar ID**, not a User ID — these are separate Clio resources. Passing a User ID where Clio expects a Calendar ID returns 404; the MCP then falls back to the NRN Claude default. To put an event on a user's personal calendar, either: (a) use `assign_to_user_id` on `create_calendar_entry` / `update_calendar_entry` (looks up the user's Calendar resource automatically); or (b) use `list_calendars(creator_user_id=N)` to find the right Calendar ID and pass it explicitly via `calendar_owner_id`. |
 | **Wrong redirect URI** | Must match Clio app registration exactly — no trailing slash |
 | **Empty/null nested data** | Every API call must include explicit `fields` parameter |
 | **Missing records** | Pagination is required — without it, only first 200 records return |
