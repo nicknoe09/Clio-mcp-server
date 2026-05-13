@@ -711,7 +711,7 @@ export async function prepareLineSplit(args: {
       note: "(original line deleted; replaced by new_activities below)",
     },
     new_activities: newActivities,
-    ui_instruction: `Original activity ${activityId} (line on bill ${bill.number}) has been deleted. ${newActivities.length} new activities have been created on matter ${matter.display_number || matter.id}, all currently unbilled. To pull the new sub-entries onto bill ${bill.number}, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. The regenerated draft will replace the (now-empty) bill with ${args.splits.length} new sub-entry lines.`,
+    ui_instruction: `Original activity ${activityId} (line on bill ${bill.number}) has been deleted. ${newActivities.length} new activities have been created on matter ${matter.display_number || matter.id}, all currently unbilled. To finalize: option A — open Clio UI → bill ${bill.number} → click "Regenerate Draft" (varies by Clio plan; may be under a ⋯ menu, or labeled "Refresh"). Option B (if regenerate isn't available on your plan) — run delete_draft_bill(bill_id=${bill.id}) then in Clio UI on matter ${matter.display_number || matter.id} click "Generate Bill". Either way, the new draft will include all ${args.splits.length} sub-entries.`,
   };
 }
 
@@ -1050,7 +1050,7 @@ export async function prepareHourChange(args: {
     line_item_id: lineItemId,
     before: { hours: originalHours, note: originalNote },
     after: { hours: args.new_hours, note: args.new_note ?? originalNote },
-    ui_instruction: `Activity ${activityId} has been removed from bill ${bill.number} and edited to ${args.new_hours}h${args.new_note !== undefined ? " with new note" : ""}. To pull it back onto bill ${bill.number} at the new hours, open Clio UI → matter ${matter.display_number || matter.id} → click "Regenerate Draft" on bill ${bill.number}. Multiple prepare_hour_change calls can be batched before a single regenerate-draft click.`,
+    ui_instruction: `Activity ${activityId} has been removed from bill ${bill.number} and edited to ${args.new_hours}h${args.new_note !== undefined ? " with new note" : ""}. To pull it back at the new hours: option A — open Clio UI → bill ${bill.number} → click "Regenerate Draft" (varies by Clio plan; may be labeled "Refresh" or under a ⋯ menu). Option B (if regenerate isn't available on your plan) — run delete_draft_bill(bill_id=${bill.id}) then in Clio UI on matter ${matter.display_number || matter.id} click "Generate Bill". Multiple prepare_hour_change calls can be batched before a single regenerate-or-delete-and-recreate finalize step.`,
   };
 }
 
@@ -1283,7 +1283,7 @@ export async function prepareHardCombine(args: {
       secondaries_succeeded: succeeded,
       secondaries_failed: failed,
     },
-    ui_instruction: `Hard-combine prep complete on bill ${primaryResult.bill.number}. Primary activity ${primaryResult.activity_id} unbilled and re-edited to ${args.new_primary_hours}h${args.new_note !== undefined ? " with new note" : ""}. ${succeeded} ${treatment === "delete" ? "secondary activit" + (succeeded === 1 ? "y was" : "ies were") + " deleted" : "secondary line" + (succeeded === 1 ? " was" : "s were") + " discounted to 100%"}${failed > 0 ? ` (${failed} failed — see secondaries[] for details)` : ""}. To finalize, click "Regenerate Draft" on bill ${primaryResult.bill.number} in Clio UI. Primary returns to bill at new hours, secondaries are ${treatment === "delete" ? "gone" : "still on the bill at $0"}.`,
+    ui_instruction: `Hard-combine prep complete on bill ${primaryResult.bill.number}. Primary activity ${primaryResult.activity_id} unbilled and re-edited to ${args.new_primary_hours}h${args.new_note !== undefined ? " with new note" : ""}. ${succeeded} ${treatment === "delete" ? "secondary activit" + (succeeded === 1 ? "y was" : "ies were") + " deleted" : "secondary line" + (succeeded === 1 ? " was" : "s were") + " discounted to 100%"}${failed > 0 ? ` (${failed} failed — see secondaries[] for details)` : ""}. To finalize: option A — open Clio UI → bill ${primaryResult.bill.number} → click "Regenerate Draft" (varies by Clio plan). Option B (if regenerate isn't available on your plan) — run delete_draft_bill(bill_id=${primaryResult.bill.id}) then in Clio UI on matter ${primaryResult.matter.display_number || primaryResult.matter.id} click "Generate Bill". Primary returns to bill at new hours, secondaries are ${treatment === "delete" ? "gone" : "still on the bill at $0"}.`,
   };
 }
 

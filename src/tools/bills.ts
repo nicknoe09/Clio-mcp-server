@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
 import JSZip from "jszip";
 
 const BILL_FIELDS =
@@ -306,6 +306,94 @@ export function registerBillTools(server: McpServer): void {
               status: err.response?.status,
               clio_error: err.response?.data,
             }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // ============================================================
+  //  delete_draft_bill — DELETE a draft bill via /bills/{id}
+  // ============================================================
+  // Underlying activities are NOT deleted; they revert to unbilled and
+  // will be picked up by Clio's "Generate Bill" / "Regenerate Draft" flow
+  // in the matter's UI. Use case: cleaning up a stale draft after
+  // prepare_line_split / prepare_hard_combine when Clio UI doesn't expose
+  // a Regenerate Draft option for the bill in question (varies by plan).
+  // Refuses if the bill is not in 'draft' state — deleting issued/paid/
+  // void bills affects accounting and isn't supported here.
+  server.tool(
+    "delete_draft_bill",
+    "Delete a draft bill via DELETE /bills/{id}. Refuses if the bill is not in 'draft' state. The underlying activities are NOT deleted — they revert to unbilled and will appear on the next bill cycle for the matter, OR you can immediately recreate a draft via Clio UI ('Generate Bill' on the matter). Use case: cleaning up a stale draft after prepare_line_split / prepare_hard_combine when Clio UI doesn't expose a per-bill Regenerate Draft option (varies by Clio plan). Reads the bill's pre-delete state for audit; returns an explicit ui_instruction for the next step.",
+    {
+      bill_id: z.coerce.number().describe("Clio bill ID. Must currently be in 'draft' state."),
+    },
+    async (params) => {
+      try {
+        // Step 1: Read the bill to verify state before deleting.
+        const beforeResp = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: BILL_FIELDS,
+        });
+        const before = beforeResp.data;
+        if (!before) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ success: false, message: `Bill ${params.bill_id} not found.` }),
+            }],
+            isError: true,
+          };
+        }
+        if (before.state !== "draft") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                bill_id: params.bill_id,
+                bill_state: before.state,
+                message: `Refusing to delete: bill ${before.number || params.bill_id} is in state "${before.state}", not "draft". Only draft bills can be deleted via this tool. To void an issued bill, use set_bill_state with target_state="void".`,
+                context: "bill_not_draft",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Step 2: DELETE the bill.
+        await rawDeleteSingle(`/bills/${params.bill_id}`);
+
+        const matterDisplay = before.matters?.[0]?.display_number ?? `matter ${before.matters?.[0]?.id ?? "?"}`;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              deleted_bill: {
+                id: params.bill_id,
+                number: before.number,
+                total: before.total,
+                balance: before.balance,
+                state: "draft",
+                matter: before.matters?.[0] ?? null,
+              },
+              ui_instruction: `Bill ${before.number || params.bill_id} (draft, was \$${before.total ?? 0}) has been deleted. The underlying activities are now unbilled. To bring them back onto a fresh draft on ${matterDisplay}, open Clio UI → that matter → click "Generate Bill" (or "Create Bill"). The new draft will include all unbilled activities for the matter within the relevant date range — including any you just created via prepare_line_split / prepare_hard_combine / etc.`,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status || err.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              bill_id: params.bill_id,
+              status,
+              message: err.message,
+              clio_error: err.response?.data,
+            }, null, 2),
           }],
           isError: true,
         };
