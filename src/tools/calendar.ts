@@ -338,9 +338,9 @@ Event types (use event_type_id or event_type name):
         "RRULE for recurring events. Set to empty string to remove recurrence."
       ),
       event_type: z.string().optional().describe(
-        "Event type name: 'hard_scheduled', 'nrn_claude', 'trial_hearing', 'deadline', 'admin', 'personal'"
+        "Event type name: 'hard_scheduled', 'nrn_claude', 'trial_hearing', 'deadline', 'admin', 'personal'. Pass 'none' (or empty string) to CLEAR an existing event_type (set to null on the calendar entry)."
       ),
-      event_type_id: z.coerce.number().optional().describe("Direct event type ID (overrides event_type name)"),
+      event_type_id: z.coerce.number().optional().describe("Direct event type ID (overrides event_type name). Pass 0 or a negative number to CLEAR an existing event_type."),
     },
     async (params) => {
       try {
@@ -377,20 +377,30 @@ Event types (use event_type_id or event_type name):
           body.data.recurrence_rule = params.recurrence_rule === "" ? null : params.recurrence_rule;
         }
 
-        // Event type
-        if (params.event_type_id) {
-          body.data.calendar_entry_event_type = { id: params.event_type_id };
-        } else if (params.event_type) {
-          const typeMap: Record<string, number> = {
-            hard_scheduled: EVENT_TYPES.HARD_SCHEDULED,
-            nrn_claude: EVENT_TYPES.NRN_CLAUDE,
-            trial_hearing: EVENT_TYPES.TRIAL_HEARING,
-            deadline: EVENT_TYPES.DEADLINE,
-            admin: EVENT_TYPES.ADMIN,
-            personal: EVENT_TYPES.OUT_PERSONAL,
-          };
-          const typeId = typeMap[params.event_type.toLowerCase()];
-          if (typeId) body.data.calendar_entry_event_type = { id: typeId };
+        // Event type. Sentinel values clear an existing event_type:
+        //   event_type_id <= 0  → null (clear)
+        //   event_type in {"", "none", "null"}  → null (clear)
+        // Otherwise: lookup by name or use the explicit id.
+        if (params.event_type_id !== undefined) {
+          body.data.calendar_entry_event_type = params.event_type_id > 0
+            ? { id: params.event_type_id }
+            : null;
+        } else if (params.event_type !== undefined) {
+          const lower = params.event_type.toLowerCase();
+          if (lower === "" || lower === "none" || lower === "null") {
+            body.data.calendar_entry_event_type = null;
+          } else {
+            const typeMap: Record<string, number> = {
+              hard_scheduled: EVENT_TYPES.HARD_SCHEDULED,
+              nrn_claude: EVENT_TYPES.NRN_CLAUDE,
+              trial_hearing: EVENT_TYPES.TRIAL_HEARING,
+              deadline: EVENT_TYPES.DEADLINE,
+              admin: EVENT_TYPES.ADMIN,
+              personal: EVENT_TYPES.OUT_PERSONAL,
+            };
+            const typeId = typeMap[lower];
+            if (typeId) body.data.calendar_entry_event_type = { id: typeId };
+          }
         }
 
         const result = await rawPatchSingle(`/calendar_entries/${params.id}`, body);
