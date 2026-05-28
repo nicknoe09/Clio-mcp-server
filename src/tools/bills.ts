@@ -4,16 +4,15 @@ import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDel
 import JSZip from "jszip";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,paid,pending,paid_at,shared,state,matters," +
-  "client{id,name,primary_email_address,type}," +
-  "recipients{id,name,primary_email_address,type}," +
-  "interest_assessments{id,date,amount,description}," +
-  "last_sent_message{id,subject,date,body}";
+  "id,number,subject,memo,kind,type,state,available_state_transitions,can_update," +
+  "issued_at,due_at,start_at,end_at,created_at,updated_at,last_sent_at," +
+  "total,due,balance,paid,pending,paid_at,credits_issued,shared,matters," +
+  "client{id,name,primary_email_address,type}";
 
 export function registerBillTools(server: McpServer): void {
   server.tool(
     "get_bills",
-    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days. Returns payment detail (`paid`, `pending`, `paid_at`, `interest_assessments`), routing info (`client`, `recipients`, `shared`), and sent indicators (`sent`, `last_sent_at`, `last_sent_message`) so callers can distinguish bills that have been emailed/shared to the client from approved bills still sitting in the drawer.",
+    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days. Returns payment detail (`paid`, `pending`, `paid_at`, `due`, `credits_issued`), routing info (`client`, `shared`), bill metadata (`subject`, `memo`, `kind`, `type`, `start_at`, `end_at`, `created_at`, `updated_at`), state machine (`available_state_transitions`, `can_update`), and sent indicators (`sent`, `last_sent_at`) so callers can distinguish bills that have been emailed/shared to the client from approved bills still sitting in the drawer.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       client_id: z.coerce.number().optional().describe("Filter by client ID"),
@@ -52,31 +51,39 @@ export function registerBillTools(server: McpServer): void {
             else if (daysOutstanding > 30) aging_flag = "30+ days";
           }
 
-          const lastSent = b.last_sent_message ?? null;
-          const last_sent_at = lastSent?.date ?? null;
-          const sent = !!lastSent;
+          const last_sent_at = b.last_sent_at ?? null;
+          const sent = !!last_sent_at;
 
           return {
             id: b.id,
             number: b.number,
+            subject: b.subject ?? null,
+            memo: b.memo ?? null,
+            kind: b.kind ?? null,
+            type: b.type ?? null,
+            state: b.state,
+            available_state_transitions: b.available_state_transitions ?? [],
+            can_update: b.can_update ?? null,
             issued_at: b.issued_at,
             due_at: b.due_at,
+            start_at: b.start_at ?? null,
+            end_at: b.end_at ?? null,
+            created_at: b.created_at ?? null,
+            updated_at: b.updated_at ?? null,
             total: b.total,
+            due: b.due ?? null,
             balance: b.balance,
             paid: b.paid ?? null,
             pending: b.pending ?? null,
             paid_at: b.paid_at ?? null,
-            interest_assessments: b.interest_assessments ?? [],
-            state: b.state,
+            credits_issued: b.credits_issued ?? null,
+            shared: b.shared ?? null,
             matter: b.matters?.[0] ?? null,
             client: b.client ?? null,
-            recipients: b.recipients ?? [],
-            shared: b.shared ?? null,
             days_outstanding: daysOutstanding,
             aging_flag,
             sent,
             last_sent_at,
-            last_sent_message: lastSent,
           };
         });
 
@@ -125,14 +132,12 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   // Hits /bills/{id} with the same field set get_bills uses, then dumps
   // (a) the raw Clio response, (b) the get_bills-shaped output for that
-  // bill, and (c) a presence check showing which of the newer fields
-  // came back populated vs null/missing. Useful when validating that
-  // Clio actually supports a field name (e.g. recipients vs
-  // bill_recipients, interest_assessments shape, etc.) before relying
-  // on it from get_bills callers.
+  // bill, and (c) a presence check showing which of the tracked fields
+  // came back populated vs null/missing. Useful for confirming Clio
+  // actually supports each name in BILL_FIELDS before relying on it.
   server.tool(
     "debug_bill_fields",
-    "Debug helper: fetch one bill with the full get_bills field set and report which fields Clio returned. Use this after adding new fields to BILL_FIELDS to confirm Clio accepts the field names and to see the actual shape of nested objects (client, recipients, interest_assessments, last_sent_message).",
+    "Debug helper: fetch one bill with the full get_bills field set and report which fields Clio returned. Use this after editing BILL_FIELDS to confirm Clio accepts each field name and to see the actual shape of nested objects (client, matters).",
     {
       bill_id: z.coerce.number().describe("Clio bill ID to inspect"),
     },
@@ -157,39 +162,58 @@ export function registerBillTools(server: McpServer): void {
         const daysOutstanding = dueDate
           ? Math.floor((today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24))
           : null;
-        const lastSent = b.last_sent_message ?? null;
+        const last_sent_at = b.last_sent_at ?? null;
 
         const mapped = {
           id: b.id,
           number: b.number,
+          subject: b.subject ?? null,
+          memo: b.memo ?? null,
+          kind: b.kind ?? null,
+          type: b.type ?? null,
+          state: b.state,
+          available_state_transitions: b.available_state_transitions ?? [],
+          can_update: b.can_update ?? null,
           issued_at: b.issued_at,
           due_at: b.due_at,
+          start_at: b.start_at ?? null,
+          end_at: b.end_at ?? null,
+          created_at: b.created_at ?? null,
+          updated_at: b.updated_at ?? null,
           total: b.total,
+          due: b.due ?? null,
           balance: b.balance,
           paid: b.paid ?? null,
           pending: b.pending ?? null,
           paid_at: b.paid_at ?? null,
-          interest_assessments: b.interest_assessments ?? [],
-          state: b.state,
+          credits_issued: b.credits_issued ?? null,
+          shared: b.shared ?? null,
           matter: b.matters?.[0] ?? null,
           client: b.client ?? null,
-          recipients: b.recipients ?? [],
-          shared: b.shared ?? null,
           days_outstanding: daysOutstanding,
-          sent: !!lastSent,
-          last_sent_at: lastSent?.date ?? null,
-          last_sent_message: lastSent,
+          sent: !!last_sent_at,
+          last_sent_at,
         };
 
         const tracked = [
+          "subject",
+          "memo",
+          "kind",
+          "type",
+          "available_state_transitions",
+          "can_update",
+          "start_at",
+          "end_at",
+          "created_at",
+          "updated_at",
+          "last_sent_at",
+          "due",
           "paid",
           "pending",
           "paid_at",
-          "interest_assessments",
-          "client",
-          "recipients",
+          "credits_issued",
           "shared",
-          "last_sent_message",
+          "client",
         ];
         const field_presence = Object.fromEntries(
           tracked.map((k) => {
