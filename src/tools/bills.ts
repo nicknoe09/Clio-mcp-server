@@ -4,12 +4,16 @@ import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDel
 import JSZip from "jszip";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matters,last_sent_message{id,subject,date,body}";
+  "id,number,issued_at,due_at,balance,total,paid,pending,paid_at,shared,state,matters," +
+  "client{id,name,primary_email_address,type}," +
+  "recipients{id,name,primary_email_address,type}," +
+  "interest_assessments{id,date,amount,description}," +
+  "last_sent_message{id,subject,date,body}";
 
 export function registerBillTools(server: McpServer): void {
   server.tool(
     "get_bills",
-    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days. Returns `sent` (bool), `last_sent_at`, and full `last_sent_message` so callers can distinguish bills that have been emailed/mailed to the client from approved bills still sitting in the drawer.",
+    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days. Returns payment detail (`paid`, `pending`, `paid_at`, `interest_assessments`), routing info (`client`, `recipients`, `shared`), and sent indicators (`sent`, `last_sent_at`, `last_sent_message`) so callers can distinguish bills that have been emailed/shared to the client from approved bills still sitting in the drawer.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       client_id: z.coerce.number().optional().describe("Filter by client ID"),
@@ -59,8 +63,15 @@ export function registerBillTools(server: McpServer): void {
             due_at: b.due_at,
             total: b.total,
             balance: b.balance,
+            paid: b.paid ?? null,
+            pending: b.pending ?? null,
+            paid_at: b.paid_at ?? null,
+            interest_assessments: b.interest_assessments ?? [],
             state: b.state,
             matter: b.matters?.[0] ?? null,
+            client: b.client ?? null,
+            recipients: b.recipients ?? [],
+            shared: b.shared ?? null,
             days_outstanding: daysOutstanding,
             aging_flag,
             sent,
