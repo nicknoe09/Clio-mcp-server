@@ -121,6 +121,117 @@ export function registerBillTools(server: McpServer): void {
   );
 
   // ============================================================
+  //  debug_bill_fields — verify Clio returns each requested field
+  // ============================================================
+  // Hits /bills/{id} with the same field set get_bills uses, then dumps
+  // (a) the raw Clio response, (b) the get_bills-shaped output for that
+  // bill, and (c) a presence check showing which of the newer fields
+  // came back populated vs null/missing. Useful when validating that
+  // Clio actually supports a field name (e.g. recipients vs
+  // bill_recipients, interest_assessments shape, etc.) before relying
+  // on it from get_bills callers.
+  server.tool(
+    "debug_bill_fields",
+    "Debug helper: fetch one bill with the full get_bills field set and report which fields Clio returned. Use this after adding new fields to BILL_FIELDS to confirm Clio accepts the field names and to see the actual shape of nested objects (client, recipients, interest_assessments, last_sent_message).",
+    {
+      bill_id: z.coerce.number().describe("Clio bill ID to inspect"),
+    },
+    async (params) => {
+      try {
+        const resp = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: BILL_FIELDS,
+        });
+        const b = resp.data;
+        if (!b) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: `Bill ${params.bill_id} not found` }),
+            }],
+            isError: true,
+          };
+        }
+
+        const today = new Date();
+        const dueDate = b.due_at ? new Date(b.due_at) : null;
+        const daysOutstanding = dueDate
+          ? Math.floor((today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24))
+          : null;
+        const lastSent = b.last_sent_message ?? null;
+
+        const mapped = {
+          id: b.id,
+          number: b.number,
+          issued_at: b.issued_at,
+          due_at: b.due_at,
+          total: b.total,
+          balance: b.balance,
+          paid: b.paid ?? null,
+          pending: b.pending ?? null,
+          paid_at: b.paid_at ?? null,
+          interest_assessments: b.interest_assessments ?? [],
+          state: b.state,
+          matter: b.matters?.[0] ?? null,
+          client: b.client ?? null,
+          recipients: b.recipients ?? [],
+          shared: b.shared ?? null,
+          days_outstanding: daysOutstanding,
+          sent: !!lastSent,
+          last_sent_at: lastSent?.date ?? null,
+          last_sent_message: lastSent,
+        };
+
+        const tracked = [
+          "paid",
+          "pending",
+          "paid_at",
+          "interest_assessments",
+          "client",
+          "recipients",
+          "shared",
+          "last_sent_message",
+        ];
+        const field_presence = Object.fromEntries(
+          tracked.map((k) => {
+            const v = (b as any)[k];
+            const present = v !== undefined && v !== null && !(Array.isArray(v) && v.length === 0);
+            return [k, { present, value: v ?? null }];
+          })
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              bill_id: params.bill_id,
+              fields_requested: BILL_FIELDS,
+              field_presence,
+              mapped_output: mapped,
+              raw_clio_response: b,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+              hint: err.response?.status === 400
+                ? "Clio rejected the request — likely an unsupported field name in BILL_FIELDS. Check clio_error for the offending field."
+                : undefined,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // ============================================================
   //  download_bill_pdf — Download a single bill as PDF
   // ============================================================
   server.tool(
