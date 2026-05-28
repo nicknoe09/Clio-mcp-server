@@ -4,12 +4,12 @@ import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDel
 import JSZip from "jszip";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matters";
+  "id,number,issued_at,due_at,balance,total,state,matters,last_sent_message{id,subject,date,body}";
 
 export function registerBillTools(server: McpServer): void {
   server.tool(
     "get_bills",
-    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days.",
+    "Get bills with filters. Flags aging: outstanding > 30, 60, 90 days. Returns `sent` (bool), `last_sent_at`, and full `last_sent_message` so callers can distinguish bills that have been emailed/mailed to the client from approved bills still sitting in the drawer.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       client_id: z.coerce.number().optional().describe("Filter by client ID"),
@@ -48,6 +48,10 @@ export function registerBillTools(server: McpServer): void {
             else if (daysOutstanding > 30) aging_flag = "30+ days";
           }
 
+          const lastSent = b.last_sent_message ?? null;
+          const last_sent_at = lastSent?.date ?? null;
+          const sent = !!lastSent;
+
           return {
             id: b.id,
             number: b.number,
@@ -59,6 +63,9 @@ export function registerBillTools(server: McpServer): void {
             matter: b.matters?.[0] ?? null,
             days_outstanding: daysOutstanding,
             aging_flag,
+            sent,
+            last_sent_at,
+            last_sent_message: lastSent,
           };
         });
 
