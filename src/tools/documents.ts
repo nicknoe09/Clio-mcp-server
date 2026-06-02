@@ -2016,7 +2016,16 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- SAVE AND UPLOAD (direct XML, no ExcelJS write) ----
           // Style indices from the original 26 Compare sheet:
           const S = { monthStr: "369", initials: "170", hrs1: "311", hrs: "171", hrsFormula: "330", totalFormula: "327", currency: "172", writeoffs: "62", collected: "173", respHrs: "174", respBilled: "175", respColl: "176", bold: "1" };
-          const colLetter = (c: number) => String.fromCharCode(64 + c);
+          // Excel column letter for a 1-based column index. Must handle >26
+          // (AA, AB, …): the Bonus Tracker lays out 7 attorneys × 4 cols and
+          // runs past Z. The old `String.fromCharCode(64 + c)` produced bytes
+          // like "[", "\\", "]" for cols 27-29, yielding invalid cell refs that
+          // corrupt the workbook (and make ExcelJS throw "A Cell needs a Row").
+          const colLetter = (c: number): string => {
+            let s = "";
+            while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); }
+            return s;
+          };
 
           // --- 26 Compare: patch the original XML ---
           const origZip = await JSZip.loadAsync(fileBuffer);
