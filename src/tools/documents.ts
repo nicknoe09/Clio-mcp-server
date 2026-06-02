@@ -193,6 +193,9 @@ async function surgicalWriteXlsx(
 
   // Remove deleted sheets
   for (const delName of deletedSheetNames) {
+    // Never delete a sheet we just (re)wrote — the broad "bonus" name match
+    // would otherwise remove the freshly-patched Bonus Config / Bonus Tracker.
+    if (delName in patchedSheets) continue;
     const path = sheetMap[delName];
     if (!path) continue;
     zip.remove(path);
@@ -2006,20 +2009,38 @@ export function registerDocumentTools(server: McpServer): void {
           }
 
           // Patch existing month data cells (cells that already exist in the XML)
-          for (const r of ROSTER) {
-            const row = initialsRowMap[r.initials.toUpperCase()];
-            if (!row) continue;
-            const d = data[r.user_id];
-            const rd = respData[r.user_id];
-            const patches: [number, number][] = [
-              [4, round1(d.bizDev)], [5, round1(d.potentialClients)], [6, round1(d.cle)], [7, round1(d.otherAdmin)],
-              [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
-              [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
-              [11, round2(d.billedDollars)], [14, round2(d.indivCollected)],
-              [17, round1(rd.respHrs)], [18, round2(rd.respBilled)], [19, round2(d.respCollected)],
-            ];
-            for (const [col, val] of patches) {
-              compareXml = patchCell(compareXml, `${colLetter(col)}${row}`, val);
+          // for EVERY backfilled YTD month — not just the target — so prior
+          // months get the fresh per-month aggregation written to "26 Compare"
+          // (matches the ExcelJS backfill loop above; mirrors its column rules).
+          // Collections (cols N=14, S=19) are target-month-only: the fee
+          // allocation CSV is single-period, so prior months' data has them
+          // zero and we must not overwrite their existing values.
+          // The target month's rows may not exist yet when blockCreated — in
+          // that case patchCell is a no-op and the blockCreated section below
+          // writes those rows.
+          for (const md of monthsData) {
+            const isTarget = md.month === params.month;
+            const block = isTarget ? monthBlock : scanMonthBlock(compareSheet, md.monthName);
+            if (!block) continue;
+            const rowMap = block.map;
+            for (const r of ROSTER) {
+              const row = rowMap[r.initials.toUpperCase()];
+              if (!row) continue;
+              const d = md.data[r.user_id];
+              const rd = md.respData[r.user_id];
+              const patches: [number, number][] = [
+                [4, round1(d.bizDev)], [5, round1(d.potentialClients)], [6, round1(d.cle)], [7, round1(d.otherAdmin)],
+                [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
+                [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
+                [11, round2(d.billedDollars)],
+                [17, round1(rd.respHrs)], [18, round2(rd.respBilled)],
+              ];
+              if (isTarget) {
+                patches.push([14, round2(d.indivCollected)], [19, round2(d.respCollected)]);
+              }
+              for (const [col, val] of patches) {
+                compareXml = patchCell(compareXml, `${colLetter(col)}${row}`, val);
+              }
             }
           }
 
