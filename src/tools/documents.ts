@@ -51,6 +51,54 @@ function buildSheetXml(rows: string[]): string {
 </worksheet>`;
 }
 
+/** Convert an Excel column ("A","AA",…) to a 1-based number for sorting. */
+function colToNum(s: string): number {
+  let n = 0;
+  for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
+}
+
+/**
+ * Normalize a worksheet's <sheetData>: rows must be unique and in ascending
+ * order, and cells within each row must be in ascending column order — Excel
+ * rejects violations as corrupt ("we found a problem with some content") even
+ * though JSZip/ExcelJS/openpyxl silently merge-and-sort them. Our patch path
+ * appends new month rows before </sheetData>, which leaves them out of order
+ * (and can duplicate existing row numbers), so run every output sheet through
+ * this. Duplicate rows/cells keep the FIRST occurrence.
+ */
+function sanitizeSheetXml(xml: string): string {
+  const m = xml.match(/(<sheetData[^>]*>)([\s\S]*?)(<\/sheetData>)/);
+  if (!m) return xml;
+  const body = m[2];
+  const rowRe = /<row\b[^>]*?(?:\/>|>[\s\S]*?<\/row>)/g;
+  const seen = new Map<number, string>();
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(body)) !== null) {
+    const rx = rm[0];
+    const rn = parseInt(rx.match(/\br="(\d+)"/)?.[1] ?? "", 10);
+    if (Number.isNaN(rn) || seen.has(rn)) continue; // keep first occurrence
+    seen.set(rn, rx);
+  }
+  const sortedRows = [...seen.keys()].sort((a, b) => a - b).map((rn) => {
+    const rx = seen.get(rn)!;
+    const open = rx.match(/^<row\b[^>]*?>/)?.[0];
+    if (!open || rx.endsWith("/>")) return rx; // self-closing row, no cells
+    const inner = rx.slice(open.length, rx.length - "</row>".length);
+    const cellRe = /<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g;
+    const cseen = new Map<string, string>();
+    let cm: RegExpExecArray | null;
+    while ((cm = cellRe.exec(inner)) !== null) {
+      const col = cm[0].match(/\br="([A-Z]+)\d+"/)?.[1];
+      if (!col || cseen.has(col)) continue;
+      cseen.set(col, cm[0]);
+    }
+    const cells = [...cseen.keys()].sort((a, b) => colToNum(a) - colToNum(b)).map((c) => cseen.get(c)!);
+    return open + cells.join("") + "</row>";
+  });
+  return xml.slice(0, m.index!) + m[1] + sortedRows.join("") + m[3] + xml.slice(m.index! + m[0].length);
+}
+
 /** Update a cell's value in existing sheet XML. Returns modified XML. */
 function xmlUpdateCell(xml: string, ref: string, newValue: number): string {
   // Match <c r="REF" ...>...<v>...</v>...</c> and replace the <v> content
@@ -172,7 +220,8 @@ async function surgicalWriteXlsx(
   const patchedSheets = buildSheets(newStyleIndices);
 
   // Process patched sheets
-  for (const [name, xml] of Object.entries(patchedSheets)) {
+  for (const [name, rawXml] of Object.entries(patchedSheets)) {
+    const xml = sanitizeSheetXml(rawXml); // enforce unique + sorted rows/cells
     const existingPath = sheetMap[name];
     if (existingPath) {
       // Replace existing sheet XML
