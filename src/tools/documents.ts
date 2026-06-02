@@ -237,6 +237,16 @@ async function surgicalWriteXlsx(
   zip.file("xl/_rels/workbook.xml.rels", relsXml);
   zip.file("[Content_Types].xml", ctXml);
 
+  // Strip directory entries. Adding new parts (e.g. xl/worksheets/sheetN.xml)
+  // makes JSZip synthesize folder objects ("xl/", "xl/worksheets/"), which it
+  // then emits as explicit zip entries whose names end in "/". A package part
+  // name ending in "/" is invalid per OPC, and Excel reports the workbook as
+  // corrupt (other readers/JSZip tolerate it). Real .xlsx packages contain no
+  // directory entries, so remove them before serializing.
+  for (const name of Object.keys(zip.files)) {
+    if ((zip.files[name] as any).dir) delete zip.files[name];
+  }
+
   return Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
 }
 
