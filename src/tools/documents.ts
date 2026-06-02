@@ -191,7 +191,10 @@ async function surgicalWriteXlsx(
     }
   }
 
-  // Remove deleted sheets
+  // Remove deleted sheets: drop the worksheet part, its _rels, and the
+  // workbook <sheet> entry. The dangling workbook relationship and
+  // content-type override left behind are cleaned up by the integrity sweep
+  // below (which also heals any orphans already baked into the input file).
   for (const delName of deletedSheetNames) {
     // Never delete a sheet we just (re)wrote — the broad "bonus" name match
     // would otherwise remove the freshly-patched Bonus Config / Bonus Tracker.
@@ -201,23 +204,34 @@ async function surgicalWriteXlsx(
     zip.remove(path);
     const relsPath = path.replace("worksheets/", "worksheets/_rels/") + ".rels";
     if (zip.file(relsPath)) zip.remove(relsPath);
-
-    // Capture the sheet element (and its r:id) BEFORE stripping it, so we can
-    // also purge the matching workbook relationship and content-type override.
-    // Leaving either behind points at a now-missing part and makes Excel flag
-    // the workbook as corrupt ("we found a problem with some content").
     const esc = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const sheetElRe = new RegExp(`<sheet[^>]+name="${esc}"[^>]*/?>`, "g");
-    const sheetEl = wbXml.match(sheetElRe)?.[0];
-    const rid = sheetEl?.match(/r:id="([^"]+)"/)?.[1];
-    wbXml = wbXml.replace(sheetElRe, "");
-    if (rid) {
-      const ridEsc = rid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      relsXml = relsXml.replace(new RegExp(`<Relationship[^>]+Id="${ridEsc}"[^>]*/?>`, "g"), "");
-    }
-    const partEsc = ("/" + path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    ctXml = ctXml.replace(new RegExp(`<Override[^>]+PartName="${partEsc}"[^>]*/?>`, "g"), "");
+    wbXml = wbXml.replace(new RegExp(`<sheet[^>]+name="${esc}"[^>]*/?>`, "g"), "");
   }
+
+  // Drop calcChain.xml. It records a calculation order keyed by sheetId, and we
+  // both rewrite formula cell values and add new SUM formulas (plus delete
+  // sheets) — leaving the stale chain in place makes it reference cells in
+  // sheets that no longer exist, which Excel reports as corrupt. Excel rebuilds
+  // the calc chain automatically on open, so removing it is safe.
+  if (zip.file("xl/calcChain.xml")) zip.remove("xl/calcChain.xml");
+
+  // Integrity sweep: drop any workbook relationship or content-type override
+  // that points to a part no longer present in the package. This heals dangling
+  // references from sheets (and calcChain) removed this run AND any orphans a
+  // prior run already baked into the downloaded file — either makes Excel flag
+  // the workbook as corrupt ("we found a problem with some content").
+  const partPresent = (zipPath: string): boolean => zip.file(zipPath) != null;
+  relsXml = relsXml.replace(/<Relationship\b[^>]*\/>/g, (rel) => {
+    if (/TargetMode="External"/.test(rel)) return rel;
+    const tgt = rel.match(/Target="([^"]+)"/)?.[1];
+    if (!tgt || /^https?:/i.test(tgt)) return rel;
+    return partPresent("xl/" + tgt.replace(/^\.\//, "")) ? rel : "";
+  });
+  ctXml = ctXml.replace(/<Override\b[^>]*\/>/g, (ov) => {
+    const part = ov.match(/PartName="([^"]+)"/)?.[1];
+    if (!part) return ov;
+    return partPresent(part.replace(/^\//, "")) ? ov : "";
+  });
 
   zip.file("xl/workbook.xml", wbXml);
   zip.file("xl/_rels/workbook.xml.rels", relsXml);
