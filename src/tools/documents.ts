@@ -201,8 +201,22 @@ async function surgicalWriteXlsx(
     zip.remove(path);
     const relsPath = path.replace("worksheets/", "worksheets/_rels/") + ".rels";
     if (zip.file(relsPath)) zip.remove(relsPath);
+
+    // Capture the sheet element (and its r:id) BEFORE stripping it, so we can
+    // also purge the matching workbook relationship and content-type override.
+    // Leaving either behind points at a now-missing part and makes Excel flag
+    // the workbook as corrupt ("we found a problem with some content").
     const esc = delName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    wbXml = wbXml.replace(new RegExp(`<sheet[^>]+name="${esc}"[^>]*/?>`, "g"), "");
+    const sheetElRe = new RegExp(`<sheet[^>]+name="${esc}"[^>]*/?>`, "g");
+    const sheetEl = wbXml.match(sheetElRe)?.[0];
+    const rid = sheetEl?.match(/r:id="([^"]+)"/)?.[1];
+    wbXml = wbXml.replace(sheetElRe, "");
+    if (rid) {
+      const ridEsc = rid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      relsXml = relsXml.replace(new RegExp(`<Relationship[^>]+Id="${ridEsc}"[^>]*/?>`, "g"), "");
+    }
+    const partEsc = ("/" + path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    ctXml = ctXml.replace(new RegExp(`<Override[^>]+PartName="${partEsc}"[^>]*/?>`, "g"), "");
   }
 
   zip.file("xl/workbook.xml", wbXml);
@@ -1071,12 +1085,12 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Generate a firm dashboard data update as a downloadable Excel file. Pulls all metrics from Clio for the specified month: individual hours, billed $, collected $, responsible collected $, utilization, realization, potential calls, case counts. When update_existing=true, the hours/billable/billed columns are REWRITTEN for ALL year-to-date months (Jan through the target month) — this catches stale values from prior calc-logic bugs automatically. Collections (cols N + S) are only written for the target month because the fee allocation CSV is single-period. Takes ~3-5min per run for full-year rewrites (vs ~30s for a fresh-build run). Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible. Use this to update Rachel's monthly dashboard.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Always downloads that workbook, recomputes all Clio metrics, REWRITES the hours/billable/billed columns for ALL year-to-date months (Jan through the target month) in '26 Compare' — catching stale values from prior calc-logic bugs automatically — and rebuilds the Bonus Config/Tracker and Attorney Performance tabs, then versions the file back to Box. Collections (cols N + S) are only written for the target month because the fee allocation CSV is single-period. Takes ~3-5min for a full-year rewrite mid-year. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
-      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
-      update_existing: z.boolean().optional().describe("If true, downloads the firm dashboard from Box, updates the '26 Compare' sheet and bonus tabs, then uploads the modified file back."),
+      box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
+      update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
     async (params) => {
       let _step = "init";
@@ -1250,8 +1264,12 @@ export function registerDocumentTools(server: McpServer): void {
           return { data: d, respData: rd, entryCount: mEntries.length };
         }
 
-        // ---- UPDATE EXISTING DASHBOARD IN BOX ----
-        if (params.update_existing) {
+        // ---- UPDATE THE DASHBOARD IN BOX ----
+        // The rich update always runs and always versions Claude Version 2 —
+        // the legacy single-sheet build was retired so no call can overwrite
+        // the dashboard with a stub. (update_existing / box_folder_id are kept
+        // in the schema for backward compatibility but no longer change paths.)
+        {
           const DASHBOARD_FILE_ID = "2199324794140"; // Claude Version 2
           _step = "downloading from Box";
           const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
@@ -2322,68 +2340,6 @@ export function registerDocumentTools(server: McpServer): void {
             }],
           };
         }
-
-        // Build Excel
-        const wb = new ExcelJS.Workbook();
-        const ws = wb.addWorksheet(`${monthName} ${params.year}`);
-
-        ws.mergeCells("A1:N1");
-        ws.getCell("A1").value = `Firm Dashboard Data - ${monthName} ${params.year}`;
-        ws.getCell("A1").font = { bold: true, size: 14 };
-        ws.addRow({});
-
-        const hRow = ws.addRow([
-          "Initials", "Name",
-          "Biz Dev", "Potential Clients", "CLE", "Other Admin", "Total Nonbillable",
-          "Billable Hours", "Total Hours",
-          "Billed $ (Time)", "Indiv Collected $",
-          "Resp Billable Hrs", "Resp Billed $", "Resp Collected $",
-        ]);
-        hRow.font = { bold: true };
-
-        for (const r of ROSTER) {
-          const d = data[r.user_id];
-          const totalNonbill = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
-          const totalHrs = round1(d.billableHrs + d.nonbillableHrs);
-
-          const rd = respData[r.user_id];
-
-          ws.addRow([
-            r.initials, r.name,
-            round1(d.bizDev), round1(d.potentialClients), round1(d.cle), round1(d.otherAdmin), totalNonbill,
-            round1(d.billableHrs), totalHrs,
-            round2(d.billedDollars), round2(d.indivCollected),
-            round1(rd.respHrs), round2(rd.respBilled), round2(d.respCollected),
-          ]);
-        }
-
-        // Format currency columns
-        for (const col of [10, 11, 13, 14]) {
-          ws.getColumn(col).numFmt = '"$"#,##0.00';
-        }
-
-        // Auto-fit columns
-        ws.columns.forEach(col => { col.width = Math.max(col.width || 10, 14); });
-
-        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
-        const filename = `Dashboard Update - ${monthName} ${params.year}.xlsx`;
-        const size_kb = Math.round(buffer.byteLength / 1024);
-
-        if (params.box_folder_id !== undefined) {
-          const boxFilename = `${params.year} Firm Dashboard.xlsx`;
-          const folderId = params.box_folder_id || "375774779182";
-          const result = await uploadToBox({ buffer, filename: boxFilename, folderId, overwriteFileId: "2191795122500" });
-          if (result.uploaded) {
-            return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
-          }
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, filename: boxFilename, size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note }) }] };
-        }
-
-        console.warn(`[Doc] download_dashboard_update — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
-        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, note: "Download the file from direct_download_url within 1 hour." }) }],
-        };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, step: _step, message: err.message, stack: err.stack?.split("\n").slice(0, 5).join(" | ") }) }], isError: true };
       }
