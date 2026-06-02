@@ -357,12 +357,64 @@ function applyTieredSplit(amount: number, ytdBefore: number) {
 
 // ─── Extracted weekly-goals logic (reusable by both single + batch tools) ───
 
+// Firm dashboard (the same workbook download_dashboard_update maintains).
+// On the "26 Compare" sheet: col B = month name, col C = initials,
+// col N (14) = that timekeeper's individual collected $ for the month.
+const FIRM_DASHBOARD_FILE_ID = "2199324794140";
+
+const INITIALS_BY_USER_ID: Record<number, string> = {
+  344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
+  358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
+  359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
+};
+
+const MONTH_NAMES_FULL = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+// Cache the parsed dashboard collections per (fileId, day) so a batch run
+// (download_all_weekly_goals) doesn't re-download the workbook for every person.
+const _dashboardCollectionsCache = new Map<string, Promise<Record<string, Record<string, number>>>>();
+
+// Returns { "January": { "PAR": 29172.05, ... }, ... } of individual collected $.
+async function getDashboardCollections(fileId: string): Promise<Record<string, Record<string, number>>> {
+  const cacheKey = `${fileId}:${new Date().toISOString().slice(0, 10)}`;
+  const cached = _dashboardCollectionsCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const buf = await downloadFromBox(fileId);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+    const sheet = wb.getWorksheet("26 Compare");
+    if (!sheet) throw new Error("'26 Compare' sheet not found in firm dashboard");
+
+    const out: Record<string, Record<string, number>> = {};
+    sheet.eachRow((row) => {
+      const month = String(row.getCell(2).value ?? "").trim(); // col B
+      if (!MONTH_NAMES_FULL.includes(month)) return;            // skips totals/header rows
+      const ini = String(row.getCell(3).value ?? "").trim().toUpperCase(); // col C
+      if (!ini) return;
+      const raw = row.getCell(14).value;                        // col N = individual collected
+      const num = typeof raw === "number" ? raw : parseFloat(String(raw ?? "").replace(/[$,()\s]/g, "")) || 0;
+      (out[month] ??= {})[ini] = num;
+    });
+    return out;
+  })();
+
+  _dashboardCollectionsCache.set(cacheKey, promise);
+  promise.catch(() => _dashboardCollectionsCache.delete(cacheKey)); // allow retry on failure
+  return promise;
+}
+
 interface WeeklyGoalsParams {
   user_id: number;
   year: number;
   weekly_billable_goal: number;
   hours_per_day?: number;
   box_folder_id?: string;
+  dashboard_file_id?: string;
 }
 
 async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
@@ -428,15 +480,38 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     allWeeks.push({ key, monDate: new Date(mon) });
   }
 
+  // Prior-month individual collections, scraped from the firm dashboard.
+  // Dashboard collections are posted ~7th of the month, so before the 7th the
+  // immediately-prior month isn't up yet — step back to the last posted month.
+  let collectionsLabel = "";
+  let collectionsValue: number | null = null;
+  try {
+    const nowD = new Date();
+    let target = new Date(nowD.getFullYear(), nowD.getMonth() - 1, 1); // prior month
+    if (nowD.getDate() < 7) target = new Date(nowD.getFullYear(), nowD.getMonth() - 2, 1);
+    // Dashboard only carries the current year's months; skip for off-year sheets.
+    if (target.getFullYear() === params.year) {
+      const map = await getDashboardCollections(params.dashboard_file_id ?? FIRM_DASHBOARD_FILE_ID);
+      const ini = INITIALS_BY_USER_ID[params.user_id] ?? "";
+      const monthName = MONTH_NAMES_FULL[target.getMonth()];
+      collectionsLabel = `${monthName} ${target.getFullYear()}`;
+      const v = map[monthName]?.[ini];
+      collectionsValue = typeof v === "number" ? v : null;
+    }
+  } catch (err: any) {
+    console.warn(`[Doc] weekly goals — collections scrape failed: ${err?.message ?? err}`);
+    collectionsValue = null;
+  }
+
   // Build Excel
   const wb = new ExcelJS.Workbook();
   const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
   // Summary (Monthly) sheet
   const ws1 = wb.addWorksheet("Summary");
-  ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
+  ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available", "Utilization %"]).font = { bold: true };
 
-  let cumBillable = 0, cumGoal = 0;
+  let cumBillable = 0, cumGoal = 0, monthsCounted = 0;
   const currentMonth = new Date().getMonth() + 1; // 1-indexed
   const isCurrentYear = params.year === new Date().getFullYear();
 
@@ -446,7 +521,9 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const WORKING_WEEKS_PER_YEAR = 47;
   const ANNUAL_AVAILABLE_HOURS = 1880;
   const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
-  const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
+  // Utilization = billable ÷ available hours (1880/12 = 156.7/mo), per the dashboard.
+  const availPerMonth = ANNUAL_AVAILABLE_HOURS / 12;
+  const flatMonthlyAvailable = round1(availPerMonth); // 156.7
 
   for (let m = 1; m <= 12; m++) {
     const key = `${params.year}-${String(m).padStart(2, "0")}`;
@@ -455,15 +532,29 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const avail = flatMonthlyAvailable;
     // Only accumulate YTD totals for months up to current month (or all months for past years)
     if (!isCurrentYear || m <= currentMonth) {
-      cumBillable += data.billable; cumGoal += goal;
+      cumBillable += data.billable; cumGoal += goal; monthsCounted++;
     }
     const ou = round1(data.billable - goal);
-    const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
+    const util = round1((data.billable / availPerMonth) * 100);
+    const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail, util]);
     row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
   }
-  const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", ""]);
+  const ytdUtil = monthsCounted > 0 ? round1((cumBillable / (availPerMonth * monthsCounted)) * 100) : 0;
+  const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", "", ytdUtil]);
   totRow.font = { bold: true };
   totRow.getCell(4).font = { bold: true, color: { argb: (cumBillable - cumGoal) >= 0 ? "FF008000" : "FFFF0000" } };
+
+  // Prior-month individual collections, scraped from the firm dashboard (posts ~7th).
+  ws1.addRow([]);
+  const collHdr = ws1.addRow(["Prior-Month Collections (Individual — from Firm Dashboard)"]);
+  collHdr.font = { bold: true };
+  const collValueRow = ws1.addRow([
+    collectionsLabel || "n/a",
+    collectionsValue != null ? collectionsValue : "not yet posted",
+  ]);
+  if (collectionsValue != null) collValueRow.getCell(2).numFmt = '"$"#,##0.00';
+  ws1.addRow(["Dashboard collections post ~7th of each month; figure reflects the most recently posted month."])
+    .font = { italic: true, color: { argb: "FF666666" } };
 
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
   const ws2 = wb.addWorksheet("Weekly");
@@ -510,11 +601,26 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
   }
 
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+
+  // Row 11: Trailing 4-week average of billable hours (this week + prior 3 that
+  // have started). A rolling read of recent pace that smooths single-week noise.
+  ws2.getCell("B11").value = "Trailing 4-Wk Avg";
+  ws2.getCell("B11").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    if (allWeeks[i].monDate > today) break; // only weeks that have started
+    let sum = 0, cnt = 0;
+    for (let j = Math.max(0, i - 3); j <= i; j++) {
+      sum += weeks[allWeeks[j].key]?.billable ?? 0;
+      cnt++;
+    }
+    ws2.getRow(11).getCell(i + 3).value = round1(sum / cnt);
+  }
+
   // Row 12: YTD Over/Under — running cumulative, only through current week
   ws2.getCell("B12").value = "YTD Over/Under";
   ws2.getCell("B12").font = { bold: true };
-  const today = new Date();
-  today.setHours(12, 0, 0, 0);
   let cumWeeklyOU = 0;
   for (let i = 0; i < allWeeks.length; i++) {
     // Only include weeks that have started (Monday <= today)
