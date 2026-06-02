@@ -315,7 +315,7 @@ export function registerScorecardTools(server: McpServer): void {
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
-      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
+      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
     },
     async (params) => {
@@ -356,10 +356,12 @@ export function registerScorecardTools(server: McpServer): void {
         const monthlySummary = [];
         let cumBillable = 0, cumGoal = 0;
 
-        // Flat monthly goal: 1880 available hrs/yr × 80% utilization = 1504 ÷ 12 = 125/mo
+        // Monthly billable goal is derived from the weekly goal so it matches the dashboard:
+        // 47 working weeks/yr ÷ 12 months. 30/wk → 1410/yr → 117.5/mo (partners & paras),
+        // 32/wk → 1504/yr → 125.33/mo (associates).
+        const WORKING_WEEKS_PER_YEAR = 47;
         const ANNUAL_AVAILABLE_HOURS = 1880;
-        const UTILIZATION_RATE = 0.80;
-        const flatMonthlyGoal = Math.round(ANNUAL_AVAILABLE_HOURS * UTILIZATION_RATE / 12); // 125
+        const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
         const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
 
         for (let m = 1; m <= 12; m++) {
