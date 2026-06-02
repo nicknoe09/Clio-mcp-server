@@ -409,10 +409,12 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const currentMonth = new Date().getMonth() + 1; // 1-indexed
   const isCurrentYear = params.year === new Date().getFullYear();
 
-  // Flat monthly goal: 1880 available hrs/yr × 80% utilization = 1504 ÷ 12 = 125/mo
+  // Monthly billable goal is derived from the weekly goal so it matches the dashboard:
+  // 47 working weeks/yr ÷ 12 months. 30/wk → 1410/yr → 117.5/mo (partners & paras),
+  // 32/wk → 1504/yr → 125.33/mo (associates).
+  const WORKING_WEEKS_PER_YEAR = 47;
   const ANNUAL_AVAILABLE_HOURS = 1880;
-  const UTILIZATION_RATE = 0.80;
-  const flatMonthlyGoal = Math.round(ANNUAL_AVAILABLE_HOURS * UTILIZATION_RATE / 12); // 125
+  const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
   const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
 
   for (let m = 1; m <= 12; m++) {
@@ -534,17 +536,18 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
 
 // ─── ROSTER (hardcoded for batch weekly goals, grouped by team) ──
 
+// Weekly billable goals match the dashboard: partners & paras = 30/wk, associates = 32/wk.
 const WEEKLY_GOALS_ROSTER = [
-  { name: "Nicholas Noe",    user_id: 348755029, goal: 35, group: "NRN" },
-  { name: "Tzipora Simmons", user_id: 359711375, goal: 30, group: "NRN" },
-  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 28, group: "NRN" },
-  { name: "Paul Romano",     user_id: 344117381, goal: 30, group: "PAR" },
-  { name: "Angela Alanis",   user_id: 358528744, goal: 28, group: "PAR" },
-  { name: "Nick Fernelius",  user_id: 359380639, goal: 30, group: "PAR" },
-  { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" },
-  { name: "Jonathan Barbee", user_id: 360091325, goal: 30, group: "KES" },
-  { name: "Anna Lozano",     user_id: 358108805, goal: 28, group: "KES" },
-  { name: "May Huynh",       user_id: 359576660, goal: 30, group: "MNH" },
+  { name: "Nicholas Noe",    user_id: 348755029, goal: 30, group: "NRN" }, // partner/para
+  { name: "Tzipora Simmons", user_id: 359711375, goal: 32, group: "NRN" }, // associate
+  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 30, group: "NRN" }, // partner/para
+  { name: "Paul Romano",     user_id: 344117381, goal: 30, group: "PAR" }, // partner/para
+  { name: "Angela Alanis",   user_id: 358528744, goal: 30, group: "PAR" }, // partner/para
+  { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
+  { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
+  { name: "Jonathan Barbee", user_id: 360091325, goal: 32, group: "KES" }, // associate
+  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para
+  { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
 
 export function registerDocumentTools(server: McpServer): void {
@@ -951,7 +954,7 @@ export function registerDocumentTools(server: McpServer): void {
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
-      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
+      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
       box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
     },
