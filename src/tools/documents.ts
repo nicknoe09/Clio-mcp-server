@@ -563,11 +563,26 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     headerRow.getCell(i + 3).value = allWeeks[i].key;
   }
 
+  // `today` gates which weeks get shaded (only weeks that have actually started).
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+
+  // Billable row — shaded red (< 20), yellow (20 → below goal), green (>= goal).
   ws2.getCell("B5").value = "Billable";
   ws2.getCell("B5").font = { bold: true };
   for (let i = 0; i < allWeeks.length; i++) {
     const data = weeks[allWeeks[i].key];
-    ws2.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
+    const billable = round1(data?.billable ?? 0);
+    const cell = ws2.getRow(5).getCell(i + 3);
+    cell.value = billable;
+    if (allWeeks[i].monDate <= today) {
+      const argb = billable < 20
+        ? "FFFFC7CE"                                   // red
+        : billable < params.weekly_billable_goal
+          ? "FFFFEB9C"                                 // yellow
+          : "FFC6EFCE";                                // green
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    }
   }
 
   ws2.getCell("B6").value = "Nonbillable";
@@ -600,9 +615,6 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     cell.value = ou;
     cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
   }
-
-  const today = new Date();
-  today.setHours(12, 0, 0, 0);
 
   // Row 11: Trailing 4-week average of billable hours (this week + prior 3 that
   // have started). A rolling read of recent pace that smooths single-week noise.
