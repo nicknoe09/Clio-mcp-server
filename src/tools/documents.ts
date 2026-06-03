@@ -2266,18 +2266,24 @@ export function registerDocumentTools(server: McpServer): void {
 
           // Paralegal section
           const paraStart = 21 + attys.length + 2;
-          trackerRows.push(xmlRow(paraStart, [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")]));
           const paraHdr = paraStart + 1;
+          // Row `paraStart`: section title + paralegal name headers.
+          // Row `paraHdr`:   per-paralegal column sub-headers.
+          // NB: each cell's ref row MUST match the row it's emitted in — a
+          // cell like B30 inside <row r="31"> is invalid OOXML and Excel
+          // discards the sheet's cell data ("Removed Records").
+          const paraTitleCells: string[] = [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")];
           const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month")];
           const XML_PARALEGALS = ["ACA", "AFL", "AKG"];
           const XML_PARA_TIERS = [{ minHours: 133, bonus: 500 }, { minHours: 121, bonus: 300 }, { minHours: 110, bonus: 100 }];
           for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
             const col = 2 + pi * 3;
-            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
+            paraTitleCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
             paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`, "Billable Hrs"));
             paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier"));
             paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus"));
           }
+          trackerRows.push(xmlRow(paraStart, paraTitleCells));
           trackerRows.push(xmlRow(paraHdr, paraHdrCells));
 
           for (let mi = 0; mi < 12; mi++) {
