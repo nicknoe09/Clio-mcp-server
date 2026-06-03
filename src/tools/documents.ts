@@ -645,6 +645,27 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     cell.font = { bold: true, color: { argb: cumWeeklyOU >= 0 ? "FF008000" : "FFFF0000" } };
   }
 
+  // Legend for the Billable-row shading (rows 14-17).
+  const goalNum = params.weekly_billable_goal;
+  ws2.getCell("B14").value = "Legend — Billable hours";
+  ws2.getCell("B14").font = { bold: true };
+  const legend: Array<[number, string, string]> = [
+    [15, "FFFFC7CE", `Below minimum (< 20)`],
+    [16, "FFFFEB9C", `Approaching goal (20 to < ${goalNum})`],
+    [17, "FFC6EFCE", `At / above goal (≥ ${goalNum})`],
+  ];
+  for (const [r, argb, label] of legend) {
+    const swatch = ws2.getCell(`B${r}`);
+    swatch.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    swatch.border = {
+      top: { style: "thin", color: { argb: "FFBFBFBF" } },
+      left: { style: "thin", color: { argb: "FFBFBFBF" } },
+      bottom: { style: "thin", color: { argb: "FFBFBFBF" } },
+      right: { style: "thin", color: { argb: "FFBFBFBF" } },
+    };
+    ws2.getCell(`C${r}`).value = label;
+  }
+
   ws2.getColumn(2).width = 14;
   for (let i = 0; i < allWeeks.length; i++) {
     ws2.getColumn(i + 3).width = 10;
