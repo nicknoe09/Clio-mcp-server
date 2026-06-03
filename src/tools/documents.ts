@@ -556,6 +556,14 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow(["Dashboard collections post ~7th of each month; figure reflects the most recently posted month."])
     .font = { italic: true, color: { argb: "FF666666" } };
 
+  // Utilization goal legend (text only).
+  const utilGoalPct = round1((params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / ANNUAL_AVAILABLE_HOURS) * 100);
+  ws1.addRow([]);
+  ws1.addRow(["Utilization Goal"]).font = { bold: true };
+  ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
+  ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
+    .font = { italic: true, color: { argb: "FF666666" } };
+
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
   const ws2 = wb.addWorksheet("Weekly");
   const headerRow = ws2.getRow(4);
