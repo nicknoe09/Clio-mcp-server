@@ -556,6 +556,14 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow(["Dashboard collections post ~7th of each month; figure reflects the most recently posted month."])
     .font = { italic: true, color: { argb: "FF666666" } };
 
+  // Utilization goal legend (text only).
+  const utilGoalPct = round1((params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / ANNUAL_AVAILABLE_HOURS) * 100);
+  ws1.addRow([]);
+  ws1.addRow(["Utilization Goal"]).font = { bold: true };
+  ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
+  ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
+    .font = { italic: true, color: { argb: "FF666666" } };
+
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
   const ws2 = wb.addWorksheet("Weekly");
   const headerRow = ws2.getRow(4);
@@ -643,6 +651,27 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const cell = ws2.getRow(12).getCell(i + 3);
     cell.value = round1(cumWeeklyOU);
     cell.font = { bold: true, color: { argb: cumWeeklyOU >= 0 ? "FF008000" : "FFFF0000" } };
+  }
+
+  // Legend for the Billable-row shading (rows 14-17).
+  const goalNum = params.weekly_billable_goal;
+  ws2.getCell("B14").value = "Legend — Billable hours";
+  ws2.getCell("B14").font = { bold: true };
+  const legend: Array<[number, string, string]> = [
+    [15, "FFFFC7CE", `Below minimum (< 20)`],
+    [16, "FFFFEB9C", `Approaching goal (20 to < ${goalNum})`],
+    [17, "FFC6EFCE", `At / above goal (≥ ${goalNum})`],
+  ];
+  for (const [r, argb, label] of legend) {
+    const swatch = ws2.getCell(`B${r}`);
+    swatch.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    swatch.border = {
+      top: { style: "thin", color: { argb: "FFBFBFBF" } },
+      left: { style: "thin", color: { argb: "FFBFBFBF" } },
+      bottom: { style: "thin", color: { argb: "FFBFBFBF" } },
+      right: { style: "thin", color: { argb: "FFBFBFBF" } },
+    };
+    ws2.getCell(`C${r}`).value = label;
   }
 
   ws2.getColumn(2).width = 14;
