@@ -1425,6 +1425,7 @@ export function registerDocumentTools(server: McpServer): void {
       try {
         const presets = await fetchAllPages<any>("/report_presets", {
           fields: "id,name,kind,format,category,options,disabled,report_schedule{id,frequency,next_scheduled_date}",
+          order: "name(asc)", // /report_presets rejects the default order=id (422)
         });
         out.report_presets = presets.map((p: any) => ({
           id: p.id, name: p.name, kind: p.kind, format: p.format, category: p.category,
@@ -1447,7 +1448,7 @@ export function registerDocumentTools(server: McpServer): void {
       // /reports at all, would show a non-"reports" source), plus recent revenue-kind
       // and completed-CSV reports.
       try {
-        const reps = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,source,category,created_at" });
+        const reps = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,source,category,created_at", order: "name(asc)" });
         const byKind: Record<string, number> = {};
         const bySource: Record<string, number> = {};
         for (const r of reps) {
@@ -1490,12 +1491,12 @@ export function registerDocumentTools(server: McpServer): void {
     {},
     async () => {
       try {
-        const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled,options" });
+        const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled,options", order: "name(asc)" });
         return { content: [{ type: "text", text: JSON.stringify(presets.map((p: any) => ({ id: p.id, name: p.name, kind: p.kind, format: p.format, category: p.category, disabled: p.disabled, options: p.options })), null, 2) }] };
       } catch (e: any) {
         // Fallback: the list endpoint may reject the `options` field; fetch options per-record.
         try {
-          const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled" });
+          const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled", order: "name(asc)" });
           const detailed: any[] = [];
           for (const p of presets.slice(0, 25)) {
             try { const one = await rawGetSingle(`/report_presets/${p.id}`, { fields: "id,name,kind,format,options" }); detailed.push(one?.data ?? one); }
