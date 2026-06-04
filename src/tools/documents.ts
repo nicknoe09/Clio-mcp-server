@@ -1416,45 +1416,63 @@ export function registerDocumentTools(server: McpServer): void {
     "Diagnostic (read-only). Probes candidate Clio report API endpoints with the firm's token and returns HTTP status + response shape for each, to discover whether the new 'Custom Reports' (beta) reporting engine is API-accessible and under what path (vs the classic /reports endpoint the dashboard uses). Also enumerates classic /reports by kind/name/format so a missing or mis-grouped report can be spotted. Run this when the dashboard can't find the expected Revenue Report.",
     {},
     async () => {
-      // All paths are relative to CLIO_API_BASE_URL (…/api/v4). If the new engine
-      // lives outside v4 entirely, every candidate will 404 — itself an answer.
-      const candidates = [
-        "/custom_reports", "/custom_report_runs", "/custom_report_presets",
-        "/custom_report_templates", "/report_schedules", "/report_presets",
-        "/report_runs", "/reporting/custom_reports", "/insights", "/insight_reports",
-      ];
-      const candidate_endpoints: any[] = [];
-      for (const path of candidates) {
-        try {
-          const res = await rawGetSingle(path, { limit: 1 });
-          const data = res?.data ?? res;
-          const sample = Array.isArray(data) ? data[0] : data;
-          candidate_endpoints.push({ path, status: 200, ok: true, sampleKeys: sample ? Object.keys(sample).slice(0, 30) : [] });
-        } catch (e: any) {
-          const status = e?.response?.status ?? "ERR";
-          const detail = typeof e?.response?.data === "string" ? e.response.data.slice(0, 160) : undefined;
-          candidate_endpoints.push({ path, status, ok: false, detail });
-        }
-      }
-      // Classic /reports: enumerate kinds + completed CSV reports so we can see
-      // exactly what the dashboard's selector has to work with.
-      let classic_reports: any = {};
+      const out: any = {};
+
+      // 1) Report Presets — this is where grouping (group_by) and scheduled-report
+      // config live in the classic API. If the "NRN Copy…(like Classic)" report is
+      // a classic preset, it'll appear here WITH its options (group_by etc.), and we
+      // can generate it on demand. If it's not here, it's beta-only.
       try {
-        const reps = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format" });
+        const presets = await fetchAllPages<any>("/report_presets", {
+          fields: "id,name,kind,format,category,options,disabled,report_schedule{id,frequency,next_scheduled_date}",
+        });
+        out.report_presets = presets.map((p: any) => ({
+          id: p.id, name: p.name, kind: p.kind, format: p.format, category: p.category,
+          disabled: p.disabled, options: p.options, report_schedule: p.report_schedule,
+        }));
+      } catch (e: any) {
+        out.report_presets = { error: e?.response?.status ?? String(e), detail: typeof e?.response?.data === "string" ? e.response.data.slice(0, 200) : undefined };
+      }
+
+      // 2) Report Schedules
+      try {
+        out.report_schedules = await fetchAllPages<any>("/report_schedules", {
+          fields: "id,frequency,report_preset_id,next_scheduled_date,status,day_of_month,days_of_week",
+        });
+      } catch (e: any) {
+        out.report_schedules = { error: e?.response?.status ?? String(e) };
+      }
+
+      // 3) /reports — break down by kind AND source (beta reports, if they land in
+      // /reports at all, would show a non-"reports" source), plus recent revenue-kind
+      // and completed-CSV reports.
+      try {
+        const reps = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,source,category,created_at" });
         const byKind: Record<string, number> = {};
-        for (const r of reps) byKind[r.kind ?? "?"] = (byKind[r.kind ?? "?"] || 0) + 1;
-        classic_reports = {
-          total: reps.length,
-          by_kind: byKind,
-          completed_csv: reps
-            .filter((r: any) => r.state === "completed" && r.format === "csv")
-            .slice(0, 50)
-            .map((r: any) => ({ id: r.id, name: r.name, kind: r.kind })),
+        const bySource: Record<string, number> = {};
+        for (const r of reps) {
+          byKind[r.kind ?? "?"] = (byKind[r.kind ?? "?"] || 0) + 1;
+          bySource[r.source ?? "?"] = (bySource[r.source ?? "?"] || 0) + 1;
+        }
+        out.reports = {
+          total: reps.length, by_kind: byKind, by_source: bySource,
+          revenue_kind: reps.filter((r: any) => r.kind === "revenue").slice(0, 25)
+            .map((r: any) => ({ id: r.id, name: r.name, state: r.state, format: r.format, source: r.source, created_at: r.created_at })),
+          completed_csv: reps.filter((r: any) => r.state === "completed" && r.format === "csv").slice(0, 40)
+            .map((r: any) => ({ id: r.id, name: r.name, kind: r.kind, source: r.source })),
         };
       } catch (e: any) {
-        classic_reports = { error: e?.response?.status ?? String(e) };
+        out.reports = { error: e?.response?.status ?? String(e) };
       }
-      return { content: [{ type: "text", text: JSON.stringify({ candidate_endpoints, classic_reports }, null, 2) }] };
+
+      // 4) Quick guesses at any separate new-engine endpoints (likely 404 if beta-only).
+      out.new_engine_guesses = [];
+      for (const path of ["/custom_reports", "/reporting/custom_reports", "/insights"]) {
+        try { await rawGetSingle(path, { limit: 1 }); out.new_engine_guesses.push({ path, status: 200 }); }
+        catch (e: any) { out.new_engine_guesses.push({ path, status: e?.response?.status ?? "ERR" }); }
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
     }
   );
 
