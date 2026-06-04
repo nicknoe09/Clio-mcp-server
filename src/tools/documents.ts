@@ -1698,7 +1698,6 @@ export function registerDocumentTools(server: McpServer): void {
           throw new Error(`Revenue CSV is missing required columns (${REVENUE_REPORT_SIGNATURE.join(", ")}). ${params.revenue_csv_box_file_id ? `The Box file ${params.revenue_csv_box_file_id} isn't a month×user Revenue Report (got: ${revRows[0] ? Object.keys(revRows[0]).join(", ") : "empty"}).` : ""}`);
         }
         const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
-        const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
 
         // month -> user_id -> indiv metrics ; month -> responsible user_id -> rollup
         const indivByMonth: Record<number, Record<number, PerUserData>> = {};
