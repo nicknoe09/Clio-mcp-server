@@ -357,7 +357,10 @@ const pageProps = {
 
 // ========== CSV helpers (for fee allocation) ==========
 function parseCSV(csv: string): Record<string, string>[] {
-  const lines = csv.split("\n");
+  // Strip a leading UTF-8 BOM — Clio CSV exports often include one, which would
+  // otherwise corrupt the first header key (e.g. "﻿Activity month") and
+  // break exact-name column lookups / signature checks.
+  const lines = csv.replace(/^﻿/, "").split("\n");
   if (lines.length < 2) return [];
   function parseLine(line: string): string[] {
     const fields: string[] = []; let current = ""; let inQuotes = false;
@@ -428,20 +431,38 @@ async function getRevenueReportCSV(reportId?: number): Promise<{ rows: Record<st
 
   // Prefer reports whose name hints "revenue" (newest first), then fall back to
   // scanning other CSV reports. Validate each candidate by header signature so a
-  // mis-named or wrong-shape report can't be silently picked. Bounded download
-  // count to avoid pathological scans.
+  // mis-named or wrong-shape report can't be silently picked. We sniff ALL
+  // revenue-named reports (so the cap can never hide the right one) and bound
+  // only the fallback scan of non-revenue reports.
   const byName = csvReports.filter((r: any) => /revenue/i.test(r.name || ""));
   const rest = csvReports.filter((r: any) => !byName.includes(r));
-  const candidates = [...byName, ...rest].slice(0, 25);
+  const candidates = [...byName, ...rest.slice(0, 25)];
+  const sniffed: { id: number; name: string; cols: string }[] = [];
   for (const cand of candidates) {
     try {
       const rows = parseCSV(await downloadReport(cand.id));
       if (hasSignature(rows)) return { rows, report: cand };
-    } catch { /* unreadable — try next */ }
+      sniffed.push({ id: cand.id, name: cand.name, cols: rows[0] ? Object.keys(rows[0]).join("|") : "(empty)" });
+    } catch (e: any) {
+      sniffed.push({ id: cand.id, name: cand.name, cols: `(download error: ${e?.message ?? e})` });
+    }
   }
+  // Self-diagnosing error: list what was actually in Clio + why revenue-named
+  // candidates were rejected, so the failure can be triaged from the message alone.
+  const listing = csvReports.slice(0, 20).map((r: any) => `#${r.id} ${r.name}`).join("; ") || "(none)";
+  const revDetail = sniffed
+    .filter((s) => /revenue/i.test(s.name))
+    .slice(0, 5)
+    .map((s) => `#${s.id} "${s.name}" cols=[${s.cols}]`)
+    .join(" || ");
   throw new Error(
     `No completed monthly classic Revenue Report found in Clio (need a CSV containing: ${REVENUE_REPORT_SIGNATURE.join(", ")}). ` +
-    `Generate the "Revenue Report (Like Classic)" grouped by Activity month + User, exported as CSV — or pass revenue_report_id explicitly.`
+    `Scanned ${csvReports.length} completed CSV report(s). ` +
+    (revDetail
+      ? `Revenue-named candidates checked but rejected: ${revDetail}. `
+      : `No completed CSV report has "revenue" in its name. `) +
+    `Completed CSV reports seen: ${listing}. ` +
+    `Fix: generate/schedule the "Revenue Report (Like Classic)" grouped by Activity month + User as CSV in Clio, or pass revenue_report_id explicitly.`
   );
 }
 
