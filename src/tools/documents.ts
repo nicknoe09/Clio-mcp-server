@@ -407,8 +407,12 @@ async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<st
 const REVENUE_REPORT_SIGNATURE = ["Activity month", "User initials", "Responsible attorney", "Billed hours value"];
 
 async function getRevenueReportCSV(reportId?: number): Promise<{ rows: Record<string, string>[]; report: any }> {
-  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format", order: "id(desc)" });
-  const csvReports = reports.filter((r: any) => r.state === "completed" && r.format === "csv");
+  // NOTE: /reports does not accept order=id(...) (Clio returns HTTP 422), so list
+  // with the proven-safe name ordering and sort newest-first (highest id) in memory.
+  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format", order: "name(asc)" });
+  const csvReports = reports
+    .filter((r: any) => r.state === "completed" && r.format === "csv")
+    .sort((a: any, b: any) => b.id - a.id);
   const hasSignature = (rows: Record<string, string>[]) =>
     rows.length > 0 && REVENUE_REPORT_SIGNATURE.every((c) => c in rows[0]);
 
