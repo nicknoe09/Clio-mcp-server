@@ -1967,24 +1967,37 @@ export function registerDocumentTools(server: McpServer): void {
           if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
 
           // ---- Helper: scan a month block in 26 Compare ----
-          // Every row in a block has the month name in col B and initials in col C.
+          // The section label (month name or "2026 Totals") sits on the FIRST row
+          // only; the rows below it have a blank col B. Data rows carry an initials
+          // value in col C; the trailing blank-col-C row is the (unlabeled) SUM row.
+          // A block runs from its label row down to the next label row / its SUM row.
           type MonthBlock = { firstRow: number; lastRow: number; sumRow: number; map: Record<string, number>; initials: string[] };
           function scanMonthBlock(sheet: ExcelJS.Worksheet, targetMonth: string): MonthBlock | null {
+            let startRow = 0;
+            sheet.eachRow((row, rowNum) => {
+              if (startRow) return;
+              if (String(row.getCell(2).value ?? "").trim() === targetMonth) startRow = rowNum;
+            });
+            if (!startRow) return null;
             const map: Record<string, number> = {};
             const initials: string[] = [];
             let firstRow = 0, lastRow = 0, sumRow = 0;
-            sheet.eachRow((row, rowNum) => {
+            const maxRow = sheet.rowCount;
+            for (let rowNum = startRow; rowNum <= maxRow; rowNum++) {
+              const row = sheet.getRow(rowNum);
               const bVal = String(row.getCell(2).value ?? "").trim();
-              if (bVal !== targetMonth) return;
+              // A non-empty col B other than our label marks the next section — stop.
+              if (rowNum !== startRow && bVal && bVal !== targetMonth) break;
               const cVal = String(row.getCell(3).value ?? "").trim();
-              if (!firstRow) firstRow = rowNum;
               if (cVal) {
+                if (!firstRow) firstRow = rowNum;
                 if (!map[cVal.toUpperCase()]) { map[cVal.toUpperCase()] = rowNum; initials.push(cVal.toUpperCase()); }
                 lastRow = rowNum;
-              } else {
-                sumRow = rowNum;
+              } else if (firstRow) {
+                sumRow = rowNum; // first blank-col-C row after the data = SUM row; block ends
+                break;
               }
-            });
+            }
             return firstRow ? { firstRow, lastRow, sumRow, map, initials } : null;
           }
 
@@ -1998,6 +2011,8 @@ export function registerDocumentTools(server: McpServer): void {
           let blockCreated = false;
 
           if (!monthBlock) {
+            throw new Error(`'${monthName}' block not found in '26 Compare'. The workbook pre-defines a labeled block for every month (Jan–Dec) plus '2026 Totals'; this tool only PATCHES existing blocks — it does not create them (in-place creation corrupted the Totals block). Add a row with '${monthName}' in column B with the timekeeper initials beneath it, then rerun.`);
+            // --- legacy in-tool create path below is now unreachable (blocks are pre-built) ---
             // Find "2026 Totals" section
             let totalsFirstRow = 0;
             compareSheet.eachRow((row, rowNum) => {
