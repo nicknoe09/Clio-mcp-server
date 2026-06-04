@@ -3055,4 +3055,40 @@ export function registerDocumentTools(server: McpServer): void {
       return { content: [{ type: "text" as const, text: JSON.stringify({ id: j.id, status: j.status, started_at: j.started_at, finished_at: j.finished_at, elapsed_s, error: j.error, result }, null, 2) }] };
     }
   );
+
+  // ============================================================
+  // dump_compare_layout — read-only: inspect the '26 Compare' sheet's exact
+  // row layout (row #, col B label, col C initials, key data cells) so block
+  // boundaries and per-row identities can be mapped precisely. Diagnostic for
+  // normalizing the initials column.
+  // ============================================================
+  server.tool(
+    "dump_compare_layout",
+    "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and which rows have 'Individual'/blank initials, so col C can be normalized safely.",
+    {},
+    async () => {
+      const DASHBOARD_FILE_ID = "2199324794140";
+      const buf = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load(buf);
+      const sheet = wb.getWorksheet("26 Compare");
+      if (!sheet) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "'26 Compare' sheet not found" }) }] };
+      const cellStr = (r: ExcelJS.Row, c: number) => {
+        const v = r.getCell(c).value as any;
+        if (v == null) return "";
+        if (typeof v === "object") return v.result ?? v.text ?? (v.richText ? v.richText.map((t: any) => t.text).join("") : JSON.stringify(v));
+        return String(v);
+      };
+      const rows: any[] = [];
+      sheet.eachRow((row, n) => {
+        const B = cellStr(row, 2).trim();
+        const C = cellStr(row, 3).trim();
+        const D = cellStr(row, 4).trim();
+        const I = cellStr(row, 9).trim();
+        const K = cellStr(row, 11).trim();
+        if (B || C || D || I || K) rows.push({ row: n, B, C, bizDev_D: D, billableHrs_I: I, billed_K: K });
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify({ sheet: "26 Compare", row_count: rows.length, rows }, null, 2) }] };
+    }
+  );
 }
