@@ -492,12 +492,64 @@ function applyTieredSplit(amount: number, ytdBefore: number) {
 
 // ─── Extracted weekly-goals logic (reusable by both single + batch tools) ───
 
+// Firm dashboard (the same workbook download_dashboard_update maintains).
+// On the "26 Compare" sheet: col B = month name, col C = initials,
+// col N (14) = that timekeeper's individual collected $ for the month.
+const FIRM_DASHBOARD_FILE_ID = "2199324794140";
+
+const INITIALS_BY_USER_ID: Record<number, string> = {
+  344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
+  358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
+  359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
+};
+
+const MONTH_NAMES_FULL = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+// Cache the parsed dashboard collections per (fileId, day) so a batch run
+// (download_all_weekly_goals) doesn't re-download the workbook for every person.
+const _dashboardCollectionsCache = new Map<string, Promise<Record<string, Record<string, number>>>>();
+
+// Returns { "January": { "PAR": 29172.05, ... }, ... } of individual collected $.
+async function getDashboardCollections(fileId: string): Promise<Record<string, Record<string, number>>> {
+  const cacheKey = `${fileId}:${new Date().toISOString().slice(0, 10)}`;
+  const cached = _dashboardCollectionsCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const buf = await downloadFromBox(fileId);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+    const sheet = wb.getWorksheet("26 Compare");
+    if (!sheet) throw new Error("'26 Compare' sheet not found in firm dashboard");
+
+    const out: Record<string, Record<string, number>> = {};
+    sheet.eachRow((row) => {
+      const month = String(row.getCell(2).value ?? "").trim(); // col B
+      if (!MONTH_NAMES_FULL.includes(month)) return;            // skips totals/header rows
+      const ini = String(row.getCell(3).value ?? "").trim().toUpperCase(); // col C
+      if (!ini) return;
+      const raw = row.getCell(14).value;                        // col N = individual collected
+      const num = typeof raw === "number" ? raw : parseFloat(String(raw ?? "").replace(/[$,()\s]/g, "")) || 0;
+      (out[month] ??= {})[ini] = num;
+    });
+    return out;
+  })();
+
+  _dashboardCollectionsCache.set(cacheKey, promise);
+  promise.catch(() => _dashboardCollectionsCache.delete(cacheKey)); // allow retry on failure
+  return promise;
+}
+
 interface WeeklyGoalsParams {
   user_id: number;
   year: number;
   weekly_billable_goal: number;
   hours_per_day?: number;
   box_folder_id?: string;
+  dashboard_file_id?: string;
 }
 
 async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
@@ -563,23 +615,50 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     allWeeks.push({ key, monDate: new Date(mon) });
   }
 
+  // Prior-month individual collections, scraped from the firm dashboard.
+  // Dashboard collections are posted ~7th of the month, so before the 7th the
+  // immediately-prior month isn't up yet — step back to the last posted month.
+  let collectionsLabel = "";
+  let collectionsValue: number | null = null;
+  try {
+    const nowD = new Date();
+    let target = new Date(nowD.getFullYear(), nowD.getMonth() - 1, 1); // prior month
+    if (nowD.getDate() < 7) target = new Date(nowD.getFullYear(), nowD.getMonth() - 2, 1);
+    // Dashboard only carries the current year's months; skip for off-year sheets.
+    if (target.getFullYear() === params.year) {
+      const map = await getDashboardCollections(params.dashboard_file_id ?? FIRM_DASHBOARD_FILE_ID);
+      const ini = INITIALS_BY_USER_ID[params.user_id] ?? "";
+      const monthName = MONTH_NAMES_FULL[target.getMonth()];
+      collectionsLabel = `${monthName} ${target.getFullYear()}`;
+      const v = map[monthName]?.[ini];
+      collectionsValue = typeof v === "number" ? v : null;
+    }
+  } catch (err: any) {
+    console.warn(`[Doc] weekly goals — collections scrape failed: ${err?.message ?? err}`);
+    collectionsValue = null;
+  }
+
   // Build Excel
   const wb = new ExcelJS.Workbook();
   const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
   // Summary (Monthly) sheet
   const ws1 = wb.addWorksheet("Summary");
-  ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available"]).font = { bold: true };
+  ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available", "Utilization %"]).font = { bold: true };
 
-  let cumBillable = 0, cumGoal = 0;
+  let cumBillable = 0, cumGoal = 0, monthsCounted = 0;
   const currentMonth = new Date().getMonth() + 1; // 1-indexed
   const isCurrentYear = params.year === new Date().getFullYear();
 
-  // Flat monthly goal: 1880 available hrs/yr × 80% utilization = 1504 ÷ 12 = 125/mo
+  // Monthly billable goal is derived from the weekly goal so it matches the dashboard:
+  // 47 working weeks/yr ÷ 12 months. 30/wk → 1410/yr → 117.5/mo (partners & paras),
+  // 32/wk → 1504/yr → 125.33/mo (associates).
+  const WORKING_WEEKS_PER_YEAR = 47;
   const ANNUAL_AVAILABLE_HOURS = 1880;
-  const UTILIZATION_RATE = 0.80;
-  const flatMonthlyGoal = Math.round(ANNUAL_AVAILABLE_HOURS * UTILIZATION_RATE / 12); // 125
-  const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
+  const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
+  // Utilization = billable ÷ available hours (1880/12 = 156.7/mo), per the dashboard.
+  const availPerMonth = ANNUAL_AVAILABLE_HOURS / 12;
+  const flatMonthlyAvailable = round1(availPerMonth); // 156.7
 
   for (let m = 1; m <= 12; m++) {
     const key = `${params.year}-${String(m).padStart(2, "0")}`;
@@ -588,15 +667,37 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const avail = flatMonthlyAvailable;
     // Only accumulate YTD totals for months up to current month (or all months for past years)
     if (!isCurrentYear || m <= currentMonth) {
-      cumBillable += data.billable; cumGoal += goal;
+      cumBillable += data.billable; cumGoal += goal; monthsCounted++;
     }
     const ou = round1(data.billable - goal);
-    const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail]);
+    const util = round1((data.billable / availPerMonth) * 100);
+    const row = ws1.addRow([monthNames[m - 1], goal, round1(data.billable), ou, round1(data.nonbillable), round1(data.billable + data.nonbillable), avail, util]);
     row.getCell(4).font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
   }
-  const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", ""]);
+  const ytdUtil = monthsCounted > 0 ? round1((cumBillable / (availPerMonth * monthsCounted)) * 100) : 0;
+  const totRow = ws1.addRow(["YTD Total", round1(cumGoal), round1(cumBillable), round1(cumBillable - cumGoal), "", "", "", ytdUtil]);
   totRow.font = { bold: true };
   totRow.getCell(4).font = { bold: true, color: { argb: (cumBillable - cumGoal) >= 0 ? "FF008000" : "FFFF0000" } };
+
+  // Prior-month individual collections, scraped from the firm dashboard (posts ~7th).
+  ws1.addRow([]);
+  const collHdr = ws1.addRow(["Prior-Month Collections (Individual — from Firm Dashboard)"]);
+  collHdr.font = { bold: true };
+  const collValueRow = ws1.addRow([
+    collectionsLabel || "n/a",
+    collectionsValue != null ? collectionsValue : "not yet posted",
+  ]);
+  if (collectionsValue != null) collValueRow.getCell(2).numFmt = '"$"#,##0.00';
+  ws1.addRow(["Dashboard collections post ~7th of each month; figure reflects the most recently posted month."])
+    .font = { italic: true, color: { argb: "FF666666" } };
+
+  // Utilization goal legend (text only).
+  const utilGoalPct = round1((params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / ANNUAL_AVAILABLE_HOURS) * 100);
+  ws1.addRow([]);
+  ws1.addRow(["Utilization Goal"]).font = { bold: true };
+  ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
+  ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
+    .font = { italic: true, color: { argb: "FF666666" } };
 
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
   const ws2 = wb.addWorksheet("Weekly");
@@ -605,11 +706,26 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     headerRow.getCell(i + 3).value = allWeeks[i].key;
   }
 
+  // `today` gates which weeks get shaded (only weeks that have actually started).
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+
+  // Billable row — shaded red (< 20), yellow (20 → below goal), green (>= goal).
   ws2.getCell("B5").value = "Billable";
   ws2.getCell("B5").font = { bold: true };
   for (let i = 0; i < allWeeks.length; i++) {
     const data = weeks[allWeeks[i].key];
-    ws2.getRow(5).getCell(i + 3).value = round1(data?.billable ?? 0);
+    const billable = round1(data?.billable ?? 0);
+    const cell = ws2.getRow(5).getCell(i + 3);
+    cell.value = billable;
+    if (allWeeks[i].monDate <= today) {
+      const argb = billable < 20
+        ? "FFFFC7CE"                                   // red
+        : billable < params.weekly_billable_goal
+          ? "FFFFEB9C"                                 // yellow
+          : "FFC6EFCE";                                // green
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    }
   }
 
   ws2.getCell("B6").value = "Nonbillable";
@@ -643,11 +759,23 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     cell.font = { color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
   }
 
+  // Row 11: Trailing 4-week average of billable hours (this week + prior 3 that
+  // have started). A rolling read of recent pace that smooths single-week noise.
+  ws2.getCell("B11").value = "Trailing 4-Wk Avg";
+  ws2.getCell("B11").font = { bold: true };
+  for (let i = 0; i < allWeeks.length; i++) {
+    if (allWeeks[i].monDate > today) break; // only weeks that have started
+    let sum = 0, cnt = 0;
+    for (let j = Math.max(0, i - 3); j <= i; j++) {
+      sum += weeks[allWeeks[j].key]?.billable ?? 0;
+      cnt++;
+    }
+    ws2.getRow(11).getCell(i + 3).value = round1(sum / cnt);
+  }
+
   // Row 12: YTD Over/Under — running cumulative, only through current week
   ws2.getCell("B12").value = "YTD Over/Under";
   ws2.getCell("B12").font = { bold: true };
-  const today = new Date();
-  today.setHours(12, 0, 0, 0);
   let cumWeeklyOU = 0;
   for (let i = 0; i < allWeeks.length; i++) {
     // Only include weeks that have started (Monday <= today)
@@ -658,6 +786,27 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const cell = ws2.getRow(12).getCell(i + 3);
     cell.value = round1(cumWeeklyOU);
     cell.font = { bold: true, color: { argb: cumWeeklyOU >= 0 ? "FF008000" : "FFFF0000" } };
+  }
+
+  // Legend for the Billable-row shading (rows 14-17).
+  const goalNum = params.weekly_billable_goal;
+  ws2.getCell("B14").value = "Legend — Billable hours";
+  ws2.getCell("B14").font = { bold: true };
+  const legend: Array<[number, string, string]> = [
+    [15, "FFFFC7CE", `Below minimum (< 20)`],
+    [16, "FFFFEB9C", `Approaching goal (20 to < ${goalNum})`],
+    [17, "FFC6EFCE", `At / above goal (≥ ${goalNum})`],
+  ];
+  for (const [r, argb, label] of legend) {
+    const swatch = ws2.getCell(`B${r}`);
+    swatch.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    swatch.border = {
+      top: { style: "thin", color: { argb: "FFBFBFBF" } },
+      left: { style: "thin", color: { argb: "FFBFBFBF" } },
+      bottom: { style: "thin", color: { argb: "FFBFBFBF" } },
+      right: { style: "thin", color: { argb: "FFBFBFBF" } },
+    };
+    ws2.getCell(`C${r}`).value = label;
   }
 
   ws2.getColumn(2).width = 14;
@@ -700,17 +849,18 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
 
 // ─── ROSTER (hardcoded for batch weekly goals, grouped by team) ──
 
+// Weekly billable goals match the dashboard: partners & paras = 30/wk, associates = 32/wk.
 const WEEKLY_GOALS_ROSTER = [
-  { name: "Nicholas Noe",    user_id: 348755029, goal: 35, group: "NRN" },
-  { name: "Tzipora Simmons", user_id: 359711375, goal: 30, group: "NRN" },
-  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 28, group: "NRN" },
-  { name: "Paul Romano",     user_id: 344117381, goal: 30, group: "PAR" },
-  { name: "Angela Alanis",   user_id: 358528744, goal: 28, group: "PAR" },
-  { name: "Nick Fernelius",  user_id: 359380639, goal: 30, group: "PAR" },
-  { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" },
-  { name: "Jonathan Barbee", user_id: 360091325, goal: 30, group: "KES" },
-  { name: "Anna Lozano",     user_id: 358108805, goal: 28, group: "KES" },
-  { name: "May Huynh",       user_id: 359576660, goal: 30, group: "MNH" },
+  { name: "Nicholas Noe",    user_id: 348755029, goal: 30, group: "NRN" }, // partner/para
+  { name: "Tzipora Simmons", user_id: 359711375, goal: 32, group: "NRN" }, // associate
+  { name: "Kaz Gonzalez",    user_id: 358550509, goal: 30, group: "NRN" }, // partner/para
+  { name: "Paul Romano",     user_id: 344117381, goal: 30, group: "PAR" }, // partner/para
+  { name: "Angela Alanis",   user_id: 358528744, goal: 30, group: "PAR" }, // partner/para
+  { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
+  { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
+  { name: "Jonathan Barbee", user_id: 360091325, goal: 32, group: "KES" }, // associate
+  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para
+  { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
 
 export function registerDocumentTools(server: McpServer): void {
@@ -1117,7 +1267,7 @@ export function registerDocumentTools(server: McpServer): void {
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
-      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (e.g. 30 for TBS, 28 for Kaz)"),
+      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
       box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
     },
@@ -2192,6 +2342,7 @@ export function registerDocumentTools(server: McpServer): void {
                 [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
                 [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
                 [11, round2(d.billedDollars)],
+                [12, round2(d.writeOffs)], [13, round2(d.lineDiscounts)],
                 [17, round1(rd.respHrs)], [18, round2(rd.respBilled)],
               ];
               if (isTarget) {
@@ -2211,8 +2362,8 @@ export function registerDocumentTools(server: McpServer): void {
               const row = initialsRowMap[ini];
               if (!row) continue;
               const rosterEntry = ROSTER.find(r => r.initials.toUpperCase() === ini);
-              const d = rosterEntry ? data[rosterEntry.user_id] : null;
-              const rd = rosterEntry ? respData[rosterEntry.user_id] : null;
+              const d = rosterEntry ? targetBundle.data[rosterEntry.user_id] : null;
+              const rd = rosterEntry ? targetBundle.respData[rosterEntry.user_id] : null;
 
               const cells = [
                 xmlCell(`B${row}`, monthName, { style: S.monthStr }),
@@ -2225,8 +2376,8 @@ export function registerDocumentTools(server: McpServer): void {
                 xmlCell(`I${row}`, d ? round1(d.billableHrs) : 0, { style: S.hrsFormula }),
                 xmlCell(`J${row}`, null, { style: S.totalFormula, formula: `H${row}+I${row}` }),
                 xmlCell(`K${row}`, d ? round2(d.billedDollars) : 0, { style: S.currency }),
-                xmlCell(`L${row}`, 0, { style: S.writeoffs }),
-                xmlCell(`M${row}`, 0, { style: S.currency }),
+                xmlCell(`L${row}`, d ? round2(d.writeOffs) : 0, { style: S.writeoffs }),
+                xmlCell(`M${row}`, d ? round2(d.lineDiscounts) : 0, { style: S.currency }),
                 xmlCell(`N${row}`, d ? round2(d.indivCollected) : 0, { style: S.collected }),
                 xmlCell(`Q${row}`, rd ? round1(rd.respHrs) : 0, { style: S.respHrs }),
                 xmlCell(`R${row}`, rd ? round2(rd.respBilled) : 0, { style: S.respBilled }),
