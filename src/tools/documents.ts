@@ -1632,11 +1632,12 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Pulls all numeric metrics from Clio's monthly classic Revenue Report (one CSV download covering every YTD month: billable hours, billed $, write-offs, and line discounts — by timekeeper AND by responsible attorney — the actual billed figures, not a hours×rate reconstruction). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. Pass revenue_report_id to force a specific report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Pulls all numeric metrics from a month×user Revenue Report (billable hours, billed $, write-offs, line discounts — by timekeeper AND by responsible attorney — the actual billed figures, not a hours×rate reconstruction). RECOMMENDED source: export the 'Revenue Report (Like Classic)' grouped by Activity month + User to CSV, put it in Box, and pass revenue_csv_box_file_id (reliable; works when the report lives in Clio's beta engine, which has no API). Otherwise the tool auto-selects/​downloads a matching report from Clio's /reports (classic engine only). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. Pass revenue_report_id to force a specific report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       revenue_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the monthly classic Revenue Report (overrides auto-selection by header signature). Use when multiple revenue-style reports exist and the wrong one is being picked."),
+      revenue_csv_box_file_id: z.string().optional().describe("Box file ID of a manually-exported month×user Revenue Report CSV (the beta 'Revenue Report (Like Classic)', grouped by Activity month + User). When set, the dashboard reads revenue from this Box CSV instead of Clio's /reports — the reliable path when the report lives in Clio's beta engine (no API) or the report-generation endpoint is flaky."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
@@ -1687,7 +1688,16 @@ export function registerDocumentTools(server: McpServer): void {
         // rolls up under the responsible attorney even though the timekeeper isn't
         // on the roster).
         _step = "downloading Revenue Report";
-        const { rows: revRows, report: revReport } = await getRevenueReportCSV(params.revenue_report_id);
+        // Revenue source priority: (1) a manually-exported month×user CSV in Box
+        // (the reliable path when the report lives in Clio's beta engine, which has
+        // no API, or when /reports generation is flaky); else (2) Clio's /reports.
+        const { rows: revRows, report: revReport } = params.revenue_csv_box_file_id
+          ? { rows: parseCSV((await downloadFromBox(params.revenue_csv_box_file_id)).toString("utf8")), report: { id: params.revenue_csv_box_file_id, name: "(Box CSV)" } }
+          : await getRevenueReportCSV(params.revenue_report_id);
+        if (!revRows.length || !REVENUE_REPORT_SIGNATURE.every((c) => c in revRows[0])) {
+          throw new Error(`Revenue CSV is missing required columns (${REVENUE_REPORT_SIGNATURE.join(", ")}). ${params.revenue_csv_box_file_id ? `The Box file ${params.revenue_csv_box_file_id} isn't a month×user Revenue Report (got: ${revRows[0] ? Object.keys(revRows[0]).join(", ") : "empty"}).` : ""}`);
+        }
+        const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
         const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
 
         // month -> user_id -> indiv metrics ; month -> responsible user_id -> rollup
