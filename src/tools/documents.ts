@@ -1561,6 +1561,47 @@ export function registerDocumentTools(server: McpServer): void {
     }
   );
 
+  server.tool(
+    "generate_classic_report",
+    "Generate a classic Clio report on demand (POST /reports) with explicit parameters — kind, format, an explicit date range, and optional user / responsible_attorney scope — then poll to completion and return report_id, state, CSV columns, row count, and the first rows. Use to produce a per-timekeeper revenue report (kind='revenue', user_id=…, start_date/end_date for the target month) or a firm-wide one. The returned report_id can be passed to download_dashboard_update as revenue_report_id.",
+    {
+      kind: z.string().default("revenue").describe("Report kind, e.g. 'revenue', 'productivity_by_user'"),
+      format: z.string().default("csv").describe("csv | xlsx | pdf | html | json | zip"),
+      start_date: z.string().describe("Inclusive start date, YYYY-MM-DD"),
+      end_date: z.string().describe("Inclusive end date, YYYY-MM-DD"),
+      user_id: z.coerce.number().optional().describe("Scope to a single working timekeeper (for per-attorney revenue)"),
+      responsible_attorney_id: z.coerce.number().optional().describe("Scope to a responsible attorney"),
+      poll_seconds: z.coerce.number().default(120).describe("Max seconds to poll for completion"),
+    },
+    async (p) => {
+      try {
+        const data: any = { kind: p.kind, format: p.format, start_date: p.start_date, end_date: p.end_date };
+        if (p.user_id) data.user = { id: p.user_id };
+        if (p.responsible_attorney_id) data.responsible_attorney = { id: p.responsible_attorney_id };
+        const gen = await rawPostSingle("/reports", { data });
+        const rep = gen?.data ?? gen;
+        const reportId = rep?.id;
+        let state = rep?.state;
+        const deadline = Date.now() + p.poll_seconds * 1000;
+        while (reportId && !["completed", "failed", "empty"].includes(state) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 4000));
+          try { const s = await rawGetSingle(`/reports/${reportId}`, { fields: "id,name,state,format,progress" }); state = (s?.data ?? s)?.state; }
+          catch { break; }
+        }
+        let columns: string[] = [];
+        let rowCount = 0;
+        let sample: any[] = [];
+        if (state === "completed") {
+          try { const rows = parseCSV(await downloadReport(reportId)); rowCount = rows.length; columns = rows[0] ? Object.keys(rows[0]) : []; sample = rows.slice(0, 3); }
+          catch { /* download/parse failed — state still reported */ }
+        }
+        return { content: [{ type: "text", text: JSON.stringify({ report_id: reportId, state, columns, rowCount, sample }, null, 2) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: e?.response?.status ?? String(e), detail: e?.response?.data }, null, 2) }] };
+      }
+    }
+  );
+
   // ============================================================
   // TOOL 4: download_dashboard_update
   // ============================================================
