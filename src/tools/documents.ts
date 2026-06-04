@@ -522,6 +522,42 @@ function pruneDashboardJobs() {
   }
 }
 
+// Repair a downloaded .xlsx so ExcelJS can load it even when a prior
+// programmatic write left a shared-string reference out of range (a cell with
+// t="s" whose <v> index points past the end of sharedStrings.xml). ExcelJS
+// crashes on that with "Cannot read properties of undefined (reading 'richText')"
+// in CellXform.reconcile. We pad sharedStrings with empty <si> entries so those
+// refs resolve to "" instead of undefined. No-op (returns the original buffer)
+// when every reference is already in range or anything looks unexpected.
+async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
+  try {
+    const zip = await JSZip.loadAsync(buf);
+    const ssFile = zip.file("xl/sharedStrings.xml");
+    if (!ssFile) return buf;
+    let ss = await ssFile.async("string");
+    const siCount = (ss.match(/<si(?:\s[^>]*)?>/g) || []).length;
+    let maxIdx = -1;
+    for (const name of Object.keys(zip.files)) {
+      if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
+      const xml = await zip.file(name)!.async("string");
+      const re = /<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)<\/v>/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(xml))) { const idx = parseInt(m[1], 10); if (idx > maxIdx) maxIdx = idx; }
+    }
+    if (maxIdx < siCount) return buf; // all refs in range
+    if (!/<\/sst>/.test(ss)) return buf; // unexpected shape — don't risk it
+    const pad = maxIdx - siCount + 1;
+    ss = ss.replace("</sst>", "<si><t></t></si>".repeat(pad) + "</sst>");
+    ss = ss.replace(/(<sst\b[^>]*\buniqueCount=")(\d+)(")/, (_s, a, _n, c) => a + (siCount + pad) + c);
+    zip.file("xl/sharedStrings.xml", ss);
+    console.warn(`[Dashboard] sanitizeXlsxBuffer: padded sharedStrings by ${pad} (had ${siCount}, max ref ${maxIdx}) to repair out-of-range shared-string refs`);
+    return await zip.generateAsync({ type: "nodebuffer" });
+  } catch (e: any) {
+    console.warn(`[Dashboard] sanitizeXlsxBuffer skipped: ${e?.message ?? e}`);
+    return buf;
+  }
+}
+
 // V&D tier logic
 const ATTORNEY_TIERS = [
   { ceiling: 250000, vdPct: 0.825, firmPct: 0.175 },
@@ -1921,7 +1957,7 @@ export function registerDocumentTools(server: McpServer): void {
         {
           const DASHBOARD_FILE_ID = "2199324794140"; // Claude Version 2
           _step = "downloading from Box";
-          const fileBuffer = await downloadFromBox(DASHBOARD_FILE_ID);
+          const fileBuffer = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
           _step = "loading workbook";
           const wb = new ExcelJS.Workbook();
           await wb.xlsx.load(fileBuffer);
