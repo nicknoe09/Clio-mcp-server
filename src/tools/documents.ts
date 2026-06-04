@@ -51,6 +51,54 @@ function buildSheetXml(rows: string[]): string {
 </worksheet>`;
 }
 
+/** Convert an Excel column ("A","AA",…) to a 1-based number for sorting. */
+function colToNum(s: string): number {
+  let n = 0;
+  for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
+}
+
+/**
+ * Normalize a worksheet's <sheetData>: rows must be unique and in ascending
+ * order, and cells within each row must be in ascending column order — Excel
+ * rejects violations as corrupt ("we found a problem with some content") even
+ * though JSZip/ExcelJS/openpyxl silently merge-and-sort them. Our patch path
+ * appends new month rows before </sheetData>, which leaves them out of order
+ * (and can duplicate existing row numbers), so run every output sheet through
+ * this. Duplicate rows/cells keep the FIRST occurrence.
+ */
+function sanitizeSheetXml(xml: string): string {
+  const m = xml.match(/(<sheetData[^>]*>)([\s\S]*?)(<\/sheetData>)/);
+  if (!m) return xml;
+  const body = m[2];
+  const rowRe = /<row\b[^>]*?(?:\/>|>[\s\S]*?<\/row>)/g;
+  const seen = new Map<number, string>();
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(body)) !== null) {
+    const rx = rm[0];
+    const rn = parseInt(rx.match(/\br="(\d+)"/)?.[1] ?? "", 10);
+    if (Number.isNaN(rn) || seen.has(rn)) continue; // keep first occurrence
+    seen.set(rn, rx);
+  }
+  const sortedRows = [...seen.keys()].sort((a, b) => a - b).map((rn) => {
+    const rx = seen.get(rn)!;
+    const open = rx.match(/^<row\b[^>]*?>/)?.[0];
+    if (!open || rx.endsWith("/>")) return rx; // self-closing row, no cells
+    const inner = rx.slice(open.length, rx.length - "</row>".length);
+    const cellRe = /<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g;
+    const cseen = new Map<string, string>();
+    let cm: RegExpExecArray | null;
+    while ((cm = cellRe.exec(inner)) !== null) {
+      const col = cm[0].match(/\br="([A-Z]+)\d+"/)?.[1];
+      if (!col || cseen.has(col)) continue;
+      cseen.set(col, cm[0]);
+    }
+    const cells = [...cseen.keys()].sort((a, b) => colToNum(a) - colToNum(b)).map((c) => cseen.get(c)!);
+    return open + cells.join("") + "</row>";
+  });
+  return xml.slice(0, m.index!) + m[1] + sortedRows.join("") + m[3] + xml.slice(m.index! + m[0].length);
+}
+
 /** Update a cell's value in existing sheet XML. Returns modified XML. */
 function xmlUpdateCell(xml: string, ref: string, newValue: number): string {
   // Match <c r="REF" ...>...<v>...</v>...</c> and replace the <v> content
@@ -172,7 +220,8 @@ async function surgicalWriteXlsx(
   const patchedSheets = buildSheets(newStyleIndices);
 
   // Process patched sheets
-  for (const [name, xml] of Object.entries(patchedSheets)) {
+  for (const [name, rawXml] of Object.entries(patchedSheets)) {
+    const xml = sanitizeSheetXml(rawXml); // enforce unique + sorted rows/cells
     const existingPath = sheetMap[name];
     if (existingPath) {
       // Replace existing sheet XML
@@ -236,6 +285,16 @@ async function surgicalWriteXlsx(
   zip.file("xl/workbook.xml", wbXml);
   zip.file("xl/_rels/workbook.xml.rels", relsXml);
   zip.file("[Content_Types].xml", ctXml);
+
+  // Strip directory entries. Adding new parts (e.g. xl/worksheets/sheetN.xml)
+  // makes JSZip synthesize folder objects ("xl/", "xl/worksheets/"), which it
+  // then emits as explicit zip entries whose names end in "/". A package part
+  // name ending in "/" is invalid per OPC, and Excel reports the workbook as
+  // corrupt (other readers/JSZip tolerate it). Real .xlsx packages contain no
+  // directory entries, so remove them before serializing.
+  for (const name of Object.keys(zip.files)) {
+    if ((zip.files[name] as any).dir) delete zip.files[name];
+  }
 
   return Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
 }
@@ -332,6 +391,82 @@ async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<st
   }
   const csv = await downloadReport(target.id);
   return { rows: parseCSV(csv), report: target };
+}
+
+// ========== Revenue Report (classic, monthly) helpers ==========
+// The "Revenue Report (Like Classic)" export grouped by Activity month + User
+// + Responsible attorney. ONE download carries every YTD month plus the
+// authoritative billed / billable / write-off / discount figures — replacing
+// the old firm-wide /activities pagination that reconstructed billed$ as
+// hours×rate (slow, and wrong because it ignored write-offs/discounts and used
+// the current rate rather than the billed amount).
+//
+// Reports aren't reliably tagged by `kind` for this export, so we select by
+// header signature: only the monthly-classic shape carries all of these
+// columns together (the per-matter and per-timekeeper variants do not).
+const REVENUE_REPORT_SIGNATURE = ["Activity month", "User initials", "Responsible attorney", "Billed hours value"];
+
+async function getRevenueReportCSV(reportId?: number): Promise<{ rows: Record<string, string>[]; report: any }> {
+  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format", order: "id(desc)" });
+  const csvReports = reports.filter((r: any) => r.state === "completed" && r.format === "csv");
+  const hasSignature = (rows: Record<string, string>[]) =>
+    rows.length > 0 && REVENUE_REPORT_SIGNATURE.every((c) => c in rows[0]);
+
+  if (reportId) {
+    const target = csvReports.find((r: any) => r.id === reportId);
+    if (!target) throw new Error(`Report ID ${reportId} not found among completed CSV reports.`);
+    const rows = parseCSV(await downloadReport(target.id));
+    if (!hasSignature(rows)) {
+      throw new Error(`Report ID ${reportId} ("${target.name}") is not a monthly classic Revenue Report (missing one of: ${REVENUE_REPORT_SIGNATURE.join(", ")}).`);
+    }
+    return { rows, report: target };
+  }
+
+  // Prefer reports whose name hints "revenue" (newest first), then fall back to
+  // scanning other CSV reports. Validate each candidate by header signature so a
+  // mis-named or wrong-shape report can't be silently picked. Bounded download
+  // count to avoid pathological scans.
+  const byName = csvReports.filter((r: any) => /revenue/i.test(r.name || ""));
+  const rest = csvReports.filter((r: any) => !byName.includes(r));
+  const candidates = [...byName, ...rest].slice(0, 25);
+  for (const cand of candidates) {
+    try {
+      const rows = parseCSV(await downloadReport(cand.id));
+      if (hasSignature(rows)) return { rows, report: cand };
+    } catch { /* unreadable — try next */ }
+  }
+  throw new Error(
+    `No completed monthly classic Revenue Report found in Clio (need a CSV containing: ${REVENUE_REPORT_SIGNATURE.join(", ")}). ` +
+    `Generate the "Revenue Report (Like Classic)" grouped by Activity month + User, exported as CSV — or pass revenue_report_id explicitly.`
+  );
+}
+
+// Match the revenue report's "User" field ("Last, First") to a roster user_id.
+// Returns null for non-roster timekeepers (staff/paralegals) so they're skipped
+// for the per-attorney columns but still roll up under their responsible attorney.
+function matchRosterUser(userField: string, roster: { initials: string; name: string; user_id: number }[]): number | null {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z ]/g, "").trim();
+  const parts = userField.split(",").map((p) => norm(p));
+  let last = "", first = "";
+  if (parts.length >= 2) { last = parts[0]; first = parts[1]; }
+  else { const t = norm(userField).split(/\s+/); first = t[0] || ""; last = t[t.length - 1] || ""; }
+  for (const r of roster) {
+    const rn = norm(r.name).split(/\s+/);
+    const rFirst = rn[0] || "", rLast = rn[rn.length - 1] || "";
+    if (rLast === last && (first === "" || rFirst.startsWith(first) || first.startsWith(rFirst))) return r.user_id;
+  }
+  return null;
+}
+
+// Match the revenue report's "Responsible attorney" field ("First Last") to a roster user_id.
+function matchRosterResponsible(respField: string, roster: { initials: string; name: string; user_id: number }[]): number | null {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z ]/g, "").trim();
+  const target = norm(respField);
+  if (!target) return null;
+  for (const r of roster) if (norm(r.name) === target) return r.user_id;
+  const tl = target.split(/\s+/).pop();
+  for (const r of roster) if (norm(r.name).split(/\s+/).pop() === tl) return r.user_id;
+  return null;
 }
 
 // V&D tier logic
@@ -1249,10 +1384,11 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Always downloads that workbook, recomputes all Clio metrics, REWRITES the hours/billable/billed columns for ALL year-to-date months (Jan through the target month) in '26 Compare' — catching stale values from prior calc-logic bugs automatically — and rebuilds the Bonus Config/Tracker and Attorney Performance tabs, then versions the file back to Box. Collections (cols N + S) are only written for the target month because the fee allocation CSV is single-period. Takes ~3-5min for a full-year rewrite mid-year. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Pulls all numeric metrics from Clio's monthly classic Revenue Report (one CSV download covering every YTD month: billable hours, billed $, write-offs, and line discounts — by timekeeper AND by responsible attorney — the actual billed figures, not a hours×rate reconstruction). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. Pass revenue_report_id to force a specific report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
+      revenue_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the monthly classic Revenue Report (overrides auto-selection by header signature). Use when multiple revenue-style reports exist and the wrong one is being picked."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
@@ -1280,152 +1416,152 @@ export function registerDocumentTools(server: McpServer): void {
         const endDay = new Date(params.year, params.month, 0).getDate();
         const monthEnd = `${params.year}-${String(params.month).padStart(2, "0")}-${endDay}`;
 
-        // Fetch time entries
-        const entries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          fields: "id,date,quantity,rounded_quantity,price,billed,note,user{id,name},matter{id,display_number,responsible_attorney}",
-          created_since: `${monthStart}T00:00:00+00:00`,
-        }).then(e => e.filter((x: any) => x.date >= monthStart && x.date <= monthEnd));
-
-        // Fetch fee allocation CSV for collections
-        let csvRows: Record<string, string>[] = [];
-        try { const result = await getFeeAllocationCSV(); csvRows = result.rows; } catch { /* may not exist */ }
-
-        // Build per-user data
-        const data: Record<number, {
+        type PerUserData = {
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
-          billableDollars: number; billedDollars: number;
+          billableDollars: number; billedDollars: number; writeOffs: number; lineDiscounts: number;
           bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
           indivCollected: number; respCollected: number;
-        }> = {};
+        };
+        type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
+        const newPerUser = (): PerUserData => ({
+          billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
+          billableDollars: 0, billedDollars: 0, writeOffs: 0, lineDiscounts: 0,
+          bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
+          indivCollected: 0, respCollected: 0,
+        });
 
-        for (const r of ROSTER) {
-          data[r.user_id] = {
-            billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
-            billableDollars: 0, billedDollars: 0,
-            bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
-            indivCollected: 0, respCollected: 0,
-          };
-        }
+        // ---- Pull all numeric metrics from the monthly classic Revenue Report ----
+        // ONE download carries every YTD month. Per row (Activity month × User ×
+        // Responsible attorney) we get the authoritative billed/billable/write-off/
+        // discount figures — no firm-wide /activities pagination, no hours×rate
+        // reconstruction. Individual columns aggregate by User; the Responsible
+        // section aggregates the same rows by Responsible attorney (so staff work
+        // rolls up under the responsible attorney even though the timekeeper isn't
+        // on the roster).
+        _step = "downloading Revenue Report";
+        const { rows: revRows, report: revReport } = await getRevenueReportCSV(params.revenue_report_id);
+        const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
 
-        for (const e of entries) {
-          const uid = e.user?.id;
-          if (!uid || !data[uid]) continue;
-          // rounded_quantity = billed hours rounded to billing increment.
-          // Using raw quantity here was under-reporting by up to ~20%.
-          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
-          const rate = e.price || 0;
+        // month -> user_id -> indiv metrics ; month -> responsible user_id -> rollup
+        const indivByMonth: Record<number, Record<number, PerUserData>> = {};
+        const respByMonth: Record<number, Record<number, { respHrs: number; respBilled: number }>> = {};
+        for (const row of revRows) {
+          const m = parseInt(row["Activity month"] || "0", 10);
+          if (!m || m < 1 || m > params.month) continue;
+          const billableHrs = num(row["Billable hours"]);
+          const billedDollars = num(row["Billed hours value"]);
+          const writeOffs = num(row["Credited hours value"]);
+          const lineDiscounts = Math.abs(num(row["Discounted hours amount"]));
+          const nonbillableHrs = num(row["Non-billable hours"]);
 
-          if (rate > 0) {
-            data[uid].billableHrs += hours;
-            data[uid].billableDollars += hours * rate;
-            if (e.billed) { data[uid].billedHrs += hours; data[uid].billedDollars += hours * rate; }
-            else { data[uid].unbilledHrs += hours; }
-          } else {
-            data[uid].nonbillableHrs += hours;
-            // Categorize nonbillable by note keywords
-            const note = (e.note || "").toLowerCase();
-            if (note.includes("biz dev") || note.includes("business dev") || note.includes("marketing")) data[uid].bizDev += hours;
-            else if (note.includes("potential") || note.includes("consult")) data[uid].potentialClients += hours;
-            else if (note.includes("cle") || note.includes("education") || note.includes("training")) data[uid].cle += hours;
-            else data[uid].otherAdmin += hours;
+          const uid = matchRosterUser(row["User"] || "", ROSTER);
+          if (uid != null) {
+            const d = ((indivByMonth[m] ??= {})[uid] ??= newPerUser());
+            d.billableHrs += billableHrs;
+            d.billedDollars += billedDollars;
+            d.writeOffs += writeOffs;
+            d.lineDiscounts += lineDiscounts;
+            d.nonbillableHrs += nonbillableHrs;
+          }
+          const rid = matchRosterResponsible(row["Responsible attorney"] || "", ROSTER);
+          if (rid != null) {
+            const rd = ((respByMonth[m] ??= {})[rid] ??= { respHrs: 0, respBilled: 0 });
+            rd.respHrs += billableHrs;
+            rd.respBilled += billedDollars;
           }
         }
 
-        // Collections from fee allocation CSV
+        // ---- Split nonbillable into the tracked categories via a targeted query ----
+        // The Revenue Report only carries a single Non-billable total (no matter
+        // dimension), so we fetch ONLY the admin-matter activities to break out
+        // Biz Dev / Potential Clients / CLE. "Other Admin" is the remainder
+        // (total nonbillable − these three), so it absorbs matter 00158 and any
+        // no-charge time on client matters — matching the old catch-all behavior
+        // while keeping the firm-wide scan out of the picture.
+        _step = "resolving nonbillable category matters";
+        const CATEGORY_PREFIXES: { key: "bizDev" | "potentialClients" | "cle"; prefix: string }[] = [
+          { key: "bizDev", prefix: "00706" },          // ROMSUM Business Development
+          { key: "potentialClients", prefix: "00050" }, // Potential Clients
+          { key: "cle", prefix: "00707" },              // Continuing Legal Education
+        ];
+        const allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number" });
+        const matterCat: Record<number, "bizDev" | "potentialClients" | "cle"> = {};
+        for (const cm of CATEGORY_PREFIXES) {
+          for (const mt of allMatters) {
+            if (String(mt.display_number || "").startsWith(cm.prefix)) matterCat[mt.id] = cm.key;
+          }
+        }
+
+        _step = "fetching nonbillable category activities";
+        // month -> user_id -> { bizDev, potentialClients, cle }
+        const catByMonth: Record<number, Record<number, { bizDev: number; potentialClients: number; cle: number }>> = {};
+        for (const mid of Object.keys(matterCat).map(Number)) {
+          const acts = await fetchAllPages<any>("/activities", {
+            type: "TimeEntry",
+            fields: "id,date,quantity,rounded_quantity,user{id}",
+            matter_id: mid,
+            created_since: `${params.year}-01-01T00:00:00+00:00`,
+          });
+          const cat = matterCat[mid];
+          for (const a of acts) {
+            if (a.date < `${params.year}-01-01` || a.date > monthEnd) continue;
+            const m = parseInt(String(a.date).slice(5, 7), 10);
+            if (!m || m > params.month) continue;
+            const uid = a.user?.id;
+            if (!uid) continue;
+            const slot = ((catByMonth[m] ??= {})[uid] ??= { bizDev: 0, potentialClients: 0, cle: 0 });
+            slot[cat] += (a.rounded_quantity ?? a.quantity) / 3600;
+          }
+        }
+
+        // ---- Fetch fee allocation CSV for collections (target month only) ----
+        let csvRows: Record<string, string>[] = [];
+        try { const result = await getFeeAllocationCSV(); csvRows = result.rows; } catch { /* may not exist */ }
+
+        // ---- Assemble per-month bundles for months 1..target ----
+        const monthsData: MonthBundle[] = [];
+        for (let m = 1; m <= params.month; m++) {
+          const md: Record<number, PerUserData> = {};
+          const mrd: Record<number, { respHrs: number; respBilled: number }> = {};
+          for (const r of ROSTER) {
+            const src = indivByMonth[m]?.[r.user_id];
+            const cat = catByMonth[m]?.[r.user_id];
+            const d = newPerUser();
+            if (src) {
+              d.billableHrs = src.billableHrs;
+              d.nonbillableHrs = src.nonbillableHrs;
+              d.billedDollars = src.billedDollars;
+              d.writeOffs = src.writeOffs;
+              d.lineDiscounts = src.lineDiscounts;
+            }
+            d.bizDev = cat?.bizDev ?? 0;
+            d.potentialClients = cat?.potentialClients ?? 0;
+            d.cle = cat?.cle ?? 0;
+            // Other Admin = remainder of total nonbillable after the tracked categories.
+            d.otherAdmin = Math.max(0, d.nonbillableHrs - d.bizDev - d.potentialClients - d.cle);
+            md[r.user_id] = d;
+            mrd[r.user_id] = respByMonth[m]?.[r.user_id] ?? { respHrs: 0, respBilled: 0 };
+          }
+          monthsData.push({ month: m, monthName: monthNames[m - 1], data: md, respData: mrd });
+        }
+        console.log(`[Dashboard] revenue report id=${revReport?.id} ("${revReport?.name}") rows=${revRows.length} months_built=${monthsData.length}`);
+
+        // ---- Collections from fee allocation CSV (target month only) ----
+        // The fee allocation CSV is single-period, so collections are written
+        // only for the target month (prior months keep their existing values).
+        const targetBundle = monthsData[params.month - 1];
         for (const r of csvRows) {
           const userName = r["User"] ?? "";
           const responsible = r["Responsible Attorney"] ?? "";
           const collected = parseFloat(r["Total Funds Collected"] || "0");
-
-          // Individual collected
           const matchedUser = ROSTER.find(ro => userName.toLowerCase().includes(ro.name.toLowerCase().split(" ").pop()!));
-          if (matchedUser && data[matchedUser.user_id]) {
-            data[matchedUser.user_id].indivCollected += collected;
+          if (matchedUser && targetBundle.data[matchedUser.user_id]) {
+            targetBundle.data[matchedUser.user_id].indivCollected += collected;
           }
-
-          // Responsible collected
           const matchedResp = ROSTER.find(ro => responsible.toLowerCase().includes(ro.name.toLowerCase().split(" ").pop()!));
-          if (matchedResp && data[matchedResp.user_id]) {
-            data[matchedResp.user_id].respCollected += collected;
+          if (matchedResp && targetBundle.data[matchedResp.user_id]) {
+            targetBundle.data[matchedResp.user_id].respCollected += collected;
           }
-        }
-
-        // Pre-compute responsible hours/billed for each roster member (used by both paths)
-        // Uses rounded_quantity (billed hours) same as the main loop above.
-        const respData: Record<number, { respHrs: number; respBilled: number }> = {};
-        for (const r of ROSTER) {
-          const respHrs = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + (e.rounded_quantity ?? e.quantity) / 3600, 0);
-          const respBilled = entries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-            .reduce((s: number, e: any) => s + ((e.rounded_quantity ?? e.quantity) / 3600) * (e.price || 0), 0);
-          respData[r.user_id] = { respHrs, respBilled };
-        }
-
-        // ---- Per-month aggregator (used by update_existing to backfill all
-        // YTD months on each run, so stale hours from prior calc-logic bugs
-        // get rewritten automatically). Returns time-entry data only —
-        // collections stay target-month-only per caller contract because the
-        // fee allocation CSV is single-period and we can't reliably map it
-        // to historical months without a report-matching strategy.
-        type PerUserData = {
-          billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
-          billableDollars: number; billedDollars: number;
-          bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
-          indivCollected: number; respCollected: number;
-        };
-        async function aggregateMonthTimeData(monthNum: number): Promise<{
-          data: Record<number, PerUserData>;
-          respData: Record<number, { respHrs: number; respBilled: number }>;
-          entryCount: number;
-        }> {
-          const mStart = `${params.year}-${String(monthNum).padStart(2, "0")}-01`;
-          const mEndDay = new Date(params.year, monthNum, 0).getDate();
-          const mEnd = `${params.year}-${String(monthNum).padStart(2, "0")}-${mEndDay}`;
-          const mEntries = await fetchAllPages<any>("/activities", {
-            type: "TimeEntry",
-            fields: "id,date,quantity,rounded_quantity,price,billed,note,user{id,name},matter{id,display_number,responsible_attorney}",
-            created_since: `${mStart}T00:00:00+00:00`,
-          }).then(e => e.filter((x: any) => x.date >= mStart && x.date <= mEnd));
-
-          const d: Record<number, PerUserData> = {};
-          for (const r of ROSTER) {
-            d[r.user_id] = {
-              billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
-              billableDollars: 0, billedDollars: 0,
-              bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
-              indivCollected: 0, respCollected: 0,
-            };
-          }
-          for (const e of mEntries) {
-            const uid = e.user?.id;
-            if (!uid || !d[uid]) continue;
-            const hours = (e.rounded_quantity ?? e.quantity) / 3600;
-            const rate = e.price || 0;
-            if (rate > 0) {
-              d[uid].billableHrs += hours;
-              d[uid].billableDollars += hours * rate;
-              if (e.billed) { d[uid].billedHrs += hours; d[uid].billedDollars += hours * rate; }
-              else { d[uid].unbilledHrs += hours; }
-            } else {
-              d[uid].nonbillableHrs += hours;
-              const note = (e.note || "").toLowerCase();
-              if (note.includes("biz dev") || note.includes("business dev") || note.includes("marketing")) d[uid].bizDev += hours;
-              else if (note.includes("potential") || note.includes("consult")) d[uid].potentialClients += hours;
-              else if (note.includes("cle") || note.includes("education") || note.includes("training")) d[uid].cle += hours;
-              else d[uid].otherAdmin += hours;
-            }
-          }
-
-          const rd: Record<number, { respHrs: number; respBilled: number }> = {};
-          for (const r of ROSTER) {
-            const rh = mEntries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-              .reduce((s: number, e: any) => s + (e.rounded_quantity ?? e.quantity) / 3600, 0);
-            const rb = mEntries.filter((e: any) => e.matter?.responsible_attorney?.id === r.user_id && (e.price || 0) > 0)
-              .reduce((s: number, e: any) => s + ((e.rounded_quantity ?? e.quantity) / 3600) * (e.price || 0), 0);
-            rd[r.user_id] = { respHrs: rh, respBilled: rb };
-          }
-          return { data: d, respData: rd, entryCount: mEntries.length };
         }
 
         // ---- UPDATE THE DASHBOARD IN BOX ----
@@ -1571,29 +1707,12 @@ export function registerDocumentTools(server: McpServer): void {
 
           const initialsRowMap = monthBlock.map;
 
-          _step = "backfilling prior months";
-          // ---- BACKFILL ALL YTD MONTHS ----
-          // Loop months 1..target, rewriting hours/billed columns for each.
-          // Collections (cols N=14, S=19) are only written for the target
-          // month because the fee allocation CSV is single-period — the
-          // target-month `data` already has CSV collections merged in
-          // (lines ~1154); prior months' `data` from aggregateMonthTimeData
-          // has those columns zero, and we deliberately skip writing them.
-          type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
-          const monthsData: MonthBundle[] = [];
-          for (let m = 1; m <= params.month; m++) {
-            if (m === params.month) {
-              // Reuse the upfront target-month aggregation (already has CSV collections)
-              monthsData.push({ month: m, monthName, data, respData });
-              console.log(`[Dashboard] month=${monthNames[m-1]} using upfront target-month data`);
-            } else {
-              console.log(`[Dashboard] backfill fetching ${monthNames[m-1]} ${params.year} entries`);
-              const { data: md, respData: mrd, entryCount } = await aggregateMonthTimeData(m);
-              console.log(`[Dashboard] month=${monthNames[m-1]} entries=${entryCount}`);
-              monthsData.push({ month: m, monthName: monthNames[m-1], data: md, respData: mrd });
-            }
-          }
-
+          // ---- ALL YTD MONTHS ----
+          // monthsData (months 1..target) was built upfront from the Revenue
+          // Report + targeted nonbillable query. Collections (cols N=14, S=19)
+          // live only on the target-month bundle because the fee allocation CSV
+          // is single-period; prior months keep their existing collection values
+          // (we deliberately skip writing N/S for non-target months below).
           _step = "writing Clio data to 26 Compare (all months)";
           let tkUpdated = 0;
           let monthsSkipped = 0;
@@ -1621,6 +1740,8 @@ export function registerDocumentTools(server: McpServer): void {
               wsRow.getCell(9).value = round1(d.billableHrs);
               wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs);
               wsRow.getCell(11).value = round2(d.billedDollars);
+              wsRow.getCell(12).value = round2(d.writeOffs);     // L = Write-offs (Credit Notes)
+              wsRow.getCell(13).value = round2(d.lineDiscounts); // M = Line Discounts
               wsRow.getCell(17).value = round1(rd.respHrs);
               wsRow.getCell(18).value = round2(rd.respBilled);
               // Collections — target month only. CSV is single-period so
@@ -2221,6 +2342,7 @@ export function registerDocumentTools(server: McpServer): void {
                 [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
                 [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
                 [11, round2(d.billedDollars)],
+                [12, round2(d.writeOffs)], [13, round2(d.lineDiscounts)],
                 [17, round1(rd.respHrs)], [18, round2(rd.respBilled)],
               ];
               if (isTarget) {
@@ -2240,8 +2362,8 @@ export function registerDocumentTools(server: McpServer): void {
               const row = initialsRowMap[ini];
               if (!row) continue;
               const rosterEntry = ROSTER.find(r => r.initials.toUpperCase() === ini);
-              const d = rosterEntry ? data[rosterEntry.user_id] : null;
-              const rd = rosterEntry ? respData[rosterEntry.user_id] : null;
+              const d = rosterEntry ? targetBundle.data[rosterEntry.user_id] : null;
+              const rd = rosterEntry ? targetBundle.respData[rosterEntry.user_id] : null;
 
               const cells = [
                 xmlCell(`B${row}`, monthName, { style: S.monthStr }),
@@ -2254,8 +2376,8 @@ export function registerDocumentTools(server: McpServer): void {
                 xmlCell(`I${row}`, d ? round1(d.billableHrs) : 0, { style: S.hrsFormula }),
                 xmlCell(`J${row}`, null, { style: S.totalFormula, formula: `H${row}+I${row}` }),
                 xmlCell(`K${row}`, d ? round2(d.billedDollars) : 0, { style: S.currency }),
-                xmlCell(`L${row}`, 0, { style: S.writeoffs }),
-                xmlCell(`M${row}`, 0, { style: S.currency }),
+                xmlCell(`L${row}`, d ? round2(d.writeOffs) : 0, { style: S.writeoffs }),
+                xmlCell(`M${row}`, d ? round2(d.lineDiscounts) : 0, { style: S.currency }),
                 xmlCell(`N${row}`, d ? round2(d.indivCollected) : 0, { style: S.collected }),
                 xmlCell(`Q${row}`, rd ? round1(rd.respHrs) : 0, { style: S.respHrs }),
                 xmlCell(`R${row}`, rd ? round2(rd.respBilled) : 0, { style: S.respBilled }),
@@ -2357,18 +2479,24 @@ export function registerDocumentTools(server: McpServer): void {
 
           // Paralegal section
           const paraStart = 21 + attys.length + 2;
-          trackerRows.push(xmlRow(paraStart, [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")]));
           const paraHdr = paraStart + 1;
+          // Row `paraStart`: section title + paralegal name headers.
+          // Row `paraHdr`:   per-paralegal column sub-headers.
+          // NB: each cell's ref row MUST match the row it's emitted in — a
+          // cell like B30 inside <row r="31"> is invalid OOXML and Excel
+          // discards the sheet's cell data ("Removed Records").
+          const paraTitleCells: string[] = [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")];
           const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month")];
           const XML_PARALEGALS = ["ACA", "AFL", "AKG"];
           const XML_PARA_TIERS = [{ minHours: 133, bonus: 500 }, { minHours: 121, bonus: 300 }, { minHours: 110, bonus: 100 }];
           for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
             const col = 2 + pi * 3;
-            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
+            paraTitleCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
             paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`, "Billable Hrs"));
             paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier"));
             paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus"));
           }
+          trackerRows.push(xmlRow(paraStart, paraTitleCells));
           trackerRows.push(xmlRow(paraHdr, paraHdrCells));
 
           for (let mi = 0; mi < 12; mi++) {
