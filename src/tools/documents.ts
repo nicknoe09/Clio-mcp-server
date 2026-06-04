@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, downloadReport, rawGetSingle } from "../clio/pagination";
+import { fetchAllPages, downloadReport, rawGetSingle, rawPostSingle } from "../clio/pagination";
 import {
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
   Header, Footer, AlignmentType, HeadingLevel, BorderStyle, WidthType,
@@ -1473,6 +1473,90 @@ export function registerDocumentTools(server: McpServer): void {
       }
 
       return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+    }
+  );
+
+  // ============================================================
+  // Report Preset tooling (classic API): list presets + their options,
+  // create a preset, and generate-on-demand from a preset. Beta custom
+  // reports are backed by classic ReportPresets (a report_schedule points at
+  // a report_preset_id), so generate_report_from_preset can produce that
+  // report NOW — a normal /reports entry, downloadable, usable as
+  // download_dashboard_update's revenue_report_id — without waiting on a schedule.
+  // ============================================================
+  server.tool(
+    "list_report_presets",
+    "List classic Clio Report Presets with their options (group_by, date_range, etc.). Beta custom reports are backed by presets too, so this reveals the exact options schema and the preset_id behind a scheduled/beta report. Read-only.",
+    {},
+    async () => {
+      try {
+        const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled,options" });
+        return { content: [{ type: "text", text: JSON.stringify(presets.map((p: any) => ({ id: p.id, name: p.name, kind: p.kind, format: p.format, category: p.category, disabled: p.disabled, options: p.options })), null, 2) }] };
+      } catch (e: any) {
+        // Fallback: the list endpoint may reject the `options` field; fetch options per-record.
+        try {
+          const presets = await fetchAllPages<any>("/report_presets", { fields: "id,name,kind,format,category,disabled" });
+          const detailed: any[] = [];
+          for (const p of presets.slice(0, 25)) {
+            try { const one = await rawGetSingle(`/report_presets/${p.id}`, { fields: "id,name,kind,format,options" }); detailed.push(one?.data ?? one); }
+            catch { detailed.push({ id: p.id, name: p.name, kind: p.kind, options: "(options fetch failed)" }); }
+          }
+          return { content: [{ type: "text", text: JSON.stringify(detailed, null, 2) }] };
+        } catch (e2: any) {
+          return { content: [{ type: "text", text: JSON.stringify({ error: e2?.response?.status ?? String(e2), detail: typeof e2?.response?.data === "string" ? e2.response.data.slice(0, 300) : e2?.response?.data }, null, 2) }] };
+        }
+      }
+    }
+  );
+
+  server.tool(
+    "create_report_preset",
+    "Create a classic Clio Report Preset (POST /report_presets). Provide kind (e.g. 'revenue'), format (default csv), and the kind-specific options object (group_by, date_range, start_date, end_date, kind). Returns the created preset or the API error detail. Model options on an existing preset from list_report_presets.",
+    {
+      name: z.string().describe("Preset name"),
+      kind: z.string().describe("Report kind, e.g. 'revenue'"),
+      format: z.string().default("csv").describe("csv | xlsx | pdf | html | json | zip"),
+      options: z.record(z.any()).describe("Options object, e.g. { date_range:'this_month', format:'csv', group_by:'user', kind:'revenue' }"),
+    },
+    async (p) => {
+      try {
+        const res = await rawPostSingle("/report_presets", { data: { name: p.name, kind: p.kind, format: p.format, options: p.options } });
+        return { content: [{ type: "text", text: JSON.stringify(res?.data ?? res, null, 2) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: e?.response?.status ?? String(e), detail: e?.response?.data }, null, 2) }] };
+      }
+    }
+  );
+
+  server.tool(
+    "generate_report_from_preset",
+    "Generate a report on demand from a Report Preset (POST /report_presets/{id}/generate_report), poll until complete (bounded), and return the new report's id, state, and CSV header columns + first row so the grouping/columns can be verified. The returned report_id is a classic /reports id usable as download_dashboard_update's revenue_report_id. Use this to produce a beta/scheduled report's output NOW instead of waiting for its schedule.",
+    {
+      preset_id: z.coerce.number().describe("ReportPreset id (from list_report_presets, or a report_schedule's report_preset_id)"),
+      poll_seconds: z.coerce.number().default(90).describe("Max seconds to poll for completion"),
+    },
+    async (p) => {
+      try {
+        const gen = await rawPostSingle(`/report_presets/${p.preset_id}/generate_report`, {});
+        const rep = gen?.data ?? gen;
+        const reportId = rep?.id;
+        let state = rep?.state;
+        const deadline = Date.now() + p.poll_seconds * 1000;
+        while (reportId && !["completed", "failed", "empty"].includes(state) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 4000));
+          try { const s = await rawGetSingle(`/reports/${reportId}`, { fields: "id,name,state,format,progress" }); state = (s?.data ?? s)?.state; }
+          catch { break; }
+        }
+        let columns: string[] = [];
+        let firstRow: any = null;
+        if (state === "completed") {
+          try { const rows = parseCSV(await downloadReport(reportId)); columns = rows[0] ? Object.keys(rows[0]) : []; firstRow = rows[0] ?? null; }
+          catch { /* download/parse failed — state still reported */ }
+        }
+        return { content: [{ type: "text", text: JSON.stringify({ report_id: reportId, state, columns, firstRow }, null, 2) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: e?.response?.status ?? String(e), detail: e?.response?.data }, null, 2) }] };
+      }
     }
   );
 
