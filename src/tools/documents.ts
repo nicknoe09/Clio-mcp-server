@@ -494,6 +494,34 @@ function matchRosterResponsible(respField: string, roster: { initials: string; n
   return null;
 }
 
+// ---- Background-job registry for long-running dashboard updates ----
+// download_dashboard_update can take several minutes (classic mode generates a
+// revenue report per timekeeper), well past the MCP client's ~180s timeout. So
+// it runs as a detached job: the tool returns a job_id immediately and the work
+// continues server-side; get_dashboard_status reports progress/result. The Map
+// is a module singleton, so it persists across tool calls for the life of the
+// server process (jobs are lost only if the process restarts).
+type DashJob = {
+  id: string;
+  status: "running" | "done" | "error";
+  started_at: string;
+  finished_at?: string;
+  result?: any;
+  error?: string;
+};
+const dashboardJobs = new Map<string, DashJob>();
+function pruneDashboardJobs() {
+  const now = Date.now();
+  for (const [id, j] of dashboardJobs) {
+    if (j.finished_at && now - new Date(j.finished_at).getTime() > 2 * 3600 * 1000) dashboardJobs.delete(id);
+  }
+  while (dashboardJobs.size > 50) {
+    const oldest = dashboardJobs.keys().next().value;
+    if (oldest === undefined) break;
+    dashboardJobs.delete(oldest);
+  }
+}
+
 // V&D tier logic
 const ATTORNEY_TIERS = [
   { ceiling: 250000, vdPct: 0.825, firmPct: 0.175 },
@@ -1642,6 +1670,13 @@ export function registerDocumentTools(server: McpServer): void {
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
     async (params) => {
+      const jobId = `dash_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      const job: DashJob = { id: jobId, status: "running", started_at: new Date().toISOString() };
+      dashboardJobs.set(jobId, job);
+      pruneDashboardJobs();
+      // Run detached so the MCP call returns immediately (the work outlasts the
+      // ~180s client timeout). Result/error are recorded on the job for polling.
+      (async () => {
       let _step = "init";
       try {
         const ROSTER = [
@@ -2958,6 +2993,30 @@ export function registerDocumentTools(server: McpServer): void {
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, step: _step, message: err.message, stack: err.stack?.split("\n").slice(0, 5).join(" | ") }) }], isError: true };
       }
+      })()
+        .then((res: any) => { job.result = res; job.status = res?.isError ? "error" : "done"; job.finished_at = new Date().toISOString(); })
+        .catch((err: any) => { job.status = "error"; job.error = String(err?.message ?? err); job.finished_at = new Date().toISOString(); });
+      return { content: [{ type: "text" as const, text: JSON.stringify({ job_id: jobId, status: "started", message: "Dashboard update is running in the background. Classic (default) mode takes ~1–5 min — it generates a revenue report per timekeeper. Poll get_dashboard_status with this job_id; the workbook versions in Box when done. (Tip: revenue_csv_box_file_id is much faster.)" }) }] };
+    }
+  );
+
+  // ============================================================
+  // get_dashboard_status — poll a download_dashboard_update background job
+  // ============================================================
+  server.tool(
+    "get_dashboard_status",
+    "Check a download_dashboard_update background job by job_id: returns running | done | error, timestamps, and (when finished) the full result or error. Poll this after calling download_dashboard_update, which returns immediately with a job_id.",
+    { job_id: z.string().describe("The job_id returned by download_dashboard_update") },
+    async (p) => {
+      const j = dashboardJobs.get(p.job_id);
+      if (!j) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No job '${p.job_id}' found — it may have expired or the server restarted. Re-run download_dashboard_update.`, known_jobs: [...dashboardJobs.keys()] }) }] };
+      }
+      let result: any;
+      const inner = j.result?.content?.[0]?.text;
+      if (inner) { try { result = JSON.parse(inner); } catch { result = inner; } }
+      const elapsed_s = Math.round(((j.finished_at ? new Date(j.finished_at).getTime() : Date.now()) - new Date(j.started_at).getTime()) / 1000);
+      return { content: [{ type: "text" as const, text: JSON.stringify({ id: j.id, status: j.status, started_at: j.started_at, finished_at: j.finished_at, elapsed_s, error: j.error, result }, null, 2) }] };
     }
   );
 }
