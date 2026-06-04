@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, downloadReport } from "../clio/pagination";
+import { fetchAllPages, downloadReport, rawGetSingle } from "../clio/pagination";
 import {
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
   Header, Footer, AlignmentType, HeadingLevel, BorderStyle, WidthType,
@@ -1401,6 +1401,60 @@ export function registerDocumentTools(server: McpServer): void {
           }, null, 2),
         }],
       };
+    }
+  );
+
+  // ============================================================
+  // DIAGNOSTIC: probe_clio_report_apis  (read-only)
+  // Determines whether Clio's new "Custom Reports" (beta) engine is reachable
+  // via the API and under what path, vs the classic /reports surface the
+  // dashboard tool uses. Hits candidate endpoints with the firm's token and
+  // reports HTTP status + response shape, plus enumerates the classic reports.
+  // ============================================================
+  server.tool(
+    "probe_clio_report_apis",
+    "Diagnostic (read-only). Probes candidate Clio report API endpoints with the firm's token and returns HTTP status + response shape for each, to discover whether the new 'Custom Reports' (beta) reporting engine is API-accessible and under what path (vs the classic /reports endpoint the dashboard uses). Also enumerates classic /reports by kind/name/format so a missing or mis-grouped report can be spotted. Run this when the dashboard can't find the expected Revenue Report.",
+    {},
+    async () => {
+      // All paths are relative to CLIO_API_BASE_URL (…/api/v4). If the new engine
+      // lives outside v4 entirely, every candidate will 404 — itself an answer.
+      const candidates = [
+        "/custom_reports", "/custom_report_runs", "/custom_report_presets",
+        "/custom_report_templates", "/report_schedules", "/report_presets",
+        "/report_runs", "/reporting/custom_reports", "/insights", "/insight_reports",
+      ];
+      const candidate_endpoints: any[] = [];
+      for (const path of candidates) {
+        try {
+          const res = await rawGetSingle(path, { limit: 1 });
+          const data = res?.data ?? res;
+          const sample = Array.isArray(data) ? data[0] : data;
+          candidate_endpoints.push({ path, status: 200, ok: true, sampleKeys: sample ? Object.keys(sample).slice(0, 30) : [] });
+        } catch (e: any) {
+          const status = e?.response?.status ?? "ERR";
+          const detail = typeof e?.response?.data === "string" ? e.response.data.slice(0, 160) : undefined;
+          candidate_endpoints.push({ path, status, ok: false, detail });
+        }
+      }
+      // Classic /reports: enumerate kinds + completed CSV reports so we can see
+      // exactly what the dashboard's selector has to work with.
+      let classic_reports: any = {};
+      try {
+        const reps = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format" });
+        const byKind: Record<string, number> = {};
+        for (const r of reps) byKind[r.kind ?? "?"] = (byKind[r.kind ?? "?"] || 0) + 1;
+        classic_reports = {
+          total: reps.length,
+          by_kind: byKind,
+          completed_csv: reps
+            .filter((r: any) => r.state === "completed" && r.format === "csv")
+            .slice(0, 50)
+            .map((r: any) => ({ id: r.id, name: r.name, kind: r.kind })),
+        };
+      } catch (e: any) {
+        classic_reports = { error: e?.response?.status ?? String(e) };
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ candidate_endpoints, classic_reports }, null, 2) }] };
     }
   );
 
