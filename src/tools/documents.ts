@@ -1602,6 +1602,31 @@ export function registerDocumentTools(server: McpServer): void {
     }
   );
 
+  server.tool(
+    "get_report",
+    "Fetch a Clio report by ID: returns its state/kind/format/source, and if completed and CSV, the columns, row count, and first rows. Decouples retrieval from generation — use it to pull a report that finished server-side after a generate call timed out, instead of regenerating (each regenerate spawns a new report). A completed CSV report's id can be passed to download_dashboard_update as revenue_report_id.",
+    {
+      report_id: z.coerce.number().describe("The Clio report id"),
+      rows_sample: z.coerce.number().default(5).describe("How many CSV rows to return as a sample"),
+    },
+    async (p) => {
+      try {
+        const meta = await rawGetSingle(`/reports/${p.report_id}`, { fields: "id,name,state,kind,format,progress,source,category,created_at" });
+        const m = meta?.data ?? meta;
+        let columns: string[] = [];
+        let rowCount = 0;
+        let sample: any[] = [];
+        if (m?.state === "completed" && m?.format === "csv") {
+          try { const rows = parseCSV(await downloadReport(p.report_id)); rowCount = rows.length; columns = rows[0] ? Object.keys(rows[0]) : []; sample = rows.slice(0, p.rows_sample); }
+          catch { /* download/parse failed — meta still returned */ }
+        }
+        return { content: [{ type: "text", text: JSON.stringify({ report: { id: m?.id, name: m?.name, state: m?.state, kind: m?.kind, format: m?.format, progress: m?.progress, source: m?.source, created_at: m?.created_at }, columns, rowCount, sample }, null, 2) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: e?.response?.status ?? String(e), detail: e?.response?.data }, null, 2) }] };
+      }
+    }
+  );
+
   // ============================================================
   // TOOL 4: download_dashboard_update
   // ============================================================
