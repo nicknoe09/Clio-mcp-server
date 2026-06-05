@@ -291,23 +291,57 @@ async function surgicalWriteXlsx(
   let relsXml = await zip.file("xl/_rels/workbook.xml.rels")!.async("string");
   let ctXml = await zip.file("[Content_Types].xml")!.async("string");
 
-  // Add custom styles to the workbook for new sheets (original default is a date format!)
-  // Append General, Currency, Decimal, and Percent styles to cellXfs
+  // Add custom styles for our rebuilt sheets: General, Currency, Decimal,
+  // Percent, Bold. CRITICAL: we must NOT assume custom numFmt id 164 means
+  // "$#,##0.00" — the host workbook may already define 164 (Rachel's file uses
+  // 164 for a DATE format "[$-409]mmmm-yy"), so hardcoding it rendered every
+  // currency cell as a date. Allocate FRESH numFmt ids above the workbook's
+  // existing max, define them, and reference those. Percent/General use the
+  // builtin ids (10, 0) which never collide.
   const stylesFile = zip.file("xl/styles.xml");
   let newStyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0" };
   if (stylesFile) {
     let stylesXml = await stylesFile.async("string");
-    // Find current cellXfs count
+
+    // Pick numFmt ids strictly above every id already present (custom ids
+    // start at 164). Cap the scan to sane ids to ignore stray large numbers.
+    let maxFmtId = 163;
+    for (const m of stylesXml.matchAll(/numFmtId="(\d+)"/g)) {
+      const id = parseInt(m[1], 10);
+      if (id >= 164 && id < 10000 && id > maxFmtId) maxFmtId = id;
+    }
+    const curFmtId = maxFmtId + 1; // "$"#,##0.00
+    const decFmtId = maxFmtId + 2; // 0.0
+    const newNumFmts =
+      `<numFmt numFmtId="${curFmtId}" formatCode="&quot;$&quot;#,##0.00"/>` +
+      `<numFmt numFmtId="${decFmtId}" formatCode="0.0"/>`;
+    const nfCountMatch = stylesXml.match(/<numFmts count="(\d+)">/);
+    if (nfCountMatch) {
+      stylesXml = stylesXml.replace(`<numFmts count="${nfCountMatch[1]}">`, `<numFmts count="${parseInt(nfCountMatch[1]) + 2}">`);
+      stylesXml = stylesXml.replace("</numFmts>", newNumFmts + "</numFmts>");
+    } else {
+      // No <numFmts> yet — it must be the first child of <styleSheet>.
+      stylesXml = stylesXml.replace(/(<styleSheet\b[^>]*>)/, `$1<numFmts count="2">${newNumFmts}</numFmts>`);
+    }
+
+    // Find a bold font id (one whose <font> contains <b/>); fall back to 1.
+    let boldFontId = 1;
+    const fontsMatch = stylesXml.match(/<fonts\b[^>]*>([\s\S]*?)<\/fonts>/);
+    if (fontsMatch) {
+      const fonts = fontsMatch[1].match(/<font\b[^>]*\/>|<font\b[^>]*>[\s\S]*?<\/font>/g) ?? [];
+      const idx = fonts.findIndex((f) => /<b\s*\/>|<b>/.test(f));
+      if (idx >= 0) boldFontId = idx;
+    }
+
     const xfCountMatch = stylesXml.match(/<cellXfs count="(\d+)">/);
     if (xfCountMatch) {
       const currentCount = parseInt(xfCountMatch[1]);
-      // Append 5 new xf entries: General (0), Currency (164), Decimal (165), Percent (10), Bold General
       const newXfs = [
-        `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,          // General
-        `<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,        // $#,##0.00
-        `<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,        // 0.0
-        `<xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,         // 0.00%
-        `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold General
+        `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                       // General
+        `<xf numFmtId="${curFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // $#,##0.00
+        `<xf numFmtId="${decFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // 0.0
+        `<xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                      // 0.00% (builtin)
+        `<xf numFmtId="0" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold General
       ];
       newStyleIndices = {
         general: String(currentCount),
@@ -321,8 +355,8 @@ async function surgicalWriteXlsx(
         `<cellXfs count="${currentCount + newXfs.length}">`
       );
       stylesXml = stylesXml.replace("</cellXfs>", newXfs.join("") + "</cellXfs>");
-      zip.file("xl/styles.xml", stylesXml);
     }
+    zip.file("xl/styles.xml", stylesXml);
   }
 
   // Find max IDs for adding new sheets
@@ -2997,15 +3031,31 @@ export function registerDocumentTools(server: McpServer): void {
           const ssFile = origZip.file("xl/sharedStrings.xml");
           const sharedStrings = ssFile ? parseSharedStrings(await ssFile.async("string")) : [];
 
-          // Helper: update a cell value in the XML
+          // Helper: write a numeric value into a cell in the XML.
+          // Handles BOTH self-closing/empty cells (<c r="C43" s="62"/>) and cells
+          // with content (<c r="D5" s="7"><v>0</v></c>). The empty-tab target
+          // cells are self-closing; the old single-regex version required </c>
+          // and so over-matched past a self-closing cell into the NEXT cell's
+          // </c>, fusing cells and dumping the value into the wrong column.
           function patchCell(xml: string, ref: string, val: number): string {
-            const re = new RegExp(`(<c\\s[^>]*r="${ref}"[^>]*>)([\\s\\S]*?)(</c>)`);
-            const m = xml.match(re);
+            // 1) self-closing empty cell — turn it into a value cell (preserve
+            //    style, drop any t="…" so the number isn't read as a string idx).
+            const selfRe = new RegExp(`<c\\b([^>]*?)\\br="${ref}"([^>]*?)/>`);
+            const sm = xml.match(selfRe);
+            if (sm) {
+              const attrs = `${sm[1]} r="${ref}"${sm[2]}`.replace(/\s+t="[^"]*"/g, "").replace(/\s+/g, " ").trim();
+              return xml.replace(selfRe, `<c ${attrs}><v>${val}</v></c>`);
+            }
+            // 2) cell with content — replace/insert its <v> (lazy match to its
+            //    own </c>; safe because self-closing was handled above).
+            const fullRe = new RegExp(`(<c\\b[^>]*\\br="${ref}"[^>]*>)([\\s\\S]*?)(</c>)`);
+            const m = xml.match(fullRe);
             if (m) {
+              const open = m[1].replace(/\s+t="[^"]*"/g, ""); // numeric write: drop t="s"/"e"/"str"
               let inner = m[2];
-              if (/<v>/.test(inner)) inner = inner.replace(/<v>[^<]*<\/v>/, `<v>${val}</v>`);
+              if (/<v>/.test(inner)) inner = inner.replace(/<v>[\s\S]*?<\/v>/, `<v>${val}</v>`);
               else inner += `<v>${val}</v>`;
-              return xml.replace(re, `${m[1]}${inner}${m[3]}`);
+              return xml.replace(fullRe, `${open}${inner}${m[3]}`);
             }
             return xml;
           }
