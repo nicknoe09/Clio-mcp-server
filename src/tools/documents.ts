@@ -451,6 +451,24 @@ async function surgicalWriteXlsx(
     return partPresent(part.replace(/^\//, "")) ? ov : "";
   });
 
+  // Force Excel to recalc every formula on open. We write VALUES into input
+  // cells; the rate/total formulas that reference them keep stale cached <v>
+  // values until a recalc. Setting calcId="0" + fullCalcOnLoad="1" makes Excel
+  // do a full recalculation the moment the file opens — no manual Ctrl+Alt+F9.
+  if (/<calcPr\b/.test(wbXml)) {
+    wbXml = wbXml.replace(/<calcPr\b[^>]*\/>/, (m) => {
+      const attrs = m.slice("<calcPr".length, -2)
+        .replace(/\s*calcId="[^"]*"/, "")
+        .replace(/\s*fullCalcOnLoad="[^"]*"/, "");
+      return `<calcPr calcId="0" fullCalcOnLoad="1"${attrs}/>`;
+    });
+  } else {
+    const cp = `<calcPr calcId="0" fullCalcOnLoad="1"/>`;
+    if (/<\/definedNames>/.test(wbXml)) wbXml = wbXml.replace("</definedNames>", () => "</definedNames>" + cp);
+    else if (/<\/sheets>/.test(wbXml)) wbXml = wbXml.replace("</sheets>", () => "</sheets>" + cp);
+    else wbXml = wbXml.replace("</workbook>", () => cp + "</workbook>");
+  }
+
   zip.file("xl/workbook.xml", wbXml);
   zip.file("xl/_rels/workbook.xml.rels", relsXml);
   zip.file("[Content_Types].xml", ctXml);
@@ -683,20 +701,30 @@ async function getRealizationReportCSV(opts: {
   return { rows: parseCSV(csv), report: { id: target.id, kind: target.kind ?? "realization", via: "list" } };
 }
 
-// Per-timekeeper $ buckets from a Realization Report CSV: each row's
-// "Billed Time Collected"/"Billed Time Outstanding" is summed by User
-// (the timekeeper who did the work). This matches the Collection tab's
-// "Collected $" / "Uncollected $" basis.
-type RealizCollectionsAgg = { collected: number; outstanding: number };
+// Per-timekeeper COLLECTED / UNCOLLECTED HOURS from a Realization Report CSV.
+// The Collection tab is in HOURS (consistent with the Realization tab), not $.
+// The report gives, per time entry: Billed Hours, Billed Time Amount ($),
+// Billed Time Collected ($), Billed Time Outstanding ($). We allocate each
+// entry's billed HOURS to collected vs uncollected in proportion to its
+// collected/outstanding dollars (so the collection rate in hours == the rate
+// in dollars, and partial payments are handled). Summed by the User who did
+// the work.
+type RealizCollectionsAgg = { collectedHrs: number; uncollectedHrs: number };
 function aggregateRealizationCollections(rows: Record<string, string>[], nameToUid: Map<string, number>): Record<number, RealizCollectionsAgg> {
+  const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
   const out: Record<number, RealizCollectionsAgg> = {};
   for (const r of rows) {
     const name = (r["User"] ?? "").trim().toLowerCase();
     const uid = nameToUid.get(name);
     if (uid == null) continue;
-    const slot = (out[uid] ??= { collected: 0, outstanding: 0 });
-    slot.collected   += parseFloat((r["Billed Time Collected"]   ?? "0").replace(/,/g, "")) || 0;
-    slot.outstanding += parseFloat((r["Billed Time Outstanding"] ?? "0").replace(/,/g, "")) || 0;
+    const billed$ = num(r["Billed Time Amount"]);
+    const coll$ = num(r["Billed Time Collected"]);
+    const out$ = num(r["Billed Time Outstanding"]);
+    const hrs = num(r["Billed Hours"]);
+    if (billed$ <= 0 || hrs <= 0) continue;
+    const slot = (out[uid] ??= { collectedHrs: 0, uncollectedHrs: 0 });
+    slot.collectedHrs += hrs * (coll$ / billed$);
+    slot.uncollectedHrs += hrs * (out$ / billed$);
   }
   return out;
 }
@@ -2049,7 +2077,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report (target month only). The month×user sources rewrite all YTD months; the classic default writes the target month only. Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected $ / Uncollected $) sourced from an auto-generated Clio Realization report's Billed Time Collected / Billed Time Outstanding columns (attributed to the timekeeper who did the work) — pass realization_report_id to use a specific pre-generated report instead. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report (target month only). The month×user sources rewrite all YTD months; the classic default writes the target month only. Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS) sourced from an auto-generated Clio Realization report — each entry's billed hours are allocated to collected vs uncollected in proportion to its collected/outstanding dollars; pass realization_report_id to use a specific pre-generated report instead. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -3258,10 +3286,10 @@ export function registerDocumentTools(server: McpServer): void {
           // ============================================================
           // Patch Collection tab from Realization Report CSV
           // ============================================================
-          // The Realization Report exposes per-time-entry "Billed Time Collected"
-          // and "Billed Time Outstanding" — attributed to the timekeeper who did
-          // the work. Summed by User per month, these match Rachel's Collection
-          // tab Collected $ / Uncollected $ columns directly.
+          // The Realization Report gives per-time-entry Billed Hours plus the
+          // collected/outstanding DOLLAR split. The Collection tab is in HOURS,
+          // so we allocate each entry's billed hours to collected vs uncollected
+          // in proportion to its collected/outstanding dollars, summed by User.
           _step = "patch collection from realization report";
           try {
             const rr = await getRealizationReportCSV({
@@ -3288,8 +3316,9 @@ export function registerDocumentTools(server: McpServer): void {
                   if (!uid) continue;
                   const c = collAgg[uid];
                   if (!c) continue;
-                  collectionXml = patchCell(collectionXml, `C${row}`, round2(c.collected));
-                  collectionXml = patchCell(collectionXml, `D${row}`, round2(c.outstanding));
+                  // Collection tab is in HOURS (collected / uncollected hrs).
+                  collectionXml = patchCell(collectionXml, `C${row}`, round1(c.collectedHrs));
+                  collectionXml = patchCell(collectionXml, `D${row}`, round1(c.uncollectedHrs));
                   collectionPatched++;
                 }
               }
