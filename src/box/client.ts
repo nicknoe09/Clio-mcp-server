@@ -158,3 +158,28 @@ export async function boxDeleteFile(
   const client = createApiClient(userEmail);
   await client.delete(`/files/${fileId}`);
 }
+
+/**
+ * Find a file by exact name within a folder. Returns its id, or null if absent.
+ * Pages through the folder's items (handles folders with >1000 entries).
+ */
+export async function boxFindFileInFolder(
+  folderId: string,
+  fileName: string,
+  userEmail: string,
+): Promise<string | null> {
+  const client = createApiClient(userEmail);
+  const limit = 1000;
+  for (let offset = 0; ; offset += limit) {
+    const resp = await client.get(`/folders/${folderId}/items`, {
+      params: { fields: "id,name,type", limit, offset },
+    });
+    const entries: any[] = resp.data?.entries ?? [];
+    for (const e of entries) {
+      if (e.type === "file" && e.name === fileName) return String(e.id);
+    }
+    const total = resp.data?.total_count ?? entries.length;
+    if (offset + entries.length >= total || entries.length === 0) break;
+  }
+  return null;
+}

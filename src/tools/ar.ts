@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import ExcelJS from "exceljs";
 import { fetchAllPages } from "../clio/pagination";
+import { uploadToBox, createBoxFile, findBoxFileId, downloadFromBox } from "../utils/box";
+
+// Box folder that holds the firm's managed workbooks (same as the dashboard).
+const AR_SCORECARD_FOLDER = "348313592902";
+const AR_SCORECARD_FILENAME = "AR Scorecard.xlsx";
 
 const BILL_FIELDS =
   "id,number,issued_at,due_at,balance,total,state,matters";
@@ -519,4 +525,246 @@ export function registerARTools(server: McpServer): void {
       }
     }
   );
+
+  // ============================================================
+  // get_ar_scorecard
+  // ============================================================
+  server.tool(
+    "get_ar_scorecard",
+    "EOS-scorecard AR metrics from live Clio AR (state=awaiting_payment). Returns compact weekly measurables — total AR, % and $ over 90 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown and the top 10 open balances. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: a 'Weekly Scorecard' tab appends one row per run (week-over-week trend), with 'By Attorney' and 'Top 10 Accounts' tabs refreshed to the current snapshot. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
+    {
+      as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
+      update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
+    },
+    async (params) => {
+      try {
+        const asOf = params.as_of_date ? new Date(params.as_of_date + "T00:00:00") : new Date();
+        const asOfStr = asOf.toISOString().split("T")[0];
+        const bills = await fetchAllPages<any>("/bills", {
+          fields: "id,number,issued_at,due_at,balance,total,state,matters{id,display_number,description,client{name},responsible_attorney{name}}",
+          state: "awaiting_payment",
+        });
+
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        type Row = { balance: number; days: number; client: string; matter: string; attorney: string };
+        const rows: Row[] = [];
+        for (const b of bills) {
+          const bal = typeof b.balance === "number" ? b.balance : parseFloat(b.balance) || 0;
+          if (bal <= 0) continue;
+          const due = b.due_at ? new Date(b.due_at) : (b.issued_at ? new Date(b.issued_at) : asOf);
+          const days = Math.max(0, Math.floor((asOf.getTime() - due.getTime()) / 86400000));
+          const m = b.matters?.[0];
+          rows.push({
+            balance: bal,
+            days,
+            client: m?.client?.name ?? "Unknown",
+            matter: m?.display_number ? `${m.display_number}${m.description ? " — " + m.description : ""}` : (m?.description ?? "—"),
+            attorney: m?.responsible_attorney?.name ?? "(Unassigned)",
+          });
+        }
+
+        const sum = (f: (r: Row) => boolean) => round2(rows.filter(f).reduce((s, r) => s + r.balance, 0));
+        const totalAR = round2(rows.reduce((s, r) => s + r.balance, 0));
+        const ar90 = sum((r) => r.days >= 91);
+        const ar60 = sum((r) => r.days >= 61);
+        const inv90 = rows.filter((r) => r.days >= 91).length;
+        const clients = new Set(rows.map((r) => r.client)).size;
+        const oldest = rows.reduce((mx, r) => Math.max(mx, r.days), 0);
+        const avgDays = totalAR > 0 ? Math.round(rows.reduce((s, r) => s + r.days * r.balance, 0) / totalAR) : 0;
+        const pct = (n: number) => (totalAR > 0 ? Math.round((n / totalAR) * 1000) / 10 : 0); // one-decimal %
+
+        const firm = {
+          as_of: asOfStr,
+          total_ar: totalAR,
+          current: sum((r) => r.days <= 0),
+          days_1_30: sum((r) => r.days >= 1 && r.days <= 30),
+          days_31_60: sum((r) => r.days >= 31 && r.days <= 60),
+          days_61_90: sum((r) => r.days >= 61 && r.days <= 90),
+          ar_90plus: ar90,
+          ar_90plus_pct: pct(ar90),
+          ar_60plus: ar60,
+          ar_60plus_pct: pct(ar60),
+          invoices_90plus: inv90,
+          delinquent_clients: clients,
+          oldest_invoice_days: oldest,
+          avg_days_outstanding: avgDays,
+        };
+
+        // Per responsible attorney
+        const byAttMap = new Map<string, { total: number; ar90: number; count: number }>();
+        for (const r of rows) {
+          const a = byAttMap.get(r.attorney) ?? { total: 0, ar90: 0, count: 0 };
+          a.total += r.balance;
+          if (r.days >= 91) a.ar90 += r.balance;
+          a.count += 1;
+          byAttMap.set(r.attorney, a);
+        }
+        const byAttorney = [...byAttMap.entries()]
+          .map(([attorney, v]) => ({
+            attorney,
+            total_ar: round2(v.total),
+            ar_90plus: round2(v.ar90),
+            ar_90plus_pct: v.total > 0 ? Math.round((v.ar90 / v.total) * 1000) / 10 : 0,
+            invoices: v.count,
+          }))
+          .sort((a, b) => b.total_ar - a.total_ar);
+
+        const top10 = [...rows]
+          .sort((a, b) => b.balance - a.balance)
+          .slice(0, 10)
+          .map((r) => ({ client: r.client, matter: r.matter, attorney: r.attorney, balance: round2(r.balance), days_past_due: r.days }));
+
+        // ---- Maintain the AR Scorecard workbook in Box ----
+        let workbook_result: any = { skipped: true };
+        if (params.update_workbook !== false) {
+          try {
+            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10);
+          } catch (e: any) {
+            workbook_result = { error: e?.message ?? String(e) };
+          }
+        }
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ firm, by_attorney: byAttorney, top_10_accounts: top10, workbook: workbook_result }, null, 2) }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// ====================================================================
+// AR Scorecard workbook — standalone, auto-updating Box file.
+// Weekly Scorecard tab appends one row per as-of date (trend); By Attorney
+// and Top 10 tabs are refreshed to the current snapshot each run. Built fresh
+// with ExcelJS (a brand-new file we fully control, so formatting is clean).
+// ====================================================================
+type FirmMetrics = {
+  as_of: string; total_ar: number; current: number; days_1_30: number; days_31_60: number;
+  days_61_90: number; ar_90plus: number; ar_90plus_pct: number; ar_60plus: number;
+  ar_60plus_pct: number; invoices_90plus: number; delinquent_clients: number;
+  oldest_invoice_days: number; avg_days_outstanding: number;
+};
+
+const WEEKLY_COLS: Array<{ key: keyof FirmMetrics; header: string; fmt?: string; width: number }> = [
+  { key: "as_of", header: "As Of", width: 12 },
+  { key: "total_ar", header: "Total AR", fmt: '"$"#,##0', width: 14 },
+  { key: "ar_90plus", header: "90+ $", fmt: '"$"#,##0', width: 13 },
+  { key: "ar_90plus_pct", header: "90+ %", fmt: '0.0"%"', width: 9 },
+  { key: "ar_60plus", header: "60+ $", fmt: '"$"#,##0', width: 13 },
+  { key: "ar_60plus_pct", header: "60+ %", fmt: '0.0"%"', width: 9 },
+  { key: "current", header: "Current $", fmt: '"$"#,##0', width: 13 },
+  { key: "invoices_90plus", header: "# Inv 90+", width: 10 },
+  { key: "delinquent_clients", header: "# Clients", width: 10 },
+  { key: "oldest_invoice_days", header: "Oldest (days)", width: 13 },
+  { key: "avg_days_outstanding", header: "Avg Days O/S", width: 13 },
+];
+
+async function updateARScorecardWorkbook(
+  firm: FirmMetrics,
+  byAttorney: Array<{ attorney: string; total_ar: number; ar_90plus: number; ar_90plus_pct: number; invoices: number }>,
+  top10: Array<{ client: string; matter: string; attorney: string; balance: number; days_past_due: number }>,
+): Promise<any> {
+  // 1. Read prior weekly history (if the file already exists).
+  const existingId = await findBoxFileId(AR_SCORECARD_FOLDER, AR_SCORECARD_FILENAME);
+  const history: Record<string, any>[] = [];
+  if (existingId) {
+    try {
+      const buf = await downloadFromBox(existingId);
+      const prev = new ExcelJS.Workbook();
+      await prev.xlsx.load(buf as any);
+      const ws = prev.getWorksheet("Weekly Scorecard");
+      if (ws) {
+        ws.eachRow((row, n) => {
+          if (n <= 2) return; // title + header
+          const asOf = row.getCell(1).value;
+          if (asOf == null || String(asOf).trim() === "") return;
+          const rec: Record<string, any> = {};
+          WEEKLY_COLS.forEach((c, i) => { rec[c.key] = row.getCell(i + 1).value; });
+          rec.as_of = String(asOf instanceof Date ? asOf.toISOString().split("T")[0] : asOf);
+          history.push(rec);
+        });
+      }
+    } catch { /* prior file unreadable — start fresh history */ }
+  }
+  // 2. Append/replace this run's row (dedupe by as_of).
+  const merged = history.filter((h) => h.as_of !== firm.as_of);
+  merged.push(firm as any);
+  merged.sort((a, b) => String(a.as_of).localeCompare(String(b.as_of)));
+
+  // 3. Build the workbook fresh.
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Clio MCP — AR Scorecard";
+  const bold = { bold: true } as const;
+
+  const weekly = wb.addWorksheet("Weekly Scorecard", { views: [{ state: "frozen" as const, ySplit: 2, xSplit: 1 }] });
+  weekly.mergeCells(1, 1, 1, WEEKLY_COLS.length);
+  weekly.getCell(1, 1).value = "AR Scorecard — Weekly (EOS)";
+  weekly.getCell(1, 1).font = { bold: true, size: 13 };
+  WEEKLY_COLS.forEach((c, i) => {
+    const cell = weekly.getCell(2, i + 1);
+    cell.value = c.header; cell.font = bold;
+    weekly.getColumn(i + 1).width = c.width;
+    if (c.fmt) weekly.getColumn(i + 1).numFmt = c.fmt;
+  });
+  merged.forEach((rec, ri) => {
+    WEEKLY_COLS.forEach((c, i) => {
+      const v = rec[c.key];
+      weekly.getCell(3 + ri, i + 1).value = c.key === "as_of" ? String(v) : (typeof v === "number" ? v : Number(v) || 0);
+    });
+  });
+
+  const att = wb.addWorksheet("By Attorney");
+  att.getCell(1, 1).value = `By Responsible Attorney — as of ${firm.as_of}`;
+  att.getCell(1, 1).font = { bold: true, size: 13 };
+  const attHeaders = ["Attorney", "Total AR", "90+ $", "90+ %", "# Invoices"];
+  const attFmt = ["", '"$"#,##0', '"$"#,##0', '0.0"%"', ""];
+  const attWidth = [26, 14, 13, 9, 11];
+  attHeaders.forEach((h, i) => { const c = att.getCell(2, i + 1); c.value = h; c.font = bold; att.getColumn(i + 1).width = attWidth[i]; if (attFmt[i]) att.getColumn(i + 1).numFmt = attFmt[i]; });
+  byAttorney.forEach((a, ri) => {
+    att.getCell(3 + ri, 1).value = a.attorney;
+    att.getCell(3 + ri, 2).value = a.total_ar;
+    att.getCell(3 + ri, 3).value = a.ar_90plus;
+    att.getCell(3 + ri, 4).value = a.ar_90plus_pct;
+    att.getCell(3 + ri, 5).value = a.invoices;
+  });
+  const totRow = 3 + byAttorney.length;
+  att.getCell(totRow, 1).value = "Firm Total"; att.getCell(totRow, 1).font = bold;
+  att.getCell(totRow, 2).value = firm.total_ar; att.getCell(totRow, 2).font = bold;
+  att.getCell(totRow, 3).value = firm.ar_90plus; att.getCell(totRow, 3).font = bold;
+  att.getCell(totRow, 4).value = firm.ar_90plus_pct; att.getCell(totRow, 4).font = bold;
+
+  const top = wb.addWorksheet("Top 10 Accounts");
+  top.getCell(1, 1).value = `Top 10 Open Balances — as of ${firm.as_of}`;
+  top.getCell(1, 1).font = { bold: true, size: 13 };
+  const topHeaders = ["Client", "Matter", "Responsible Attorney", "Balance", "Days Past Due"];
+  const topWidth = [28, 36, 24, 14, 13];
+  topHeaders.forEach((h, i) => { const c = top.getCell(2, i + 1); c.value = h; c.font = bold; top.getColumn(i + 1).width = topWidth[i]; });
+  top.getColumn(4).numFmt = '"$"#,##0';
+  top10.forEach((t, ri) => {
+    top.getCell(3 + ri, 1).value = t.client;
+    top.getCell(3 + ri, 2).value = t.matter;
+    top.getCell(3 + ri, 3).value = t.attorney;
+    top.getCell(3 + ri, 4).value = t.balance;
+    top.getCell(3 + ri, 5).value = t.days_past_due;
+  });
+
+  const out = Buffer.from(await wb.xlsx.writeBuffer());
+
+  // 4. Version the existing file, or create it the first time.
+  const result = existingId
+    ? await uploadToBox({ buffer: out, filename: AR_SCORECARD_FILENAME, folderId: AR_SCORECARD_FOLDER, overwriteFileId: existingId })
+    : await createBoxFile({ buffer: out, filename: AR_SCORECARD_FILENAME, folderId: AR_SCORECARD_FOLDER });
+
+  return {
+    created: !existingId,
+    weeks_tracked: merged.length,
+    ...(result.uploaded
+      ? { uploaded: true, box_file_id: result.box_file_id, box_url: result.box_url }
+      : { uploaded: false, direct_download_url: (result as any).direct_download_url, reason: (result as any).reason }),
+  };
 }

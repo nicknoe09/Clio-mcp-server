@@ -1,4 +1,4 @@
-import { boxUploadFile, boxUploadNewVersion, boxDownloadFile, boxDeleteFile } from "../box/client";
+import { boxUploadFile, boxUploadNewVersion, boxDownloadFile, boxDeleteFile, boxFindFileInFolder } from "../box/client";
 import { getBoxRegisteredUsers } from "./tokenStore";
 import { registerDownload, mimeForFilename } from "./downloadStore";
 
@@ -92,6 +92,55 @@ export async function downloadFromBox(fileId: string): Promise<Buffer> {
     throw new Error("No Box user authenticated. Visit /box/oauth/start to connect your Box account.");
   }
   return boxDownloadFile(fileId, users[0]);
+}
+
+/**
+ * Look up a file id by exact name within a folder (null if not present).
+ * Use before uploadToBox/createBoxFile to decide version-vs-create and to
+ * download prior contents.
+ */
+export async function findBoxFileId(folderId: string, fileName: string): Promise<string | null> {
+  const users = getBoxRegisteredUsers();
+  if (users.length === 0) return null;
+  try {
+    return await boxFindFileInFolder(folderId, fileName, users[0]);
+  } catch (e: any) {
+    console.warn(`[Box] findBoxFileId failed for ${fileName}: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+/**
+ * Create a BRAND-NEW file in Box (used for first-ever creation of a managed
+ * file like the AR Scorecard). uploadToBox deliberately refuses to create
+ * files; this is the explicit-create counterpart. Falls back to a download
+ * link on failure, same as uploadToBox.
+ */
+export async function createBoxFile(opts: {
+  buffer: Buffer;
+  filename: string;
+  folderId: string;
+}): Promise<UploadResult> {
+  const { buffer, filename, folderId } = opts;
+  const size_kb = Math.round(buffer.length / 1024);
+  const users = getBoxRegisteredUsers();
+  if (users.length === 0) return fallback(buffer, filename, "no-box-user-authenticated");
+  try {
+    const meta = await boxUploadFile(buffer, filename, folderId, users[0]);
+    return {
+      uploaded: true,
+      box_file_id: meta.id,
+      box_url: `https://app.box.com/file/${meta.id}`,
+      filename,
+      size_kb,
+      elapsed_ms: 0,
+      via: "direct_version",
+    };
+  } catch (err: any) {
+    const status = err?.response?.status;
+    const boxMsg = err?.response?.data?.message ?? err?.message ?? "unknown";
+    return fallback(buffer, filename, `create_failed status=${status ?? "?"} msg=${boxMsg}`);
+  }
 }
 
 /**
