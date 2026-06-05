@@ -583,6 +583,37 @@ async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<st
   return { rows: parseCSV(csv), report: target };
 }
 
+/**
+ * Guard against Clio returning a report for the WRONG period. POST /reports
+ * with start_date/end_date can hand back a cached/dedup'd report from a prior
+ * run (e.g. April's) when the firm's engine doesn't apply the requested range —
+ * which silently writes the wrong month's numbers into the target month. After
+ * a report completes, read its authoritative start_date back and abort if it
+ * doesn't match what we asked for. Returns the report's period for logging.
+ * If Clio doesn't expose start_date on the report, we can't verify — log and
+ * proceed (no false abort).
+ */
+async function assertReportPeriod(reportId: number | string, wantStart: string, label: string): Promise<{ start?: string; end?: string }> {
+  let meta: any;
+  try {
+    const s = await rawGetSingle(`/reports/${reportId}`, { fields: "id,state,start_date,end_date,kind" });
+    meta = s?.data ?? s;
+  } catch {
+    return {};
+  }
+  const got = meta?.start_date ? String(meta.start_date).slice(0, 10) : "";
+  if (got && got !== wantStart) {
+    throw new Error(
+      `${label}: Clio returned report ${reportId} for ${got}..${meta?.end_date ? String(meta.end_date).slice(0, 10) : "?"}, ` +
+      `but the target month is ${wantStart}. Aborting so the wrong month's data is NOT written. ` +
+      `(Clio likely returned a cached report; retry, or pass an explicit report_id generated for the target month.)`,
+    );
+  }
+  if (!got) console.warn(`[Dashboard] ${label}: report ${reportId} did not expose start_date — period unverified`);
+  else console.log(`[Dashboard] ${label}: report ${reportId} period ${got}..${meta?.end_date ? String(meta.end_date).slice(0, 10) : "?"} OK`);
+  return { start: meta?.start_date, end: meta?.end_date };
+}
+
 // ========== Client Activity Report (per-month) ==========
 // Auto-generates a single-month Client Activity report and downloads the CSV.
 // Each row is one time entry / expense with: User (full name), Date, Quantity,
@@ -637,6 +668,7 @@ async function getClientActivityCSV(opts: {
     catch { break; }
   }
   if (state !== "completed") throw new Error(`Client Activity report ${reportId} did not complete (state=${state})`);
+  await assertReportPeriod(reportId, opts.start_date, "Client Activity report");
   const csv = await downloadReport(reportId);
   return { rows: parseCSV(csv), report: { id: reportId, kind: "client_activity", via: "post" } };
 }
@@ -681,6 +713,7 @@ async function getRealizationReportCSV(opts: {
       catch { break; }
     }
     if (state === "completed") {
+      await assertReportPeriod(reportId, opts.start_date, "Realization report");
       const csv = await downloadReport(reportId);
       return { rows: parseCSV(csv), report: { id: reportId, kind, via: "post" } };
     }
@@ -2205,6 +2238,10 @@ export function registerDocumentTools(server: McpServer): void {
               catch { /* transient — keep polling */ }
             }
             if (state !== "completed") throw new Error(`revenue report ${rid} did not complete (state=${state})`);
+            // Guard: confirm Clio honored the requested month. If it handed back
+            // a cached/wrong-period report (the cause of April being duplicated
+            // into May), abort instead of writing the wrong month's numbers.
+            await assertReportPeriod(rid, monthStart, `revenue report (${userId ? "user " + userId : "firm-wide"})`);
             return parseCSV(await downloadReport(rid));
           };
           const m = params.month;
@@ -2392,6 +2429,37 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- Create month block if it doesn't exist (overwrite approach) ----
           let monthBlock = scanMonthBlock(compareSheet, monthName);
           let blockCreated = false;
+
+          // ---- Content guard against duplicating the prior month ----
+          // In classic (target-month-only) mode, if the freshly-pulled target-month
+          // billed $ matches the PRIOR month ALREADY in the sheet for every active
+          // timekeeper, Clio returned the prior month's report (the April-into-May
+          // bug). An exact full-roster match to the cent can't happen by chance, so
+          // abort rather than write a duplicate month. (Belt-and-suspenders with
+          // assertReportPeriod, which relies on Clio exposing the report period.)
+          if (!useBeta && params.month >= 2) {
+            const priorName = monthNames[params.month - 2];
+            const priorBlock = scanMonthBlock(compareSheet, priorName);
+            if (priorBlock) {
+              let comparable = 0, identical = 0;
+              for (const r of ROSTER) {
+                const cur = round2(targetBundle.data[r.user_id]?.billedDollars ?? 0);
+                const rowNum = priorBlock.map[r.initials.toUpperCase()];
+                if (!rowNum) continue;
+                const raw = compareSheet.getRow(rowNum).getCell(11).value; // col K = Billed $
+                const prior = round2(typeof raw === "number" ? raw : parseFloat(String(raw)) || 0);
+                if (cur > 0 && prior > 0) { comparable++; if (Math.abs(cur - prior) < 0.005) identical++; }
+              }
+              if (comparable >= 3 && identical === comparable) {
+                throw new Error(
+                  `Aborting: ${monthName} billed $ is identical to ${priorName} for all ${comparable} active timekeepers — ` +
+                  `Clio returned the prior month's revenue instead of ${monthName}'s. No data was written. ` +
+                  `Retry (Clio likely served a cached report), or pass the month×user Revenue CSV (revenue_csv_box_file_id) ` +
+                  `or an explicit revenue_report_id generated for ${monthName}.`,
+                );
+              }
+            }
+          }
 
           if (!monthBlock) {
             throw new Error(`'${monthName}' block not found in '26 Compare'. The workbook pre-defines a labeled block for every month (Jan–Dec) plus '2026 Totals'; this tool only PATCHES existing blocks — it does not create them (in-place creation corrupted the Totals block). Add a row with '${monthName}' in column B with the timekeeper initials beneath it, then rerun.`);
