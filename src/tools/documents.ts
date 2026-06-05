@@ -15,6 +15,98 @@ import { registerDownload, mimeForFilename } from "../utils/downloadStore";
 // ExcelJS is only used for READING. All writes go through direct XML manipulation.
 
 const xmlEsc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const xmlUnesc = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
+/** Parse xl/sharedStrings.xml into an index→text array (concatenates rich-text runs). */
+function parseSharedStrings(ssXml: string): string[] {
+  const out: string[] = [];
+  const siRe = /<si\b[^>]*>([\s\S]*?)<\/si>/g;
+  let m: RegExpExecArray | null;
+  while ((m = siRe.exec(ssXml)) !== null) {
+    const texts = [...m[1].matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)].map((x) => x[1]);
+    out.push(xmlUnesc(texts.join("")));
+  }
+  return out;
+}
+
+const MONTH_ABBRS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+/**
+ * Locate the target month block in a month-blocked tab (Utilization / Realization
+ * / Collection). Each tab lays out a month-label row in col A with attorney rows
+ * beneath it keyed by initials in col B.
+ *
+ * Two subtleties this handles that a naive scan does not:
+ *  1. Cells are SHARED STRINGS (`<c t="s"><v>105</v></c>` — the <v> is an index
+ *     into sharedStrings, not the text). col A/B text MUST be resolved through
+ *     `sharedStrings` or the month label reads back as a number and nothing
+ *     matches (this was the 0/0/0 bug).
+ *  2. The sheet can hold MULTIPLE YEARS (one JAN..DEC set per year), so there are
+ *     several "APR" headers. We pick the block whose target `dataCols` are still
+ *     EMPTY — the one being filled this run; prior years are already populated.
+ *     Falls back to the last matching block if none are empty (e.g. a deliberate
+ *     re-run overwriting an already-filled month).
+ *
+ * Month matching is on the first 3 letters, so "APR" / "Apr" / "April" all match.
+ */
+function findTabMonthBlock(
+  xml: string,
+  monthAbbr: string,
+  sharedStrings: string[],
+  dataCols: string[],
+): { hdr: number; attorneys: Array<{ row: number; ini: string }> } | null {
+  const rowRe = /<row\b[^>]*\br="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
+  const cellText = (rowXml: string, col: string): string => {
+    const re = new RegExp(`(<c\\b[^>]*\\br="${col}\\d+"[^>]*>)([\\s\\S]*?)</c>`);
+    const m = rowXml.match(re);
+    if (!m) return "";
+    const open = m[1], inner = m[2];
+    const t = inner.match(/<t\b[^>]*>([\s\S]*?)<\/t>/);
+    if (t) return xmlUnesc(t[1]);
+    const v = inner.match(/<v>([\s\S]*?)<\/v>/);
+    if (v) {
+      if (/\bt="s"/.test(open)) { const i = parseInt(v[1], 10); return sharedStrings[i] ?? ""; }
+      return v[1];
+    }
+    return "";
+  };
+  const cellHasNumber = (rowXml: string, col: string): boolean => {
+    const re = new RegExp(`<c\\b[^>]*\\br="${col}\\d+"[^>]*>([\\s\\S]*?)</c>`);
+    const m = rowXml.match(re);
+    if (!m) return false;
+    const v = m[1].match(/<v>([\s\S]*?)<\/v>/);
+    return !!(v && v[1].trim() !== "");
+  };
+  const rows: Array<{ n: number; body: string }> = [];
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(xml)) !== null) rows.push({ n: parseInt(rm[1], 10), body: rm[2] });
+  rows.sort((a, b) => a.n - b.n);
+
+  type Blk = { hdr: number; attorneys: Array<{ row: number; ini: string }>; filled: boolean };
+  const blocks: Blk[] = [];
+  let cur: Blk | null = null;
+  for (const { n, body } of rows) {
+    const a3 = cellText(body, "A").trim().toUpperCase().slice(0, 3);
+    const b = cellText(body, "B").trim().toUpperCase();
+    if (MONTH_ABBRS.includes(a3)) {
+      if (cur && cur.attorneys.length) blocks.push(cur);
+      cur = a3 === monthAbbr ? { hdr: n, attorneys: [], filled: false } : null;
+      continue;
+    }
+    if (!cur) continue;
+    if (b === "" || b === "EMPLOYEE" || b === "TOTAL") {
+      if (cur.attorneys.length) { blocks.push(cur); cur = null; }
+      continue;
+    }
+    cur.attorneys.push({ row: n, ini: b });
+    if (dataCols.some((c) => cellHasNumber(body, c))) cur.filled = true;
+  }
+  if (cur && cur.attorneys.length) blocks.push(cur);
+  if (!blocks.length) return null;
+  const empty = blocks.filter((b) => !b.filled);
+  const chosen = empty.length ? empty[0] : blocks[blocks.length - 1];
+  return { hdr: chosen.hdr, attorneys: chosen.attorneys };
+}
 
 /** Build a single <c> element */
 function xmlCell(ref: string, value: number | string | null | undefined, opts?: { style?: string; formula?: string }): string {
@@ -2899,6 +2991,11 @@ export function registerDocumentTools(server: McpServer): void {
           const compareSheetMap = await getZipSheetMap(origZip);
           const comparePath = compareSheetMap["26 Compare"];
           let compareXml = await origZip.file(comparePath)!.async("string");
+          // Resolve the workbook's shared-string table once — the Util/Realiz/
+          // Collection tabs store col A month labels and col B initials as shared
+          // strings, so findTabMonthBlock needs this to read them as text.
+          const ssFile = origZip.file("xl/sharedStrings.xml");
+          const sharedStrings = ssFile ? parseSharedStrings(await ssFile.async("string")) : [];
 
           // Helper: update a cell value in the XML
           function patchCell(xml: string, ref: string, val: number): string {
@@ -3024,65 +3121,18 @@ export function registerDocumentTools(server: McpServer): void {
             const nameToUid = new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id]));
             const agg = aggregateClientActivity(ca.rows, nameToUid);
             // 3-letter month label (JAN/FEB/.../DEC) used in col A of Util/Realiz/Collection.
-            const monthAbbr = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][params.month - 1];
+            const monthAbbr = MONTH_ABBRS[params.month - 1];
             // Per-tab initials aliases. The Utilization tab has a typo: "JBP"
             // instead of "JPB" for Jonathan Barbee. Map both to JPB so the
             // patch hits the right row regardless.
             const initialsAliases: Record<string, string> = { JBP: "JPB" };
             const initialsToUid: Record<string, number> = {};
             for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
-            // Find the row of the target month label in col A; the attorney
-            // rows are the contiguous block immediately below until col B is
-            // blank or another month label appears.
-            function findBlockRows(xml: string): { hdr: number; attorneys: Array<{ row: number; ini: string }> } | null {
-              // Iterate <row r="N"> ... </row> in order; track A and B cell values per row.
-              const rowRe = /<row\b[^>]*\br="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
-              const cellVal = (rowXml: string, col: string): string => {
-                // <c r="A2"...><v>...</v></c>  or  <c r="A2" t="inlineStr"><is><t>JAN</t></is></c>
-                // or shared string <c r="A2" t="s"><v>123</v></c> — but the tabs use inline
-                // strings/text per inspection. Read both inlineStr <t> and direct <v>.
-                const re = new RegExp(`<c\\b[^>]*\\br="${col}\\d+"[^>]*>([\\s\\S]*?)</c>`);
-                const m = rowXml.match(re);
-                if (!m) return "";
-                const inner = m[1];
-                const t = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
-                if (t) return t[1];
-                const v = inner.match(/<v>([\s\S]*?)<\/v>/);
-                if (v) return v[1];
-                return "";
-              };
-              let hdr = 0;
-              const attorneys: Array<{ row: number; ini: string }> = [];
-              let m: RegExpExecArray | null;
-              const rows: Array<{ n: number; body: string }> = [];
-              while ((m = rowRe.exec(xml)) !== null) rows.push({ n: parseInt(m[1], 10), body: m[2] });
-              rows.sort((a, b) => a.n - b.n);
-              for (const { n, body } of rows) {
-                const a = cellVal(body, "A").trim().toUpperCase();
-                const b = cellVal(body, "B").trim().toUpperCase();
-                if (!hdr) {
-                  if (a === monthAbbr) hdr = n;
-                  continue;
-                }
-                // After header, accumulate attorney rows. Stop at another month
-                // label in col A or a "Total" row.
-                if (a && a !== monthAbbr) break;
-                if (b === "" || b === "EMPLOYEE" || b === "TOTAL") {
-                  // Header sub-row, total row, or blank separator — stop on blank
-                  // following at least one collected attorney row.
-                  if (attorneys.length) break;
-                  continue;
-                }
-                attorneys.push({ row: n, ini: b });
-              }
-              if (!hdr || !attorneys.length) return null;
-              return { hdr, attorneys };
-            }
-            // -- Utilization patch --
+            // -- Utilization patch -- (target cols C=billable, D=nonbillable)
             const utilPath = compareSheetMap["Utilization"];
             if (utilPath) {
               utilXml = await origZip.file(utilPath)!.async("string");
-              const block = findBlockRows(utilXml);
+              const block = findTabMonthBlock(utilXml, monthAbbr, sharedStrings, ["C", "D"]);
               if (block) {
                 for (const { row, ini } of block.attorneys) {
                   const realIni = initialsAliases[ini] ?? ini;
@@ -3098,11 +3148,11 @@ export function registerDocumentTools(server: McpServer): void {
                 }
               }
             }
-            // -- Realization patch --
+            // -- Realization patch -- (target cols D/E/F = billed-nondisc/disc/unbilled hrs)
             const realizPath = compareSheetMap["Realization"];
             if (realizPath) {
               realizXml = await origZip.file(realizPath)!.async("string");
-              const block = findBlockRows(realizXml);
+              const block = findTabMonthBlock(realizXml, monthAbbr, sharedStrings, ["D", "E", "F"]);
               if (block) {
                 for (const { row, ini } of block.attorneys) {
                   const realIni = initialsAliases[ini] ?? ini;
@@ -3139,47 +3189,15 @@ export function registerDocumentTools(server: McpServer): void {
             realizationReportId = rr.report.id;
             const nameToUid = new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id]));
             const collAgg = aggregateRealizationCollections(rr.rows, nameToUid);
-            const monthAbbr = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][params.month - 1];
+            const monthAbbr = MONTH_ABBRS[params.month - 1];
             const initialsAliases: Record<string, string> = { JBP: "JPB" };
             const initialsToUid: Record<string, number> = {};
             for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
-            function findBlockRows(xml: string): { hdr: number; attorneys: Array<{ row: number; ini: string }> } | null {
-              const rowRe = /<row\b[^>]*\br="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
-              const cellVal = (rowXml: string, col: string): string => {
-                const re = new RegExp(`<c\\b[^>]*\\br="${col}\\d+"[^>]*>([\\s\\S]*?)</c>`);
-                const m = rowXml.match(re);
-                if (!m) return "";
-                const inner = m[1];
-                const t = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
-                if (t) return t[1];
-                const v = inner.match(/<v>([\s\S]*?)<\/v>/);
-                if (v) return v[1];
-                return "";
-              };
-              let hdr = 0;
-              const attorneys: Array<{ row: number; ini: string }> = [];
-              let m: RegExpExecArray | null;
-              const rows: Array<{ n: number; body: string }> = [];
-              while ((m = rowRe.exec(xml)) !== null) rows.push({ n: parseInt(m[1], 10), body: m[2] });
-              rows.sort((a, b) => a.n - b.n);
-              for (const { n, body } of rows) {
-                const a = cellVal(body, "A").trim().toUpperCase();
-                const b = cellVal(body, "B").trim().toUpperCase();
-                if (!hdr) { if (a === monthAbbr) hdr = n; continue; }
-                if (a && a !== monthAbbr) break;
-                if (b === "" || b === "EMPLOYEE" || b === "TOTAL") {
-                  if (attorneys.length) break;
-                  continue;
-                }
-                attorneys.push({ row: n, ini: b });
-              }
-              if (!hdr || !attorneys.length) return null;
-              return { hdr, attorneys };
-            }
+            // -- Collection patch -- (target cols C=collected $, D=uncollected $)
             const collPath = compareSheetMap["Collection"];
             if (collPath) {
               collectionXml = await origZip.file(collPath)!.async("string");
-              const block = findBlockRows(collectionXml);
+              const block = findTabMonthBlock(collectionXml, monthAbbr, sharedStrings, ["C", "D"]);
               if (block) {
                 for (const { row, ini } of block.attorneys) {
                   const realIni = initialsAliases[ini] ?? ini;
