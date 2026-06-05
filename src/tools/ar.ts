@@ -541,7 +541,11 @@ export function registerARTools(server: McpServer): void {
         const asOf = params.as_of_date ? new Date(params.as_of_date + "T00:00:00") : new Date();
         const asOfStr = asOf.toISOString().split("T")[0];
         const bills = await fetchAllPages<any>("/bills", {
-          fields: "id,number,issued_at,due_at,balance,total,state,matters{id,display_number,description,client{name},responsible_attorney{name}}",
+          // Request bare `matters` — Clio returns the default matter expansion
+          // (display_number, description, client, responsible_attorney). This is
+          // the exact field set get_ar_aging uses and that Clio accepts; the
+          // earlier nested form (matters{…responsible_attorney{name}}) 400s.
+          fields: "id,number,issued_at,due_at,balance,total,state,matters",
           state: "awaiting_payment",
         });
 
