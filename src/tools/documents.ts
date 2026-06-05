@@ -291,40 +291,53 @@ async function surgicalWriteXlsx(
   let relsXml = await zip.file("xl/_rels/workbook.xml.rels")!.async("string");
   let ctXml = await zip.file("[Content_Types].xml")!.async("string");
 
-  // Add custom styles for our rebuilt sheets: General, Currency, Decimal,
-  // Percent, Bold. CRITICAL: we must NOT assume custom numFmt id 164 means
-  // "$#,##0.00" — the host workbook may already define 164 (Rachel's file uses
-  // 164 for a DATE format "[$-409]mmmm-yy"), so hardcoding it rendered every
-  // currency cell as a date. Allocate FRESH numFmt ids above the workbook's
-  // existing max, define them, and reference those. Percent/General use the
-  // builtin ids (10, 0) which never collide.
+  // Add cell styles for our rebuilt sheets: General, Currency, Decimal,
+  // Percent, Bold. Two hard-won rules baked in here:
+  //  - Do NOT assume custom numFmt id 164 == "$#,##0.00". Rachel's workbook
+  //    already defines 164 as a DATE format, so hardcoding it rendered every
+  //    currency cell as a date. We REUSE an existing currency/decimal numFmt
+  //    when present (her file has 166="$"#,##0.00 and 165=0.0) and only mint a
+  //    fresh id above the max when absent — touching <numFmts> as little as
+  //    possible.
+  //  - NEVER build a String.replace REPLACEMENT string that can contain "$":
+  //    JS expands $&/$1/$$ in replacements, and a "$" in a currency formatCode
+  //    once injected "</numFmts>" into an attribute → invalid XML → Excel threw
+  //    out styles.xml. All replacements below use function replacers (literal).
   const stylesFile = zip.file("xl/styles.xml");
   let newStyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0" };
   if (stylesFile) {
     let stylesXml = await stylesFile.async("string");
 
-    // Pick numFmt ids strictly above every id already present (custom ids
-    // start at 164). Cap the scan to sane ids to ignore stray large numbers.
+    // Catalogue existing numFmts (id + formatCode) and the max custom id.
+    const fmts: Array<{ id: number; code: string }> = [];
     let maxFmtId = 163;
+    for (const m of stylesXml.matchAll(/<numFmt\b[^>]*\bnumFmtId="(\d+)"[^>]*\bformatCode="([^"]*)"/g)) {
+      fmts.push({ id: parseInt(m[1], 10), code: m[2] });
+    }
     for (const m of stylesXml.matchAll(/numFmtId="(\d+)"/g)) {
       const id = parseInt(m[1], 10);
       if (id >= 164 && id < 10000 && id > maxFmtId) maxFmtId = id;
     }
-    const curFmtId = maxFmtId + 1; // "$"#,##0.00
-    const decFmtId = maxFmtId + 2; // 0.0
-    const newNumFmts =
-      `<numFmt numFmtId="${curFmtId}" formatCode="&quot;$&quot;#,##0.00"/>` +
-      `<numFmt numFmtId="${decFmtId}" formatCode="0.0"/>`;
-    const nfCountMatch = stylesXml.match(/<numFmts count="(\d+)">/);
-    if (nfCountMatch) {
-      stylesXml = stylesXml.replace(`<numFmts count="${nfCountMatch[1]}">`, `<numFmts count="${parseInt(nfCountMatch[1]) + 2}">`);
-      stylesXml = stylesXml.replace("</numFmts>", newNumFmts + "</numFmts>");
-    } else {
-      // No <numFmts> yet — it must be the first child of <styleSheet>.
-      stylesXml = stylesXml.replace(/(<styleSheet\b[^>]*>)/, `$1<numFmts count="2">${newNumFmts}</numFmts>`);
+    const findId = (re: RegExp) => fmts.find((f) => re.test(f.code))?.id;
+    // Prefer a plain "$"#,##0.00; else any $ + thousands format.
+    let curFmtId = findId(/^&quot;\$&quot;#,##0\.00$/) ?? findId(/\$.*#,##0/);
+    let decFmtId = findId(/^0\.0$/);
+    const toAdd: string[] = [];
+    if (curFmtId == null) { curFmtId = ++maxFmtId; toAdd.push(`<numFmt numFmtId="${curFmtId}" formatCode="&quot;$&quot;#,##0.00"/>`); }
+    if (decFmtId == null) { decFmtId = ++maxFmtId; toAdd.push(`<numFmt numFmtId="${decFmtId}" formatCode="0.0"/>`); }
+    if (toAdd.length) {
+      const addStr = toAdd.join("");
+      const nf = stylesXml.match(/<numFmts count="(\d+)">/);
+      if (nf) {
+        const newCount = parseInt(nf[1], 10) + toAdd.length;
+        stylesXml = stylesXml.replace(`<numFmts count="${nf[1]}">`, () => `<numFmts count="${newCount}">`);
+        stylesXml = stylesXml.replace("</numFmts>", () => addStr + "</numFmts>");
+      } else {
+        stylesXml = stylesXml.replace(/<styleSheet\b[^>]*>/, (m0) => `${m0}<numFmts count="${toAdd.length}">${addStr}</numFmts>`);
+      }
     }
 
-    // Find a bold font id (one whose <font> contains <b/>); fall back to 1.
+    // Find a bold font id (a <font> containing <b/>); fall back to 1.
     let boldFontId = 1;
     const fontsMatch = stylesXml.match(/<fonts\b[^>]*>([\s\S]*?)<\/fonts>/);
     if (fontsMatch) {
@@ -335,13 +348,13 @@ async function surgicalWriteXlsx(
 
     const xfCountMatch = stylesXml.match(/<cellXfs count="(\d+)">/);
     if (xfCountMatch) {
-      const currentCount = parseInt(xfCountMatch[1]);
+      const currentCount = parseInt(xfCountMatch[1], 10);
       const newXfs = [
         `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                       // General
-        `<xf numFmtId="${curFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // $#,##0.00
+        `<xf numFmtId="${curFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // currency
         `<xf numFmtId="${decFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // 0.0
         `<xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                      // 0.00% (builtin)
-        `<xf numFmtId="0" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold General
+        `<xf numFmtId="0" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold
       ];
       newStyleIndices = {
         general: String(currentCount),
@@ -350,11 +363,9 @@ async function surgicalWriteXlsx(
         percent: String(currentCount + 3),
         bold: String(currentCount + 4),
       };
-      stylesXml = stylesXml.replace(
-        `<cellXfs count="${currentCount}">`,
-        `<cellXfs count="${currentCount + newXfs.length}">`
-      );
-      stylesXml = stylesXml.replace("</cellXfs>", newXfs.join("") + "</cellXfs>");
+      const newXfCount = currentCount + newXfs.length;
+      stylesXml = stylesXml.replace(`<cellXfs count="${currentCount}">`, () => `<cellXfs count="${newXfCount}">`);
+      stylesXml = stylesXml.replace("</cellXfs>", () => newXfs.join("") + "</cellXfs>");
     }
     zip.file("xl/styles.xml", stylesXml);
   }
@@ -852,26 +863,48 @@ function pruneDashboardJobs() {
 async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
   try {
     const zip = await JSZip.loadAsync(buf);
-    const ssFile = zip.file("xl/sharedStrings.xml");
-    if (!ssFile) return buf;
-    let ss = await ssFile.async("string");
-    const siCount = (ss.match(/<si(?:\s[^>]*)?>/g) || []).length;
-    let maxIdx = -1;
-    for (const name of Object.keys(zip.files)) {
-      if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
-      const xml = await zip.file(name)!.async("string");
-      const re = /<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)<\/v>/g;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(xml))) { const idx = parseInt(m[1], 10); if (idx > maxIdx) maxIdx = idx; }
+    let changed = false;
+
+    // (A) Self-heal a styles.xml corrupted by the old String.replace "$&"
+    // footgun: a currency formatCode "$" was expanded to the matched text
+    // "</numFmts>", leaving e.g. formatCode="&quot;</numFmts>quot;#,##0.00",
+    // which contains '<' in an attribute → invalid XML → Excel discards
+    // styles.xml (and cascades cell/table repairs). Undo the injection.
+    const stylesFile = zip.file("xl/styles.xml");
+    if (stylesFile) {
+      let styles = await stylesFile.async("string");
+      if (styles.includes("&quot;</numFmts>quot;")) {
+        styles = styles.split("&quot;</numFmts>quot;").join("&quot;$&quot;");
+        zip.file("xl/styles.xml", styles);
+        changed = true;
+        console.warn('[Dashboard] sanitizeXlsxBuffer: healed corrupted styles.xml ("$&" numFmt injection)');
+      }
     }
-    if (maxIdx < siCount) return buf; // all refs in range
-    if (!/<\/sst>/.test(ss)) return buf; // unexpected shape — don't risk it
-    const pad = maxIdx - siCount + 1;
-    ss = ss.replace("</sst>", "<si><t></t></si>".repeat(pad) + "</sst>");
-    ss = ss.replace(/(<sst\b[^>]*\buniqueCount=")(\d+)(")/, (_s, a, _n, c) => a + (siCount + pad) + c);
-    zip.file("xl/sharedStrings.xml", ss);
-    console.warn(`[Dashboard] sanitizeXlsxBuffer: padded sharedStrings by ${pad} (had ${siCount}, max ref ${maxIdx}) to repair out-of-range shared-string refs`);
-    return await zip.generateAsync({ type: "nodebuffer" });
+
+    // (B) Pad sharedStrings to cover any out-of-range refs (the original repair).
+    const ssFile = zip.file("xl/sharedStrings.xml");
+    if (ssFile) {
+      let ss = await ssFile.async("string");
+      const siCount = (ss.match(/<si(?:\s[^>]*)?>/g) || []).length;
+      let maxIdx = -1;
+      for (const name of Object.keys(zip.files)) {
+        if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
+        const xml = await zip.file(name)!.async("string");
+        const re = /<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)<\/v>/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(xml))) { const idx = parseInt(m[1], 10); if (idx > maxIdx) maxIdx = idx; }
+      }
+      if (maxIdx >= siCount && /<\/sst>/.test(ss)) {
+        const pad = maxIdx - siCount + 1;
+        ss = ss.replace("</sst>", () => "<si><t></t></si>".repeat(pad) + "</sst>");
+        ss = ss.replace(/(<sst\b[^>]*\buniqueCount=")(\d+)(")/, (_s, a, _n, c) => a + (siCount + pad) + c);
+        zip.file("xl/sharedStrings.xml", ss);
+        changed = true;
+        console.warn(`[Dashboard] sanitizeXlsxBuffer: padded sharedStrings by ${pad} (had ${siCount}, max ref ${maxIdx})`);
+      }
+    }
+
+    return changed ? await zip.generateAsync({ type: "nodebuffer" }) : buf;
   } catch (e: any) {
     console.warn(`[Dashboard] sanitizeXlsxBuffer skipped: ${e?.message ?? e}`);
     return buf;
