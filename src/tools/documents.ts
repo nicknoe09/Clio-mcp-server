@@ -454,6 +454,84 @@ async function getClientActivityCSV(opts: {
   return { rows: parseCSV(csv), report: { id: reportId, kind: "client_activity", via: "post" } };
 }
 
+// ========== Realization Report (per-month) ==========
+// Auto-generates a single-month Realization report and downloads the CSV.
+// Each row is one time entry with: User, Time Entry Date, Invoice Status,
+// Billed Time Amount, Amount Discounted, Adjusted Amount, **Billed Time
+// Collected**, **Billed Time Outstanding**, Billed Time Credited, Billed
+// Hours, Hours Discounted, Adjusted Hours. The collected/outstanding columns
+// attribute payment $ back to the timekeeper who did the work — that is the
+// basis Rachel's hand-entered Collection tab uses (verified against the
+// 06/05/2026 April sample: PAR April Collected = $56,553, Outstanding = $8,923).
+async function getRealizationReportCSV(opts: {
+  start_date: string;
+  end_date: string;
+  reportId?: number;
+  pollSeconds?: number;
+}): Promise<{ rows: Record<string, string>[]; report: { id: number; kind: string; via: "post" | "list" } }> {
+  if (opts.reportId) {
+    const csv = await downloadReport(opts.reportId);
+    return { rows: parseCSV(csv), report: { id: opts.reportId, kind: "matter_realization", via: "list" } };
+  }
+  // Try several plausible kind strings — Clio's report kinds vary slightly.
+  const kindCandidates = ["matter_realization", "realization", "matter_realization_rate"];
+  let lastErr: any;
+  for (const kind of kindCandidates) {
+    const body: any = { data: { kind, format: "csv", start_date: opts.start_date, end_date: opts.end_date } };
+    let reportId: number | undefined;
+    let state: string | undefined;
+    try {
+      const gen = await rawPostSingle("/reports", body);
+      const rep = gen?.data ?? gen;
+      reportId = rep?.id;
+      state = rep?.state;
+    } catch (e: any) { lastErr = e; continue; }
+    if (!reportId) { lastErr = new Error(`POST ${kind} returned no id`); continue; }
+    const deadline = Date.now() + (opts.pollSeconds ?? 120) * 1000;
+    while (state && !["completed", "failed", "empty"].includes(state) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 4000));
+      try { const s = await rawGetSingle(`/reports/${reportId}`, { fields: "id,state" }); state = (s?.data ?? s)?.state; }
+      catch { break; }
+    }
+    if (state === "completed") {
+      const csv = await downloadReport(reportId);
+      return { rows: parseCSV(csv), report: { id: reportId, kind, via: "post" } };
+    }
+    lastErr = new Error(`Report ${reportId} kind=${kind} did not complete (state=${state})`);
+  }
+  // Fallback: pick the most recent completed realization CSV by name match.
+  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,created_at", order: "id(desc)" });
+  const candidates = reports.filter((r: any) =>
+    r.state === "completed" && r.format === "csv" &&
+    (String(r.kind || "").toLowerCase().includes("realization") ||
+     String(r.name || "").toLowerCase().includes("realization")));
+  if (!candidates.length) {
+    const detail = lastErr?.response?.data ? JSON.stringify(lastErr.response.data) : String(lastErr ?? "no candidates");
+    throw new Error(`Could not POST a Realization report and no completed Realization reports found in /reports. Detail: ${detail}`);
+  }
+  const target = candidates[0];
+  const csv = await downloadReport(target.id);
+  return { rows: parseCSV(csv), report: { id: target.id, kind: target.kind ?? "realization", via: "list" } };
+}
+
+// Per-timekeeper $ buckets from a Realization Report CSV: each row's
+// "Billed Time Collected"/"Billed Time Outstanding" is summed by User
+// (the timekeeper who did the work). This matches the Collection tab's
+// "Collected $" / "Uncollected $" basis.
+type RealizCollectionsAgg = { collected: number; outstanding: number };
+function aggregateRealizationCollections(rows: Record<string, string>[], nameToUid: Map<string, number>): Record<number, RealizCollectionsAgg> {
+  const out: Record<number, RealizCollectionsAgg> = {};
+  for (const r of rows) {
+    const name = (r["User"] ?? "").trim().toLowerCase();
+    const uid = nameToUid.get(name);
+    if (uid == null) continue;
+    const slot = (out[uid] ??= { collected: 0, outstanding: 0 });
+    slot.collected   += parseFloat((r["Billed Time Collected"]   ?? "0").replace(/,/g, "")) || 0;
+    slot.outstanding += parseFloat((r["Billed Time Outstanding"] ?? "0").replace(/,/g, "")) || 0;
+  }
+  return out;
+}
+
 // Per-timekeeper hours buckets derived from a Client Activity CSV.
 // - billedNondiscHrs: Status=Billed AND |Qty*Price - Total| < 0.005
 // - billedDiscHrs:    Status=Billed AND Total < Qty*Price (line discount or full no-charge)
@@ -1780,13 +1858,14 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report (target month only). The month×user sources rewrite all YTD months; the classic default writes the target month only. Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report (target month only). The month×user sources rewrite all YTD months; the classic default writes the target month only. Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected $ / Uncollected $) sourced from an auto-generated Clio Realization report's Billed Time Collected / Billed Time Outstanding columns (attributed to the timekeeper who did the work) — pass realization_report_id to use a specific pre-generated report instead. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       revenue_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the monthly classic Revenue Report (overrides auto-selection by header signature). Use when multiple revenue-style reports exist and the wrong one is being picked."),
       revenue_csv_box_file_id: z.string().optional().describe("Box file ID of a manually-exported month×user Revenue Report CSV (the beta 'Revenue Report (Like Classic)', grouped by Activity month + User). When set, the dashboard reads revenue from this Box CSV instead of Clio's /reports — the reliable path when the report lives in Clio's beta engine (no API) or the report-generation endpoint is flaky."),
       client_activity_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the Client Activity report covering the target month (overrides auto-generation). Use when a Client Activity CSV has already been generated and you want to reuse it instead of POSTing a new one."),
+      realization_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the Realization report covering the target month (overrides auto-generation). The Realization report is the source for the Collection tab's Collected/Uncollected $ — pass this to reuse an existing report instead of POSTing a new one."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
@@ -2895,10 +2974,12 @@ export function registerDocumentTools(server: McpServer): void {
           // We patch ONLY the target month's block on each tab — prior months
           // remain as-entered (matches the patch-only invariant from PR #70).
           _step = "patch util/realiz from client activity";
-          let utilXml: string | undefined, realizXml: string | undefined;
-          let utilPatched = 0, realizPatched = 0;
+          let utilXml: string | undefined, realizXml: string | undefined, collectionXml: string | undefined;
+          let utilPatched = 0, realizPatched = 0, collectionPatched = 0;
           let clientActivityReportId: number | undefined;
           let clientActivityErr: string | undefined;
+          let realizationReportId: number | undefined;
+          let realizationErr: string | undefined;
           try {
             const ca = await getClientActivityCSV({
               start_date: monthStart, end_date: monthEnd,
@@ -3007,6 +3088,82 @@ export function registerDocumentTools(server: McpServer): void {
           } catch (e: any) {
             clientActivityErr = e?.message ?? String(e);
             console.error("[dashboard] Client Activity tab patch failed:", clientActivityErr);
+          }
+
+          // ============================================================
+          // Patch Collection tab from Realization Report CSV
+          // ============================================================
+          // The Realization Report exposes per-time-entry "Billed Time Collected"
+          // and "Billed Time Outstanding" — attributed to the timekeeper who did
+          // the work. Summed by User per month, these match Rachel's Collection
+          // tab Collected $ / Uncollected $ columns directly.
+          _step = "patch collection from realization report";
+          try {
+            const rr = await getRealizationReportCSV({
+              start_date: monthStart, end_date: monthEnd,
+              reportId: params.realization_report_id,
+              pollSeconds: 180,
+            });
+            realizationReportId = rr.report.id;
+            const nameToUid = new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id]));
+            const collAgg = aggregateRealizationCollections(rr.rows, nameToUid);
+            const monthAbbr = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][params.month - 1];
+            const initialsAliases: Record<string, string> = { JBP: "JPB" };
+            const initialsToUid: Record<string, number> = {};
+            for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
+            function findBlockRows(xml: string): { hdr: number; attorneys: Array<{ row: number; ini: string }> } | null {
+              const rowRe = /<row\b[^>]*\br="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
+              const cellVal = (rowXml: string, col: string): string => {
+                const re = new RegExp(`<c\\b[^>]*\\br="${col}\\d+"[^>]*>([\\s\\S]*?)</c>`);
+                const m = rowXml.match(re);
+                if (!m) return "";
+                const inner = m[1];
+                const t = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+                if (t) return t[1];
+                const v = inner.match(/<v>([\s\S]*?)<\/v>/);
+                if (v) return v[1];
+                return "";
+              };
+              let hdr = 0;
+              const attorneys: Array<{ row: number; ini: string }> = [];
+              let m: RegExpExecArray | null;
+              const rows: Array<{ n: number; body: string }> = [];
+              while ((m = rowRe.exec(xml)) !== null) rows.push({ n: parseInt(m[1], 10), body: m[2] });
+              rows.sort((a, b) => a.n - b.n);
+              for (const { n, body } of rows) {
+                const a = cellVal(body, "A").trim().toUpperCase();
+                const b = cellVal(body, "B").trim().toUpperCase();
+                if (!hdr) { if (a === monthAbbr) hdr = n; continue; }
+                if (a && a !== monthAbbr) break;
+                if (b === "" || b === "EMPLOYEE" || b === "TOTAL") {
+                  if (attorneys.length) break;
+                  continue;
+                }
+                attorneys.push({ row: n, ini: b });
+              }
+              if (!hdr || !attorneys.length) return null;
+              return { hdr, attorneys };
+            }
+            const collPath = compareSheetMap["Collection"];
+            if (collPath) {
+              collectionXml = await origZip.file(collPath)!.async("string");
+              const block = findBlockRows(collectionXml);
+              if (block) {
+                for (const { row, ini } of block.attorneys) {
+                  const realIni = initialsAliases[ini] ?? ini;
+                  const uid = initialsToUid[realIni];
+                  if (!uid) continue;
+                  const c = collAgg[uid];
+                  if (!c) continue;
+                  collectionXml = patchCell(collectionXml, `C${row}`, round2(c.collected));
+                  collectionXml = patchCell(collectionXml, `D${row}`, round2(c.outstanding));
+                  collectionPatched++;
+                }
+              }
+            }
+          } catch (e: any) {
+            realizationErr = e?.message ?? String(e);
+            console.error("[dashboard] Collection tab patch failed:", realizationErr);
           }
 
           // --- Build new sheet XMLs from data ---
@@ -3200,6 +3357,7 @@ export function registerDocumentTools(server: McpServer): void {
             };
             if (utilXml && utilPatched > 0) out["Utilization"] = utilXml;
             if (realizXml && realizPatched > 0) out["Realization"] = realizXml;
+            if (collectionXml && collectionPatched > 0) out["Collection"] = collectionXml;
             return out;
           }, deletedSheets);
           const result = await uploadToBox({
@@ -3222,8 +3380,11 @@ export function registerDocumentTools(server: McpServer): void {
             attorneys_tracked: attys.length,
             utilization_patched: utilPatched,
             realization_patched: realizPatched,
+            collection_patched: collectionPatched,
             client_activity_report_id: clientActivityReportId,
+            realization_report_id: realizationReportId,
             ...(clientActivityErr ? { client_activity_error: clientActivityErr } : {}),
+            ...(realizationErr ? { realization_error: realizationErr } : {}),
           };
 
           if (result.uploaded) {
