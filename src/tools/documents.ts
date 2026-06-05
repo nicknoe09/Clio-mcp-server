@@ -42,12 +42,44 @@ function xmlRow(rowNum: number, cells: string[]): string {
   return `<row r="${rowNum}">${filtered.join("")}</row>`;
 }
 
-/** Build a complete minimal worksheet XML */
-function buildSheetXml(rows: string[]): string {
+/**
+ * Per-cell style placeholders. xmlCell writes these into the s="…" attribute at
+ * build time; surgicalWriteXlsx's addStyles pass substitutes them with the real
+ * style indices once the workbook's cellXfs have been extended. This lets us
+ * differentiate currency vs decimal vs percent vs bold cells per-call without
+ * having to thread ST through every helper.
+ */
+const STYLE_CUR  = "__CUR__";  // $#,##0.00
+const STYLE_DEC  = "__DEC__";  // 0.0  (hours)
+const STYLE_PCT  = "__PCT__";  // 0.00%
+const STYLE_BOLD = "__BOLD__"; // bold, general
+const STYLE_GEN  = "__GEN__";  // general (default fallback)
+
+/**
+ * Build a complete minimal worksheet XML.
+ * Optional `cols` lets you set per-column widths; `freezeRow`/`freezeCol`
+ * freeze the rows above / columns left of the given 1-based indices.
+ */
+function buildSheetXml(
+  rows: string[],
+  opts?: { cols?: Array<{ min: number; max: number; width: number }>; freezeRow?: number; freezeCol?: number },
+): string {
   const filtered = rows.filter(Boolean);
+  const colsXml = opts?.cols?.length
+    ? `<cols>${opts.cols.map(c => `<col min="${c.min}" max="${c.max}" width="${c.width}" customWidth="1"/>`).join("")}</cols>`
+    : "";
+  let viewsXml = "";
+  if (opts?.freezeRow || opts?.freezeCol) {
+    const fr = opts.freezeRow ?? 0;
+    const fc = opts.freezeCol ?? 0;
+    const cl = (c: number): string => { let s = ""; while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); } return s; };
+    const tlc = `${cl(fc + 1)}${fr + 1}`;
+    const split = fr && fc ? `xSplit="${fc}" ySplit="${fr}"` : fr ? `ySplit="${fr}"` : `xSplit="${fc}"`;
+    viewsXml = `<sheetViews><sheetView workbookViewId="0"><pane ${split} topLeftCell="${tlc}" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>`;
+  }
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<sheetData>${filtered.join("")}</sheetData>
+${viewsXml}${colsXml}<sheetData>${filtered.join("")}</sheetData>
 </worksheet>`;
 }
 
@@ -3169,43 +3201,72 @@ export function registerDocumentTools(server: McpServer): void {
           // --- Build new sheet XMLs from data ---
           // Bonus Config
           const configRows: string[] = [];
-          configRows.push(xmlRow(1, [xmlCell("A1", "Bonus Configuration")]));
-          configRows.push(xmlRow(4, [xmlCell("A4", "Attorney"), xmlCell("B4", "Base Salary"), xmlCell("C4", "Associate"), xmlCell("D4", "Paralegal"), xmlCell("E4", "Para Salary"), xmlCell("F4", "Legal Asst"), xmlCell("G4", "Payroll %")]));
+          configRows.push(xmlRow(1, [xmlCell("A1", "Bonus Configuration", { style: STYLE_BOLD })]));
+          configRows.push(xmlRow(4, [
+            xmlCell("A4", "Attorney",    { style: STYLE_BOLD }),
+            xmlCell("B4", "Base Salary", { style: STYLE_BOLD }),
+            xmlCell("C4", "Associate",   { style: STYLE_BOLD }),
+            xmlCell("D4", "Paralegal",   { style: STYLE_BOLD }),
+            xmlCell("E4", "Para Salary", { style: STYLE_BOLD }),
+            xmlCell("F4", "Legal Asst",  { style: STYLE_BOLD }),
+            xmlCell("G4", "Payroll %",   { style: STYLE_BOLD }),
+          ]));
           for (let i = 0; i < configAttorneys.length; i++) {
             const a = configAttorneys[i];
-            configRows.push(xmlRow(5 + i, [xmlCell(`A${5+i}`, a.ini), xmlCell(`B${5+i}`, a.salary), xmlCell(`C${5+i}`, a.associate), xmlCell(`D${5+i}`, a.paralegal), xmlCell(`E${5+i}`, a.paraSalary), xmlCell(`F${5+i}`, a.legalAsst), xmlCell(`G${5+i}`, a.payroll)]));
+            configRows.push(xmlRow(5 + i, [
+              xmlCell(`A${5+i}`, a.ini,        { style: STYLE_BOLD }),
+              xmlCell(`B${5+i}`, a.salary,     { style: STYLE_CUR }),
+              xmlCell(`C${5+i}`, a.associate),
+              xmlCell(`D${5+i}`, a.paralegal),
+              xmlCell(`E${5+i}`, a.paraSalary, { style: STYLE_CUR }),
+              xmlCell(`F${5+i}`, a.legalAsst,  { style: STYLE_CUR }),
+              xmlCell(`G${5+i}`, a.payroll,    { style: STYLE_PCT }),
+            ]));
           }
-          configRows.push(xmlRow(13, [xmlCell("A13", "Firm Overhead"), xmlCell("B13", firmOverhead)]));
-          configRows.push(xmlRow(14, [xmlCell("A14", "# of Attorneys"), xmlCell("B14", numAttorneys)]));
-          configRows.push(xmlRow(16, [xmlCell("A16", "Bracket"), xmlCell("B16", "Width"), xmlCell("C16", "Rate")]));
-          configRows.push(xmlRow(17, [xmlCell("A17", 1), xmlCell("B17", "Base Target"), xmlCell("C17", 0)]));
-          configRows.push(xmlRow(18, [xmlCell("A18", 2), xmlCell("B18", 50000), xmlCell("C18", 0.05)]));
-          configRows.push(xmlRow(19, [xmlCell("A19", 3), xmlCell("B19", 50000), xmlCell("C19", 0.10)]));
-          configRows.push(xmlRow(20, [xmlCell("A20", 4), xmlCell("B20", "Unlimited"), xmlCell("C20", 0.15)]));
+          configRows.push(xmlRow(13, [xmlCell("A13", "Firm Overhead",  { style: STYLE_BOLD }), xmlCell("B13", firmOverhead, { style: STYLE_CUR })]));
+          configRows.push(xmlRow(14, [xmlCell("A14", "# of Attorneys", { style: STYLE_BOLD }), xmlCell("B14", numAttorneys)]));
+          configRows.push(xmlRow(16, [xmlCell("A16", "Bracket", { style: STYLE_BOLD }), xmlCell("B16", "Width", { style: STYLE_BOLD }), xmlCell("C16", "Rate", { style: STYLE_BOLD })]));
+          configRows.push(xmlRow(17, [xmlCell("A17", 1), xmlCell("B17", "Base Target"),                   xmlCell("C17", 0,    { style: STYLE_PCT })]));
+          configRows.push(xmlRow(18, [xmlCell("A18", 2), xmlCell("B18", 50000, { style: STYLE_CUR }),     xmlCell("C18", 0.05, { style: STYLE_PCT })]));
+          configRows.push(xmlRow(19, [xmlCell("A19", 3), xmlCell("B19", 50000, { style: STYLE_CUR }),     xmlCell("C19", 0.10, { style: STYLE_PCT })]));
+          configRows.push(xmlRow(20, [xmlCell("A20", 4), xmlCell("B20", "Unlimited"),                     xmlCell("C20", 0.15, { style: STYLE_PCT })]));
           configRows.push(xmlRow(22, [xmlCell("A22", "MNH collections split equally among: PAR, KES, NRN")]));
-          configRows.push(xmlRow(24, [xmlCell("A24", "Paralegal Hours Bonus")]));
-          configRows.push(xmlRow(25, [xmlCell("A25", "Min Hours"), xmlCell("B25", "Bonus")]));
-          configRows.push(xmlRow(26, [xmlCell("A26", 110), xmlCell("B26", 100)]));
-          configRows.push(xmlRow(27, [xmlCell("A27", 121), xmlCell("B27", 300)]));
-          configRows.push(xmlRow(28, [xmlCell("A28", 133), xmlCell("B28", 500)]));
+          configRows.push(xmlRow(24, [xmlCell("A24", "Paralegal Hours Bonus", { style: STYLE_BOLD })]));
+          configRows.push(xmlRow(25, [xmlCell("A25", "Min Hours", { style: STYLE_BOLD }), xmlCell("B25", "Bonus", { style: STYLE_BOLD })]));
+          configRows.push(xmlRow(26, [xmlCell("A26", 110), xmlCell("B26", 100, { style: STYLE_CUR })]));
+          configRows.push(xmlRow(27, [xmlCell("A27", 121), xmlCell("B27", 300, { style: STYLE_CUR })]));
+          configRows.push(xmlRow(28, [xmlCell("A28", 133), xmlCell("B28", 500, { style: STYLE_CUR })]));
           configRows.push(xmlRow(30, [xmlCell("A30", "Paralegals: ACA, AFL, AKG")]));
-          const bonusConfigXml = buildSheetXml(configRows);
+          // Column widths so the Bonus Config table reads cleanly.
+          const bonusConfigXml = buildSheetXml(configRows, {
+            cols: [
+              { min: 1, max: 1, width: 16 },  // Attorney label / section names
+              { min: 2, max: 2, width: 14 },  // Base Salary / etc.
+              { min: 3, max: 4, width: 11 },  // Associate / Paralegal initials
+              { min: 5, max: 5, width: 13 },  // Para Salary
+              { min: 6, max: 6, width: 12 },  // Legal Asst
+              { min: 7, max: 7, width: 11 },  // Payroll %
+            ],
+          });
 
           // Bonus Tracker
+          // Layout: title row 1; attorney name headers row 3 (4 cols each);
+          // sub-headers row 4 (Collections/YTD/Bonus/CumBonus); months rows
+          // 5-16; Year Total row 17; Attorney Summary block starting row 19;
+          // Paralegal Hours section follows. All $ cells use currency style,
+          // all hours cells use decimal, headers/totals use bold.
           const trackerRows: string[] = [];
-          trackerRows.push(xmlRow(1, [xmlCell("A1", `${params.year} Bonus Tracker`)]));
-          // Attorney headers
+          trackerRows.push(xmlRow(1, [xmlCell("A1", `${params.year} Bonus Tracker`, { style: STYLE_BOLD })]));
           const xmlColsPerAtty = 4;
           const trackerHeaderCells: string[] = [];
-          const trackerSubCells: string[] = [xmlCell("A4", "Month")];
+          const trackerSubCells: string[] = [xmlCell("A4", "Month", { style: STYLE_BOLD })];
           for (let ai = 0; ai < attys.length; ai++) {
             const col = 2 + ai * xmlColsPerAtty;
-            const L = colLetter(col);
-            trackerHeaderCells.push(xmlCell(`${L}3`, attys[ai].ini));
-            trackerSubCells.push(xmlCell(`${colLetter(col)}4`, "Collections"));
-            trackerSubCells.push(xmlCell(`${colLetter(col+1)}4`, "YTD"));
-            trackerSubCells.push(xmlCell(`${colLetter(col+2)}4`, "Bonus"));
-            trackerSubCells.push(xmlCell(`${colLetter(col+3)}4`, "Cum Bonus"));
+            trackerHeaderCells.push(xmlCell(`${colLetter(col)}3`, attys[ai].ini, { style: STYLE_BOLD }));
+            trackerSubCells.push(xmlCell(`${colLetter(col)}4`,   "Collections", { style: STYLE_BOLD }));
+            trackerSubCells.push(xmlCell(`${colLetter(col+1)}4`, "YTD",         { style: STYLE_BOLD }));
+            trackerSubCells.push(xmlCell(`${colLetter(col+2)}4`, "Bonus",       { style: STYLE_BOLD }));
+            trackerSubCells.push(xmlCell(`${colLetter(col+3)}4`, "Cum Bonus",   { style: STYLE_BOLD }));
           }
           trackerRows.push(xmlRow(3, trackerHeaderCells));
           trackerRows.push(xmlRow(4, trackerSubCells));
@@ -3217,27 +3278,58 @@ export function registerDocumentTools(server: McpServer): void {
               const col = 2 + ai * xmlColsPerAtty;
               const br = bonusData[attys[ai].ini]?.rows[mi];
               if (br && (br.collections > 0 || br.ytd > 0)) {
-                cells.push(xmlCell(`${colLetter(col)}${rn}`, br.collections));
-                cells.push(xmlCell(`${colLetter(col+1)}${rn}`, br.ytd));
-                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, br.bonusEarned));
-                cells.push(xmlCell(`${colLetter(col+3)}${rn}`, br.cumBonus));
+                cells.push(xmlCell(`${colLetter(col)}${rn}`,   br.collections, { style: STYLE_CUR }));
+                cells.push(xmlCell(`${colLetter(col+1)}${rn}`, br.ytd,         { style: STYLE_CUR }));
+                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, br.bonusEarned, { style: STYLE_CUR }));
+                cells.push(xmlCell(`${colLetter(col+3)}${rn}`, br.cumBonus,    { style: STYLE_CUR }));
               }
             }
             trackerRows.push(xmlRow(rn, cells));
           }
 
+          // Row 17: Year Total — sums collections + bonus, shows final YTD/CumBonus.
+          const yearTotalCells: string[] = [xmlCell("A17", "Year Total", { style: STYLE_BOLD })];
+          for (let ai = 0; ai < attys.length; ai++) {
+            const col = 2 + ai * xmlColsPerAtty;
+            const bd = bonusData[attys[ai].ini];
+            if (!bd) continue;
+            const yearColl  = round2(bd.rows.reduce((s, r) => s + r.collections, 0));
+            const yearBonus = round2(bd.rows.reduce((s, r) => s + r.bonusEarned, 0));
+            const finalYtd  = bd.rows.length ? bd.rows[bd.rows.length - 1].ytd      : 0;
+            const finalCum  = bd.rows.length ? bd.rows[bd.rows.length - 1].cumBonus : 0;
+            yearTotalCells.push(xmlCell(`${colLetter(col)}17`,   yearColl,  { style: STYLE_BOLD }));
+            yearTotalCells.push(xmlCell(`${colLetter(col+1)}17`, finalYtd,  { style: STYLE_BOLD }));
+            yearTotalCells.push(xmlCell(`${colLetter(col+2)}17`, yearBonus, { style: STYLE_BOLD }));
+            yearTotalCells.push(xmlCell(`${colLetter(col+3)}17`, finalCum,  { style: STYLE_BOLD }));
+          }
+          trackerRows.push(xmlRow(17, yearTotalCells));
+
           // Summary section
-          trackerRows.push(xmlRow(19, [xmlCell("A19", "Attorney Summary")]));
-          trackerRows.push(xmlRow(20, [xmlCell("A20", "Attorney"), xmlCell("B20", "Base Target"), xmlCell("C20", "YTD Collections"), xmlCell("D20", "Current Bracket"), xmlCell("E20", "To Next Bracket"), xmlCell("F20", "Total Bonus"), xmlCell("G20", "Paid"), xmlCell("H20", "Balance")]));
+          trackerRows.push(xmlRow(19, [xmlCell("A19", "Attorney Summary", { style: STYLE_BOLD })]));
+          trackerRows.push(xmlRow(20, [
+            xmlCell("A20", "Attorney",         { style: STYLE_BOLD }),
+            xmlCell("B20", "Base Target",      { style: STYLE_BOLD }),
+            xmlCell("C20", "YTD Collections",  { style: STYLE_BOLD }),
+            xmlCell("D20", "Current Bracket",  { style: STYLE_BOLD }),
+            xmlCell("E20", "To Next Bracket",  { style: STYLE_BOLD }),
+            xmlCell("F20", "Total Bonus",      { style: STYLE_BOLD }),
+            xmlCell("G20", "Paid",             { style: STYLE_BOLD }),
+            xmlCell("H20", "Balance",          { style: STYLE_BOLD }),
+          ]));
           for (let ai = 0; ai < attys.length; ai++) {
             const rn = 21 + ai;
             const bd = bonusData[attys[ai].ini];
             if (!bd) continue;
             const lastActive = bd.rows.filter(r => r.collections > 0).pop() || bd.rows[0];
             trackerRows.push(xmlRow(rn, [
-              xmlCell(`A${rn}`, attys[ai].ini), xmlCell(`B${rn}`, bd.baseTarget), xmlCell(`C${rn}`, lastActive.ytd),
-              xmlCell(`D${rn}`, lastActive.bracket), xmlCell(`E${rn}`, lastActive.toNext),
-              xmlCell(`F${rn}`, lastActive.cumBonus), xmlCell(`G${rn}`, 0), xmlCell(`H${rn}`, lastActive.cumBonus),
+              xmlCell(`A${rn}`, attys[ai].ini, { style: STYLE_BOLD }),
+              xmlCell(`B${rn}`, bd.baseTarget,       { style: STYLE_CUR }),
+              xmlCell(`C${rn}`, lastActive.ytd,      { style: STYLE_CUR }),
+              xmlCell(`D${rn}`, lastActive.bracket),
+              xmlCell(`E${rn}`, lastActive.toNext,   { style: STYLE_CUR }),
+              xmlCell(`F${rn}`, lastActive.cumBonus, { style: STYLE_CUR }),
+              xmlCell(`G${rn}`, 0,                   { style: STYLE_CUR }),
+              xmlCell(`H${rn}`, lastActive.cumBonus, { style: STYLE_CUR }),
             ]));
           }
 
@@ -3249,16 +3341,16 @@ export function registerDocumentTools(server: McpServer): void {
           // NB: each cell's ref row MUST match the row it's emitted in — a
           // cell like B30 inside <row r="31"> is invalid OOXML and Excel
           // discards the sheet's cell data ("Removed Records").
-          const paraTitleCells: string[] = [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus")];
-          const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month")];
+          const paraTitleCells: string[] = [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus", { style: STYLE_BOLD })];
+          const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month", { style: STYLE_BOLD })];
           const XML_PARALEGALS = ["ACA", "AFL", "AKG"];
           const XML_PARA_TIERS = [{ minHours: 133, bonus: 500 }, { minHours: 121, bonus: 300 }, { minHours: 110, bonus: 100 }];
           for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
             const col = 2 + pi * 3;
-            paraTitleCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi]));
-            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`, "Billable Hrs"));
-            paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier"));
-            paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus"));
+            paraTitleCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi], { style: STYLE_BOLD }));
+            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`,   "Billable Hrs", { style: STYLE_BOLD }));
+            paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier",         { style: STYLE_BOLD }));
+            paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus",        { style: STYLE_BOLD }));
           }
           trackerRows.push(xmlRow(paraStart, paraTitleCells));
           trackerRows.push(xmlRow(paraHdr, paraHdrCells));
@@ -3272,14 +3364,22 @@ export function registerDocumentTools(server: McpServer): void {
               if (hrs > 0) {
                 let bonus = 0, tier = "-";
                 for (const t of XML_PARA_TIERS) { if (hrs >= t.minHours) { bonus = t.bonus; tier = `≥${t.minHours}`; break; } }
-                cells.push(xmlCell(`${colLetter(col)}${rn}`, round1(hrs)));
+                cells.push(xmlCell(`${colLetter(col)}${rn}`,   round1(hrs), { style: STYLE_DEC }));
                 cells.push(xmlCell(`${colLetter(col+1)}${rn}`, tier));
-                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, bonus));
+                cells.push(xmlCell(`${colLetter(col+2)}${rn}`, bonus,       { style: STYLE_CUR }));
               }
             }
             trackerRows.push(xmlRow(rn, cells));
           }
-          const bonusTrackerXml = buildSheetXml(trackerRows);
+          // Column widths: A = month names (12), then for each of 7 attorneys
+          // 4 cols × 13 chars wide ≈ $XX,XXX.XX fits comfortably.
+          const trackerCols: Array<{ min: number; max: number; width: number }> = [{ min: 1, max: 1, width: 12 }];
+          for (let ai = 0; ai < attys.length; ai++) {
+            const colStart = 2 + ai * xmlColsPerAtty;
+            trackerCols.push({ min: colStart, max: colStart + xmlColsPerAtty - 1, width: 13 });
+          }
+          // Freeze first column (A) and the first 4 rows (title + headers).
+          const bonusTrackerXml = buildSheetXml(trackerRows, { cols: trackerCols, freezeRow: 4, freezeCol: 1 });
 
           // Attorney Performance
           const perfRows: string[] = [];
@@ -3340,14 +3440,22 @@ export function registerDocumentTools(server: McpServer): void {
           // Use placeholder styles, then replace after surgicalWriteXlsx injects real indices
           const deletedSheets = new Set(sheetsToDelete.map((ws: any) => ws.name));
           const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
-            // Post-process new sheet XMLs to add style attributes
-            // For Bonus Config: numbers use general, currency uses currency
-            // For Bonus Tracker: collections/bonus use currency
-            // For Attorney Performance: hours use decimal, $ use currency, rates use percent
+            // Post-process new sheet XMLs to apply style indices.
+            // 1. Any <c r="…"> with no s="…" attribute gets the general style
+            //    (prevents Excel from defaulting to the date format).
+            // 2. Cells whose s="…" is one of our placeholders (__CUR__,
+            //    __DEC__, __PCT__, __BOLD__, __GEN__) get rewritten to the
+            //    real cellXfs index that surgicalWriteXlsx just injected.
+            //    This is what lets us emit currency vs decimal vs percent
+            //    cells per-call without threading ST through every helper.
             function addStyles(xml: string): string {
-              // All <c> elements without s= attribute and with <v> (number) get general style
-              // This prevents the default date format from being applied
-              return xml.replace(/<c r="([^"]+)">/g, (match, ref) => `<c r="${ref}" s="${ST.general}">`);
+              xml = xml.replace(/<c r="([^"]+)">/g, (_, ref) => `<c r="${ref}" s="${ST.general}">`);
+              xml = xml.split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`);
+              xml = xml.split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`);
+              xml = xml.split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`);
+              xml = xml.split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`);
+              xml = xml.split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`);
+              return xml;
             }
             const out: Record<string, string> = {
               "26 Compare": compareXml,  // already has correct styles from original
