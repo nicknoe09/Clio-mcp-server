@@ -541,11 +541,12 @@ export function registerARTools(server: McpServer): void {
         const asOf = params.as_of_date ? new Date(params.as_of_date + "T00:00:00") : new Date();
         const asOfStr = asOf.toISOString().split("T")[0];
         const bills = await fetchAllPages<any>("/bills", {
-          // Request bare `matters` — Clio returns the default matter expansion
-          // (display_number, description, client, responsible_attorney). This is
-          // the exact field set get_ar_aging uses and that Clio accepts; the
-          // earlier nested form (matters{…responsible_attorney{name}}) 400s.
-          fields: "id,number,issued_at,due_at,balance,total,state,matters",
+          // Request matter sub-objects WITHOUT deeper {name} nesting — Clio
+          // returns client/responsible_attorney as full objects (with .name).
+          // Bare `matters` omits client/responsible_attorney (everything came
+          // back Unknown/Unassigned); the deep form matters{…client{name}} 400s.
+          // This middle form is the proven get_wip_report pattern.
+          fields: "id,number,issued_at,due_at,balance,total,state,matters{id,display_number,description,client,responsible_attorney}",
           state: "awaiting_payment",
         });
 
