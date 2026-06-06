@@ -146,6 +146,30 @@ const STYLE_DEC  = "__DEC__";  // 0.0  (hours)
 const STYLE_PCT  = "__PCT__";  // 0.00%
 const STYLE_BOLD = "__BOLD__"; // bold, general
 const STYLE_GEN  = "__GEN__";  // general (default fallback)
+const STYLE_GREEN = "__GREEN__"; // currency + green fill (on goal)
+const STYLE_AMBER = "__AMBER__"; // currency + amber fill (within 10% below goal)
+const STYLE_RED   = "__RED__";   // currency + red fill (off goal)
+
+/**
+ * On/off-goal color placeholder: green if actual ≥ goal, amber within 10% below,
+ * red otherwise. Returns plain currency (STYLE_CUR) when there's no goal to
+ * compare against, so callers can leave such cells uncolored.
+ */
+function goalColorStyle(actual: number, proratedGoal: number): string {
+  if (!(proratedGoal > 0)) return STYLE_CUR;
+  const ratio = actual / proratedGoal;
+  return ratio >= 1 ? STYLE_GREEN : ratio >= 0.9 ? STYLE_AMBER : STYLE_RED;
+}
+
+/** Set (or insert) the s="…" style attribute on a specific cell in a sheet XML. */
+function setCellStyle(xml: string, ref: string, styleId: string): string {
+  const re = new RegExp(`(<c\\b[^>]*\\br="${ref}")([^>]*?)(/?>)`);
+  const m = xml.match(re);
+  if (!m) return xml;
+  let mid = m[2];
+  mid = /\bs="/.test(mid) ? mid.replace(/\bs="[^"]*"/, ` s="${styleId}"`) : ` s="${styleId}"${mid}`;
+  return xml.replace(re, `${m[1]}${mid}${m[3]}`);
+}
 
 /**
  * Build a complete minimal worksheet XML.
@@ -277,7 +301,7 @@ async function getZipSheetMap(zip: JSZip): Promise<Record<string, string>> {
  * - deletedSheetNames: sheets to remove
  * No ExcelJS involved in the write path.
  */
-interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; }
+interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; green: string; amber: string; red: string; }
 
 async function surgicalWriteXlsx(
   originalBuffer: Buffer,
@@ -304,7 +328,7 @@ async function surgicalWriteXlsx(
   //    once injected "</numFmts>" into an attribute → invalid XML → Excel threw
   //    out styles.xml. All replacements below use function replacers (literal).
   const stylesFile = zip.file("xl/styles.xml");
-  let newStyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0" };
+  let newStyleIndices: StyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0", green: "0", amber: "0", red: "0" };
   if (stylesFile) {
     let stylesXml = await stylesFile.async("string");
 
@@ -349,12 +373,31 @@ async function surgicalWriteXlsx(
     const xfCountMatch = stylesXml.match(/<cellXfs count="(\d+)">/);
     if (xfCountMatch) {
       const currentCount = parseInt(xfCountMatch[1], 10);
+
+      // Add 3 solid pattern fills (green / amber / red) for on/off-goal coloring,
+      // and remember their fillIds. Append to <fills count="F"> and bump count
+      // (function replacer — no "$" footgun; these strings have no "$").
+      let fillGreen = 0, fillAmber = 0, fillRed = 0;
+      const fillsMatch = stylesXml.match(/<fills count="(\d+)">/);
+      if (fillsMatch) {
+        const fc = parseInt(fillsMatch[1], 10);
+        fillGreen = fc; fillAmber = fc + 1; fillRed = fc + 2;
+        const mkFill = (rgb: string) => `<fill><patternFill patternType="solid"><fgColor rgb="${rgb}"/><bgColor indexed="64"/></patternFill></fill>`;
+        const addFills = mkFill("FFC6EFCE") + mkFill("FFFFEB9C") + mkFill("FFFFC7CE"); // green, amber, red
+        stylesXml = stylesXml.replace(`<fills count="${fc}">`, () => `<fills count="${fc + 3}">`);
+        stylesXml = stylesXml.replace("</fills>", () => addFills + "</fills>");
+      }
+
       const newXfs = [
         `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                       // General
         `<xf numFmtId="${curFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // currency
         `<xf numFmtId="${decFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,            // 0.0
         `<xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,                      // 0.00% (builtin)
         `<xf numFmtId="0" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`, // Bold
+        // Currency + on/off-goal fill (green / amber / red).
+        `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillGreen}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
+        `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillAmber}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
+        `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillRed}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
       ];
       newStyleIndices = {
         general: String(currentCount),
@@ -362,6 +405,9 @@ async function surgicalWriteXlsx(
         decimal: String(currentCount + 2),
         percent: String(currentCount + 3),
         bold: String(currentCount + 4),
+        green: String(currentCount + 5),
+        amber: String(currentCount + 6),
+        red: String(currentCount + 7),
       };
       const newXfCount = currentCount + newXfs.length;
       stylesXml = stylesXml.replace(`<cellXfs count="${currentCount}">`, () => `<cellXfs count="${newXfCount}">`);
@@ -3573,7 +3619,9 @@ export function registerDocumentTools(server: McpServer): void {
             trackerRows.push(xmlRow(rn, [
               xmlCell(`A${rn}`, attys[ai].ini, { style: STYLE_BOLD }),
               xmlCell(`B${rn}`, bd.baseTarget,       { style: STYLE_CUR }),
-              xmlCell(`C${rn}`, lastActive.ytd,      { style: STYLE_CUR }),
+              // Color YTD collections vs base target prorated to today (green = on
+              // pace to clear the bonus threshold by year-end, amber within 10%, red below).
+              xmlCell(`C${rn}`, lastActive.ytd,      { style: goalColorStyle(lastActive.ytd, bd.baseTarget * params.month / 12) }),
               xmlCell(`D${rn}`, lastActive.bracket),
               xmlCell(`E${rn}`, lastActive.toNext,   { style: STYLE_CUR }),
               xmlCell(`F${rn}`, lastActive.cumBonus, { style: STYLE_CUR }),
@@ -3685,6 +3733,33 @@ export function registerDocumentTools(server: McpServer): void {
           }
           const perfXml = buildSheetXml(perfRows);
 
+          // ---- Color the 2026 Totals "Collected" cells (col N) on/off-goal ----
+          // YTD collected (sum of monthly col N in compareSheet) vs the attorney's
+          // annual collection goal (Totals col O) prorated to today. green/amber/red
+          // placeholders are substituted with real style indices in buildSheets.
+          _step = "color-coding 2026 Totals vs goal";
+          try {
+            const totalsBlock = scanMonthBlock(compareSheet, "2026 Totals");
+            if (totalsBlock) {
+              const monthsElapsed = params.month;
+              for (const r of ROSTER) {
+                const ini = r.initials.toUpperCase();
+                const tRow = totalsBlock.map[ini];
+                if (!tRow) continue;
+                const annualGoal = Number(compareSheet.getRow(tRow).getCell(15).value) || 0; // col O
+                if (annualGoal <= 0) continue;
+                let ytd = 0;
+                for (let m = 1; m <= monthsElapsed; m++) {
+                  const mb = scanMonthBlock(compareSheet, monthNames[m - 1]);
+                  const mrow = mb?.map[ini];
+                  if (mrow) ytd += Number(compareSheet.getRow(mrow).getCell(14).value) || 0; // col N
+                }
+                const color = goalColorStyle(ytd, (annualGoal * monthsElapsed) / 12);
+                if (color !== STYLE_CUR) compareXml = setCellStyle(compareXml, `N${tRow}`, color);
+              }
+            }
+          } catch (e: any) { console.warn(`[Dashboard] 2026 Totals color-coding skipped: ${e?.message ?? e}`); }
+
           // --- Assemble and upload ---
           // Use placeholder styles, then replace after surgicalWriteXlsx injects real indices
           const deletedSheets = new Set(sheetsToDelete.map((ws: any) => ws.name));
@@ -3704,10 +3779,19 @@ export function registerDocumentTools(server: McpServer): void {
               xml = xml.split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`);
               xml = xml.split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`);
               xml = xml.split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`);
-              return xml;
+              return applyColors(xml);
+            }
+            // Substitute only the on/off-goal color placeholders. Used on the
+            // rebuilt sheets (via addStyles) AND on the in-place 26 Compare XML,
+            // whose Totals collected cells carry these placeholders.
+            function applyColors(xml: string): string {
+              return xml
+                .split(`s="${STYLE_GREEN}"`).join(`s="${ST.green}"`)
+                .split(`s="${STYLE_AMBER}"`).join(`s="${ST.amber}"`)
+                .split(`s="${STYLE_RED}"`).join(`s="${ST.red}"`);
             }
             const out: Record<string, string> = {
-              "26 Compare": compareXml,  // already has correct styles from original
+              "26 Compare": applyColors(compareXml),  // original styles + on/off-goal color placeholders
               "Bonus Config": addStyles(bonusConfigXml),
               "Bonus Tracker": addStyles(bonusTrackerXml),
               "Attorney Performance": addStyles(perfXml),
