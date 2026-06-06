@@ -563,7 +563,15 @@ export function registerARTools(server: McpServer): void {
             balance: bal,
             days,
             client: m?.client?.name ?? "Unknown",
-            matter: m?.display_number ? `${m.display_number}${m.description ? " — " + m.description : ""}` : (m?.description ?? "—"),
+            // display_number already includes the matter name (e.g.
+            // "02653-Lopez, Juan B. - Estate of"); only append description if it
+            // adds something not already present.
+            matter: (() => {
+              const dn = String(m?.display_number ?? "").trim();
+              const desc = String(m?.description ?? "").trim();
+              if (dn && desc && !dn.includes(desc)) return `${dn} — ${desc}`;
+              return dn || desc || "—";
+            })(),
             attorney: m?.responsible_attorney?.name ?? "(Unassigned)",
           });
         }
