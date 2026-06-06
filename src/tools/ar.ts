@@ -689,10 +689,10 @@ type FirmMetrics = {
 const WEEKLY_COLS: Array<{ key: keyof FirmMetrics; header: string; fmt?: string; width: number }> = [
   { key: "as_of", header: "As Of", width: 12 },
   { key: "total_ar", header: "Total AR", fmt: '"$"#,##0', width: 14 },
-  { key: "ar_90plus", header: "90+ $", fmt: '"$"#,##0', width: 13 },
-  { key: "ar_90plus_pct", header: "90+ %", fmt: '0.0"%"', width: 9 },
   { key: "ar_120plus", header: "120+ $", fmt: '"$"#,##0', width: 13 },
   { key: "ar_120plus_pct", header: "120+ %", fmt: '0.0"%"', width: 9 },
+  { key: "ar_90plus", header: "90+ $", fmt: '"$"#,##0', width: 13 },
+  { key: "ar_90plus_pct", header: "90+ %", fmt: '0.0"%"', width: 9 },
   { key: "ar_60plus", header: "60+ $", fmt: '"$"#,##0', width: 13 },
   { key: "ar_60plus_pct", header: "60+ %", fmt: '0.0"%"', width: 9 },
   { key: "current", header: "Current $", fmt: '"$"#,##0', width: 13 },
@@ -720,12 +720,20 @@ async function updateARScorecardWorkbook(
       await prev.xlsx.load(buf as any);
       const ws = prev.getWorksheet("Weekly Scorecard");
       if (ws) {
+        // Map prior columns by HEADER text (row 2), not position — so reordering
+        // or adding columns can't mismap an existing week's values.
+        const headerToCol: Record<string, number> = {};
+        ws.getRow(2).eachCell((cell, col) => { const h = String(cell.value ?? "").trim(); if (h) headerToCol[h] = col; });
+        const asOfCol = headerToCol["As Of"] ?? 1;
         ws.eachRow((row, n) => {
           if (n <= 2) return; // title + header
-          const asOf = row.getCell(1).value;
+          const asOf = row.getCell(asOfCol).value;
           if (asOf == null || String(asOf).trim() === "") return;
           const rec: Record<string, any> = {};
-          WEEKLY_COLS.forEach((c, i) => { rec[c.key] = row.getCell(i + 1).value; });
+          WEEKLY_COLS.forEach((c) => {
+            const col = headerToCol[c.header];
+            rec[c.key] = col ? row.getCell(col).value : (c.key === "as_of" ? "" : 0);
+          });
           rec.as_of = String(asOf instanceof Date ? asOf.toISOString().split("T")[0] : asOf);
           history.push(rec);
         });
@@ -762,26 +770,26 @@ async function updateARScorecardWorkbook(
   const att = wb.addWorksheet("By Attorney");
   att.getCell(1, 1).value = `By Responsible Attorney — as of ${firm.as_of}`;
   att.getCell(1, 1).font = { bold: true, size: 13 };
-  const attHeaders = ["Attorney", "Total AR", "90+ $", "90+ %", "120+ $", "120+ %", "# Invoices"];
+  const attHeaders = ["Attorney", "Total AR", "120+ $", "120+ %", "90+ $", "90+ %", "# Invoices"];
   const attFmt = ["", '"$"#,##0', '"$"#,##0', '0.0"%"', '"$"#,##0', '0.0"%"', ""];
   const attWidth = [26, 14, 13, 9, 13, 9, 11];
   attHeaders.forEach((h, i) => { const c = att.getCell(2, i + 1); c.value = h; c.font = bold; att.getColumn(i + 1).width = attWidth[i]; if (attFmt[i]) att.getColumn(i + 1).numFmt = attFmt[i]; });
   byAttorney.forEach((a, ri) => {
     att.getCell(3 + ri, 1).value = a.attorney;
     att.getCell(3 + ri, 2).value = a.total_ar;
-    att.getCell(3 + ri, 3).value = a.ar_90plus;
-    att.getCell(3 + ri, 4).value = a.ar_90plus_pct;
-    att.getCell(3 + ri, 5).value = a.ar_120plus;
-    att.getCell(3 + ri, 6).value = a.ar_120plus_pct;
+    att.getCell(3 + ri, 3).value = a.ar_120plus;
+    att.getCell(3 + ri, 4).value = a.ar_120plus_pct;
+    att.getCell(3 + ri, 5).value = a.ar_90plus;
+    att.getCell(3 + ri, 6).value = a.ar_90plus_pct;
     att.getCell(3 + ri, 7).value = a.invoices;
   });
   const totRow = 3 + byAttorney.length;
   att.getCell(totRow, 1).value = "Firm Total"; att.getCell(totRow, 1).font = bold;
   att.getCell(totRow, 2).value = firm.total_ar; att.getCell(totRow, 2).font = bold;
-  att.getCell(totRow, 3).value = firm.ar_90plus; att.getCell(totRow, 3).font = bold;
-  att.getCell(totRow, 4).value = firm.ar_90plus_pct; att.getCell(totRow, 4).font = bold;
-  att.getCell(totRow, 5).value = firm.ar_120plus; att.getCell(totRow, 5).font = bold;
-  att.getCell(totRow, 6).value = firm.ar_120plus_pct; att.getCell(totRow, 6).font = bold;
+  att.getCell(totRow, 3).value = firm.ar_120plus; att.getCell(totRow, 3).font = bold;
+  att.getCell(totRow, 4).value = firm.ar_120plus_pct; att.getCell(totRow, 4).font = bold;
+  att.getCell(totRow, 5).value = firm.ar_90plus; att.getCell(totRow, 5).font = bold;
+  att.getCell(totRow, 6).value = firm.ar_90plus_pct; att.getCell(totRow, 6).font = bold;
 
   const top = wb.addWorksheet("Top 10 Accounts");
   top.getCell(1, 1).value = `Top 10 Open Balances — as of ${firm.as_of}`;
