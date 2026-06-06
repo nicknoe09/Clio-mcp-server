@@ -806,27 +806,30 @@ async function updateARScorecardWorkbook(
     top.getCell(3 + ri, 5).value = t.days_past_due;
   });
 
-  // One detail tab per responsible attorney: the full matter × bill list.
+  // Detail tabs per responsible attorney: TWO views each —
+  //   "{Attorney}"            : every bill, largest balance first
+  //   "{Attorney} by Matter"  : bills grouped/sorted by matter, with a subtotal
+  //                             row per matter (total AR exposure per matter)
   const usedNames = new Set<string>();
   const sheetName = (name: string): string => {
-    let base = (name || "Unknown").replace(/[:\\/?*\[\]]/g, "-").slice(0, 28).trim() || "Unknown";
+    let base = (name || "Unknown").replace(/[:\\/?*\[\]]/g, "-").slice(0, 31).trim() || "Unknown";
     let candidate = base, i = 2;
-    while (usedNames.has(candidate.toLowerCase())) candidate = `${base.slice(0, 25)}~${i++}`;
+    while (usedNames.has(candidate.toLowerCase())) { const suf = `~${i++}`; candidate = base.slice(0, 31 - suf.length) + suf; }
     usedNames.add(candidate.toLowerCase());
     return candidate;
   };
   const detHeaders = ["Client", "Matter", "Bill #", "Issued", "Due", "Days Past Due", "Bucket", "Balance"];
   const detWidth = [26, 42, 10, 12, 12, 13, 10, 14];
-  for (const d of detail) {
-    if (!d.bills.length) continue;
-    const ws = wb.addWorksheet(sheetName(d.attorney), { views: [{ state: "frozen" as const, ySplit: 2 }] });
+  type DetBill = AttyDetail["bills"][number];
+  const writeDetailTab = (tabName: string, title: string, bills: DetBill[], groupByMatter: boolean) => {
+    const ws = wb.addWorksheet(sheetName(tabName), { views: [{ state: "frozen" as const, ySplit: 2 }] });
     ws.mergeCells(1, 1, 1, detHeaders.length);
-    ws.getCell(1, 1).value = `AR Detail — ${d.attorney} — as of ${firm.as_of} (${d.bills.length} bills)`;
+    ws.getCell(1, 1).value = title;
     ws.getCell(1, 1).font = { bold: true, size: 13 };
     detHeaders.forEach((h, i) => { const c = ws.getCell(2, i + 1); c.value = h; c.font = bold; ws.getColumn(i + 1).width = detWidth[i]; });
     ws.getColumn(8).numFmt = '"$"#,##0.00';
-    d.bills.forEach((b, ri) => {
-      const rr = 3 + ri;
+    let rr = 3;
+    const writeBill = (b: DetBill) => {
       ws.getCell(rr, 1).value = b.client;
       ws.getCell(rr, 2).value = b.matter;
       ws.getCell(rr, 3).value = b.bill;
@@ -835,10 +838,36 @@ async function updateARScorecardWorkbook(
       ws.getCell(rr, 6).value = b.days_past_due;
       ws.getCell(rr, 7).value = b.bucket;
       ws.getCell(rr, 8).value = b.balance;
-    });
-    const tr = 3 + d.bills.length;
-    ws.getCell(tr, 1).value = "Total"; ws.getCell(tr, 1).font = bold;
-    ws.getCell(tr, 8).value = r2(d.bills.reduce((s, b) => s + b.balance, 0)); ws.getCell(tr, 8).font = bold;
+      rr++;
+    };
+    if (groupByMatter) {
+      let curMatter: string | null = null, matterSum = 0;
+      const flush = () => {
+        if (curMatter === null) return;
+        ws.getCell(rr, 2).value = `  Subtotal — ${curMatter}`; ws.getCell(rr, 2).font = bold;
+        ws.getCell(rr, 8).value = r2(matterSum); ws.getCell(rr, 8).font = bold;
+        rr++;
+      };
+      for (const b of bills) {
+        if (b.matter !== curMatter) { flush(); curMatter = b.matter; matterSum = 0; }
+        writeBill(b);
+        matterSum += b.balance;
+      }
+      flush();
+    } else {
+      for (const b of bills) writeBill(b);
+    }
+    ws.getCell(rr, 1).value = "Total"; ws.getCell(rr, 1).font = bold;
+    ws.getCell(rr, 8).value = r2(bills.reduce((s, b) => s + b.balance, 0)); ws.getCell(rr, 8).font = bold;
+  };
+  for (const d of detail) {
+    if (!d.bills.length) continue;
+    const stamp = `as of ${firm.as_of} (${d.bills.length} bills)`;
+    // By amount (bills arrive sorted largest-first from the caller).
+    writeDetailTab(d.attorney, `AR Detail — ${d.attorney} — by amount — ${stamp}`, d.bills, false);
+    // By matter: sort by matter, then oldest-due first within a matter.
+    const byMatter = [...d.bills].sort((a, b) => a.matter.localeCompare(b.matter) || a.due.localeCompare(b.due));
+    writeDetailTab(`${d.attorney} by Matter`, `AR Detail — ${d.attorney} — by matter — ${stamp}`, byMatter, true);
   }
 
   const out = Buffer.from(await wb.xlsx.writeBuffer());
