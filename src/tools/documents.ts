@@ -3912,7 +3912,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "dump_compare_layout",
-    "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and which rows have 'Individual'/blank initials, so col C can be normalized safely.",
+    "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K, Collected N). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and to compare month blocks (e.g. April vs May) for duplicated data.",
     {},
     async () => {
       const DASHBOARD_FILE_ID = "2199324794140";
@@ -3921,10 +3921,15 @@ export function registerDocumentTools(server: McpServer): void {
       await wb.xlsx.load(buf);
       const sheet = wb.getWorksheet("26 Compare");
       if (!sheet) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "'26 Compare' sheet not found" }) }] };
-      const cellStr = (r: ExcelJS.Row, c: number) => {
+      const cellStr = (r: ExcelJS.Row, c: number): string => {
         const v = r.getCell(c).value as any;
         if (v == null) return "";
-        if (typeof v === "object") return v.result ?? v.text ?? (v.richText ? v.richText.map((t: any) => t.text).join("") : JSON.stringify(v));
+        if (typeof v === "object") {
+          if (v.result != null) return String(v.result);
+          if (v.text != null) return String(v.text);
+          if (v.richText) return v.richText.map((t: any) => t.text).join("");
+          return JSON.stringify(v);
+        }
         return String(v);
       };
       const rows: any[] = [];
@@ -3934,7 +3939,8 @@ export function registerDocumentTools(server: McpServer): void {
         const D = cellStr(row, 4).trim();
         const I = cellStr(row, 9).trim();
         const K = cellStr(row, 11).trim();
-        if (B || C || D || I || K) rows.push({ row: n, B, C, bizDev_D: D, billableHrs_I: I, billed_K: K });
+        const N = cellStr(row, 14).trim();
+        if (B || C || D || I || K || N) rows.push({ row: n, B, C, bizDev_D: D, billableHrs_I: I, billed_K: K, collected_N: N });
       });
       return { content: [{ type: "text" as const, text: JSON.stringify({ sheet: "26 Compare", row_count: rows.length, rows }, null, 2) }] };
     }
