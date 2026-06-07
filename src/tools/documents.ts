@@ -3363,9 +3363,9 @@ export function registerDocumentTools(server: McpServer): void {
                 [12, round2(d.writeOffs)], [13, round2(d.lineDiscounts)],
                 [17, round1(rd.respHrs)], [18, round2(rd.respBilled)],
               ];
-              if (isTarget) {
-                patches.push([14, round2(d.indivCollected)], [19, round2(d.respCollected)]);
-              }
+              // Collections (cols 14=N indiv, 19=S resp) are patched per-month
+              // for ALL YTD months in the dedicated loop below — not here — from
+              // the Issue-Date-grouped Fee Allocation CSV.
               for (const [col, val] of patches) {
                 compareXml = patchCell(compareXml, `${colLetter(col)}${row}`, val);
               }
@@ -3419,6 +3419,33 @@ export function registerDocumentTools(server: McpServer): void {
             // Insert before </sheetData>
             compareXml = compareXml.replace("</sheetData>", newRowsXml.join("") + "</sheetData>");
           }
+
+          // ---- PERSIST PER-MONTH COLLECTIONS to compareXml (cols N=14, S=19) ----
+          // compareXml (the original sheet XML + patches) is what actually gets
+          // saved — the ExcelJS edits above only feed the in-memory bonus-tracker
+          // derivation and color-coding. The Fee Allocation CSV is cumulative
+          // (Jan 1 → report date), so we group it by Issue Date month and patch
+          // each month its own slice into EVERY YTD month block. This de-cumulates
+          // collections (fixes the April==May duplication) and backfills all prior
+          // months from the one cumulative report. Runs after the blockCreated
+          // insertion so a freshly-created target block's N/S cells exist to patch.
+          let collCellsPatched = 0;
+          const collFirmByMonth: Record<number, number> = {};
+          for (let m = 1; m <= params.month; m++) {
+            const blk = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
+            if (!blk) continue;
+            for (const r of ROSTER) {
+              const row = blk.map[r.initials.toUpperCase()];
+              if (!row) continue;
+              const iv = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
+              const rv = round2(respCollByMonth[m]?.[r.user_id] ?? 0);
+              compareXml = patchCell(compareXml, `N${row}`, iv);
+              compareXml = patchCell(compareXml, `S${row}`, rv);
+              collFirmByMonth[m] = round2((collFirmByMonth[m] ?? 0) + iv);
+              collCellsPatched++;
+            }
+          }
+          console.log(`[Dashboard] collections patched to compareXml: cells=${collCellsPatched} per-month-indiv-firm=${JSON.stringify(collFirmByMonth)}`);
 
           // ============================================================
           // Patch Utilization / Realization tabs from Client Activity CSV
