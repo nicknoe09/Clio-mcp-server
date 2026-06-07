@@ -2457,6 +2457,10 @@ export function registerDocumentTools(server: McpServer): void {
         }
         console.log(`[Dashboard] revenue source: ${revLabel}; months_built=${monthsData.length}`);
 
+        // The target-month bundle is used by the billed-$ content guard and the
+        // Attorney Performance tab below.
+        const targetBundle = monthsData.find((b) => b.month === params.month)!;
+
         // Collections (cols N/S) are written per-month from the cumulative Fee
         // Allocation CSV AFTER the main write loop below — see the per-month
         // backfill block. They are intentionally NOT folded into the revenue
