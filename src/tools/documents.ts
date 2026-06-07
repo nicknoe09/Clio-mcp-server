@@ -2211,7 +2211,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report (target month only). The month×user sources rewrite all YTD months; the classic default writes the target month only. Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report and are written for the target month only (that CSV is single-period). REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report, split per-month by Issue Date. The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report, which is cumulative YTD — the tool groups its rows by Issue Date month and writes each month its own slice into ALL year-to-date month blocks (Jan through target), so consecutive months are distinct and every prior month is backfilled from one report; pass fee_report_id to pin a specific Fee Allocation report. REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -2219,6 +2219,7 @@ export function registerDocumentTools(server: McpServer): void {
       revenue_csv_box_file_id: z.string().optional().describe("Box file ID of a manually-exported month×user Revenue Report CSV (the beta 'Revenue Report (Like Classic)', grouped by Activity month + User). When set, the dashboard reads revenue from this Box CSV instead of Clio's /reports — the reliable path when the report lives in Clio's beta engine (no API) or the report-generation endpoint is flaky."),
       client_activity_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the Client Activity report covering the target month (overrides auto-generation). Use when a Client Activity CSV has already been generated and you want to reuse it instead of POSTing a new one."),
       realization_report_id: z.coerce.number().optional().describe("Specific Clio report ID for the Realization report covering the target month (overrides auto-generation). The Realization report is the source for the Collection tab's Collected/Uncollected $ — pass this to reuse an existing report instead of POSTing a new one."),
+      fee_report_id: z.coerce.number().optional().describe("Specific Clio Fee Allocation report ID for collections (cols N/S of 26 Compare). The report is cumulative YTD and is split by Issue Date month, so one report backfills every month's collections. Defaults to the latest completed Fee Allocation report."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
     },
@@ -2420,9 +2421,13 @@ export function registerDocumentTools(server: McpServer): void {
           }
         }
 
-        // ---- Fetch fee allocation CSV for collections (target month only) ----
+        // ---- Fetch fee allocation CSV for collections (ALL months, per-month) ----
+        // The Fee Allocation Report is CUMULATIVE (Jan 1 → report date), so it
+        // carries every month's collections. We group rows by Issue Date month
+        // below and write each month its own slice (de-cumulated), which fixes the
+        // April==May duplication and backfills every prior month in one pass.
         let csvRows: Record<string, string>[] = [];
-        try { const result = await getFeeAllocationCSV(); csvRows = result.rows; } catch { /* may not exist */ }
+        try { const result = await getFeeAllocationCSV(params.fee_report_id); csvRows = result.rows; } catch { /* may not exist */ }
 
         // ---- Assemble per-month bundles (only the months we have revenue for) ----
         const monthsData: MonthBundle[] = [];
@@ -2452,23 +2457,11 @@ export function registerDocumentTools(server: McpServer): void {
         }
         console.log(`[Dashboard] revenue source: ${revLabel}; months_built=${monthsData.length}`);
 
-        // ---- Collections from fee allocation CSV (target month only) ----
-        // The fee allocation CSV is single-period, so collections are written
-        // only for the target month (prior months keep their existing values).
-        const targetBundle = monthsData.find((b) => b.month === params.month)!;
-        for (const r of csvRows) {
-          const userName = r["User"] ?? "";
-          const responsible = r["Responsible Attorney"] ?? "";
-          const collected = parseFloat(r["Total Funds Collected"] || "0");
-          const matchedUser = ROSTER.find(ro => userName.toLowerCase().includes(ro.name.toLowerCase().split(" ").pop()!));
-          if (matchedUser && targetBundle.data[matchedUser.user_id]) {
-            targetBundle.data[matchedUser.user_id].indivCollected += collected;
-          }
-          const matchedResp = ROSTER.find(ro => responsible.toLowerCase().includes(ro.name.toLowerCase().split(" ").pop()!));
-          if (matchedResp && targetBundle.data[matchedResp.user_id]) {
-            targetBundle.data[matchedResp.user_id].respCollected += collected;
-          }
-        }
+        // Collections (cols N/S) are written per-month from the cumulative Fee
+        // Allocation CSV AFTER the main write loop below — see the per-month
+        // backfill block. They are intentionally NOT folded into the revenue
+        // bundles (which are single-snapshot) to avoid stamping a YTD total into
+        // a single month (the cause of the April==May duplication).
 
         // ---- UPDATE THE DASHBOARD IN BOX ----
         // The rich update always runs and always versions Claude Version 2 —
@@ -2661,10 +2654,10 @@ export function registerDocumentTools(server: McpServer): void {
 
           // ---- ALL YTD MONTHS ----
           // monthsData (months 1..target) was built upfront from the Revenue
-          // Report + targeted nonbillable query. Collections (cols N=14, S=19)
-          // live only on the target-month bundle because the fee allocation CSV
-          // is single-period; prior months keep their existing collection values
-          // (we deliberately skip writing N/S for non-target months below).
+          // Report + targeted nonbillable query. This loop writes the hours /
+          // billable / billed / write-off / discount columns. Collections
+          // (cols N=14, S=19) are written separately, per-month, in the
+          // Fee-Allocation backfill block right after this loop.
           _step = "writing Clio data to 26 Compare (all months)";
           let tkUpdated = 0;
           let monthsSkipped = 0;
@@ -2676,7 +2669,6 @@ export function registerDocumentTools(server: McpServer): void {
               continue;
             }
             const rowMap = block.map;
-            const isTarget = md.month === params.month;
             for (const r of ROSTER) {
               const row = rowMap[r.initials.toUpperCase()];
               if (!row) continue;
@@ -2696,17 +2688,66 @@ export function registerDocumentTools(server: McpServer): void {
               wsRow.getCell(13).value = round2(d.lineDiscounts); // M = Line Discounts
               wsRow.getCell(17).value = round1(rd.respHrs);
               wsRow.getCell(18).value = round2(rd.respBilled);
-              // Collections — target month only. CSV is single-period so
-              // writing the same value to prior months would corrupt them.
-              if (isTarget) {
-                wsRow.getCell(14).value = round2(d.indivCollected);
-                wsRow.getCell(19).value = round2(d.respCollected);
-              }
+              // Collections (cols N=14, S=19) are written in the per-month
+              // Fee-Allocation backfill block below — not here.
               wsRow.commit();
               tkUpdated++;
             }
           }
           console.log(`[Dashboard] wrote tkUpdated=${tkUpdated} across months_processed=${monthsData.length - monthsSkipped} months_skipped=${monthsSkipped}`);
+
+          // ---- PER-MONTH COLLECTIONS (Fee Allocation Report, all YTD months) ----
+          // The Fee Allocation CSV is CUMULATIVE (Jan 1 → report date). Group each
+          // row by its Issue Date month (the same convention as
+          // get_responsible_collections) and write each month its own slice into
+          // that month's block: col N (14) = individual collected (by timekeeper),
+          // col S (19) = responsible-attorney collected. This de-cumulates
+          // collections so consecutive months are distinct (fixes April==May) and
+          // backfills every prior month from the single cumulative report. The
+          // Bonus Tracker is derived from col N below, so it picks these up too.
+          _step = "writing per-month collections to 26 Compare";
+          const collNum = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
+          const issueMonth = (d: string): number => {
+            // Issue Date is M/D/YYYY in Clio's Fee Allocation export.
+            const parts = String(d ?? "").split("/");
+            if (parts.length < 3) return 0;
+            const m = parseInt(parts[0], 10);
+            const y = parseInt(parts[2], 10);
+            return (y === params.year && m >= 1 && m <= 12) ? m : 0;
+          };
+          const indivCollByMonth: Record<number, Record<number, number>> = {};
+          const respCollByMonth: Record<number, Record<number, number>> = {};
+          for (const r of csvRows) {
+            const m = issueMonth(r["Issue Date"]);
+            if (!m || m > params.month) continue;
+            const collected = collNum(r["Total Funds Collected"]);
+            if (!collected) continue;
+            const uid = matchRosterUser(r["User"] || "", ROSTER);
+            if (uid != null) {
+              const slot = (indivCollByMonth[m] ??= {});
+              slot[uid] = (slot[uid] ?? 0) + collected;
+            }
+            const rid = matchRosterResponsible(r["Responsible Attorney"] || "", ROSTER);
+            if (rid != null) {
+              const slot = (respCollByMonth[m] ??= {});
+              slot[rid] = (slot[rid] ?? 0) + collected;
+            }
+          }
+          let collCellsWritten = 0;
+          for (let m = 1; m <= params.month; m++) {
+            const block = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
+            if (!block) continue;
+            for (const r of ROSTER) {
+              const rowNum = block.map[r.initials.toUpperCase()];
+              if (!rowNum) continue;
+              const wsRow = compareSheet.getRow(rowNum);
+              wsRow.getCell(14).value = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
+              wsRow.getCell(19).value = round2(respCollByMonth[m]?.[r.user_id] ?? 0);
+              wsRow.commit();
+              collCellsWritten++;
+            }
+          }
+          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=1..${params.month} (issue-date grouped, fee report)`);
 
           _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
