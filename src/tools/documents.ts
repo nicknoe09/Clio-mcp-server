@@ -149,6 +149,8 @@ const STYLE_GEN  = "__GEN__";  // general (default fallback)
 const STYLE_GREEN = "__GREEN__"; // currency + green fill (on goal)
 const STYLE_AMBER = "__AMBER__"; // currency + amber fill (within 10% below goal)
 const STYLE_RED   = "__RED__";   // currency + red fill (off goal)
+const STYLE_CURDASH  = "__CURDASH__";  // "$"#,##0.00, zero shown as "-"
+const STYLE_CURDASHB = "__CURDASHB__"; // same, bold
 
 /**
  * On/off-goal color placeholder: green if actual ≥ goal, amber within 10% below,
@@ -301,7 +303,7 @@ async function getZipSheetMap(zip: JSZip): Promise<Record<string, string>> {
  * - deletedSheetNames: sheets to remove
  * No ExcelJS involved in the write path.
  */
-interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; green: string; amber: string; red: string; }
+interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; green: string; amber: string; red: string; currencyDash: string; currencyDashBold: string; }
 
 async function surgicalWriteXlsx(
   originalBuffer: Buffer,
@@ -328,7 +330,7 @@ async function surgicalWriteXlsx(
   //    once injected "</numFmts>" into an attribute → invalid XML → Excel threw
   //    out styles.xml. All replacements below use function replacers (literal).
   const stylesFile = zip.file("xl/styles.xml");
-  let newStyleIndices: StyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0", green: "0", amber: "0", red: "0" };
+  let newStyleIndices: StyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0", green: "0", amber: "0", red: "0", currencyDash: "0", currencyDashBold: "0" };
   if (stylesFile) {
     let stylesXml = await stylesFile.async("string");
 
@@ -349,6 +351,9 @@ async function surgicalWriteXlsx(
     const toAdd: string[] = [];
     if (curFmtId == null) { curFmtId = ++maxFmtId; toAdd.push(`<numFmt numFmtId="${curFmtId}" formatCode="&quot;$&quot;#,##0.00"/>`); }
     if (decFmtId == null) { decFmtId = ++maxFmtId; toAdd.push(`<numFmt numFmtId="${decFmtId}" formatCode="0.0"/>`); }
+    // Currency that renders exact zero as a dash: "$"#,##0.00 ; -"$"#,##0.00 ; "-"
+    const dashFmtId = ++maxFmtId;
+    toAdd.push(`<numFmt numFmtId="${dashFmtId}" formatCode="&quot;$&quot;#,##0.00;-&quot;$&quot;#,##0.00;&quot;-&quot;"/>`);
     if (toAdd.length) {
       const addStr = toAdd.join("");
       const nf = stylesXml.match(/<numFmts count="(\d+)">/);
@@ -398,6 +403,9 @@ async function surgicalWriteXlsx(
         `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillGreen}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
         `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillAmber}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
         `<xf numFmtId="${curFmtId}" fontId="0" fillId="${fillRed}" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/>`,
+        // Dash-zero currency (plain + bold) for the collections-by-matter tab.
+        `<xf numFmtId="${dashFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,
+        `<xf numFmtId="${dashFmtId}" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`,
       ];
       newStyleIndices = {
         general: String(currentCount),
@@ -408,6 +416,8 @@ async function surgicalWriteXlsx(
         green: String(currentCount + 5),
         amber: String(currentCount + 6),
         red: String(currentCount + 7),
+        currencyDash: String(currentCount + 8),
+        currencyDashBold: String(currentCount + 9),
       };
       const newXfCount = currentCount + newXfs.length;
       stylesXml = stylesXml.replace(`<cellXfs count="${currentCount}">`, () => `<cellXfs count="${newXfCount}">`);
@@ -3927,6 +3937,123 @@ export function registerDocumentTools(server: McpServer): void {
         if (B || C || D || I || K) rows.push({ row: n, B, C, bizDev_D: D, billableHrs_I: I, billed_K: K });
       });
       return { content: [{ type: "text" as const, text: JSON.stringify({ sheet: "26 Compare", row_count: rows.length, rows }, null, 2) }] };
+    }
+  );
+
+  // ============================================================
+  // add_collections_by_matter_tab — YTD Collections by Resp. Attorney × Matter
+  // ============================================================
+  server.tool(
+    "add_collections_by_matter_tab",
+    "Add or replace a 'YTD Collections by Matter' worksheet in the Claude Version 2 dashboard (Box file 2199324794140). Reads the Fee Allocation Report (same pipeline the Collection tab uses), aggregates 'Total Funds Collected' by Responsible Attorney → Matter (summing all timekeeper rows that share a matter), and writes attorney blocks (bold header + subtotal, matters nested beneath sorted by $ desc) with Excel SUM formulas plus a firm grand total. Reconciles the grouped sum to the report's firm total to the cent and ABORTS without writing if it doesn't match. Additive only — does not touch any existing sheet/formula/formatting. Versions the workbook back to Box and recalculates on open. Defaults to the latest Fee Allocation report; pass report_id to pin one.",
+    {
+      month: z.coerce.number().describe("Target month (1-12) for the 'YTD through' label"),
+      year: z.coerce.number().describe("Year (e.g. 2026)"),
+      report_id: z.coerce.number().optional().describe("Specific Fee Allocation report id (default: latest completed)"),
+    },
+    async (params) => {
+      const SHEET = "YTD Collections by Matter";
+      const DASHBOARD_FILE_ID = "2199324794140";
+      const FOLDER_ID = "348313592902";
+      try {
+        const mNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+        const endDay = new Date(params.year, params.month, 0).getDate();
+        const periodLabel = `Jan 1 – ${mNames[params.month - 1]} ${endDay}, ${params.year} (YTD)`;
+        const num = (x?: string) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
+        const r2 = (n: number) => Math.round(n * 100) / 100;
+
+        // 1. Fee Allocation CSV (latest or pinned)
+        const { rows, report } = await getFeeAllocationCSV(params.report_id);
+        // Report firm total = sum of every row's Total Funds Collected.
+        const firmTotal = r2(rows.reduce((s, r) => s + num(r["Total Funds Collected"]), 0));
+
+        // 2. Aggregate at the row level: Responsible Attorney -> Matter -> sum.
+        const byAtt = new Map<string, Map<string, number>>();
+        for (const r of rows) {
+          const att = (r["Responsible Attorney"] ?? "").trim() || "(Unassigned)";
+          const matter = (r["Matter"] ?? "").trim() || "(No matter)";
+          if (!byAtt.has(att)) byAtt.set(att, new Map());
+          const mm = byAtt.get(att)!;
+          mm.set(matter, (mm.get(matter) ?? 0) + num(r["Total Funds Collected"]));
+        }
+        const attorneys = [...byAtt.entries()].map(([name, mm]) => {
+          const matters = [...mm.entries()].map(([matter, amt]) => ({ matter, amt: r2(amt) })).sort((a, b) => b.amt - a.amt);
+          return { name, total: r2(matters.reduce((s, m) => s + m.amt, 0)), matters };
+        }).sort((a, b) => b.total - a.total);
+
+        // 3. Reconciliation gate — abort (no write) if grouped != report firm total.
+        const grouped = r2(attorneys.reduce((s, a) => s + a.total, 0));
+        if (Math.abs(grouped - firmTotal) >= 0.005) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            tab: SHEET, status: "failed", reconciled: false,
+            message: `Reconciliation failed: grouped attorney×matter total $${grouped.toFixed(2)} != report firm total $${firmTotal.toFixed(2)} — not writing a partial tab.`,
+            report_id: report.id, report_name: report.name,
+          }, null, 2) }], isError: true };
+        }
+
+        // 4. Build the sheet XML. Subtotals + grand total are Excel SUM formulas
+        //    referencing the cells (recalculable); $ uses dash-zero currency.
+        const sheetRows: string[] = [];
+        sheetRows.push(xmlRow(1, [xmlCell("A1", `YTD Collections by Resp. Attorney × Matter — ${periodLabel}`, { style: STYLE_BOLD })]));
+        sheetRows.push(xmlRow(2, [xmlCell("A2", "Responsible Attorney / Matter", { style: STYLE_BOLD }), xmlCell("B2", "Collected", { style: STYLE_BOLD })]));
+        let rn = 3;
+        const subtotalRefs: string[] = [];
+        for (const a of attorneys) {
+          const hdrRn = rn;
+          const firstMatter = hdrRn + 1, lastMatter = hdrRn + a.matters.length;
+          subtotalRefs.push(`B${hdrRn}`);
+          sheetRows.push(xmlRow(hdrRn, [
+            xmlCell(`A${hdrRn}`, a.name, { style: STYLE_BOLD }),
+            xmlCell(`B${hdrRn}`, a.total, { style: STYLE_CURDASHB, formula: a.matters.length ? `SUM(B${firstMatter}:B${lastMatter})` : undefined }),
+          ]));
+          rn++;
+          for (const m of a.matters) {
+            sheetRows.push(xmlRow(rn, [xmlCell(`A${rn}`, `    ${m.matter}`), xmlCell(`B${rn}`, m.amt, { style: STYLE_CURDASH })]));
+            rn++;
+          }
+        }
+        const grandRn = rn;
+        sheetRows.push(xmlRow(grandRn, [
+          xmlCell(`A${grandRn}`, "Firm Total", { style: STYLE_BOLD }),
+          xmlCell(`B${grandRn}`, firmTotal, { style: STYLE_CURDASHB, formula: subtotalRefs.length ? `SUM(${subtotalRefs.join(",")})` : undefined }),
+        ]));
+        const sheetXml = buildSheetXml(sheetRows, { cols: [{ min: 1, max: 1, width: 60 }, { min: 2, max: 2, width: 16 }], freezeRow: 2 });
+
+        // 5. Write the single sheet into the workbook (additive) and version to Box.
+        //    surgicalWriteXlsx adds the sheet if new / replaces it if it exists,
+        //    leaves every other sheet untouched, and sets recalc-on-open.
+        const fileBuffer = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
+        const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
+          const styled = (xml: string) => xml
+            .replace(/<c r="([^"]+)">/g, (_, ref) => `<c r="${ref}" s="${ST.general}">`)
+            .split(`s="${STYLE_CURDASHB}"`).join(`s="${ST.currencyDashBold}"`)
+            .split(`s="${STYLE_CURDASH}"`).join(`s="${ST.currencyDash}"`)
+            .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`);
+          return { [SHEET]: styled(sheetXml) };
+        }, new Set<string>());
+
+        const result = await uploadToBox({
+          buffer: outputBuffer,
+          filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
+          folderId: FOLDER_ID,
+          overwriteFileId: DASHBOARD_FILE_ID,
+        });
+
+        const payload: any = {
+          tab: SHEET,
+          status: result.uploaded ? "ok" : "failed",
+          reconciled: true,
+          firm_total: firmTotal,
+          attorneys: attorneys.length,
+          matters: attorneys.reduce((s, a) => s + a.matters.length, 0),
+          report_id: report.id, report_name: report.name, period: periodLabel,
+        };
+        if (result.uploaded) { payload.box_file_id = result.box_file_id; payload.box_url = result.box_url; }
+        else { payload.direct_download_url = (result as any).direct_download_url; payload.reason = (result as any).reason; }
+        return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }], ...(result.uploaded ? {} : { isError: true }) };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ tab: SHEET, status: "failed", error: true, message: e?.message ?? String(e) }) }], isError: true };
+      }
     }
   );
 }
