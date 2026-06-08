@@ -1012,8 +1012,17 @@ async function updateARScorecardWorkbook(
     const stamp = `as of ${firm.as_of} (${d.bills.length} bills)`;
     // By amount (bills arrive sorted largest-first from the caller).
     writeDetailTab(d.attorney, `AR Detail — ${d.attorney} — by amount — ${stamp}`, d.bills, false);
-    // By matter: sort by matter, then oldest-due first within a matter.
-    const byMatter = [...d.bills].sort((a, b) => a.matter.localeCompare(b.matter) || a.due.localeCompare(b.due));
+    // By matter: matters ordered by total amount due (summed balance) descending —
+    // the matter with the largest AR exposure first. Bills of a matter are kept
+    // contiguous (the subtotal logic depends on it; ties broken by matter name) and
+    // largest bill first within a matter.
+    const matterDue = new Map<string, number>();
+    for (const b of d.bills) matterDue.set(b.matter, (matterDue.get(b.matter) ?? 0) + b.balance);
+    const byMatter = [...d.bills].sort((a, b) =>
+      (matterDue.get(b.matter)! - matterDue.get(a.matter)!) ||
+      a.matter.localeCompare(b.matter) ||
+      b.balance - a.balance
+    );
     writeDetailTab(`${d.attorney} by Matter`, `AR Detail — ${d.attorney} — by matter — ${stamp}`, byMatter, true);
   }
 
