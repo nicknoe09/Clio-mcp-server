@@ -9,7 +9,7 @@ const AR_SCORECARD_FOLDER = "348313592902";
 const AR_SCORECARD_FILENAME = "AR Scorecard.xlsx";
 
 const BILL_FIELDS =
-  "id,number,issued_at,due_at,balance,total,state,matters";
+  "id,number,issued_at,due_at,balance,total,kind,state,matters";
 
 // trust_line_items has limited fields — use defaults + matter association
 const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
@@ -47,7 +47,7 @@ export function registerARTools(server: McpServer): void {
   // get_ar_aging
   server.tool(
     "get_ar_aging",
-    "Full accounts receivable aging report. Groups outstanding invoices into buckets: Current (0-30), 31-60, 61-90, 91-120, 120+. Includes client emails for direct action.",
+    "Full accounts receivable aging report. Counts ONLY revenue_kind fee bills; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded. Groups outstanding invoices into buckets: Current (0-30), 31-60, 61-90, 91-120, 120+. Includes client emails for direct action.",
     {
       responsible_attorney_id: z
         .number()
@@ -80,6 +80,14 @@ export function registerARTools(server: McpServer): void {
         };
 
         for (const b of bills) {
+          // AR = revenue_kind fee bills only. A trust_kind bill is a trust/retainer
+          // funding request, not a receivable; any other (unexpected) kind is
+          // excluded and surfaced rather than silently aged into AR.
+          if (b.kind === "trust_kind") continue;
+          if (b.kind !== "revenue_kind") {
+            console.warn(`[get_ar_aging] excluding bill ${b.number ?? b.id} from AR — unexpected kind=${JSON.stringify(b.kind)}`);
+            continue;
+          }
           const dueDate = b.due_at ? new Date(b.due_at) : new Date(b.issued_at);
           const daysOut = Math.floor(
             (asOf.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)
