@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
@@ -1319,48 +1320,10 @@ export function registerDocumentTools(server: McpServer): void {
         // Months we have revenue data for: all YTD for the month×user file; target-only for classic.
         const revMonths = useBeta ? Array.from({ length: params.month }, (_, i) => i + 1) : [params.month];
 
-        // ---- Nonbillable categories via a targeted /activities query (Rachel #1–4) ----
-        // Revenue reports don't carry nonbillable time, so the four nonbillable
-        // buckets come straight from their admin matters, exactly as Rachel pulls
-        // them: Biz Dev (00706), Potential Clients (00050), CLE (00707), Other
-        // Admin (00158). Total nonbillable = the sum of these four.
-        _step = "resolving nonbillable category matters";
-        type CatKey = "bizDev" | "potentialClients" | "cle" | "otherAdmin";
-        const CATEGORY_PREFIXES: { key: CatKey; prefix: string }[] = [
-          { key: "bizDev", prefix: "00706" },           // ROMSUM Business Development
-          { key: "potentialClients", prefix: "00050" }, // Potential Clients
-          { key: "cle", prefix: "00707" },              // Continuing Legal Education
-          { key: "otherAdmin", prefix: "00158" },       // Other Admin
-        ];
-        const allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number" });
-        const matterCat: Record<number, CatKey> = {};
-        for (const cm of CATEGORY_PREFIXES) {
-          for (const mt of allMatters) {
-            if (String(mt.display_number || "").startsWith(cm.prefix)) matterCat[mt.id] = cm.key;
-          }
-        }
-
-        _step = "fetching nonbillable category activities";
-        // month -> user_id -> { bizDev, potentialClients, cle, otherAdmin }
-        const catByMonth: Record<number, Record<number, { bizDev: number; potentialClients: number; cle: number; otherAdmin: number }>> = {};
-        for (const mid of Object.keys(matterCat).map(Number)) {
-          const acts = await fetchAllPages<any>("/activities", {
-            type: "TimeEntry",
-            fields: "id,date,quantity,rounded_quantity,user{id}",
-            matter_id: mid,
-            created_since: `${params.year}-01-01T00:00:00+00:00`,
-          });
-          const cat = matterCat[mid];
-          for (const a of acts) {
-            if (a.date < `${params.year}-01-01` || a.date > monthEnd) continue;
-            const m = parseInt(String(a.date).slice(5, 7), 10);
-            if (!m || m > params.month) continue;
-            const uid = a.user?.id;
-            if (!uid) continue;
-            const slot = ((catByMonth[m] ??= {})[uid] ??= { bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0 });
-            slot[cat] += (a.rounded_quantity ?? a.quantity) / 3600;
-          }
-        }
+        // Nonbillable categories (Biz Dev / Potential Clients / CLE / Other Admin),
+        // by month×user, from a targeted /activities query on the admin matters.
+        _step = "building nonbillable categories";
+        const catByMonth = await buildNonbillableByMonth(params.year, params.month);
 
         // ---- Fetch fee allocation CSV for collections (ALL months, per-month) ----
         // The Fee Allocation Report is CUMULATIVE (Jan 1 → report date), so it
