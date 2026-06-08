@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport, rawGetSingle, rawPostSingle } from "../clio/pagination";
 import {
@@ -37,8 +38,6 @@ import {
 
 // ========== SHARED HELPERS ==========
 
-function round2(n: number): number { return Math.round(n * 100) / 100; }
-function round1(n: number): number { return Math.round(n * 10) / 10; }
 function fmt(n: number | null | undefined): string {
   if (n === null || n === undefined) return "";
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;

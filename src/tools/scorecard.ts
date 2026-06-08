@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
@@ -61,8 +62,6 @@ function getWeekKey(dateStr: string): string {
   return `${fmt(monday)}-${fmt(sunday)}`;
 }
 
-function round1(n: number): number { return Math.round(n * 10) / 10; }
-function round2(n: number): number { return Math.round(n * 100) / 100; }
 
 export function registerScorecardTools(server: McpServer): void {
 

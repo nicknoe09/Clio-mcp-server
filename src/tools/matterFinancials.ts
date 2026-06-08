@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { round2 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 
@@ -22,9 +23,6 @@ const EXPENSE_FIELDS = "id,date,price,note,user{id,name},bill{id,state}";
 
 const BILL_FIELDS = "id,number,issued_at,due_at,balance,total,state";
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 function daysBetween(a: Date, b: Date): number {
   return Math.floor((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
