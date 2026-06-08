@@ -1,12 +1,10 @@
 import { z } from "zod";
+import { round2 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport } from "../clio/pagination";
 import { getFeeAllocationCSV } from "../clio/reportCsv";
 
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 // V&D Agreement tiers — COMBINED (Gus + Courteney pooled), annual reset
 const ATTORNEY_TIERS = [
