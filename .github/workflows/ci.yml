@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (esbuild)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  typecheck:
+    name: Typecheck (lib layer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Scoped typecheck of the dependency-light helper layer (src/clio, src/utils),
+      # where shared logic + the refactor's extracted modules live. Runs in ~2s and
+      # is clean. NOTE: full-program `tsc --noEmit` currently OOMs (>12 GB / ~24 min)
+      # because TypeScript deeply instantiates the ~50 zod `server.tool(...)` schemas
+      # in the tool files — a known zod-v3 + compiler hot spot. esbuild (the build
+      # job) covers those files for resolution/syntax; widening real type coverage
+      # to them is tracked separately (likely a zod v4 upgrade or schema typing).
+      - run: npx tsc -p tsconfig.ci.json
