@@ -14,6 +14,14 @@ const BILL_FIELDS =
 // trust_line_items has limited fields — use defaults + matter association
 const TRUST_FIELDS = "id,date,total,matter{id,display_number,client}";
 
+// Scorecard fetch needs matter sub-objects (client/responsible_attorney) plus
+// `kind` (revenue_kind = true AR for services; trust_kind = trust/retainer
+// funding request — NOT a receivable), `paid`/`paid_at` (whether/when a trust
+// request was funded) and `state`.
+const SCORECARD_BILL_FIELDS =
+  "id,number,issued_at,due_at,balance,total,paid,paid_at,kind,state," +
+  "matters{id,display_number,description,client,responsible_attorney}";
+
 interface Invoice {
   bill_id: number;
   bill_number: string;
@@ -531,7 +539,7 @@ export function registerARTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_ar_scorecard",
-    "EOS-scorecard AR metrics from live Clio AR (state=awaiting_payment). Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+) and the top 10 open balances. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: a 'Weekly Scorecard' tab appends one row per run (week-over-week trend), 'By Attorney' and 'Top 10 Accounts' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR (client, matter, bill #, issued, due, days past due, bucket, balance). Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
+    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR (client, matter, bill #, issued, due, days past due, bucket, balance). Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
     {
       as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
       update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
@@ -540,40 +548,61 @@ export function registerARTools(server: McpServer): void {
       try {
         const asOf = params.as_of_date ? new Date(params.as_of_date + "T00:00:00") : new Date();
         const asOfStr = asOf.toISOString().split("T")[0];
-        const bills = await fetchAllPages<any>("/bills", {
-          // Request matter sub-objects WITHOUT deeper {name} nesting — Clio
-          // returns client/responsible_attorney as full objects (with .name).
-          // Bare `matters` omits client/responsible_attorney (everything came
-          // back Unknown/Unassigned); the deep form matters{…client{name}} 400s.
-          // This middle form is the proven get_wip_report pattern.
-          fields: "id,number,issued_at,due_at,balance,total,state,matters{id,display_number,description,client,responsible_attorney}",
-          state: "awaiting_payment",
-        });
+
+        // Pull open (awaiting_payment) bills for AR, plus paid bills so that funded
+        // trust/retainer requests can be reported alongside the unfunded ones. The
+        // matter sub-object form (client/responsible_attorney as full objects) is the
+        // proven get_wip_report pattern; the deeper matters{…client{name}} form 400s.
+        // The paid-bills fetch is only needed to mark trust requests funded; if it
+        // fails, fall back to awaiting_payment only rather than failing the whole AR
+        // scorecard (mirrors the resilient paid-bill fetch used elsewhere).
+        const [awaitingBills, paidBills] = await Promise.all([
+          fetchAllPages<any>("/bills", { fields: SCORECARD_BILL_FIELDS, state: "awaiting_payment" }),
+          fetchAllPages<any>("/bills", { fields: SCORECARD_BILL_FIELDS, state: "paid" }).catch((e: any) => {
+            console.warn(`[get_ar_scorecard] paid-bills fetch failed (${e?.message ?? e}); funded trust requests will be incomplete`);
+            return [] as any[];
+          }),
+        ]);
 
         const round2 = (n: number) => Math.round(n * 100) / 100;
         const bucketLabel = (d: number) =>
           d <= 0 ? "Current" : d <= 30 ? "1-30" : d <= 60 ? "31-60" : d <= 90 ? "61-90" : d <= 120 ? "91-120" : "120+";
+        const daysOutstanding = (b: any) => {
+          const due = b.due_at ? new Date(b.due_at) : (b.issued_at ? new Date(b.issued_at) : asOf);
+          return Math.max(0, Math.floor((asOf.getTime() - due.getTime()) / 86400000));
+        };
+        // display_number already includes the matter name (e.g.
+        // "02653-Lopez, Juan B. - Estate of"); only append description if it
+        // adds something not already present.
+        const matterLabel = (m: any) => {
+          const dn = String(m?.display_number ?? "").trim();
+          const desc = String(m?.description ?? "").trim();
+          if (dn && desc && !dn.includes(desc)) return `${dn} — ${desc}`;
+          return dn || desc || "—";
+        };
+
         type Row = { balance: number; days: number; client: string; matter: string; attorney: string; bill: string; issued: string; due: string; bucket: string };
         const rows: Row[] = [];
-        for (const b of bills) {
+
+        // --- AR rows: revenue_kind ONLY (whitelist). A trust_kind bill is a
+        // trust/retainer funding request, not a receivable, and is captured below.
+        // Any other (unexpected) kind is excluded from AR and surfaced via a warning
+        // rather than silently summed into receivables. ---
+        for (const b of awaitingBills) {
+          if (b.kind === "trust_kind") continue; // captured below as a trust request
+          if (b.kind !== "revenue_kind") {
+            console.warn(`[get_ar_scorecard] excluding bill ${b.number ?? b.id} from AR — unexpected kind=${JSON.stringify(b.kind)}`);
+            continue;
+          }
           const bal = typeof b.balance === "number" ? b.balance : parseFloat(b.balance) || 0;
           if (bal <= 0) continue;
-          const due = b.due_at ? new Date(b.due_at) : (b.issued_at ? new Date(b.issued_at) : asOf);
-          const days = Math.max(0, Math.floor((asOf.getTime() - due.getTime()) / 86400000));
           const m = b.matters?.[0];
+          const days = daysOutstanding(b);
           rows.push({
             balance: bal,
             days,
             client: m?.client?.name ?? "Unknown",
-            // display_number already includes the matter name (e.g.
-            // "02653-Lopez, Juan B. - Estate of"); only append description if it
-            // adds something not already present.
-            matter: (() => {
-              const dn = String(m?.display_number ?? "").trim();
-              const desc = String(m?.description ?? "").trim();
-              if (dn && desc && !dn.includes(desc)) return `${dn} — ${desc}`;
-              return dn || desc || "—";
-            })(),
+            matter: matterLabel(m),
             attorney: m?.responsible_attorney?.name ?? "(Unassigned)",
             bill: String(b.number ?? b.id ?? ""),
             issued: b.issued_at ? String(b.issued_at).slice(0, 10) : "",
@@ -581,6 +610,38 @@ export function registerARTools(server: McpServer): void {
             bucket: bucketLabel(days),
           });
         }
+
+        // --- Trust requests: every trust_kind bill across awaiting_payment + paid.
+        // These never touch any AR metric, the delinquent-client count, or the
+        // oldest-invoice calc. Funded if balance is cleared (or state == paid). ---
+        const trustRows: TrustRequestRow[] = [];
+        for (const b of [...awaitingBills, ...paidBills]) {
+          if (b.kind !== "trust_kind") continue;
+          const m = b.matters?.[0];
+          const requested = typeof b.total === "number" ? b.total : parseFloat(b.total) || 0;
+          const balRaw = typeof b.balance === "number" ? b.balance : parseFloat(b.balance) || 0;
+          const balance = Math.max(0, balRaw);
+          const isFunded = balRaw <= 0 || b.state === "paid";
+          trustRows.push({
+            attorney: m?.responsible_attorney?.name ?? "(Unassigned)",
+            client: m?.client?.name ?? b.client?.name ?? "Unknown",
+            matter: matterLabel(m),
+            bill: String(b.number ?? b.id ?? ""),
+            issued: b.issued_at ? String(b.issued_at).slice(0, 10) : "",
+            due: b.due_at ? String(b.due_at).slice(0, 10) : "",
+            days: daysOutstanding(b),
+            requested: round2(requested),
+            balance: round2(balance),
+            funded: round2(Math.max(0, requested - balance)),
+            status: isFunded ? "Funded" : "Unfunded",
+            dateFunded: isFunded && b.paid_at ? String(b.paid_at).slice(0, 10) : "",
+          });
+        }
+        // Unfunded first, then by Days Outstanding descending.
+        trustRows.sort((a, b) => {
+          const rank = (s: string) => (s === "Unfunded" ? 0 : 1);
+          return rank(a.status) - rank(b.status) || b.days - a.days;
+        });
 
         const sum = (f: (r: Row) => boolean) => round2(rows.filter(f).reduce((s, r) => s + r.balance, 0));
         const totalAR = round2(rows.reduce((s, r) => s + r.balance, 0));
@@ -649,18 +710,30 @@ export function registerARTools(server: McpServer): void {
             .map((r) => ({ client: r.client, matter: r.matter, bill: r.bill, issued: r.issued, due: r.due, days_past_due: r.days, bucket: r.bucket, balance: round2(r.balance) })),
         }));
 
+        // ---- Trust request summary (parallel to `firm`; never mixed into AR) ----
+        const trustRequested = round2(trustRows.reduce((s, r) => s + r.requested, 0));
+        const trustUnfunded = round2(trustRows.reduce((s, r) => s + r.balance, 0));
+        const trustFunded = round2(trustRequested - trustUnfunded);
+        const trust: TrustSummary = {
+          requested_total: trustRequested,
+          funded_total: trustFunded,
+          unfunded_total: trustUnfunded,
+          unfunded_count: trustRows.filter((r) => r.status === "Unfunded").length,
+          fund_rate_pct: trustRequested > 0 ? Math.round((trustFunded / trustRequested) * 1000) / 10 : 0,
+        };
+
         // ---- Maintain the AR Scorecard workbook in Box ----
         let workbook_result: any = { skipped: true };
         if (params.update_workbook !== false) {
           try {
-            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10, detail);
+            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows);
           } catch (e: any) {
             workbook_result = { error: e?.message ?? String(e) };
           }
         }
 
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ firm, by_attorney: byAttorney, top_10_accounts: top10, workbook: workbook_result }, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ firm, trust_requests: trust, by_attorney: byAttorney, top_10_accounts: top10, workbook: workbook_result }, null, 2) }],
         };
       } catch (err: any) {
         return {
@@ -674,9 +747,11 @@ export function registerARTools(server: McpServer): void {
 
 // ====================================================================
 // AR Scorecard workbook — standalone, auto-updating Box file.
-// Weekly Scorecard tab appends one row per as-of date (trend); By Attorney
-// and Top 10 tabs are refreshed to the current snapshot each run. Built fresh
-// with ExcelJS (a brand-new file we fully control, so formatting is clean).
+// Weekly Scorecard tab appends one row per as-of date (trend); By Attorney,
+// Top 10 and Trust Requests tabs are refreshed to the current snapshot each run.
+// Built fresh with ExcelJS (a brand-new file we fully control, so formatting is
+// clean). AR tabs reflect revenue_kind bills only; Trust Requests holds the
+// trust_kind funding requests that must never be counted as AR.
 // ====================================================================
 type FirmMetrics = {
   as_of: string; total_ar: number; current: number; days_1_30: number; days_31_60: number;
@@ -686,7 +761,23 @@ type FirmMetrics = {
   oldest_invoice_days: number; avg_days_outstanding: number;
 };
 
-const WEEKLY_COLS: Array<{ key: keyof FirmMetrics; header: string; fmt?: string; width: number }> = [
+type TrustSummary = {
+  requested_total: number; funded_total: number; unfunded_total: number;
+  unfunded_count: number; fund_rate_pct: number;
+};
+type TrustRequestRow = {
+  attorney: string; client: string; matter: string; bill: string;
+  issued: string; due: string; days: number;
+  requested: number; balance: number; funded: number;
+  status: "Funded" | "Unfunded"; dateFunded: string;
+};
+
+// Weekly trend row = firm AR metrics + trust-request tracking columns. Trust
+// figures are tracked alongside AR so they're visible week-over-week without
+// ever being conflated with receivables.
+type WeeklyRecord = FirmMetrics & { trust_outstanding: number; trust_unfunded_count: number };
+
+const WEEKLY_COLS: Array<{ key: keyof WeeklyRecord; header: string; fmt?: string; width: number }> = [
   { key: "as_of", header: "As Of", width: 12 },
   { key: "total_ar", header: "Total AR", fmt: '"$"#,##0', width: 14 },
   { key: "ar_120plus", header: "120+ $", fmt: '"$"#,##0', width: 13 },
@@ -700,6 +791,8 @@ const WEEKLY_COLS: Array<{ key: keyof FirmMetrics; header: string; fmt?: string;
   { key: "delinquent_clients", header: "# Clients", width: 10 },
   { key: "oldest_invoice_days", header: "Oldest (days)", width: 13 },
   { key: "avg_days_outstanding", header: "Avg Days O/S", width: 13 },
+  { key: "trust_outstanding", header: "Trust Requests Outstanding ($)", fmt: '"$"#,##0', width: 28 },
+  { key: "trust_unfunded_count", header: "Trust Requests Unfunded (#)", width: 26 },
 ];
 
 type AttyDetail = { attorney: string; bills: Array<{ client: string; matter: string; bill: string; issued: string; due: string; days_past_due: number; bucket: string; balance: number }> };
@@ -708,6 +801,8 @@ async function updateARScorecardWorkbook(
   byAttorney: Array<{ attorney: string; total_ar: number; ar_90plus: number; ar_90plus_pct: number; ar_120plus: number; ar_120plus_pct: number; invoices: number }>,
   top10: Array<{ client: string; matter: string; attorney: string; balance: number; days_past_due: number }>,
   detail: AttyDetail[],
+  trust: TrustSummary,
+  trustRows: TrustRequestRow[],
 ): Promise<any> {
   const r2 = (n: number) => Math.round(n * 100) / 100;
   // 1. Read prior weekly history (if the file already exists).
@@ -740,9 +835,11 @@ async function updateARScorecardWorkbook(
       }
     } catch { /* prior file unreadable — start fresh history */ }
   }
-  // 2. Append/replace this run's row (dedupe by as_of).
+  // 2. Append/replace this run's row (dedupe by as_of). The weekly row carries
+  // firm AR metrics plus the two trust-request tracking columns.
   const merged = history.filter((h) => h.as_of !== firm.as_of);
-  merged.push(firm as any);
+  const currentRecord: WeeklyRecord = { ...firm, trust_outstanding: trust.unfunded_total, trust_unfunded_count: trust.unfunded_count };
+  merged.push(currentRecord as any);
   merged.sort((a, b) => String(a.as_of).localeCompare(String(b.as_of)));
 
   // 3. Build the workbook fresh.
@@ -805,6 +902,48 @@ async function updateARScorecardWorkbook(
     top.getCell(3 + ri, 4).value = t.balance;
     top.getCell(3 + ri, 5).value = t.days_past_due;
   });
+
+  // ---- Trust Requests tab ----
+  // trust_kind bills only — advance-deposit / retainer funding requests, NOT
+  // accounts receivable. Reports funded vs. unfunded so the firm can chase
+  // outstanding replenishment requests without polluting AR. Title (row 1),
+  // summary block (rows 2–6), detail header (row 8, frozen), rows from 9.
+  const trustWs = wb.addWorksheet("Trust Requests", { views: [{ state: "frozen" as const, ySplit: 8 }] });
+  const trustHeaders = ["Responsible Attorney", "Client", "Matter", "Bill #", "Issued", "Due", "Days Outstanding", "Amount Requested", "Status", "Date Funded"];
+  const trustWidth = [24, 26, 42, 10, 12, 12, 16, 16, 11, 12];
+  const moneyFmt = '"$"#,##0.00';
+  trustWs.mergeCells(1, 1, 1, trustHeaders.length);
+  trustWs.getCell(1, 1).value = `Trust / Retainer Replenishment Requests — as of ${firm.as_of}`;
+  trustWs.getCell(1, 1).font = { bold: true, size: 13 };
+  const trustSummary: Array<{ label: string; value: number; fmt?: string }> = [
+    { label: "Requests Sent", value: trustRows.length },
+    { label: "Total Requested", value: trust.requested_total, fmt: moneyFmt },
+    { label: "Funded", value: trust.funded_total, fmt: moneyFmt },
+    { label: "Unfunded", value: trust.unfunded_total, fmt: moneyFmt },
+    { label: "Fund Rate", value: trust.fund_rate_pct, fmt: '0.0"%"' },
+  ];
+  trustSummary.forEach((s, i) => {
+    const lbl = trustWs.getCell(2 + i, 1); lbl.value = s.label; lbl.font = bold;
+    const val = trustWs.getCell(2 + i, 2); val.value = s.value; if (s.fmt) val.numFmt = s.fmt;
+  });
+  trustHeaders.forEach((h, i) => { const c = trustWs.getCell(8, i + 1); c.value = h; c.font = bold; trustWs.getColumn(i + 1).width = trustWidth[i]; });
+  trustWs.getColumn(8).numFmt = moneyFmt; // Amount Requested
+  let trr = 9;
+  for (const t of trustRows) {
+    trustWs.getCell(trr, 1).value = t.attorney;
+    trustWs.getCell(trr, 2).value = t.client;
+    trustWs.getCell(trr, 3).value = t.matter;
+    trustWs.getCell(trr, 4).value = t.bill;
+    trustWs.getCell(trr, 5).value = t.issued;
+    trustWs.getCell(trr, 6).value = t.due;
+    trustWs.getCell(trr, 7).value = t.days;
+    trustWs.getCell(trr, 8).value = t.requested;
+    trustWs.getCell(trr, 9).value = t.status;
+    trustWs.getCell(trr, 10).value = t.dateFunded;
+    trr++;
+  }
+  trustWs.getCell(trr, 1).value = "Total"; trustWs.getCell(trr, 1).font = bold;
+  trustWs.getCell(trr, 8).value = trust.requested_total; trustWs.getCell(trr, 8).font = bold;
 
   // Detail tabs per responsible attorney: TWO views each —
   //   "{Attorney}"            : every bill, largest balance first
