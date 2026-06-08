@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "noEmit": true },
-  "include": ["src/clio/**/*", "src/utils/**/*", "src/domain/**/*"]
+  "include": ["src/clio/**/*", "src/utils/**/*", "src/domain/**/*", "src/dashboard/**/*"]
 }
