@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { buildMonthlyCollections } from "../dashboard/collections";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -49,7 +50,6 @@ import {
   parseCSV,
   getFeeAllocationCSV,
   assertReportPeriod,
-  genFeeAllocationByMonth,
   getClientActivityCSV,
   getRealizationReportCSV,
   aggregateRealizationCollections,
@@ -1653,24 +1653,8 @@ export function registerDocumentTools(server: McpServer): void {
           // write loop below AND the surgical compareXml patch both consume these
           // maps; the Bonus Tracker is derived from col N, so it picks these up too.
           _step = "generating payment-filtered Fee Allocation reports (per YTD month)";
-          const collNum = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
-          const indivCollByMonth: Record<number, Record<number, number>> = {};
-          const respCollByMonth: Record<number, Record<number, number>> = {};
-          let collFirmYtd = 0;
-          for (let m = 1; m <= params.month; m++) {
-            let feeRows: Record<string, string>[] = [];
-            try { feeRows = await genFeeAllocationByMonth(params.year, m); }
-            catch (e: any) { console.warn(`[Dashboard] payment-filtered fee allocation failed for ${params.year}-${String(m).padStart(2, "0")}: ${e?.message ?? e}`); }
-            for (const r of feeRows) {
-              const collected = collNum(r["Total Funds Collected"]);
-              if (!collected) continue;
-              collFirmYtd += collected;
-              const uid = matchRosterUser(r["User"] || "", ROSTER);
-              if (uid != null) { const slot = (indivCollByMonth[m] ??= {}); slot[uid] = (slot[uid] ?? 0) + collected; }
-              const rid = matchRosterResponsible(r["Responsible Attorney"] || "", ROSTER);
-              if (rid != null) { const slot = (respCollByMonth[m] ??= {}); slot[rid] = (slot[rid] ?? 0) + collected; }
-            }
-          }
+          const { indivByMonth: indivCollByMonth, respByMonth: respCollByMonth, firmYtd: collFirmYtd } =
+            await buildMonthlyCollections(params.year, params.month, ROSTER);
           console.log(`[Dashboard] payment-filtered collections built: firm YTD received=$${collFirmYtd.toFixed(2)} (should reconcile to firm payments received; if it instead matches issue-date-2026 only, filter_by_payment was ignored)`);
           let collCellsWritten = 0;
           for (let m = 1; m <= params.month; m++) {
