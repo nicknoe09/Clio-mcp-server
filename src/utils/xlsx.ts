@@ -595,3 +595,39 @@ export async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
     return buf;
   }
 }
+
+// Excel column number (1-based) -> letter(s): 1->A, 27->AA.
+export           const colLetter = (c: number): string => {
+            let s = "";
+            while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); }
+            return s;
+          };
+
+          // Helper: write a numeric value into a cell in the XML.
+          // Handles BOTH self-closing/empty cells (<c r="C43" s="62"/>) and cells
+          // with content (<c r="D5" s="7"><v>0</v></c>). The empty-tab target
+          // cells are self-closing; the old single-regex version required </c>
+          // and so over-matched past a self-closing cell into the NEXT cell's
+          // </c>, fusing cells and dumping the value into the wrong column.
+          export function patchCell(xml: string, ref: string, val: number): string {
+            // 1) self-closing empty cell — turn it into a value cell (preserve
+            //    style, drop any t="…" so the number isn't read as a string idx).
+            const selfRe = new RegExp(`<c\\b([^>]*?)\\br="${ref}"([^>]*?)/>`);
+            const sm = xml.match(selfRe);
+            if (sm) {
+              const attrs = `${sm[1]} r="${ref}"${sm[2]}`.replace(/\s+t="[^"]*"/g, "").replace(/\s+/g, " ").trim();
+              return xml.replace(selfRe, `<c ${attrs}><v>${val}</v></c>`);
+            }
+            // 2) cell with content — replace/insert its <v> (lazy match to its
+            //    own </c>; safe because self-closing was handled above).
+            const fullRe = new RegExp(`(<c\\b[^>]*\\br="${ref}"[^>]*>)([\\s\\S]*?)(</c>)`);
+            const m = xml.match(fullRe);
+            if (m) {
+              const open = m[1].replace(/\s+t="[^"]*"/g, ""); // numeric write: drop t="s"/"e"/"str"
+              let inner = m[2];
+              if (/<v>/.test(inner)) inner = inner.replace(/<v>[\s\S]*?<\/v>/, `<v>${val}</v>`);
+              else inner += `<v>${val}</v>`;
+              return xml.replace(fullRe, `${open}${inner}${m[3]}`);
+            }
+            return xml;
+          }
