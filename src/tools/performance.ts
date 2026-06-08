@@ -1,57 +1,11 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport } from "../clio/pagination";
+import { getFeeAllocationCSV } from "../clio/reportCsv";
 
 const TIME_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,billed,matter{id,display_number,description},user{id,name}";
 
-/**
- * Parse CSV content into an array of objects using header row as keys.
- * Handles quoted fields with commas inside.
- */
-function parseCSV(csv: string): Record<string, string>[] {
-  const lines = csv.split("\n");
-  if (lines.length < 2) return [];
-
-  // Parse a CSV line respecting quoted fields
-  function parseLine(line: string): string[] {
-    const fields: string[] = [];
-    let current = "";
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (ch === "," && !inQuotes) {
-        fields.push(current.trim());
-        current = "";
-      } else {
-        current += ch;
-      }
-    }
-    fields.push(current.trim());
-    return fields;
-  }
-
-  const headers = parseLine(lines[0]);
-  const rows: Record<string, string>[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const values = parseLine(line);
-    const row: Record<string, string> = {};
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = values[j] ?? "";
-    }
-    rows.push(row);
-  }
-  return rows;
-}
 
 /**
  * List all completed Fee Allocation Reports in Clio.
@@ -67,30 +21,6 @@ async function listFeeAllocationReports(): Promise<any[]> {
   );
 }
 
-/**
- * Download and parse a Fee Allocation Report from Clio.
- * If reportId is provided, uses that specific report.
- * Otherwise uses the most recent one (highest ID).
- * Returns { rows, report } where report is the selected report's metadata.
- */
-async function getFeeAllocationCSV(reportId?: number): Promise<{ rows: Record<string, string>[]; report: any }> {
-  const feeReports = await listFeeAllocationReports();
-
-  if (feeReports.length === 0) {
-    throw new Error("No completed Fee Allocation Report found in Clio. Please generate one from Clio's Reports UI.");
-  }
-
-  let target;
-  if (reportId) {
-    target = feeReports.find((r: any) => r.id === reportId);
-    if (!target) throw new Error(`Report ID ${reportId} not found among ${feeReports.length} fee allocation reports. Use list_fee_allocation_reports to see available reports.`);
-  } else {
-    target = feeReports.reduce((a: any, b: any) => (a.id > b.id ? a : b));
-  }
-
-  const csv = await downloadReport(target.id);
-  return { rows: parseCSV(csv), report: target };
-}
 
 /**
  * Count working days (Mon-Fri) between two dates inclusive.
