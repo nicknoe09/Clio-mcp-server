@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { applyTieredSplit } from "../domain/vd";
+import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
 import { border, $, makePara, makeDocxTable, pageBreak, spacer, h2, pageProps } from "../utils/docx";
-import { round2, round1 } from "../utils/num";
+import { round2, round1, fmt } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport, rawGetSingle, rawPostSingle } from "../clio/pagination";
 import {
@@ -36,14 +38,11 @@ import {
   getZipSheetMap,
   StyleIndices,
   surgicalWriteXlsx,
+  sanitizeXlsxBuffer,
 } from "../utils/xlsx";
 
 // ========== SHARED HELPERS ==========
 
-function fmt(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "";
-  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
 
 
 import {
@@ -63,110 +62,9 @@ import {
   RealizCollectionsAgg,
 } from "../clio/reportCsv";
 
-// ---- Background-job registry for long-running dashboard updates ----
-// download_dashboard_update can take several minutes (classic mode generates a
-// revenue report per timekeeper), well past the MCP client's ~180s timeout. So
-// it runs as a detached job: the tool returns a job_id immediately and the work
-// continues server-side; get_dashboard_status reports progress/result. The Map
-// is a module singleton, so it persists across tool calls for the life of the
-// server process (jobs are lost only if the process restarts).
-type DashJob = {
-  id: string;
-  status: "running" | "done" | "error";
-  started_at: string;
-  finished_at?: string;
-  result?: any;
-  error?: string;
-};
-const dashboardJobs = new Map<string, DashJob>();
-function pruneDashboardJobs() {
-  const now = Date.now();
-  for (const [id, j] of dashboardJobs) {
-    if (j.finished_at && now - new Date(j.finished_at).getTime() > 2 * 3600 * 1000) dashboardJobs.delete(id);
-  }
-  while (dashboardJobs.size > 50) {
-    const oldest = dashboardJobs.keys().next().value;
-    if (oldest === undefined) break;
-    dashboardJobs.delete(oldest);
-  }
-}
 
-// Repair a downloaded .xlsx so ExcelJS can load it even when a prior
-// programmatic write left a shared-string reference out of range (a cell with
-// t="s" whose <v> index points past the end of sharedStrings.xml). ExcelJS
-// crashes on that with "Cannot read properties of undefined (reading 'richText')"
-// in CellXform.reconcile. We pad sharedStrings with empty <si> entries so those
-// refs resolve to "" instead of undefined. No-op (returns the original buffer)
-// when every reference is already in range or anything looks unexpected.
-async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
-  try {
-    const zip = await JSZip.loadAsync(buf);
-    let changed = false;
-
-    // (A) Self-heal a styles.xml corrupted by the old String.replace "$&"
-    // footgun: a currency formatCode "$" was expanded to the matched text
-    // "</numFmts>", leaving e.g. formatCode="&quot;</numFmts>quot;#,##0.00",
-    // which contains '<' in an attribute → invalid XML → Excel discards
-    // styles.xml (and cascades cell/table repairs). Undo the injection.
-    const stylesFile = zip.file("xl/styles.xml");
-    if (stylesFile) {
-      let styles = await stylesFile.async("string");
-      if (styles.includes("&quot;</numFmts>quot;")) {
-        styles = styles.split("&quot;</numFmts>quot;").join("&quot;$&quot;");
-        zip.file("xl/styles.xml", styles);
-        changed = true;
-        console.warn('[Dashboard] sanitizeXlsxBuffer: healed corrupted styles.xml ("$&" numFmt injection)');
-      }
-    }
-
-    // (B) Pad sharedStrings to cover any out-of-range refs (the original repair).
-    const ssFile = zip.file("xl/sharedStrings.xml");
-    if (ssFile) {
-      let ss = await ssFile.async("string");
-      const siCount = (ss.match(/<si(?:\s[^>]*)?>/g) || []).length;
-      let maxIdx = -1;
-      for (const name of Object.keys(zip.files)) {
-        if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
-        const xml = await zip.file(name)!.async("string");
-        const re = /<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)<\/v>/g;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(xml))) { const idx = parseInt(m[1], 10); if (idx > maxIdx) maxIdx = idx; }
-      }
-      if (maxIdx >= siCount && /<\/sst>/.test(ss)) {
-        const pad = maxIdx - siCount + 1;
-        ss = ss.replace("</sst>", () => "<si><t></t></si>".repeat(pad) + "</sst>");
-        ss = ss.replace(/(<sst\b[^>]*\buniqueCount=")(\d+)(")/, (_s, a, _n, c) => a + (siCount + pad) + c);
-        zip.file("xl/sharedStrings.xml", ss);
-        changed = true;
-        console.warn(`[Dashboard] sanitizeXlsxBuffer: padded sharedStrings by ${pad} (had ${siCount}, max ref ${maxIdx})`);
-      }
-    }
-
-    return changed ? await zip.generateAsync({ type: "nodebuffer" }) : buf;
-  } catch (e: any) {
-    console.warn(`[Dashboard] sanitizeXlsxBuffer skipped: ${e?.message ?? e}`);
-    return buf;
-  }
-}
 
 // V&D tier logic
-const ATTORNEY_TIERS = [
-  { ceiling: 250000, vdPct: 0.825, firmPct: 0.175 },
-  { ceiling: 500000, vdPct: 0.80, firmPct: 0.20 },
-  { ceiling: Infinity, vdPct: 0.775, firmPct: 0.225 },
-];
-function applyTieredSplit(amount: number, ytdBefore: number) {
-  let remaining = amount, vd = 0, firm = 0, ytd = ytdBefore;
-  for (const tier of ATTORNEY_TIERS) {
-    if (remaining <= 0) break;
-    const space = Math.max(0, tier.ceiling - ytd);
-    if (space <= 0) continue;
-    const inTier = Math.min(remaining, space);
-    vd += inTier * tier.vdPct; firm += inTier * tier.firmPct;
-    ytd += inTier; remaining -= inTier;
-  }
-  return { vd: round2(vd), firm: round2(firm), ytdAfter: ytd };
-}
 
 // ========== REGISTER TOOLS ==========
 
