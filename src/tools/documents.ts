@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
+import { border, $, makePara, makeDocxTable, pageBreak, spacer, h2, pageProps } from "../utils/docx";
 import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport, rawGetSingle, rawPostSingle } from "../clio/pagination";
@@ -43,52 +45,6 @@ function fmt(n: number | null | undefined): string {
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-// ---- docx table helpers ----
-const border = { style: BorderStyle.SINGLE, size: 1, color: "999999" };
-const borders = { top: border, bottom: border, left: border, right: border };
-const cellMargins = { top: 60, bottom: 60, left: 100, right: 100 };
-const TW = 9360;
-
-function $(text: string, opts: any = {}) {
-  return new TextRun({ text, font: "Arial", size: 20, ...opts });
-}
-
-function makePara(text?: string, opts: any = {}) {
-  const children = text ? [$(text, { bold: opts.bold, size: opts.size || 20, color: opts.color })] : opts.runs || [];
-  return new Paragraph({ children, spacing: { after: opts.spacingAfter ?? 120, before: opts.spacingBefore }, alignment: opts.alignment });
-}
-
-function makeDocxTable(headers: string[], rows: string[][], colWidths: number[]) {
-  const headerRow = new TableRow({
-    children: headers.map((h, i) => new TableCell({
-      borders, width: { size: colWidths[i], type: WidthType.DXA }, margins: cellMargins,
-      shading: { fill: "2E4057", type: ShadingType.CLEAR },
-      children: [new Paragraph({ alignment: i > 0 ? AlignmentType.RIGHT : AlignmentType.LEFT, children: [$(h, { bold: true, color: "FFFFFF", size: 18 })] })],
-    })),
-  });
-
-  const dataRows = rows.map(row => {
-    const isTotalRow = ["Total", "YTD", "Tier", "Subtotal"].some(kw => String(row[0]).includes(kw));
-    return new TableRow({
-      children: row.map((cell, i) => new TableCell({
-        borders, width: { size: colWidths[i], type: WidthType.DXA }, margins: cellMargins,
-        shading: isTotalRow ? { fill: "E8EDF2", type: ShadingType.CLEAR } : undefined,
-        children: [new Paragraph({ alignment: i > 0 ? AlignmentType.RIGHT : AlignmentType.LEFT, children: [$(String(cell ?? ""), { bold: isTotalRow, size: 18 })] })],
-      })),
-    });
-  });
-
-  return new Table({ width: { size: TW, type: WidthType.DXA }, columnWidths: colWidths, rows: [headerRow, ...dataRows] });
-}
-
-function pageBreak() { return new Paragraph({ children: [new PageBreak()] }); }
-function spacer() { return new Paragraph({ spacing: { after: 80 } }); }
-function h2(text: string) { return new Paragraph({ heading: HeadingLevel.HEADING_2, children: [$(text, { size: 24, bold: true, color: "2E4057" })] }); }
-
-// Common page properties
-const pageProps = {
-  page: { size: { width: 12240, height: 15840 }, margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 } },
-};
 
 import {
   parseCSV,
@@ -221,16 +177,7 @@ function applyTieredSplit(amount: number, ytdBefore: number) {
 // col N (14) = that timekeeper's individual collected $ for the month.
 const FIRM_DASHBOARD_FILE_ID = "2199324794140";
 
-const INITIALS_BY_USER_ID: Record<number, string> = {
-  344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
-  358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
-  359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
-};
 
-const MONTH_NAMES_FULL = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December",
-];
 
 // Cache the parsed dashboard collections per (fileId, day) so a batch run
 // (download_all_weekly_goals) doesn't re-download the workbook for every person.
@@ -364,7 +311,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
 
   // Build Excel
   const wb = new ExcelJS.Workbook();
-  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const monthNames = MONTH_NAMES_SHORT;
 
   // Summary (Monthly) sheet
   const ws1 = wb.addWorksheet("Summary");
@@ -601,7 +548,7 @@ export function registerDocumentTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        const monthNames = MONTH_NAMES_FULL;
         const monthName = monthNames[params.month - 1];
         const startDate = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
         const endDay = new Date(params.year, params.month, 0).getDate();
@@ -850,18 +797,7 @@ export function registerDocumentTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const ROSTER = [
-          { initials: "PAR", name: "Paul Romano", user_id: 344117381 },
-          { initials: "KES", name: "Kenny Sumner", user_id: 344134017 },
-          { initials: "NRN", name: "Nicholas Noe", user_id: 348755029 },
-          { initials: "NAF", name: "Nicholas Fernelius", user_id: 359380639 },
-          { initials: "ACA", name: "Angela Alanis", user_id: 358528744 },
-          { initials: "AFL", name: "Anna Lozano", user_id: 358108805 },
-          { initials: "AKG", name: "Kaz Gonzalez", user_id: 358550509 },
-          { initials: "TBS", name: "Tzipora Simmons", user_id: 359711375 },
-          { initials: "MNH", name: "May Huynh", user_id: 359576660 },
-          { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
-        ];
+        const ROSTER = SCORECARD_ROSTER;
 
         const targetDate = params.week_of ?? new Date().toISOString().split("T")[0];
         const d = new Date(targetDate + "T12:00:00");
@@ -1353,22 +1289,9 @@ export function registerDocumentTools(server: McpServer): void {
       (async () => {
       let _step = "init";
       try {
-        const ROSTER = [
-          { initials: "PAR", name: "Paul Romano", user_id: 344117381 },
-          { initials: "KES", name: "Kenny Sumner", user_id: 344134017 },
-          { initials: "NRN", name: "Nicholas Noe", user_id: 348755029 },
-          { initials: "NAF", name: "Nicholas Fernelius", user_id: 359380639 },
-          { initials: "ACA", name: "Angela Alanis", user_id: 358528744 },
-          { initials: "AFL", name: "Anna Lozano", user_id: 358108805 },
-          { initials: "AKG", name: "Kaz Gonzalez", user_id: 358550509 },
-          { initials: "TBS", name: "Tzipora Simmons", user_id: 359711375 },
-          { initials: "MNH", name: "May Huynh", user_id: 359576660 },
-          { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
-          { initials: "KGV", name: "Gus Vlahadamis", user_id: 360049685 },
-          { initials: "CTD", name: "Courteney Daniel", user_id: 359865560 },
-        ];
+        const ROSTER = FIRM_ROSTER;
 
-        const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        const monthNames = MONTH_NAMES_FULL;
         const monthName = monthNames[params.month - 1];
         const monthStart = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
         const endDay = new Date(params.year, params.month, 0).getDate();

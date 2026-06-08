@@ -1,21 +1,11 @@
 import { z } from "zod";
+import { SCORECARD_ROSTER, MONTH_NAMES_SHORT } from "../domain/roster";
 import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
 // --- Firm roster: initials → Clio user ID ---
-const ROSTER = [
-  { initials: "PAR", name: "Paul Romano", user_id: 344117381 },
-  { initials: "KES", name: "Kenny Sumner", user_id: 344134017 },
-  { initials: "NRN", name: "Nicholas Noe", user_id: 348755029 },
-  { initials: "NAF", name: "Nicholas Fernelius", user_id: 359380639 },
-  { initials: "ACA", name: "Angela Alanis", user_id: 358528744 },
-  { initials: "AFL", name: "Anna Lozano", user_id: 358108805 },
-  { initials: "AKG", name: "Kaz Gonzalez", user_id: 358550509 },
-  { initials: "TBS", name: "Tzipora Simmons", user_id: 359711375 },
-  { initials: "MNH", name: "May Huynh", user_id: 359576660 },
-  { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
-];
+const ROSTER = SCORECARD_ROSTER;
 
 // --- Helpers ---
 function getWeekRange(dateStr: string): { start: string; end: string; label: string } {
@@ -351,7 +341,7 @@ export function registerScorecardTools(server: McpServer): void {
           }
         }
 
-        const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        const monthNames = MONTH_NAMES_SHORT;
         const monthlySummary = [];
         let cumBillable = 0, cumGoal = 0;
 
