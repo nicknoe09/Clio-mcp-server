@@ -670,6 +670,54 @@ async function assertReportPeriod(reportId: number | string, wantStart: string, 
   return { start: meta?.start_date, end: meta?.end_date };
 }
 
+// Generate a PAYMENT-FILTERED Fee Allocation report for ONE month and return its rows.
+// filter_by_payment=true makes the date range filter by PAYMENT date (money actually
+// received in the period) rather than invoice issue date — the payment-received basis,
+// which also captures payments on prior-year invoices (the issue-date split dropped
+// them). Each row is a timekeeper's allocation on an invoice: "User" (working
+// timekeeper → col N), "Responsible Attorney" (→ col S), "Total Funds Collected".
+// Mirrors getClientActivityCSV's POST+poll+retry and verifies the period via
+// assertReportPeriod so a wrong-month report aborts instead of writing bad data.
+async function genFeeAllocationByMonth(year: number, month: number): Promise<Record<string, string>[]> {
+  const start = `${year}-${String(month).padStart(2, "0")}-01`;
+  const endDay = new Date(year, month, 0).getDate();
+  const end = `${year}-${String(month).padStart(2, "0")}-${endDay}`;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const attempts = 3;
+  let lastErr: any;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let reportId: number | undefined;
+    let state: string | undefined;
+    try {
+      const gen = await rawPostSingle("/reports", { data: { kind: "fee_allocation", format: "csv", filter_by_payment: true, start_date: start, end_date: end } });
+      const rep = gen?.data ?? gen;
+      reportId = rep?.id;
+      state = rep?.state;
+    } catch (e: any) {
+      lastErr = e;
+      if (e?.response?.status === 422) throw e; // bad params — retrying won't help
+      console.warn(`[Dashboard] fee allocation (payment) gen attempt ${attempt}/${attempts} for ${start}: POST failed: ${e?.message ?? e}`);
+      if (attempt < attempts) await sleep(3000 * attempt);
+      continue;
+    }
+    if (!reportId) { lastErr = new Error("fee allocation POST returned no report id"); if (attempt < attempts) await sleep(3000 * attempt); continue; }
+    const deadline = Date.now() + 150000;
+    while (!["completed", "failed", "empty"].includes(state ?? "") && Date.now() < deadline) {
+      await sleep(4000);
+      try { const s = await rawGetSingle(`/reports/${reportId}`, { fields: "id,state" }); state = (s?.data ?? s)?.state; }
+      catch { /* transient — keep polling */ }
+    }
+    if (state === "completed") {
+      await assertReportPeriod(reportId, start, `fee allocation (payment-filtered) ${start}`);
+      return parseCSV(await downloadReport(reportId));
+    }
+    lastErr = new Error(`fee allocation report ${reportId} did not complete (state=${state ?? "unknown"})`);
+    console.warn(`[Dashboard] fee allocation (payment) gen attempt ${attempt}/${attempts}: ${lastErr.message}`);
+    if (attempt < attempts) await sleep(3000 * attempt);
+  }
+  throw new Error(`payment-filtered fee allocation for ${start}..${end} failed after ${attempts} attempt(s): ${lastErr?.message ?? lastErr}`);
+}
+
 // ========== Client Activity Report (per-month) ==========
 // Auto-generates a single-month Client Activity report and downloads the CSV.
 // Each row is one time entry / expense with: User (full name), Date, Quantity,
@@ -2211,7 +2259,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from the Fee Allocation Report, split per-month by Issue Date. The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from the Fee Allocation Report, which is cumulative YTD — the tool groups its rows by Issue Date month and writes each month its own slice into ALL year-to-date month blocks (Jan through target), so consecutive months are distinct and every prior month is backfilled from one report; pass fee_report_id to pin a specific Fee Allocation report. REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -2700,43 +2748,37 @@ export function registerDocumentTools(server: McpServer): void {
           }
           console.log(`[Dashboard] wrote tkUpdated=${tkUpdated} across months_processed=${monthsData.length - monthsSkipped} months_skipped=${monthsSkipped}`);
 
-          // ---- PER-MONTH COLLECTIONS (Fee Allocation Report, all YTD months) ----
-          // The Fee Allocation CSV is CUMULATIVE (Jan 1 → report date). Group each
-          // row by its Issue Date month (the same convention as
-          // get_responsible_collections) and write each month its own slice into
-          // that month's block: col N (14) = individual collected (by timekeeper),
-          // col S (19) = responsible-attorney collected. This de-cumulates
-          // collections so consecutive months are distinct (fixes April==May) and
-          // backfills every prior month from the single cumulative report. The
-          // Bonus Tracker is derived from col N below, so it picks these up too.
-          _step = "writing per-month collections to 26 Compare";
+          // ---- PER-MONTH COLLECTIONS (payment-filtered Fee Allocation, all YTD months) ----
+          // Payment-received basis: one PAYMENT-FILTERED Fee Allocation report per
+          // month (filter_by_payment=true) = money actually received that month,
+          // allocated by working timekeeper (User → col N=14 individual) and by
+          // Responsible Attorney (col S=19). This captures payments on prior-year
+          // invoices and reconciles to Clio's Revenue Report; assertReportPeriod (in
+          // genFeeAllocationByMonth) guards each month so a wrong-period report aborts.
+          // Replaces the old cumulative issue-date split, which bucketed by invoice
+          // issue month and dropped prior-year payments (~$326K low). The ExcelJS
+          // write loop below AND the surgical compareXml patch both consume these
+          // maps; the Bonus Tracker is derived from col N, so it picks these up too.
+          _step = "generating payment-filtered Fee Allocation reports (per YTD month)";
           const collNum = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
-          const issueMonth = (d: string): number => {
-            // Issue Date is M/D/YYYY in Clio's Fee Allocation export.
-            const parts = String(d ?? "").split("/");
-            if (parts.length < 3) return 0;
-            const m = parseInt(parts[0], 10);
-            const y = parseInt(parts[2], 10);
-            return (y === params.year && m >= 1 && m <= 12) ? m : 0;
-          };
           const indivCollByMonth: Record<number, Record<number, number>> = {};
           const respCollByMonth: Record<number, Record<number, number>> = {};
-          for (const r of csvRows) {
-            const m = issueMonth(r["Issue Date"]);
-            if (!m || m > params.month) continue;
-            const collected = collNum(r["Total Funds Collected"]);
-            if (!collected) continue;
-            const uid = matchRosterUser(r["User"] || "", ROSTER);
-            if (uid != null) {
-              const slot = (indivCollByMonth[m] ??= {});
-              slot[uid] = (slot[uid] ?? 0) + collected;
-            }
-            const rid = matchRosterResponsible(r["Responsible Attorney"] || "", ROSTER);
-            if (rid != null) {
-              const slot = (respCollByMonth[m] ??= {});
-              slot[rid] = (slot[rid] ?? 0) + collected;
+          let collFirmYtd = 0;
+          for (let m = 1; m <= params.month; m++) {
+            let feeRows: Record<string, string>[] = [];
+            try { feeRows = await genFeeAllocationByMonth(params.year, m); }
+            catch (e: any) { console.warn(`[Dashboard] payment-filtered fee allocation failed for ${params.year}-${String(m).padStart(2, "0")}: ${e?.message ?? e}`); }
+            for (const r of feeRows) {
+              const collected = collNum(r["Total Funds Collected"]);
+              if (!collected) continue;
+              collFirmYtd += collected;
+              const uid = matchRosterUser(r["User"] || "", ROSTER);
+              if (uid != null) { const slot = (indivCollByMonth[m] ??= {}); slot[uid] = (slot[uid] ?? 0) + collected; }
+              const rid = matchRosterResponsible(r["Responsible Attorney"] || "", ROSTER);
+              if (rid != null) { const slot = (respCollByMonth[m] ??= {}); slot[rid] = (slot[rid] ?? 0) + collected; }
             }
           }
+          console.log(`[Dashboard] payment-filtered collections built: firm YTD received=$${collFirmYtd.toFixed(2)} (should reconcile to firm payments received; if it instead matches issue-date-2026 only, filter_by_payment was ignored)`);
           let collCellsWritten = 0;
           for (let m = 1; m <= params.month; m++) {
             const block = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
