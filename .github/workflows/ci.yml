@@ -28,8 +28,9 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      # tsc is memory-hungry on this project (large dependency type graphs);
-      # give the compiler extra heap so the type graph fits on CI runners.
+      # tsc is memory-hungry on this project (large dependency type graphs +
+      # many zod tool schemas); give it ample heap. Public-repo hosted runners
+      # have ~16 GB RAM, so 12 GB is safe and well above what the compiler needs.
       - run: npx tsc --noEmit
         env:
-          NODE_OPTIONS: --max-old-space-size=6144
+          NODE_OPTIONS: --max-old-space-size=12288
