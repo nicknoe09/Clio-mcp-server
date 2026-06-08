@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { buildRevenueByMonth } from "../dashboard/revenue";
 import { computeBonusData } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
@@ -1217,115 +1218,16 @@ export function registerDocumentTools(server: McpServer): void {
           indivCollected: 0, respCollected: 0,
         });
 
-        // ---- Pull all numeric metrics from the monthly classic Revenue Report ----
-        // ONE download carries every YTD month. Per row (Activity month × User ×
-        // Responsible attorney) we get the authoritative billed/billable/write-off/
-        // discount figures — no firm-wide /activities pagination, no hours×rate
-        // reconstruction. Individual columns aggregate by User; the Responsible
-        // section aggregates the same rows by Responsible attorney (so staff work
-        // rolls up under the responsible attorney even though the timekeeper isn't
-        // on the roster).
-        const num = (v: string | undefined) => { const n = parseFloat(v ?? ""); return isNaN(n) ? 0 : n; };
-        // month -> user_id -> indiv metrics ; month -> responsible user_id -> rollup
-        const indivByMonth: Record<number, Record<number, PerUserData>> = {};
-        const respByMonth: Record<number, Record<number, { respHrs: number; respBilled: number }>> = {};
-
-        // Revenue source:
-        //   (A) month×user "(like Classic)" CSV — from Box (revenue_csv_box_file_id)
-        //       or Clio /reports (revenue_report_id). Covers all YTD months in one file.
-        //   (B) DEFAULT: classic per-timekeeper revenue, Rachel's manual method — 12
-        //       per-user revenue reports (individual) + 1 firm-wide (responsible),
-        //       generated on demand for the TARGET MONTH only. revenue honors the
-        //       date range (unlike productivity_by_user, which ignores it).
-        const useBox = !!params.revenue_csv_box_file_id;
-        const useBeta = useBox || params.revenue_report_id != null;
-        let revLabel = "";
-
-        if (useBeta) {
-          _step = "downloading Revenue Report (month×user)";
-          const { rows: revRows } = useBox
-            ? { rows: parseCSV((await downloadFromBox(params.revenue_csv_box_file_id!)).toString("utf8")) }
-            : await getRevenueReportCSV(params.revenue_report_id);
-          if (!revRows.length || !REVENUE_REPORT_SIGNATURE.every((c) => c in revRows[0])) {
-            throw new Error(`Revenue CSV is missing required columns (${REVENUE_REPORT_SIGNATURE.join(", ")}). ${useBox ? `The Box file ${params.revenue_csv_box_file_id} isn't a month×user Revenue Report (got: ${revRows[0] ? Object.keys(revRows[0]).join(", ") : "empty"}).` : ""}`);
-          }
-          for (const row of revRows) {
-            const m = parseInt(row["Activity month"] || "0", 10);
-            if (!m || m < 1 || m > params.month) continue;
-            const billableHrs = num(row["Billable hours"]);
-            const billedDollars = num(row["Billed hours value"]);
-            const uid = matchRosterUser(row["User"] || "", ROSTER);
-            if (uid != null) {
-              const d = ((indivByMonth[m] ??= {})[uid] ??= newPerUser());
-              d.billableHrs += billableHrs;
-              d.billedDollars += billedDollars;
-              d.writeOffs += num(row["Credited hours value"]);
-              d.lineDiscounts += Math.abs(num(row["Discounted hours amount"]));
-              d.nonbillableHrs += num(row["Non-billable hours"]);
-            }
-            const rid = matchRosterResponsible(row["Responsible attorney"] || "", ROSTER);
-            if (rid != null) {
-              const rd = ((respByMonth[m] ??= {})[rid] ??= { respHrs: 0, respBilled: 0 });
-              rd.respHrs += billableHrs;
-              rd.respBilled += billedDollars;
-            }
-          }
-          revLabel = `month×user (${useBox ? "Box CSV" : "/reports #" + params.revenue_report_id}) rows=${revRows.length}`;
-        } else {
-          _step = "generating classic revenue reports (per timekeeper + firm-wide)";
-          // Generate a classic revenue report (optional user scope) for the target
-          // month, poll to completion (the endpoint is flaky), then download + parse.
-          const genRevenueRows = async (userId?: number): Promise<Record<string, string>[]> => {
-            const data: any = { kind: "revenue", format: "csv", start_date: monthStart, end_date: monthEnd };
-            if (userId) data.user = { id: userId };
-            const gen = await rawPostSingle("/reports", { data });
-            const rep = gen?.data ?? gen;
-            const rid = rep?.id;
-            let state = rep?.state;
-            const deadline = Date.now() + 150000;
-            while (rid && !["completed", "failed", "empty"].includes(state) && Date.now() < deadline) {
-              await new Promise((r) => setTimeout(r, 4000));
-              try { const s = await rawGetSingle(`/reports/${rid}`, { fields: "id,state" }); state = (s?.data ?? s)?.state; }
-              catch { /* transient — keep polling */ }
-            }
-            if (state !== "completed") throw new Error(`revenue report ${rid} did not complete (state=${state})`);
-            // Guard: confirm Clio honored the requested month. If it handed back
-            // a cached/wrong-period report (the cause of April being duplicated
-            // into May), abort instead of writing the wrong month's numbers.
-            await assertReportPeriod(rid, monthStart, `revenue report (${userId ? "user " + userId : "firm-wide"})`);
-            return parseCSV(await downloadReport(rid));
-          };
-          const m = params.month;
-          // Firm-wide → responsible-attorney rollup (skip the trailing TOTAL row, which has no Matter Number)
-          const firmRows = await genRevenueRows();
-          for (const row of firmRows) {
-            if (!row["Matter Number"]) continue;
-            const rid = matchRosterResponsible(row["Responsible Attorney"] || "", ROSTER);
-            if (rid == null) continue;
-            const rd = ((respByMonth[m] ??= {})[rid] ??= { respHrs: 0, respBilled: 0 });
-            rd.respHrs += num(row["Billed Hours"]) + num(row["Unbilled Hours"]);
-            rd.respBilled += num(row["Billed Time"]);
-          }
-          // Per-timekeeper → individual (one revenue report scoped to each user)
-          let okUsers = 0;
-          for (const ro of ROSTER) {
-            let rows: Record<string, string>[];
-            try { rows = await genRevenueRows(ro.user_id); }
-            catch (e: any) { console.warn(`[Dashboard] classic revenue failed for ${ro.initials}: ${e?.message ?? e}`); continue; }
-            const d = ((indivByMonth[m] ??= {})[ro.user_id] ??= newPerUser());
-            for (const row of rows) {
-              if (!row["Matter Number"]) continue;
-              d.billedDollars += num(row["Billed Time"]);
-              d.billableHrs += num(row["Billed Hours"]) + num(row["Unbilled Hours"]);
-              d.writeOffs += num(row["Credit Notes"]);
-              d.lineDiscounts += num(row["Discounted Time"]);
-            }
-            okUsers++;
-          }
-          revLabel = `classic per-timekeeper (${okUsers}/${ROSTER.length} users) + firm-wide, month ${m}`;
-        }
-        // Months we have revenue data for: all YTD for the month×user file; target-only for classic.
-        const revMonths = useBeta ? Array.from({ length: params.month }, (_, i) => i + 1) : [params.month];
+        // ---- Revenue (billed hours/$, write-offs, discounts) by month×user ----
+        // Extracted to src/dashboard/revenue.ts: a month×user CSV (Box or Clio)
+        // when revenue_csv_box_file_id/revenue_report_id is given, else the default
+        // classic per-timekeeper generation for the target month. Returns the indiv
+        // (by working timekeeper) + responsible-attorney rollup maps + revMonths.
+        _step = "building revenue (by month)";
+        const { indivByMonth, respByMonth, revMonths, revLabel, useBeta } = await buildRevenueByMonth(
+          { year: params.year, month: params.month, revenueCsvBoxFileId: params.revenue_csv_box_file_id, revenueReportId: params.revenue_report_id },
+          ROSTER,
+        );
 
         // Nonbillable categories (Biz Dev / Potential Clients / CLE / Other Admin),
         // by month×user, from a targeted /activities query on the admin matters.
