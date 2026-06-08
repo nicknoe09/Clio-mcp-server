@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
 import JSZip from "jszip";

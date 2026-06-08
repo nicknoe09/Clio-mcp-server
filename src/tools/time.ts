@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
 import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
@@ -50,8 +50,8 @@ export function registerTimeTools(server: McpServer): void {
         else if (params.billed === "false") entries = entries.filter((e: any) => e.billed !== true);
 
         // Client-side date filtering (created_since filters by creation, not activity date)
-        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
-        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date);
+        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date!);
+        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date!);
 
         const formatted = entries.map((e: any) => ({
           id: e.id,

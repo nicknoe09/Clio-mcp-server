@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport } from "../clio/pagination";
 import { getFeeAllocationCSV } from "../clio/reportCsv";
