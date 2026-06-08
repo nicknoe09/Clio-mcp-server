@@ -351,7 +351,7 @@ export function registerPerformanceTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const [rawTimeEntries, bills] = await Promise.all([
+        const [rawTimeEntries, rawBills] = await Promise.all([
           fetchAllPages<any>("/activities", {
             type: "TimeEntry",
             fields: TIME_FIELDS,
@@ -359,12 +359,16 @@ export function registerPerformanceTools(server: McpServer): void {
           }),
           fetchAllPages<any>("/bills", {
             fields:
-              "id,number,issued_at,total,state,matters",
+              "id,number,issued_at,total,kind,state,matters",
             issued_after: params.start_date,
             issued_before: params.end_date,
           }),
         ]);
         const timeEntries = rawTimeEntries.filter((e: any) => e.date >= params.start_date && e.date <= params.end_date);
+        // Realization compares FEE billings to worked value. Trust/retainer funding
+        // requests (trust_kind) are advance deposits, not billed fees, and would
+        // inflate billed value — count revenue_kind bills only.
+        const bills = rawBills.filter((b: any) => b.kind === "revenue_kind");
 
         // Firm-wide worked value
         const totalWorkedValue = timeEntries.reduce(

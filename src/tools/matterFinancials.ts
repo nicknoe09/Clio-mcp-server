@@ -21,7 +21,7 @@ const TIME_FIELDS =
 
 const EXPENSE_FIELDS = "id,date,price,note,user{id,name},bill{id,state}";
 
-const BILL_FIELDS = "id,number,issued_at,due_at,balance,total,state";
+const BILL_FIELDS = "id,number,issued_at,due_at,balance,total,kind,state";
 
 
 function daysBetween(a: Date, b: Date): number {
@@ -31,7 +31,7 @@ function daysBetween(a: Date, b: Date): number {
 export function registerMatterFinancialsTools(server: McpServer): void {
   server.tool(
     "get_matter_financial_summary",
-    "Per-matter financial snapshot: trust balance from bank_transactions on the IOLTA account (matches Clio UI), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR).",
+    "Per-matter financial snapshot: trust balance from bank_transactions on the IOLTA account (matches Clio UI), WIP split into truly-unbilled vs draft-billed, and outstanding invoices (AR — revenue_kind fee bills only; trust/retainer funding requests are excluded from AR).",
     {
       matter_id: z.coerce.number().describe("Clio matter ID"),
       trust_history_limit: z
@@ -265,9 +265,20 @@ export function registerMatterFinancialsTools(server: McpServer): void {
         else if (wipDaysSinceOldest !== null && wipDaysSinceOldest > 30) wipFlags.push("YELLOW");
 
         // --- AR ---
+        // AR = revenue_kind fee bills only. A trust_kind bill is a trust/retainer
+        // funding request (advance deposit), not a receivable; any other
+        // (unexpected) kind is excluded and surfaced rather than counted as AR.
         let arBalance = 0;
         let oldestDueDate: string | null = null;
-        const outstanding = outstandingBills.map((b: any) => {
+        const arBills = outstandingBills.filter((b: any) => {
+          if (b.kind === "trust_kind") return false;
+          if (b.kind !== "revenue_kind") {
+            console.warn(`[get_matter_financial_summary] excluding bill ${b.number ?? b.id} from AR — unexpected kind=${JSON.stringify(b.kind)}`);
+            return false;
+          }
+          return true;
+        });
+        const outstanding = arBills.map((b: any) => {
           const balance = b.balance || 0;
           arBalance += balance;
           const dueRef = b.due_at || b.issued_at;
