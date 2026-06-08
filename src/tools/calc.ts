@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { applyTieredSplit, STAFF_VD_PCT, STAFF_FIRM_PCT, STAFF_ALLOWANCE_HOURS } from "../domain/vd";
 import { round2 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, downloadReport } from "../clio/pagination";
@@ -7,46 +8,6 @@ import { getFeeAllocationCSV } from "../clio/reportCsv";
 
 
 // V&D Agreement tiers — COMBINED (Gus + Courteney pooled), annual reset
-const ATTORNEY_TIERS = [
-  { ceiling: 250000, vdPct: 0.825, firmPct: 0.175 },
-  { ceiling: 500000, vdPct: 0.80, firmPct: 0.20 },
-  { ceiling: Infinity, vdPct: 0.775, firmPct: 0.225 },
-];
-
-// Staff time split (beyond the 10 hr/month allowance)
-const STAFF_VD_PCT = 0.35;
-const STAFF_FIRM_PCT = 0.65;
-
-// Staff hours per month per of counsel that get attorney-tier treatment
-const STAFF_ALLOWANCE_HOURS = 10;
-
-/**
- * Apply tiered split to an amount given combined YTD collections already processed.
- * Returns { vd, firm } amounts and the new YTD total.
- */
-function applyTieredSplit(
-  amount: number,
-  ytdBefore: number
-): { vd: number; firm: number; ytdAfter: number } {
-  let remaining = amount;
-  let vd = 0;
-  let firm = 0;
-  let ytd = ytdBefore;
-
-  for (const tier of ATTORNEY_TIERS) {
-    if (remaining <= 0) break;
-    const tierSpace = Math.max(0, tier.ceiling - ytd);
-    if (tierSpace <= 0) continue;
-
-    const inThisTier = Math.min(remaining, tierSpace);
-    vd += inThisTier * tier.vdPct;
-    firm += inThisTier * tier.firmPct;
-    ytd += inThisTier;
-    remaining -= inThisTier;
-  }
-
-  return { vd: round2(vd), firm: round2(firm), ytdAfter: ytd };
-}
 
 /**
  * Get month key from Issue Date (MM/DD/YYYY format)

@@ -537,3 +537,61 @@ export async function surgicalWriteXlsx(
 
   return Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
 }
+
+// Repair a downloaded .xlsx so ExcelJS can load it even when a prior
+// programmatic write left a shared-string reference out of range (a cell with
+// t="s" whose <v> index points past the end of sharedStrings.xml). ExcelJS
+// crashes on that with "Cannot read properties of undefined (reading 'richText')"
+// in CellXform.reconcile. We pad sharedStrings with empty <si> entries so those
+// refs resolve to "" instead of undefined. No-op (returns the original buffer)
+// when every reference is already in range or anything looks unexpected.
+export async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
+  try {
+    const zip = await JSZip.loadAsync(buf);
+    let changed = false;
+
+    // (A) Self-heal a styles.xml corrupted by the old String.replace "$&"
+    // footgun: a currency formatCode "$" was expanded to the matched text
+    // "</numFmts>", leaving e.g. formatCode="&quot;</numFmts>quot;#,##0.00",
+    // which contains '<' in an attribute → invalid XML → Excel discards
+    // styles.xml (and cascades cell/table repairs). Undo the injection.
+    const stylesFile = zip.file("xl/styles.xml");
+    if (stylesFile) {
+      let styles = await stylesFile.async("string");
+      if (styles.includes("&quot;</numFmts>quot;")) {
+        styles = styles.split("&quot;</numFmts>quot;").join("&quot;$&quot;");
+        zip.file("xl/styles.xml", styles);
+        changed = true;
+        console.warn('[Dashboard] sanitizeXlsxBuffer: healed corrupted styles.xml ("$&" numFmt injection)');
+      }
+    }
+
+    // (B) Pad sharedStrings to cover any out-of-range refs (the original repair).
+    const ssFile = zip.file("xl/sharedStrings.xml");
+    if (ssFile) {
+      let ss = await ssFile.async("string");
+      const siCount = (ss.match(/<si(?:\s[^>]*)?>/g) || []).length;
+      let maxIdx = -1;
+      for (const name of Object.keys(zip.files)) {
+        if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
+        const xml = await zip.file(name)!.async("string");
+        const re = /<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)<\/v>/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(xml))) { const idx = parseInt(m[1], 10); if (idx > maxIdx) maxIdx = idx; }
+      }
+      if (maxIdx >= siCount && /<\/sst>/.test(ss)) {
+        const pad = maxIdx - siCount + 1;
+        ss = ss.replace("</sst>", () => "<si><t></t></si>".repeat(pad) + "</sst>");
+        ss = ss.replace(/(<sst\b[^>]*\buniqueCount=")(\d+)(")/, (_s, a, _n, c) => a + (siCount + pad) + c);
+        zip.file("xl/sharedStrings.xml", ss);
+        changed = true;
+        console.warn(`[Dashboard] sanitizeXlsxBuffer: padded sharedStrings by ${pad} (had ${siCount}, max ref ${maxIdx})`);
+      }
+    }
+
+    return changed ? await zip.generateAsync({ type: "nodebuffer" }) : buf;
+  } catch (e: any) {
+    console.warn(`[Dashboard] sanitizeXlsxBuffer skipped: ${e?.message ?? e}`);
+    return buf;
+  }
+}
