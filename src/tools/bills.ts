@@ -256,6 +256,136 @@ export function registerBillTools(server: McpServer): void {
   );
 
   // ============================================================
+  //  get_bill_line_items — list all line items on a specific bill
+  // ============================================================
+  // Use this when you need exactly the lines on bill X for an invoice
+  // review. get_time_entries filters by matter/user and sweeps in
+  // prior-bill entries plus unbilled activities; this tool filters by
+  // bill_id directly via Clio's /line_items?bill_id=X — so you get
+  // ONLY the lines currently sitting on the requested bill, in the
+  // order they appear (group_ordering, then date, then id).
+  server.tool(
+    "get_bill_line_items",
+    "Get all line items on a specific Clio bill, ordered as they appear on the bill. Use this — NOT get_time_entries — when you want exactly the lines on bill X for an invoice review. get_time_entries filters by matter or user, which sweeps in prior-bill entries and unbilled activities; this tool filters by bill_id directly. Returns each line's line_item_id, activity_id, date, hours, rate, total, note, timekeeper, type (ActivityLineItem / NoChargeLineItem / SummaryLineItem), and any discount applied. Includes the bill's number, state, total, balance, and matter for context.",
+    {
+      bill_id: z.coerce.number().describe("Clio bill ID"),
+      include_hidden: z.boolean().optional().default(false).describe("If true, include line items that are present on the bill but hidden (Clio's display=false). Default false matches what the user sees on the rendered bill."),
+    },
+    async (params) => {
+      try {
+        // Read the bill metadata for context (matter, state, totals).
+        const billResp = await rawGetSingle(`/bills/${params.bill_id}`, {
+          fields: "id,number,subject,state,issued_at,due_at,total,balance,matters{id,display_number}",
+        });
+        const bill = billResp.data;
+        if (!bill) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: true, message: `Bill ${params.bill_id} not found.` }),
+            }],
+            isError: true,
+          };
+        }
+
+        // Fetch all line items on this bill.
+        const queryParams: Record<string, any> = {
+          fields: "id,type,kind,description,note,date,quantity,price,total,group_ordering,discount{rate,type},activity{id,user{id,name}}",
+          bill_id: params.bill_id,
+        };
+        if (!params.include_hidden) queryParams.display = true;
+
+        const lineItems = await fetchAllPages<any>("/line_items", queryParams);
+
+        // Sort by Clio's bill ordering: group_ordering, then date, then id.
+        lineItems.sort((a: any, b: any) => {
+          const ga = a.group_ordering ?? Number.MAX_SAFE_INTEGER;
+          const gb = b.group_ordering ?? Number.MAX_SAFE_INTEGER;
+          if (ga !== gb) return ga - gb;
+          if (a.date !== b.date) return (a.date || "").localeCompare(b.date || "");
+          return (a.id || 0) - (b.id || 0);
+        });
+
+        const formatted = lineItems.map((li: any) => ({
+          line_item_id: li.id,
+          activity_id: li.activity?.id ?? null,
+          type: li.type ?? null,
+          kind: li.kind ?? null,
+          date: li.date ?? null,
+          hours: li.quantity ?? null,
+          rate: li.price ?? null,
+          total: li.total ?? null,
+          note: li.note ?? null,
+          description: li.description ?? null,
+          timekeeper: li.activity?.user
+            ? { id: li.activity.user.id, name: li.activity.user.name }
+            : null,
+          discount:
+            li.discount && (li.discount.rate != null || li.discount.type)
+              ? { rate: li.discount.rate, type: li.discount.type }
+              : null,
+          group_ordering: li.group_ordering ?? null,
+        }));
+
+        const sumHours =
+          Math.round(
+            formatted.reduce(
+              (s, li) => s + (typeof li.hours === "number" ? li.hours : 0),
+              0,
+            ) * 100,
+          ) / 100;
+        const sumTotal =
+          Math.round(
+            formatted.reduce(
+              (s, li) => s + (typeof li.total === "number" ? li.total : 0),
+              0,
+            ) * 100,
+          ) / 100;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                bill: {
+                  id: bill.id,
+                  number: bill.number,
+                  subject: bill.subject ?? null,
+                  state: bill.state,
+                  issued_at: bill.issued_at,
+                  due_at: bill.due_at,
+                  total: bill.total,
+                  balance: bill.balance,
+                  matter: bill.matters?.[0] ?? null,
+                },
+                count: formatted.length,
+                sum_hours: sumHours,
+                sum_total: sumTotal,
+                line_items: formatted,
+              },
+              null,
+              2,
+            ),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // ============================================================
   //  download_bill_pdf — Download a single bill as PDF
   // ============================================================
   server.tool(
