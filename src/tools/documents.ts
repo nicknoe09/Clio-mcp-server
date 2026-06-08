@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { computeBonusData } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { applyTieredSplit } from "../domain/vd";
@@ -1637,8 +1638,6 @@ export function registerDocumentTools(server: McpServer): void {
 
           _step = "computing bonus data";
           // ---- COMPUTE BONUS DATA ----
-          const overheadShare = firmOverhead / numAttorneys;
-
           // Gather individual collected (col N) from ALL existing month blocks
           const monthCollections: Record<string, Record<string, number>> = {}; // monthName -> initials -> collected
           for (let mi = 0; mi < 12; mi++) {
@@ -1652,68 +1651,10 @@ export function registerDocumentTools(server: McpServer): void {
             }
           }
 
-          // Compute per-attorney bonus
-          interface BonusRow { month: string; collections: number; ytd: number; bracket: string; toNext: number; bonusEarned: number; cumBonus: number; }
-          const bonusData: Record<string, { baseTarget: number; rows: BonusRow[] }> = {};
-
-          for (const atty of configAttorneys) {
-            const baseTarget = atty.salary + atty.paraSalary + atty.legalAsst + (atty.payroll * (atty.salary + atty.paraSalary)) + overheadShare;
-            const bracketCeilings = [baseTarget, baseTarget + BRACKETS[1].width, baseTarget + BRACKETS[1].width + BRACKETS[2].width];
-            const rows: BonusRow[] = [];
-            let ytd = 0;
-            let cumBonus = 0;
-
-            for (let mi = 0; mi < 12; mi++) {
-              const mn = monthNames[mi];
-              const mc = monthCollections[mn];
-              if (!mc) { rows.push({ month: mn, collections: 0, ytd, bracket: "-", toNext: 0, bonusEarned: 0, cumBonus }); continue; }
-
-              // Attributed collections = own + associate + paralegal + MNH split
-              let collections = mc[atty.ini] || 0;
-              if (atty.associate) collections += mc[atty.associate] || 0;
-              if (atty.paralegal) collections += mc[atty.paralegal] || 0;
-              if (MNH_SPLIT_AMONG.includes(atty.ini)) {
-                collections += (mc["MNH"] || 0) / MNH_SPLIT_AMONG.length;
-              }
-              collections = round2(collections);
-
-              const prevYtd = ytd;
-              ytd = round2(ytd + collections);
-
-              // Bracket label
-              let bracket = "Bracket 1";
-              if (ytd > bracketCeilings[2]) bracket = "Bracket 4";
-              else if (ytd > bracketCeilings[1]) bracket = "Bracket 3";
-              else if (ytd > bracketCeilings[0]) bracket = "Bracket 2";
-
-              // To next bracket
-              let toNext = 0;
-              if (ytd <= bracketCeilings[0]) toNext = round2(bracketCeilings[0] - ytd + 0.01);
-              else if (ytd <= bracketCeilings[1]) toNext = round2(bracketCeilings[1] - ytd + 0.01);
-              else if (ytd <= bracketCeilings[2]) toNext = round2(bracketCeilings[2] - ytd + 0.01);
-
-              // Bonus earned this month (incremental bracket calculation)
-              let bonusEarned = 0;
-              // Apply each bracket rate to the portion of this month's collections that falls in it
-              let remaining = collections;
-              let cursor = prevYtd;
-              for (let bi = 0; bi < BRACKETS.length && remaining > 0; bi++) {
-                const ceil = bi < bracketCeilings.length ? bracketCeilings[bi] : Infinity;
-                const space = Math.max(0, ceil - cursor);
-                const inBracket = Math.min(remaining, space);
-                bonusEarned += inBracket * BRACKETS[bi].rate;
-                cursor += inBracket;
-                remaining -= inBracket;
-              }
-              // Any remaining above all ceilings gets the last bracket rate
-              if (remaining > 0) bonusEarned += remaining * BRACKETS[BRACKETS.length - 1].rate;
-              bonusEarned = round2(bonusEarned);
-              cumBonus = round2(cumBonus + bonusEarned);
-
-              rows.push({ month: mn, collections, ytd, bracket, toNext, bonusEarned, cumBonus });
-            }
-            bonusData[atty.ini] = { baseTarget: round2(baseTarget), rows };
-          }
+          // Per-attorney bonus math — pure, extracted to src/dashboard/bonus.ts (unit-tested).
+          const bonusData = computeBonusData(monthCollections, configAttorneys, {
+            firmOverhead, numAttorneys, brackets: BRACKETS, mnhSplitAmong: MNH_SPLIT_AMONG,
+          });
 
           _step = "creating Bonus Tracker";
           // ---- CREATE BONUS TRACKER SHEET ----
