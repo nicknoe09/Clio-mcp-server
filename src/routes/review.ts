@@ -248,7 +248,7 @@ Return ONLY the revised description text, nothing else.`;
 // ---------------------------------------------------------------------------
 //  Audit draft bill entries for a specific user
 // ---------------------------------------------------------------------------
-async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEntry[]; billCount: number; matterCount: number }> {
+async function auditDraftBillEntries(userId: number) {
   // First, get all matters where this user has billed time (as responsible attorney)
   const matters = await fetchAllPages<any>("/matters", {
     fields: "id,display_number,description,responsible_attorney{id},custom_field_values{id,field_name,value}",
@@ -268,7 +268,7 @@ async function auditDraftBillEntries(userId: number): Promise<{ entries: AuditEn
     });
   }
 
-  if (matterMap.size === 0) return [];
+  if (matterMap.size === 0) return { entries: [] as AuditEntry[], combineGroups: [] as ReturnType<typeof detectCombinables>["groups"], billCount: 0, matterCount: 0 };
 
   // Get all draft bills
   const draftBills = await fetchAllPages<any>("/bills", {

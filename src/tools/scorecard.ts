@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { SCORECARD_ROSTER, MONTH_NAMES_SHORT } from "../domain/roster";
 import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

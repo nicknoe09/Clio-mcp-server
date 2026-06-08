@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { applyTieredSplit, STAFF_VD_PCT, STAFF_FIRM_PCT, STAFF_ALLOWANCE_HOURS } from "../domain/vd";
 import { round2 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

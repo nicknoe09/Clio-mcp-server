@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
 import { detectFlags, detectDuplicates, detectBillingSpikes, detectCombinables, detectOverstaffing, detectRepeatedShortComms, HC_COURT_IDS, Flag, CombineGroup } from "./audit";

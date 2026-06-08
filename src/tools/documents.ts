@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { applyTieredSplit } from "../domain/vd";
@@ -93,7 +93,7 @@ async function getDashboardCollections(fileId: string): Promise<Record<string, R
   const promise = (async () => {
     const buf = await downloadFromBox(fileId);
     const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(buf);
+    await wb.xlsx.load(buf as any);
     const sheet = wb.getWorksheet("26 Compare");
     if (!sheet) throw new Error("'26 Compare' sheet not found in firm dashboard");
 
@@ -130,6 +130,10 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   box_url?: string;
   base64?: string;
   size_kb?: number;
+  direct_download_url?: string;
+  expires_at?: string;
+  reason?: string;
+  note?: string;
 }> {
   const hoursPerDay = params.hours_per_day ?? 8;
   const startDate = `${params.year}-01-01`;
@@ -565,7 +569,7 @@ export function registerDocumentTools(server: McpServer): void {
                   ] }),
                 ] }),
               },
-            },
+            } as any,
             children: [
               // PAGE 1: COVER LETTER
               makePara(letterDate, { size: 22, spacingAfter: 200 }),
@@ -1053,7 +1057,7 @@ export function registerDocumentTools(server: McpServer): void {
       name: z.string().describe("Preset name"),
       kind: z.string().describe("Report kind, e.g. 'revenue'"),
       format: z.string().default("csv").describe("csv | xlsx | pdf | html | json | zip"),
-      options: z.record(z.any()).describe("Options object, e.g. { date_range:'this_month', format:'csv', group_by:'user', kind:'revenue' }"),
+      options: z.record(z.string(), z.any()).describe("Options object, e.g. { date_range:'this_month', format:'csv', group_by:'user', kind:'revenue' }"),
     },
     async (p) => {
       try {
@@ -1384,7 +1388,7 @@ export function registerDocumentTools(server: McpServer): void {
           const fileBuffer = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
           _step = "loading workbook";
           const wb = new ExcelJS.Workbook();
-          await wb.xlsx.load(fileBuffer);
+          await wb.xlsx.load(fileBuffer as any);
           _step = "getting 26 Compare sheet";
 
           const compareSheet = wb.getWorksheet("26 Compare");
@@ -1467,97 +1471,6 @@ export function registerDocumentTools(server: McpServer): void {
 
           if (!monthBlock) {
             throw new Error(`'${monthName}' block not found in '26 Compare'. The workbook pre-defines a labeled block for every month (Jan–Dec) plus '2026 Totals'; this tool only PATCHES existing blocks — it does not create them (in-place creation corrupted the Totals block). Add a row with '${monthName}' in column B with the timekeeper initials beneath it, then rerun.`);
-            // --- legacy in-tool create path below is now unreachable (blocks are pre-built) ---
-            // Find "2026 Totals" section
-            let totalsFirstRow = 0;
-            compareSheet.eachRow((row, rowNum) => {
-              if (String(row.getCell(2).value ?? "").trim() === "2026 Totals" && !totalsFirstRow) totalsFirstRow = rowNum;
-            });
-
-            // Find last existing month's SUM row
-            let lastSumRow = 0;
-            for (let mi = params.month - 2; mi >= 0; mi--) {
-              const prev = scanMonthBlock(compareSheet, monthNames[mi]);
-              if (prev?.sumRow) { lastSumRow = prev.sumRow; break; }
-            }
-
-            // New month block starts 3 rows after last SUM (gap rows)
-            const blockStart = lastSumRow ? lastSumRow + 3 : (totalsFirstRow || compareSheet.rowCount + 3);
-            const templateInitials = janBlock.initials;
-            const blockSize = templateInitials.length;
-
-            // Write new month block data rows
-            const newMap: Record<string, number> = {};
-            const newInitials: string[] = [];
-            for (let i = 0; i < blockSize; i++) {
-              const rowNum = blockStart + i;
-              const row = compareSheet.getRow(rowNum);
-              row.getCell(2).value = monthName;
-              row.getCell(3).value = templateInitials[i];
-              newMap[templateInitials[i]] = rowNum;
-              newInitials.push(templateInitials[i]);
-              row.commit();
-            }
-
-            // Write SUM row for the new month
-            const newSumRow = blockStart + blockSize;
-            const sumRow = compareSheet.getRow(newSumRow);
-            sumRow.getCell(2).value = monthName;
-            const colLetters = ["D","E","F","G","H","I","J","K","L","M","N","O","Q","R","S"];
-            const colNums =    [ 4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 17, 18, 19];
-            for (let ci = 0; ci < colLetters.length; ci++) {
-              sumRow.getCell(colNums[ci]).value = { formula: `SUM(${colLetters[ci]}${blockStart}:${colLetters[ci]}${blockStart + blockSize - 1})` } as any;
-            }
-            sumRow.commit();
-
-            // Rewrite "2026 Totals" section after the new block
-            // First, collect all existing month blocks to build totals formulas
-            const allBlocks: MonthBlock[] = [];
-            for (let mi = 0; mi < params.month; mi++) {
-              const b = mi === params.month - 1
-                ? { firstRow: blockStart, lastRow: blockStart + blockSize - 1, sumRow: newSumRow, map: newMap, initials: newInitials }
-                : scanMonthBlock(compareSheet, monthNames[mi]);
-              if (b) allBlocks.push(b);
-            }
-
-            // Clear old 2026 Totals rows if they exist
-            if (totalsFirstRow) {
-              for (let r = totalsFirstRow; r <= totalsFirstRow + blockSize + 2; r++) {
-                const row = compareSheet.getRow(r);
-                for (let c = 1; c <= 19; c++) row.getCell(c).value = null;
-                row.commit();
-              }
-            }
-
-            // Write new 2026 Totals starting 3 rows after new month's SUM
-            const newTotalsStart = newSumRow + 3;
-            for (let i = 0; i < templateInitials.length; i++) {
-              const ini = templateInitials[i];
-              const rowNum = newTotalsStart + i;
-              const row = compareSheet.getRow(rowNum);
-              row.getCell(2).value = "2026 Totals";
-              row.getCell(3).value = ini;
-              // For each data column, sum that initials' row across all month blocks
-              for (let ci = 0; ci < colLetters.length; ci++) {
-                const refs = allBlocks.map(b => b.map[ini] ? `${colLetters[ci]}${b.map[ini]}` : null).filter(Boolean);
-                if (refs.length > 0) {
-                  row.getCell(colNums[ci]).value = { formula: refs.join("+") } as any;
-                }
-              }
-              row.commit();
-            }
-
-            // Totals SUM row
-            const totalsSumRowNum = newTotalsStart + templateInitials.length;
-            const totalsSumRow = compareSheet.getRow(totalsSumRowNum);
-            totalsSumRow.getCell(2).value = "2026 Totals";
-            for (let ci = 0; ci < colLetters.length; ci++) {
-              totalsSumRow.getCell(colNums[ci]).value = { formula: `SUM(${colLetters[ci]}${newTotalsStart}:${colLetters[ci]}${newTotalsStart + templateInitials.length - 1})` } as any;
-            }
-            totalsSumRow.commit();
-
-            monthBlock = { firstRow: blockStart, lastRow: blockStart + blockSize - 1, sumRow: newSumRow, map: newMap, initials: newInitials };
-            blockCreated = true;
           }
 
           const initialsRowMap = monthBlock.map;
@@ -2841,7 +2754,7 @@ export function registerDocumentTools(server: McpServer): void {
       const DASHBOARD_FILE_ID = "2199324794140";
       const buf = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
       const wb = new ExcelJS.Workbook();
-      await wb.xlsx.load(buf);
+      await wb.xlsx.load(buf as any);
       const sheet = wb.getWorksheet("26 Compare");
       if (!sheet) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "'26 Compare' sheet not found" }) }] };
       const cellStr = (r: ExcelJS.Row, c: number): string => {

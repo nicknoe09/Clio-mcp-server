@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
@@ -33,8 +33,8 @@ export function registerExpenseTools(server: McpServer): void {
         if (params.billed !== "all") queryParams.billed = params.billed === "true";
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
-        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date);
-        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date);
+        if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date!);
+        if (params.end_date) entries = entries.filter((e: any) => e.date <= params.end_date!);
 
         const formatted = entries.map((e: any) => ({
           id: e.id,

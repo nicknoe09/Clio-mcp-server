@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { patchTimeEntrySmart } from "../clio/lineItems";
 import { readCSV, writeCSV } from "../routes/review";
