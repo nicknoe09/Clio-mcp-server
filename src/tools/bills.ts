@@ -288,14 +288,48 @@ export function registerBillTools(server: McpServer): void {
           };
         }
 
-        // Fetch all line items on this bill.
+        // Fetch all line items on this bill. NOTE: Clio's /line_items field
+        // selector supports only 1-level nesting (e.g. `activity{id}` works;
+        // `activity{id,user{id,name}}` returns 400 InvalidFields). We pull
+        // the activity ref here and resolve the timekeeper in a separate
+        // batch step below.
         const queryParams: Record<string, any> = {
-          fields: "id,type,kind,description,note,date,quantity,price,total,group_ordering,discount{rate,type},activity{id,user{id,name}}",
+          fields: "id,type,kind,description,note,date,quantity,price,total,group_ordering,discount{rate,type},activity{id}",
           bill_id: params.bill_id,
         };
         if (!params.include_hidden) queryParams.display = true;
 
         const lineItems = await fetchAllPages<any>("/line_items", queryParams);
+
+        // Resolve timekeeper for each unique activity via parallel per-activity
+        // GETs. /activities supports 1-level nesting on `user{id,name}` so each
+        // lookup is one tiny round-trip. For a 50-line bill this finishes in
+        // sub-second; well under Clio's rate limits. Failures on individual
+        // activities surface as null timekeeper for that line, not a fatal error.
+        const activityIds = Array.from(
+          new Set(
+            (lineItems as any[])
+              .map((li) => li.activity?.id)
+              .filter((id): id is number => typeof id === "number"),
+          ),
+        );
+        const userByActivityId = new Map<number, { id: number; name: string } | null>();
+        await Promise.all(
+          activityIds.map(async (id) => {
+            try {
+              const resp = await rawGetSingle(`/activities/${id}`, {
+                fields: "id,user{id,name}",
+              });
+              const u = resp.data?.user;
+              userByActivityId.set(
+                id,
+                u && typeof u.id === "number" ? { id: u.id, name: u.name } : null,
+              );
+            } catch {
+              userByActivityId.set(id, null);
+            }
+          }),
+        );
 
         // Sort by Clio's bill ordering: group_ordering, then date, then id.
         lineItems.sort((a: any, b: any) => {
@@ -317,9 +351,10 @@ export function registerBillTools(server: McpServer): void {
           total: li.total ?? null,
           note: li.note ?? null,
           description: li.description ?? null,
-          timekeeper: li.activity?.user
-            ? { id: li.activity.user.id, name: li.activity.user.name }
-            : null,
+          timekeeper:
+            typeof li.activity?.id === "number"
+              ? userByActivityId.get(li.activity.id) ?? null
+              : null,
           discount:
             li.discount && (li.discount.rate != null || li.discount.type)
               ? { rate: li.discount.rate, type: li.discount.type }
