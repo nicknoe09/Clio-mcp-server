@@ -1,8 +1,15 @@
 import https from "https";
+import { als } from "../auth/identity";
 
 const RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2";
 
-// --- Clio Tokens (single-user) ---
+// --- Clio Tokens (per-user) ---
+//
+// Clio tokens are no longer a single shared secret. Each /mcp request runs
+// inside an AsyncLocalStorage scope (see auth/identity.ts) carrying the acting
+// attorney's own Clio token, preloaded from the platform vault. getAccessToken
+// stays SYNCHRONOUS so the central HTTP layer (clio/pagination.ts) and the ~18
+// tool modules need no changes — they just read the in-flight context.
 
 async function persistToRailway(): Promise<void> {
     const token = process.env.RAILWAY_API_TOKEN;
@@ -13,8 +20,6 @@ async function persistToRailway(): Promise<void> {
   if (!token || !projectId || !environmentId || !serviceId) return;
 
   const variables: Record<string, string> = {
-    CLIO_ACCESS_TOKEN: process.env.CLIO_ACCESS_TOKEN ?? "",
-    CLIO_REFRESH_TOKEN: process.env.CLIO_REFRESH_TOKEN ?? "",
     BOX_USER_TOKENS: serializeBoxTokenMap(),
   };
 
@@ -53,20 +58,28 @@ async function persistToRailway(): Promise<void> {
   });
 }
 
-export async function persistTokens(access: string, refresh: string): Promise<void> {
-    process.env.CLIO_ACCESS_TOKEN = access;
-    process.env.CLIO_REFRESH_TOKEN = refresh;
-    await persistToRailway().catch((err) =>
-          console.error("[tokenStore] Failed to persist tokens to Railway:", err)
-                                                    );
-}
-
+/**
+ * Per-user Clio access token for the in-flight request. SYNCHRONOUS by design:
+ * the token was preloaded into the request's ALS context before the MCP
+ * handler ran. Throws (rather than returning "") when called outside a request
+ * context or when the user has no usable Clio token, so failures are loud and
+ * the message is actionable instead of producing a silent `Bearer ` 401.
+ */
 export function getAccessToken(): string {
-    return process.env.CLIO_ACCESS_TOKEN ?? "";
+    const ctx = als.getStore();
+    if (!ctx) {
+          throw new Error(
+                "No user context: Clio access is only available inside an authenticated /mcp request.",
+          );
+    }
+    if (!ctx.accessToken) {
+          throw new Error(ctx.clioError || "No Clio access token available for this user.");
+    }
+    return ctx.accessToken;
 }
 
 export function getRefreshToken(): string {
-    return process.env.CLIO_REFRESH_TOKEN ?? "";
+    return als.getStore()?.refreshToken ?? "";
 }
 
 // --- Box Tokens (per-user by email) ---

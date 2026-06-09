@@ -1,11 +1,23 @@
+// WebCrypto polyfill guard — jose needs globalThis.crypto (present on Node 18+,
+// but make it explicit so this is the first thing that runs).
+import { webcrypto } from "node:crypto";
+if (!(globalThis as any).crypto) {
+  (globalThis as any).crypto = webcrypto;
+}
+
 import dotenv from "dotenv";
 dotenv.config();
 
-import express from "express";
+import { randomUUID } from "node:crypto";
+import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { ENV } from "./utils/env";
-import { getAuthorizationUrl, exchangeCodeForTokens } from "./clio/auth";
+import { als } from "./auth/identity";
+import { verifyMicrosoftToken, isEmailAllowed, AuthError } from "./auth/microsoft";
+import { buildUserContext, NotProvisionedError } from "./auth/vault";
+import { registerOAuthProxyRoutes } from "./auth/oauthProxy";
 import { getBoxAuthorizationUrl, exchangeBoxCodeForTokens } from "./box/auth";
 import { registerMatterTools } from "./tools/matters";
 import { registerMatterFinancialsTools } from "./tools/matterFinancials";
@@ -28,91 +40,13 @@ import { registerMorningReportTools } from "./tools/morningReport";
 import reviewRouter from "./routes/review";
 import { getDownload } from "./utils/downloadStore";
 
-// Fail closed: refuse to start without a bearer secret. /sse + /messages
-// expose every registered tool against the firm's shared Clio OAuth identity,
-// so an unauthenticated deployment is a firm-wide data exposure.
-const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
-if (!MCP_AUTH_TOKEN) {
-  throw new Error(
-    "MCP_AUTH_TOKEN is required. Set it to a long random secret; MCP clients must send it as `Authorization: Bearer <token>` (or `?token=` on /sse).",
-  );
-}
-
-const ALLOWED_ORIGINS = new Set(
-  (process.env.MCP_ALLOWED_ORIGINS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
+const BASE_URL = ENV.PUBLIC_BASE_URL.replace(/\/$/, "");
 
 const app = express();
-
-// Only parse JSON on non-MCP routes — SSEServerTransport reads the raw body itself
-app.use((req, res, next) => {
-  if (req.path === "/messages") return next();
-  express.json()(req, res, next);
-});
-
-function timingSafeEqualStr(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-function extractBearer(req: express.Request): string | null {
-  const header = req.headers.authorization;
-  if (header && header.startsWith("Bearer ")) return header.slice(7).trim();
-  const q = req.query.token;
-  if (typeof q === "string" && q.length > 0) return q;
-  return null;
-}
-
-function checkOrigin(req: express.Request, res: express.Response): boolean {
-  // Blocks CSRF-style browser drive-by: EventSource can't set custom headers,
-  // so a page loaded in the token holder's browser could otherwise open an SSE
-  // stream using their ambient cookies. Non-browser clients don't send Origin.
-  const origin = req.headers.origin;
-  if (typeof origin === "string" && origin.length > 0) {
-    if (!ALLOWED_ORIGINS.has(origin)) {
-      res.status(403).json({ error: "Origin not allowed" });
-      return false;
-    }
-  }
-  return true;
-}
-
-function sseGuard(req: express.Request, res: express.Response, next: express.NextFunction): void {
-  if (!checkOrigin(req, res)) return;
-  const token = extractBearer(req);
-  if (!token || !timingSafeEqualStr(token, MCP_AUTH_TOKEN)) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-}
-
-// /messages is the follow-up leg of the SSE handshake: the client posts here
-// using the sessionId advertised by the `event: endpoint` frame. Claude.ai
-// doesn't propagate the `?token=` query (or Authorization header) from the
-// initial /sse URL into these POSTs, so we accept a live sessionId as proof
-// of prior auth. Possession of the sessionId implies the client already
-// passed the bearer check on /sse. Falls back to the bearer check for
-// clients that do propagate credentials.
-function messagesGuard(req: express.Request, res: express.Response, next: express.NextFunction): void {
-  if (!checkOrigin(req, res)) return;
-  const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
-  if (sessionId && transports[sessionId]) {
-    next();
-    return;
-  }
-  const token = extractBearer(req);
-  if (!token || !timingSafeEqualStr(token, MCP_AUTH_TOKEN)) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-}
+// Streamable HTTP works on the PARSED JSON body (unlike the old SSE /messages
+// route, which read the raw body). Parse JSON globally; the /token proxy adds
+// its own urlencoded parser at the route level.
+app.use(express.json({ limit: "10mb" }));
 
 // --- MCP Server Factory ---
 function createMcpServer(): McpServer {
@@ -179,34 +113,150 @@ function createMcpServer(): McpServer {
   }
 }
 
-// --- SSE Transport for Claude.ai ---
-// Track active transports by session
-const transports: Record<string, SSEServerTransport> = {};
+// --- OAuth discovery + proxy (how the connector logs in via Microsoft) ---
+registerOAuthProxyRoutes(app);
 
-app.get("/sse", sseGuard, async (req, res) => {
-  console.log(
-    `[MCP] /sse connect origin=${req.headers.origin || "none"} ua=${req.headers["user-agent"] || "none"} ip=${req.ip || "?"}`,
+// --- Auth gate (per-user Microsoft identity) ---
+function send401(res: Response): void {
+  res.setHeader(
+    "WWW-Authenticate",
+    `Bearer realm="clio-mcp", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`
   );
-  const transport = new SSEServerTransport("/messages", res);
-  const mcpServer = createMcpServer();
-  transports[transport.sessionId] = transport;
+  res.status(401).json({ error: "unauthorized" });
+}
 
-  res.on("close", () => {
-    delete transports[transport.sessionId];
+// Don't confirm a session exists to the wrong identity — return 404.
+function sessionNotFound(res: Response): void {
+  res.status(404).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Session not found" },
+    id: null,
   });
+}
 
-  await mcpServer.connect(transport);
-});
+/**
+ * Validate the Bearer JWT from the Authorization header (never `?token=`).
+ * Returns the verified, allowlisted email, or sends 401 and returns null.
+ */
+async function authenticate(req: Request, res: Response): Promise<string | null> {
+  const header = req.headers.authorization;
+  const token = header && header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) {
+    send401(res);
+    return null;
+  }
+  let email: string;
+  try {
+    ({ email } = await verifyMicrosoftToken(token));
+  } catch (err) {
+    console.warn(`[auth] token rejected: ${err instanceof AuthError ? err.code : "invalid_token"}`);
+    send401(res);
+    return null;
+  }
+  if (!isEmailAllowed(email)) {
+    console.warn("[auth] authenticated email is not on the onboarding allowlist");
+    send401(res);
+    return null;
+  }
+  return email;
+}
 
-app.post("/messages", messagesGuard, async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  const transport = transports[sessionId];
-  if (!transport) {
-    res.status(400).json({ error: "No active SSE session for this sessionId" });
+// --- Streamable HTTP transport at /mcp (stateful, per-session) ---
+const transports: Record<string, StreamableHTTPServerTransport> = {};
+const sessionEmail: Record<string, string> = {};
+
+app.post("/mcp", async (req: Request, res: Response) => {
+  const email = await authenticate(req, res);
+  if (!email) return;
+
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  let transport: StreamableHTTPServerTransport;
+
+  if (sessionId && transports[sessionId]) {
+    // Existing session: the JWT email must match the email bound at init.
+    if (sessionEmail[sessionId] !== email) {
+      sessionNotFound(res);
+      return;
+    }
+    transport = transports[sessionId];
+  } else if (!sessionId && isInitializeRequest(req.body)) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        transports[sid] = transport;
+        sessionEmail[sid] = email; // bind session -> verified identity
+        console.log(`[MCP] session ${sid.slice(0, 8)}… initialized`);
+      },
+    });
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid) {
+        delete transports[sid];
+        delete sessionEmail[sid];
+      }
+    };
+    const server = createMcpServer();
+    await server.connect(transport);
+  } else {
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Bad Request: no valid session id" },
+      id: null,
+    });
     return;
   }
-  await transport.handlePostMessage(req, res);
+
+  // Preload the user's Clio token from the vault, then run the handler inside
+  // the per-request identity context so pagination.ts reads the right token.
+  let ctx;
+  try {
+    ctx = await buildUserContext(email);
+  } catch (err) {
+    if (err instanceof NotProvisionedError) {
+      send401(res);
+      return;
+    }
+    console.error("[MCP] failed to build user context:", (err as Error).message);
+    res.status(503).json({
+      jsonrpc: "2.0",
+      error: { code: -32002, message: "User vault temporarily unavailable" },
+      id: null,
+    });
+    return;
+  }
+
+  await als.run(ctx, () => transport.handleRequest(req, res, req.body));
 });
+
+// GET (server->client notification stream) and DELETE (session teardown).
+async function handleSessionRequest(req: Request, res: Response): Promise<void> {
+  const email = await authenticate(req, res);
+  if (!email) return;
+
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !transports[sessionId] || sessionEmail[sessionId] !== email) {
+    sessionNotFound(res);
+    return;
+  }
+  const transport = transports[sessionId];
+
+  let ctx;
+  try {
+    ctx = await buildUserContext(email);
+  } catch (err) {
+    if (err instanceof NotProvisionedError) {
+      send401(res);
+      return;
+    }
+    res.status(503).json({ error: "vault_unavailable" });
+    return;
+  }
+
+  await als.run(ctx, () => transport.handleRequest(req, res));
+}
+
+app.get("/mcp", handleSessionRequest);
+app.delete("/mcp", handleSessionRequest);
 
 // --- Health Check ---
 // Reports the deployed git SHA via RAILWAY_GIT_COMMIT_SHA (Railway sets this
@@ -225,6 +275,7 @@ app.get("/health", (_req, res) => {
     server: "clio-mcp",
     version: "1.1.0",
     build: "all-tools",
+    transport: "streamable-http",
     git_sha: DEPLOY_SHA,
     git_sha_short: DEPLOY_SHA === "unknown" ? "unknown" : DEPLOY_SHA.slice(0, 7),
     git_branch: DEPLOY_BRANCH,
@@ -256,30 +307,7 @@ app.get("/download/:token", (req, res) => {
 // --- Review UI Routes ---
 app.use(reviewRouter);
 
-// --- OAuth Bootstrap ---
-app.get("/oauth/start", (_req, res) => {
-  const url = getAuthorizationUrl();
-  res.redirect(url);
-});
-
-app.get("/oauth/callback", async (req, res) => {
-  const code = req.query.code as string;
-  if (!code) {
-    res.status(400).send("Missing authorization code");
-    return;
-  }
-
-  try {
-    await exchangeCodeForTokens(code);
-    res.send(
-      "<h1>Clio OAuth Complete</h1><p>Tokens have been saved. You can close this window and start using the MCP server.</p>"
-    );
-  } catch (err: any) {
-    res.status(500).send(`OAuth error: ${err.message}`);
-  }
-});
-
-// --- Box OAuth ---
+// --- Box OAuth (unchanged — out of scope) ---
 app.get("/box/oauth/start", (_req, res) => {
   const url = getBoxAuthorizationUrl();
   res.redirect(url);
@@ -306,11 +334,9 @@ app.get("/box/oauth/callback", async (req, res) => {
 const PORT = ENV.PORT;
 app.listen(PORT, () => {
   console.log(`Clio MCP Server running on port ${PORT}`);
-  console.log(`  Health:   http://localhost:${PORT}/health`);
-  console.log(`  SSE:      http://localhost:${PORT}/sse`);
-  console.log(`  OAuth:    http://localhost:${PORT}/oauth/start`);
+  console.log(`  Health:    http://localhost:${PORT}/health`);
+  console.log(`  MCP:       http://localhost:${PORT}/mcp (Streamable HTTP)`);
+  console.log(`  Discovery: ${BASE_URL}/.well-known/oauth-protected-resource`);
   console.log(`  Box OAuth: http://localhost:${PORT}/box/oauth/start`);
-  console.log(
-    `  Auth:     bearer required; origin allowlist size=${ALLOWED_ORIGINS.size}`,
-  );
+  console.log(`  Auth:      per-user Microsoft OAuth (Bearer JWT required)`);
 });
