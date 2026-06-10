@@ -18,6 +18,20 @@ function msTokenUrl(): string {
   return `https://login.microsoftonline.com/${ENV.MS_TENANT_ID}/oauth2/v2.0/token`;
 }
 
+/**
+ * Build the scope string Microsoft needs for a durable, refreshable login:
+ * the fully-qualified API scope (bare names resolve against Graph on the v2
+ * endpoint), plus openid/profile/email and — critically — offline_access,
+ * which is what makes Microsoft return a refresh token.
+ */
+function normalizeScope(requested: string | null | undefined): string {
+  const scopes = new Set((requested ?? "").split(/\s+/).filter(Boolean));
+  scopes.delete(ENV.MCP_SCOPE_NAME);
+  scopes.add(`${ENV.MCP_AUDIENCE}/${ENV.MCP_SCOPE_NAME}`);
+  for (const s of ["openid", "profile", "email", "offline_access"]) scopes.add(s);
+  return [...scopes].join(" ");
+}
+
 export function registerOAuthProxyRoutes(app: Express): void {
   const baseUrl = ENV.PUBLIC_BASE_URL.replace(/\/$/, "");
 
@@ -64,13 +78,14 @@ export function registerOAuthProxyRoutes(app: Express): void {
     }
     // Help connectors that don't carry a client_id of their own.
     if (!params.has("client_id")) params.set("client_id", ENV.MS_CLIENT_ID);
-    // Default scope when absent.
-    if (!params.has("scope")) {
-      params.set(
-        "scope",
-        `openid profile email offline_access ${ENV.MCP_AUDIENCE}/${ENV.MCP_SCOPE_NAME}`
-      );
-    }
+    // Connectors request only the scope advertised by the resource metadata
+    // (the bare scope name), so never rely on them asking for more. Always:
+    //  - qualify the bare scope name to api://<audience>/<scope> (Microsoft v2
+    //    resolves unqualified names against Graph, not our app), and
+    //  - merge in offline_access — WITHOUT it Microsoft issues no refresh
+    //    token, the access token dies after ~1h, and the user is forced
+    //    through an interactive reconnect every time it expires.
+    params.set("scope", normalizeScope(params.get("scope")));
     res.redirect(302, `${msAuthorizeUrl()}?${params.toString()}`);
   });
 
@@ -88,6 +103,10 @@ export function registerOAuthProxyRoutes(app: Express): void {
         form.append(key, String(value));
       }
     }
+
+    // Refresh-token grants may resend the scope; qualify it the same way the
+    // /authorize leg did or Microsoft rejects the bare scope name.
+    if (form.has("scope")) form.set("scope", normalizeScope(form.get("scope")));
 
     // If client creds arrive via HTTP Basic, fold them into the body.
     const authz = req.headers.authorization;

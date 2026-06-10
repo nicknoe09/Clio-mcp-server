@@ -179,7 +179,14 @@ app.post("/mcp", async (req: Request, res: Response) => {
       return;
     }
     transport = transports[sessionId];
-  } else if (!sessionId && isInitializeRequest(req.body)) {
+  } else if (sessionId) {
+    // Stale session id — sessions live in memory, so every restart/redeploy
+    // forgets them. The spec requires 404 here: that's the signal the client
+    // uses to re-initialize transparently. (A 400 surfaces to the user as a
+    // dropped connection that needs a manual reconnect.)
+    sessionNotFound(res);
+    return;
+  } else if (isInitializeRequest(req.body)) {
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
@@ -332,7 +339,7 @@ app.get("/box/oauth/callback", async (req, res) => {
 
 // --- Start Server ---
 const PORT = ENV.PORT;
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`Clio MCP Server running on port ${PORT}`);
   console.log(`  Health:    http://localhost:${PORT}/health`);
   console.log(`  MCP:       http://localhost:${PORT}/mcp (Streamable HTTP)`);
@@ -340,3 +347,8 @@ app.listen(PORT, () => {
   console.log(`  Box OAuth: http://localhost:${PORT}/box/oauth/start`);
   console.log(`  Auth:      per-user Microsoft OAuth (Bearer JWT required)`);
 });
+// Node's default keep-alive timeout (5s) is shorter than Railway's edge proxy
+// idle timeout, so the proxy reuses sockets the server already closed —
+// sporadic ECONNRESET/502 that the connector sees as a dropped connection.
+httpServer.keepAliveTimeout = 75_000;
+httpServer.headersTimeout = 80_000;
