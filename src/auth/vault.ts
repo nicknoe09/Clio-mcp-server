@@ -31,12 +31,45 @@ function pool(): Pool {
     connectionString: ENV.DATABASE_URL,
     ssl: wantSsl ? { rejectUnauthorized: false } : undefined,
     max: 5,
+    // Railway's proxy silently drops idle TCP connections. TCP keepalives plus
+    // a short idle timeout keep pooled clients from going stale between
+    // requests; the connection timeout stops a dead socket from hanging a
+    // request indefinitely.
+    keepAlive: true,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
   });
   _pool.on("error", (err) => {
     // Background idle-client errors shouldn't crash the process.
     console.error("[vault] idle pg client error:", err.message);
   });
   return _pool;
+}
+
+/**
+ * Connection-level failures (the proxy killed an idle socket, the DB
+ * restarted) are retryable: the pool discards the dead client and the retry
+ * checks out a fresh connection. Query-level errors are NOT retried.
+ */
+function isTransientConnectionError(err: unknown): boolean {
+  const e = err as NodeJS.ErrnoException;
+  if (!e) return false;
+  // 57P0x = Postgres admin shutdown / crash / cannot-connect-now.
+  const codes = ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "57P01", "57P02", "57P03"];
+  if (e.code && codes.includes(String(e.code))) return true;
+  return /connection terminated|server closed the connection|timeout exceeded when trying to connect/i.test(
+    String(e.message ?? "")
+  );
+}
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isTransientConnectionError(err)) throw err;
+    console.warn("[vault] transient pg connection error, retrying once:", (err as Error).message);
+    return fn();
+  }
 }
 
 interface PlatformUser {
@@ -46,9 +79,11 @@ interface PlatformUser {
 
 /** Look up a provisioned platform user by email (no RLS on `users`). */
 export async function getUserByEmail(email: string): Promise<PlatformUser | null> {
-  const res = await pool().query(
-    "SELECT id, token_version FROM users WHERE lower(email) = lower($1) LIMIT 1",
-    [email]
+  const res = await withRetry(() =>
+    pool().query(
+      "SELECT id, token_version FROM users WHERE lower(email) = lower($1) LIMIT 1",
+      [email]
+    )
   );
   if (res.rows.length === 0) return null;
   return { id: String(res.rows[0].id), tokenVersion: res.rows[0].token_version ?? null };
@@ -56,24 +91,28 @@ export async function getUserByEmail(email: string): Promise<PlatformUser | null
 
 /** Run a callback inside a tenant-scoped transaction (RLS context set). */
 async function withTenant<T>(userId: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool().connect();
-  try {
-    await client.query("BEGIN");
-    // `true` => transaction-local; reset automatically on COMMIT/ROLLBACK.
-    await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
-    const out = await fn(client);
-    await client.query("COMMIT");
-    return out;
-  } catch (err) {
+  // Retry wraps the whole transaction: a connection-level failure means the
+  // transaction never committed, so rerunning it on a fresh client is safe.
+  return withRetry(async () => {
+    const client = await pool().connect();
     try {
-      await client.query("ROLLBACK");
-    } catch {
-      /* ignore rollback failure */
+      await client.query("BEGIN");
+      // `true` => transaction-local; reset automatically on COMMIT/ROLLBACK.
+      await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+      const out = await fn(client);
+      await client.query("COMMIT");
+      return out;
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore rollback failure */
+      }
+      throw err;
+    } finally {
+      client.release();
     }
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 export interface ClioTokens {
