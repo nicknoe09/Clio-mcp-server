@@ -17,7 +17,7 @@ import {
 } from "docx";
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
-import { uploadToBox, downloadFromBox } from "../utils/box";
+import { uploadToBox, createBoxFile, findBoxFileId, downloadFromBox } from "../utils/box";
 import { registerDownload, mimeForFilename } from "../utils/downloadStore";
 
 import {
@@ -79,6 +79,10 @@ import {
 // On the "26 Compare" sheet: col B = month name, col C = initials,
 // col N (14) = that timekeeper's individual collected $ for the month.
 const FIRM_DASHBOARD_FILE_ID = "2199324794140";
+
+// Box folder the individual weekly goals sheets live in. The monthly goals
+// summary saves to the same folder.
+const WEEKLY_GOALS_FOLDER_ID = "372923594239";
 
 
 
@@ -404,7 +408,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     };
     const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
     const boxFilename = `${initials} Goals ${params.year}.xlsx`;
-    const folderId = params.box_folder_id || "372923594239";
+    const folderId = params.box_folder_id || WEEKLY_GOALS_FOLDER_ID;
     const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
     if (result.uploaded) {
       return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url };
@@ -440,6 +444,194 @@ const WEEKLY_GOALS_ROSTER = [
   { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para
   { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
+
+// ─── Monthly goals summary (firm-wide chart, one workbook) ──
+
+// Same shading palette as the weekly goals sheets.
+const FILL_GREEN = "FFC6EFCE";
+const FILL_YELLOW = "FFFFEB9C";
+const FILL_RED = "FFFFC7CE";
+
+interface MonthlyGoalsSummaryParams {
+  year: number;
+  box_folder_id?: string;
+  close_threshold_pct?: number;
+}
+
+async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): Promise<{
+  filename: string;
+  created: boolean;
+  months_reported: number;
+  box_file_id?: string;
+  box_url?: string;
+  size_kb?: number;
+  direct_download_url?: string;
+  expires_at?: string;
+  reason?: string;
+  note?: string;
+}> {
+  const closePct = params.close_threshold_pct ?? 90;
+  const startDate = `${params.year}-01-01`;
+  const endDate = `${params.year}-12-31`;
+
+  // One fetch covers every timekeeper (the weekly sheets fetch per user).
+  const rawEntries = await fetchAllPages<any>("/activities", {
+    type: "TimeEntry",
+    fields: "id,date,quantity,rounded_quantity,price,user{id}",
+    created_since: `${startDate}T00:00:00+00:00`,
+  });
+  const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
+
+  // billableByUser[user_id][monthIdx] = billable hours
+  const billableByUser: Record<number, number[]> = {};
+  for (const r of WEEKLY_GOALS_ROSTER) billableByUser[r.user_id] = Array(12).fill(0);
+  for (const e of entries) {
+    const uid = e.user?.id;
+    if (!uid || !billableByUser[uid]) continue;
+    if ((e.price || 0) <= 0) continue; // chart tracks billable vs goal only
+    const m = parseInt(e.date.slice(5, 7), 10) - 1;
+    billableByUser[uid][m] += (e.rounded_quantity ?? e.quantity) / 3600;
+  }
+
+  // Months that have started (the current month shades month-to-date, same
+  // as the weekly sheets shade the in-progress week).
+  const now = new Date();
+  const monthsStarted =
+    params.year < now.getFullYear() ? 12 :
+    params.year > now.getFullYear() ? 0 :
+    now.getMonth() + 1;
+
+  // Monthly goal derived from the weekly goal, same as the weekly sheets:
+  // 47 working weeks/yr ÷ 12 months (30/wk → 117.5, 32/wk → 125.3).
+  const WORKING_WEEKS_PER_YEAR = 47;
+  const ANNUAL_AVAILABLE_HOURS = 1880;
+  const availPerMonth = ANNUAL_AVAILABLE_HOURS / 12;
+  const roster = WEEKLY_GOALS_ROSTER.map((r) => ({
+    ...r,
+    initials: INITIALS_BY_USER_ID[r.user_id]
+      ?? r.name.split(" ").map((p) => p[0]?.toUpperCase() ?? "").join(""),
+    monthlyGoal: round1(r.goal * WORKING_WEEKS_PER_YEAR / 12),
+  }));
+
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("Monthly Summary", { views: [{ state: "frozen" as const, ySplit: 4, xSplit: 1 }] });
+
+  ws.getCell(1, 1).value = `Monthly Goals Summary — ${params.year}`;
+  ws.getCell(1, 1).font = { bold: true, size: 13 };
+
+  // Rows 3-4: attorney headers (initials) + each person's monthly goal.
+  ws.getCell(3, 1).value = "Month";
+  ws.getCell(3, 1).font = { bold: true };
+  ws.getCell(4, 1).value = "Monthly Goal";
+  ws.getCell(4, 1).font = { bold: true };
+  roster.forEach((r, i) => {
+    const col = i + 2;
+    const head = ws.getCell(3, col);
+    head.value = r.initials;
+    head.font = { bold: true };
+    head.alignment = { horizontal: "center" as const };
+    ws.getCell(4, col).value = r.monthlyGoal;
+    ws.getColumn(col).width = 11;
+  });
+  ws.getColumn(1).width = 16;
+
+  // Rows 5-16: one row per month, attorneys side by side. Shaded green
+  // (>= goal), yellow (close: >= closePct% of goal), red (off goal).
+  for (let m = 0; m < 12; m++) {
+    const row = ws.getRow(5 + m);
+    row.getCell(1).value = MONTH_NAMES_SHORT[m];
+    row.getCell(1).font = { bold: true };
+    if (m >= monthsStarted) continue; // future months stay blank
+    roster.forEach((r, i) => {
+      const billable = round1(billableByUser[r.user_id][m]);
+      const cell = row.getCell(i + 2);
+      cell.value = billable;
+      const argb = billable >= r.monthlyGoal
+        ? FILL_GREEN
+        : billable >= r.monthlyGoal * (closePct / 100)
+          ? FILL_YELLOW
+          : FILL_RED;
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    });
+  }
+
+  // Rows 18-21: YTD section (months that have started only).
+  const ytdLabels: Array<[number, string]> = [
+    [18, "YTD Billable"], [19, "YTD Goal"], [20, "YTD Over/Under"], [21, "YTD Utilization %"],
+  ];
+  for (const [rowNum, label] of ytdLabels) {
+    ws.getCell(rowNum, 1).value = label;
+    ws.getCell(rowNum, 1).font = { bold: true };
+  }
+  roster.forEach((r, i) => {
+    const col = i + 2;
+    const ytd = billableByUser[r.user_id].slice(0, monthsStarted).reduce((s, v) => s + v, 0);
+    const ytdGoal = r.monthlyGoal * monthsStarted;
+    ws.getCell(18, col).value = round1(ytd);
+    ws.getCell(19, col).value = round1(ytdGoal);
+    const ou = round1(ytd - ytdGoal);
+    const ouCell = ws.getCell(20, col);
+    ouCell.value = ou;
+    ouCell.font = { bold: true, color: { argb: ou >= 0 ? "FF008000" : "FFFF0000" } };
+    ws.getCell(21, col).value = monthsStarted > 0
+      ? round1((ytd / (availPerMonth * monthsStarted)) * 100)
+      : 0;
+  });
+
+  // Legend (rows 23-26) — swatch + label, matching the weekly sheets.
+  ws.getCell(23, 1).value = "Legend — monthly billable vs goal";
+  ws.getCell(23, 1).font = { bold: true };
+  const legend: Array<[number, string, string]> = [
+    [24, FILL_GREEN, "On goal (≥ monthly goal)"],
+    [25, FILL_YELLOW, `Close (≥ ${closePct}% of goal)`],
+    [26, FILL_RED, `Off goal (< ${closePct}% of goal)`],
+  ];
+  for (const [rowNum, argb, label] of legend) {
+    const swatch = ws.getCell(rowNum, 1);
+    swatch.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
+    swatch.border = {
+      top: { style: "thin", color: { argb: "FFBFBFBF" } },
+      left: { style: "thin", color: { argb: "FFBFBFBF" } },
+      bottom: { style: "thin", color: { argb: "FFBFBFBF" } },
+      right: { style: "thin", color: { argb: "FFBFBFBF" } },
+    };
+    ws.getCell(rowNum, 2).value = label;
+  }
+  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date.";
+  ws.getCell(28, 1).font = { italic: true, color: { argb: "FF666666" } };
+
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const filename = `Monthly Goals Summary ${params.year}.xlsx`;
+  const folderId = params.box_folder_id || WEEKLY_GOALS_FOLDER_ID;
+
+  // Version the existing file, or create it the first time (same pattern as
+  // the AR scorecard — uploadToBox alone never creates new files).
+  const existingId = await findBoxFileId(folderId, filename);
+  const result = existingId
+    ? await uploadToBox({ buffer, filename, folderId, overwriteFileId: existingId })
+    : await createBoxFile({ buffer, filename, folderId });
+
+  if (result.uploaded) {
+    return {
+      filename,
+      created: !existingId,
+      months_reported: monthsStarted,
+      size_kb: result.size_kb,
+      box_file_id: result.box_file_id,
+      box_url: result.box_url,
+    };
+  }
+  return {
+    filename,
+    created: !existingId,
+    months_reported: monthsStarted,
+    size_kb: result.size_kb,
+    direct_download_url: result.direct_download_url,
+    expires_at: result.expires_at,
+    reason: result.reason,
+    note: result.note,
+  };
+}
 
 export function registerDocumentTools(server: McpServer): void {
 
@@ -943,6 +1135,64 @@ export function registerDocumentTools(server: McpServer): void {
           }, null, 2),
         }],
       };
+    }
+  );
+
+  // ============================================================
+  // TOOL 3c: download_monthly_goals_summary (firm-wide chart)
+  // ============================================================
+  server.tool(
+    "download_monthly_goals_summary",
+    "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
+    "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
+    "Saves the workbook to the same Box folder as the weekly goals sheets (versioned on re-runs, created on first run).",
+    {
+      year: z.coerce.number().optional().describe("Year (defaults to current year)"),
+      box_folder_id: z.string().optional().describe("Box folder ID. Defaults to the weekly goals folder."),
+      close_threshold_pct: z.coerce.number().optional().describe("Percent of monthly goal that still counts as 'close' (yellow). Default 90."),
+    },
+    async (params) => {
+      try {
+        const result = await downloadMonthlyGoalsSummary({
+          year: params.year ?? new Date().getFullYear(),
+          box_folder_id: params.box_folder_id,
+          close_threshold_pct: params.close_threshold_pct,
+        });
+
+        if (result.box_file_id) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                filename: result.filename,
+                created: result.created,
+                months_reported: result.months_reported,
+                box_file_id: result.box_file_id,
+                box_url: result.box_url,
+              }),
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              filename: result.filename,
+              created: result.created,
+              months_reported: result.months_reported,
+              format: "xlsx",
+              size_kb: result.size_kb,
+              direct_download_url: result.direct_download_url,
+              expires_at: result.expires_at,
+              reason: result.reason,
+              note: result.note,
+            }),
+          }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
+      }
     }
   );
 
