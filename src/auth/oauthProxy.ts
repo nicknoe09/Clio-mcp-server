@@ -133,6 +133,27 @@ export function registerOAuthProxyRoutes(app: Express): void {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         validateStatus: () => true,
       });
+      // Diagnostic: never logs token values — only grant type, status, whether
+      // a refresh_token came back (the thing that decides if the session can
+      // survive past the ~1h access-token lifetime), and Microsoft's error
+      // code on failure. Lets us tell "refresh worked" from "AADSTS rejected"
+      // from "connector never refreshed" without guessing.
+      const grant = String((body as Record<string, unknown>).grant_type ?? "unknown");
+      const data = (upstream.data ?? {}) as Record<string, unknown>;
+      if (upstream.status >= 200 && upstream.status < 300) {
+        console.log(
+          `[oauth] token grant=${grant} status=${upstream.status} ` +
+            `access_token=${data.access_token ? "yes" : "no"} ` +
+            `refresh_token=${data.refresh_token ? "yes" : "no"} ` +
+            `expires_in=${data.expires_in ?? "?"}`
+        );
+      } else {
+        console.warn(
+          `[oauth] token grant=${grant} status=${upstream.status} ` +
+            `error=${data.error ?? "?"} ` +
+            `desc=${String(data.error_description ?? "").replace(/\s+/g, " ").slice(0, 200)}`
+        );
+      }
       res.status(upstream.status).json(upstream.data);
     } catch (err) {
       console.error("[oauth] token proxy error:", (err as Error).message);
