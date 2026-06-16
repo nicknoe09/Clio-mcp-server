@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
+import { createRemoteJWKSet, jwtVerify, decodeJwt, JWTPayload } from "jose";
 import { ENV } from "../utils/env";
 
 /**
@@ -54,7 +54,22 @@ export async function verifyMicrosoftToken(token: string): Promise<{ email: stri
       audience: acceptedAudiences(),
     }));
   } catch (err) {
-    // Never log token contents — code only.
+    // Decode (NOT verify) to surface *why* it failed — expiry vs audience vs
+    // issuer vs signature — without ever logging the token itself. Claims like
+    // aud/iss/scp/exp are not secrets and are exactly what we need to debug an
+    // audience mismatch after re-pointing MCP_AUDIENCE.
+    try {
+      const c = decodeJwt(token);
+      console.warn(
+        `[auth] token rejected reason=${(err as Error).name} ` +
+          `token_aud=${JSON.stringify(c.aud)} expected_aud=${JSON.stringify(acceptedAudiences())} ` +
+          `iss=${c.iss} ver=${(c as any).ver} scp=${(c as any).scp ?? ""} ` +
+          `roles=${JSON.stringify((c as any).roles ?? [])} ` +
+          `exp=${c.exp} now=${Math.floor(Date.now() / 1000)}`
+      );
+    } catch {
+      console.warn(`[auth] token rejected reason=${(err as Error).name} (token undecodable)`);
+    }
     throw new AuthError("invalid_token", `Token validation failed: ${(err as Error).name}`);
   }
 
