@@ -7,7 +7,17 @@ import { ENV } from "../utils/env";
  * Mirrors the platform's `auth.py` (lean Microsoft-OAuth connector, no DCR).
  */
 
-const issuer = `https://login.microsoftonline.com/${ENV.MS_TENANT_ID}/v2.0`;
+// Accept BOTH the v2 issuer and the v1 (sts.windows.net) issuer for this
+// tenant. A freshly-created API app registration issues v1.0 access tokens by
+// default (iss=sts.windows.net, ver=1.0); their signature still verifies
+// against the v2 JWKS and their aud/scp are correct, so the only thing that
+// differs is the issuer string. Accepting both means the server works whether
+// the API app issues v1 or v2 tokens — no dependence on the app's
+// accessTokenAcceptedVersion manifest setting.
+const issuers = [
+  `https://login.microsoftonline.com/${ENV.MS_TENANT_ID}/v2.0`,
+  `https://sts.windows.net/${ENV.MS_TENANT_ID}/`,
+];
 const jwksUri = `https://login.microsoftonline.com/${ENV.MS_TENANT_ID}/discovery/v2.0/keys`;
 
 // Cached remote JWKS — jose handles fetching + key rotation.
@@ -50,7 +60,7 @@ export async function verifyMicrosoftToken(token: string): Promise<{ email: stri
   let payload: JWTPayload;
   try {
     ({ payload } = await jwtVerify(token, JWKS, {
-      issuer,
+      issuer: issuers,
       audience: acceptedAudiences(),
     }));
   } catch (err) {
