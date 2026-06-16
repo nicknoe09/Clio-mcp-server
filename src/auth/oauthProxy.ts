@@ -104,9 +104,21 @@ export function registerOAuthProxyRoutes(app: Express): void {
       }
     }
 
-    // Refresh-token grants may resend the scope; qualify it the same way the
-    // /authorize leg did or Microsoft rejects the bare scope name.
-    if (form.has("scope")) form.set("scope", normalizeScope(form.get("scope")));
+    // Scope handling differs by grant:
+    //  - authorization_code: qualify the bare scope to api://<audience>/<scope>
+    //    + offline_access (interactive consent supports the app tokening itself).
+    //  - refresh_token: DROP scope entirely. This app is its own API resource
+    //    (client_id == MCP_AUDIENCE app), and Azure rejects a non-interactive
+    //    request for the app's own scope with AADSTS90009 ("requesting a token
+    //    for itself"). With no scope, Azure reuses the scopes already consented
+    //    at auth-code time, so the refreshed access token still carries
+    //    aud=<MCP_AUDIENCE> — without tripping AADSTS90009.
+    const grantType = String((body as Record<string, unknown>).grant_type ?? "");
+    if (grantType === "refresh_token") {
+      form.delete("scope");
+    } else if (form.has("scope")) {
+      form.set("scope", normalizeScope(form.get("scope")));
+    }
 
     // If client creds arrive via HTTP Basic, fold them into the body.
     const authz = req.headers.authorization;
