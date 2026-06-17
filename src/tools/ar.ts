@@ -601,7 +601,7 @@ export function registerARTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_ar_scorecard",
-    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side, a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
+    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side (Gated, Non-Gated, Unclassified — the Semi-Gated/Probate column is not shown; Probate is folded per probate_treatment), a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, two Gated-only tabs ('Gated by Attorney' and 'Gated by Matter', the latter grouping gated matters under each responsible attorney) break out the Gated track, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
     {
       as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
       update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
@@ -879,6 +879,51 @@ export function registerARTools(server: McpServer): void {
             .map((r) => ({ client: r.client, matter: r.matter, bill: r.bill, issued: r.issued, due: r.due, days_past_due: r.days, bucket: r.bucket, balance: round2(r.balance) })),
         }));
 
+        // ---- Gated-only breakdowns (dedicated workbook tabs) ----
+        // The Gated track is court-appointment work; partners want to see it on
+        // its own, split by responsible attorney and (under each attorney) by
+        // matter. trackRows.gated already reflects probate_treatment (Probate is
+        // folded into Gated only when probate_treatment="gated").
+        const gatedRows = trackRows.gated;
+        const gatedAttMap = new Map<string, { total: number; ar90: number; ar120: number; count: number }>();
+        for (const r of gatedRows) {
+          const a = gatedAttMap.get(r.attorney) ?? { total: 0, ar90: 0, ar120: 0, count: 0 };
+          a.total += r.balance;
+          if (r.days >= 91) a.ar90 += r.balance;
+          if (r.days >= 121) a.ar120 += r.balance;
+          a.count += 1;
+          gatedAttMap.set(r.attorney, a);
+        }
+        const gatedByAttorney = [...gatedAttMap.entries()]
+          .map(([attorney, v]) => ({
+            attorney,
+            total_ar: round2(v.total),
+            ar_90plus: round2(v.ar90),
+            ar_90plus_pct: v.total > 0 ? Math.round((v.ar90 / v.total) * 1000) / 10 : 0,
+            ar_120plus: round2(v.ar120),
+            ar_120plus_pct: v.total > 0 ? Math.round((v.ar120 / v.total) * 1000) / 10 : 0,
+            invoices: v.count,
+          }))
+          .sort((a, b) => b.total_ar - a.total_ar);
+
+        // Per attorney → matter (matter-level summary rows under each attorney).
+        const gatedByMatter = gatedByAttorney.map((a) => {
+          const attRows = gatedRows.filter((r) => r.attorney === a.attorney);
+          const matterMap = new Map<string, { client: string; total: number; ar90: number; ar120: number; count: number }>();
+          for (const r of attRows) {
+            const mm = matterMap.get(r.matter) ?? { client: r.client, total: 0, ar90: 0, ar120: 0, count: 0 };
+            mm.total += r.balance;
+            if (r.days >= 91) mm.ar90 += r.balance;
+            if (r.days >= 121) mm.ar120 += r.balance;
+            mm.count += 1;
+            matterMap.set(r.matter, mm);
+          }
+          const matters = [...matterMap.entries()]
+            .map(([matter, v]) => ({ matter, client: v.client, total_ar: round2(v.total), ar_90plus: round2(v.ar90), ar_120plus: round2(v.ar120), invoices: v.count }))
+            .sort((x, y) => y.total_ar - x.total_ar);
+          return { attorney: a.attorney, total_ar: a.total_ar, ar_90plus: a.ar_90plus, ar_120plus: a.ar_120plus, invoices: a.invoices, matters };
+        });
+
         // ---- Trust request summary (parallel to `firm`; never mixed into AR) ----
         const trustRequested = round2(trustRows.reduce((s, r) => s + r.requested, 0));
         const trustUnfunded = round2(trustRows.reduce((s, r) => s + r.balance, 0));
@@ -895,7 +940,7 @@ export function registerARTools(server: McpServer): void {
         let workbook_result: any = { skipped: true };
         if (params.update_workbook !== false) {
           try {
-            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation);
+            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation, gatedByAttorney, gatedByMatter);
           } catch (e: any) {
             workbook_result = { error: e?.message ?? String(e) };
           }
@@ -961,7 +1006,7 @@ type WeeklyRecord = FirmMetrics & {
   trust_outstanding: number; trust_unfunded_count: number;
   non_gated_total_ar: number; non_gated_ar90: number; non_gated_ar90_pct: number;
   gated_total_ar: number; gated_ar90: number; gated_ar90_pct: number;
-  semi_gated_total_ar: number; unclassified_total_ar: number;
+  unclassified_total_ar: number;
 };
 
 const WEEKLY_COLS: Array<{ key: keyof WeeklyRecord; header: string; fmt?: string; width: number }> = [
@@ -987,11 +1032,14 @@ const WEEKLY_COLS: Array<{ key: keyof WeeklyRecord; header: string; fmt?: string
   { key: "gated_total_ar", header: "Gated Total AR", fmt: '"$"#,##0', width: 16 },
   { key: "gated_ar90", header: "Gated 90+ $", fmt: '"$"#,##0', width: 14 },
   { key: "gated_ar90_pct", header: "Gated 90+ %", fmt: '0.0"%"', width: 14 },
-  { key: "semi_gated_total_ar", header: "Semi-Gated (Probate) Total AR", fmt: '"$"#,##0', width: 28 },
   { key: "unclassified_total_ar", header: "Unclassified Total AR", fmt: '"$"#,##0', width: 20 },
 ];
 
 type AttyDetail = { attorney: string; bills: Array<{ client: string; matter: string; bill: string; issued: string; due: string; days_past_due: number; bucket: string; balance: number }> };
+// Gated-only breakdowns for the dedicated Gated tabs.
+type GatedAttySummary = { attorney: string; total_ar: number; ar_90plus: number; ar_90plus_pct: number; ar_120plus: number; ar_120plus_pct: number; invoices: number };
+type GatedMatterRow = { matter: string; client: string; total_ar: number; ar_90plus: number; ar_120plus: number; invoices: number };
+type GatedByMatterGroup = { attorney: string; total_ar: number; ar_90plus: number; ar_120plus: number; invoices: number; matters: GatedMatterRow[] };
 async function updateARScorecardWorkbook(
   firm: FirmMetrics,
   byAttorney: Array<{ attorney: string; total_ar: number; ar_90plus: number; ar_90plus_pct: number; ar_120plus: number; ar_120plus_pct: number; invoices: number }>,
@@ -1002,6 +1050,8 @@ async function updateARScorecardWorkbook(
   tracks: Record<TrackKey, TrackMetrics>,
   probateTreatment: ProbateTreatment,
   reconciliation: { reconciliation_ok: boolean; track_total_sum: number; firm_total_ar: number; delta: number; unclassified_total_ar: number; unclassified_invoices: number },
+  gatedByAttorney: GatedAttySummary[],
+  gatedByMatter: GatedByMatterGroup[],
 ): Promise<any> {
   const r2 = (n: number) => Math.round(n * 100) / 100;
   // 1. Read prior weekly history (if the file already exists).
@@ -1047,7 +1097,6 @@ async function updateARScorecardWorkbook(
     gated_total_ar: tracks.gated.total_ar,
     gated_ar90: tracks.gated.ar_90plus,
     gated_ar90_pct: tracks.gated.ar_90plus_pct,
-    semi_gated_total_ar: tracks.semi_gated.total_ar,
     unclassified_total_ar: tracks.unclassified.total_ar,
   };
   merged.push(currentRecord as any);
@@ -1065,10 +1114,12 @@ async function updateARScorecardWorkbook(
   const moneyFmt2 = '"$"#,##0.00';
   const pctFmt = '0.0"%"';
   const trackSheet = wb.addWorksheet("AR by Track", { views: [{ state: "frozen" as const, ySplit: 3, xSplit: 1 }] });
-  const foldNote = probateTreatment === "separate" ? "" : ` (folded into ${probateTreatment === "gated" ? "Gated" : "Non-Gated"})`;
+  // The Semi-Gated (Probate) column is intentionally not shown. Probate AR is
+  // folded into Gated/Non-Gated per probate_treatment (default Non-Gated); the
+  // semi_gated partition is still computed internally for reconciliation and the
+  // firm-total invoice count, just never rendered as its own column.
   const trackCols: Array<{ header: string; key: TrackKey | "firm" }> = [
     { header: "Gated", key: "gated" },
-    { header: `Semi-Gated (Probate)${foldNote}`, key: "semi_gated" },
     { header: "Non-Gated (headline)", key: "non_gated" },
     { header: "Unclassified", key: "unclassified" },
     { header: "Firm Total", key: "firm" },
@@ -1155,6 +1206,77 @@ async function updateARScorecardWorkbook(
   att.getCell(totRow, 4).value = firm.ar_120plus_pct; att.getCell(totRow, 4).font = bold;
   att.getCell(totRow, 5).value = firm.ar_90plus; att.getCell(totRow, 5).font = bold;
   att.getCell(totRow, 6).value = firm.ar_90plus_pct; att.getCell(totRow, 6).font = bold;
+
+  // ---- Gated AR: by responsible attorney (summary) ----
+  // Same shape as "By Attorney" but restricted to the Gated track, so partners
+  // can see court-appointment AR per attorney without the client-pay noise.
+  const gAtt = wb.addWorksheet("Gated by Attorney");
+  gAtt.getCell(1, 1).value = `Gated AR by Responsible Attorney — as of ${firm.as_of}`;
+  gAtt.getCell(1, 1).font = { bold: true, size: 13 };
+  const gAttHeaders = ["Attorney", "Total AR", "120+ $", "120+ %", "90+ $", "90+ %", "# Invoices"];
+  const gAttFmt = ["", '"$"#,##0', '"$"#,##0', '0.0"%"', '"$"#,##0', '0.0"%"', ""];
+  const gAttWidth = [26, 14, 13, 9, 13, 9, 11];
+  gAttHeaders.forEach((h, i) => { const c = gAtt.getCell(2, i + 1); c.value = h; c.font = bold; gAtt.getColumn(i + 1).width = gAttWidth[i]; if (gAttFmt[i]) gAtt.getColumn(i + 1).numFmt = gAttFmt[i]; });
+  gatedByAttorney.forEach((a, ri) => {
+    gAtt.getCell(3 + ri, 1).value = a.attorney;
+    gAtt.getCell(3 + ri, 2).value = a.total_ar;
+    gAtt.getCell(3 + ri, 3).value = a.ar_120plus;
+    gAtt.getCell(3 + ri, 4).value = a.ar_120plus_pct;
+    gAtt.getCell(3 + ri, 5).value = a.ar_90plus;
+    gAtt.getCell(3 + ri, 6).value = a.ar_90plus_pct;
+    gAtt.getCell(3 + ri, 7).value = a.invoices;
+  });
+  const gTotRow = 3 + gatedByAttorney.length;
+  gAtt.getCell(gTotRow, 1).value = "Gated Total"; gAtt.getCell(gTotRow, 1).font = bold;
+  gAtt.getCell(gTotRow, 2).value = tracks.gated.total_ar; gAtt.getCell(gTotRow, 2).font = bold;
+  gAtt.getCell(gTotRow, 3).value = tracks.gated.ar_120plus; gAtt.getCell(gTotRow, 3).font = bold;
+  gAtt.getCell(gTotRow, 4).value = tracks.gated.ar_120plus_pct; gAtt.getCell(gTotRow, 4).font = bold;
+  gAtt.getCell(gTotRow, 5).value = tracks.gated.ar_90plus; gAtt.getCell(gTotRow, 5).font = bold;
+  gAtt.getCell(gTotRow, 6).value = tracks.gated.ar_90plus_pct; gAtt.getCell(gTotRow, 6).font = bold;
+  gAtt.getCell(gTotRow, 7).value = tracks.gated.invoices; gAtt.getCell(gTotRow, 7).font = bold;
+
+  // ---- Gated AR: by responsible attorney → matter ----
+  // Gated matters grouped under each responsible attorney (an attorney group
+  // header, one summary row per matter, then an attorney subtotal). Matters and
+  // attorneys are both ordered by gated AR exposure (largest first).
+  const gMat = wb.addWorksheet("Gated by Matter", { views: [{ state: "frozen" as const, ySplit: 2 }] });
+  const gMatHeaders = ["Client", "Matter", "# Invoices", "90+ $", "120+ $", "Total AR"];
+  const gMatFmt = ["", "", "", '"$"#,##0.00', '"$"#,##0.00', '"$"#,##0.00'];
+  const gMatWidth = [26, 44, 11, 14, 14, 14];
+  gMat.mergeCells(1, 1, 1, gMatHeaders.length);
+  gMat.getCell(1, 1).value = `Gated AR by Responsible Attorney → Matter — as of ${firm.as_of}`;
+  gMat.getCell(1, 1).font = { bold: true, size: 13 };
+  gMatHeaders.forEach((h, i) => { const c = gMat.getCell(2, i + 1); c.value = h; c.font = bold; gMat.getColumn(i + 1).width = gMatWidth[i]; if (gMatFmt[i]) gMat.getColumn(i + 1).numFmt = gMatFmt[i]; });
+  let gmr = 3;
+  for (const g of gatedByMatter) {
+    if (!g.matters.length) continue;
+    gMat.mergeCells(gmr, 1, gmr, gMatHeaders.length);
+    const hc = gMat.getCell(gmr, 1);
+    hc.value = `${g.attorney} — ${g.matters.length} matter(s) — $${g.total_ar.toFixed(2)}`;
+    hc.font = bold;
+    hc.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFEFEF" } } as any;
+    gmr++;
+    for (const m of g.matters) {
+      gMat.getCell(gmr, 1).value = m.client;
+      gMat.getCell(gmr, 2).value = m.matter;
+      gMat.getCell(gmr, 3).value = m.invoices;
+      gMat.getCell(gmr, 4).value = m.ar_90plus;
+      gMat.getCell(gmr, 5).value = m.ar_120plus;
+      gMat.getCell(gmr, 6).value = m.total_ar;
+      gmr++;
+    }
+    gMat.getCell(gmr, 2).value = `  Subtotal — ${g.attorney}`; gMat.getCell(gmr, 2).font = bold;
+    gMat.getCell(gmr, 3).value = g.invoices; gMat.getCell(gmr, 3).font = bold;
+    gMat.getCell(gmr, 4).value = g.ar_90plus; gMat.getCell(gmr, 4).font = bold;
+    gMat.getCell(gmr, 5).value = g.ar_120plus; gMat.getCell(gmr, 5).font = bold;
+    gMat.getCell(gmr, 6).value = g.total_ar; gMat.getCell(gmr, 6).font = bold;
+    gmr++;
+  }
+  gMat.getCell(gmr, 1).value = "Gated Total"; gMat.getCell(gmr, 1).font = bold;
+  gMat.getCell(gmr, 3).value = tracks.gated.invoices; gMat.getCell(gmr, 3).font = bold;
+  gMat.getCell(gmr, 4).value = tracks.gated.ar_90plus; gMat.getCell(gmr, 4).font = bold;
+  gMat.getCell(gmr, 5).value = tracks.gated.ar_120plus; gMat.getCell(gmr, 5).font = bold;
+  gMat.getCell(gmr, 6).value = tracks.gated.total_ar; gMat.getCell(gmr, 6).font = bold;
 
   const top = wb.addWorksheet("Top 10 Accounts");
   top.getCell(1, 1).value = `Top 10 Open Balances — as of ${firm.as_of}`;
