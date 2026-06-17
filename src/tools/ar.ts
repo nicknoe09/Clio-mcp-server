@@ -44,9 +44,10 @@ export const GATED_PRACTICE_AREAS = new Set<string>([
   "Mental Comm",
   "Representative",
 ]);
-// Probate is paced by estate liquidity but is not pure court-appointment.
-// It is its own flag (semi_gated) so the data can show which track it resembles
-// before we fold it either way; default treatment is "separate".
+// Probate is paced by estate liquidity, but per firm policy it is client-pay
+// (Non-Gated) in the general case, so it defaults to the non_gated track. It is
+// still its own flag (semi_gated) so probate_treatment="separate" can break it
+// out for review, or ="gated" if that ever changes.
 export const SEMI_GATED_PRACTICE_AREAS = new Set<string>(["Probate"]);
 // Everything else with a known practice area = Non-Gated (client-pay).
 
@@ -600,11 +601,11 @@ export function registerARTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_ar_scorecard",
-    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric); Semi-Gated = Probate (reported separately by default, configurable via probate_treatment); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side, a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
+    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side, a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
     {
       as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
       update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
-      probate_treatment: z.enum(["gated", "non_gated", "separate"]).optional().default("separate").describe("How to treat Probate AR. 'separate' (default): report Probate under semi_gated. 'gated'/'non_gated': fold Probate into that track and omit semi_gated."),
+      probate_treatment: z.enum(["gated", "non_gated", "separate"]).optional().default("non_gated").describe("How to treat Probate AR. 'non_gated' (default): Probate is client-pay, folded into non_gated. 'gated': fold into gated. 'separate': break Probate out under semi_gated for review."),
     },
     async (params) => {
       try {
@@ -618,7 +619,7 @@ export function registerARTools(server: McpServer): void {
         // The paid-bills fetch is only needed to mark trust requests funded; if it
         // fails, fall back to awaiting_payment only rather than failing the whole AR
         // scorecard (mirrors the resilient paid-bill fetch used elsewhere).
-        const probateTreatment: ProbateTreatment = params.probate_treatment ?? "separate";
+        const probateTreatment: ProbateTreatment = params.probate_treatment ?? "non_gated";
 
         const [awaitingBills, paidBills, allMatters] = await Promise.all([
           fetchAllPages<any>("/bills", { fields: SCORECARD_BILL_FIELDS, state: "awaiting_payment" }),
