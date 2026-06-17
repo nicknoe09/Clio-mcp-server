@@ -601,10 +601,11 @@ export function registerARTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_ar_scorecard",
-    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side (Gated, Non-Gated, Unclassified — the Semi-Gated/Probate column is not shown; Probate is folded per probate_treatment), a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, two Gated-only tabs ('Gated by Attorney' and 'Gated by Matter', the latter grouping gated matters under each responsible attorney) break out the Gated track, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook (set update_workbook=false to skip it).",
+    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side (Gated, Non-Gated, Unclassified — the Semi-Gated/Probate column is not shown; Probate is folded per probate_treatment), a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, two Gated-only tabs ('Gated by Attorney' and 'Gated by Matter', the latter grouping gated matters under each responsible attorney) break out the Gated track, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook, which by DEFAULT is written in the background so metrics return immediately (the Box write can take minutes and would otherwise time out the whole call); set update_workbook=false to skip it, or await_workbook=true to block on the write and get the Box link in the response.",
     {
       as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
       update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
+      await_workbook: z.boolean().optional().default(false).describe("Wait for the Box workbook write to finish and return its result/link inline. Default false: the workbook is written in the BACKGROUND so metrics return immediately. The Box write can take minutes (the Box client alone allows a 5-minute request timeout), which is far longer than the MCP call timeout — awaiting it is what makes the whole call fail on the workbook leg even though every metric is already computed. Set true only when you need the Box link in this response and can tolerate that risk."),
       probate_treatment: z.enum(["gated", "non_gated", "separate"]).optional().default("non_gated").describe("How to treat Probate AR. 'non_gated' (default): Probate is client-pay, folded into non_gated. 'gated': fold into gated. 'separate': break Probate out under semi_gated for review."),
     },
     async (params) => {
@@ -937,12 +938,35 @@ export function registerARTools(server: McpServer): void {
         };
 
         // ---- Maintain the AR Scorecard workbook in Box ----
+        // The Box write (download prior file + build workbook + version-upload)
+        // can take minutes — the Box client alone allows a 5-minute request
+        // timeout — which is far longer than the MCP call timeout. Awaiting it
+        // here is what made the whole scorecard call fail on the workbook leg even
+        // though every metric was already computed. So by DEFAULT we detach the
+        // write: metrics return immediately and the workbook is written in the
+        // background (the server is long-lived, so the task finishes after this
+        // response is sent). Pass await_workbook=true to block and get the link.
         let workbook_result: any = { skipped: true };
         if (params.update_workbook !== false) {
-          try {
-            workbook_result = await updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation, gatedByAttorney, gatedByMatter);
-          } catch (e: any) {
-            workbook_result = { error: e?.message ?? String(e) };
+          const runWrite = () =>
+            updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation, gatedByAttorney, gatedByMatter);
+          if (params.await_workbook === true) {
+            try {
+              workbook_result = await runWrite();
+            } catch (e: any) {
+              workbook_result = { error: e?.message ?? String(e) };
+            }
+          } else {
+            // Fire-and-forget. Catch everything so a slow or failed Box write can
+            // never reject into the event loop (an unhandled rejection would crash
+            // the long-lived server) and never blocks this response.
+            void runWrite()
+              .then((r) => console.log(`[get_ar_scorecard] background workbook write complete: ${JSON.stringify(r)}`))
+              .catch((e: any) => console.error(`[get_ar_scorecard] background workbook write FAILED: ${e?.message ?? e}`));
+            workbook_result = {
+              status: "writing_in_background",
+              note: "Metrics returned immediately; the AR Scorecard workbook is being written to Box in the background. Re-run with await_workbook=true to get the Box link in the response.",
+            };
           }
         }
 
