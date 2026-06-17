@@ -627,19 +627,32 @@ export function registerARTools(server: McpServer): void {
             console.warn(`[get_ar_scorecard] paid-bills fetch failed (${e?.message ?? e}); funded trust requests will be incomplete`);
             return [] as any[];
           }),
-          // Join key for the Gated/Non-Gated split. status=all so closed-matter
-          // invoices still classify. If this fails, AR rows fall back to
-          // "unclassified" rather than failing the whole scorecard.
-          fetchAllPages<any>("/matters", { fields: SCORECARD_MATTER_FIELDS, status: "all" }).catch((e: any) => {
+          // Join key for the Gated/Non-Gated split. We need ALL matters (open
+          // AND closed — closed matters still hold AR), so the `status` param is
+          // OMITTED: Clio's /matters only accepts open|closed|pending and 400s on
+          // status=all (which previously emptied this join and sent 100% of AR to
+          // "unclassified"). Omitting status returns every status, matching the
+          // get_matters tool's own "all" handling. If this fails, AR rows fall
+          // back to "unclassified" rather than failing the whole scorecard.
+          fetchAllPages<any>("/matters", { fields: SCORECARD_MATTER_FIELDS }).catch((e: any) => {
             console.warn(`[get_ar_scorecard] matters fetch failed (${e?.message ?? e}); AR will be reported as unclassified`);
             return [] as any[];
           }),
         ]);
 
-        // matter_id → practice_area name (null when the matter has none).
+        // matter_id → practice_area name (null when the matter has none). Clio
+        // returns matter ids as numbers and bills carry the same numeric
+        // matters[].id, so the Map<number> keys line up without coercion.
         const practiceAreaByMatter = new Map<number, string | null>();
         for (const m of allMatters) {
           if (m?.id != null) practiceAreaByMatter.set(m.id, m.practice_area?.name ?? null);
+        }
+        // Join-health diagnostic: empties here are the difference between a real
+        // Gated/Non-Gated split and everything collapsing to "unclassified".
+        const mattersWithPa = [...practiceAreaByMatter.values()].filter((v) => v != null).length;
+        console.warn(`[get_ar_scorecard] matter→practice_area join: ${practiceAreaByMatter.size} matters, ${mattersWithPa} with a practice_area`);
+        if (practiceAreaByMatter.size === 0) {
+          console.warn(`[get_ar_scorecard] WARNING: empty matters join — all AR will classify as "unclassified"`);
         }
 
         const round2 = (n: number) => Math.round(n * 100) / 100;
