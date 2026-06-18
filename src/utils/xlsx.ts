@@ -104,6 +104,128 @@ export function findTabMonthBlock(
   return { hdr: chosen.hdr, attorneys: chosen.attorneys };
 }
 
+/** Highest <row r="N"> number present in a worksheet XML (0 when none). */
+export function maxRowNumber(xml: string): number {
+  let max = 0;
+  for (const m of xml.matchAll(/<row\b[^>]*\br="(\d+)"/g)) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * Compute a per-month firm-average rate for a month-blocked tab (Utilization /
+ * Realization). For every month block, each attorney row's own rate is derived
+ * from the numeric hour columns via `rateFn` (NOT read from the tab's rate-column
+ * FORMULAS, whose cached values are stale until Excel recalculates), and the
+ * block's firm figure is the simple MEAN of the listed billers' rates. `rateFn`
+ * returns null for a row that should be excluded (e.g. an inactive timekeeper
+ * with a zero denominator), so those rows never drag the mean down.
+ *
+ * Shares the exact block-scan rules of findTabMonthBlock (col A month label, col
+ * B initials, block ends on blank/"EMPLOYEE"/"TOTAL"). When a sheet holds the
+ * same month more than once (multi-year), the LAST block with data for that
+ * month wins.
+ */
+export function firmAvgRateByMonth(
+  xml: string,
+  sharedStrings: string[],
+  numCols: string[],
+  rateFn: (vals: Record<string, number>) => number | null,
+): Array<{ monthAbbr: string; avgRate: number; billers: number }> {
+  const cellText = (rowXml: string, col: string): string => {
+    const re = new RegExp(`(<c\\b[^>]*\\br="${col}\\d+"[^>]*>)([\\s\\S]*?)</c>`);
+    const m = rowXml.match(re);
+    if (!m) return "";
+    const open = m[1], inner = m[2];
+    const t = inner.match(/<t\b[^>]*>([\s\S]*?)<\/t>/);
+    if (t) return xmlUnesc(t[1]);
+    const v = inner.match(/<v>([\s\S]*?)<\/v>/);
+    if (v) {
+      if (/\bt="s"/.test(open)) { const i = parseInt(v[1], 10); return sharedStrings[i] ?? ""; }
+      return v[1];
+    }
+    return "";
+  };
+  const cellNum = (rowXml: string, col: string): number => {
+    const re = new RegExp(`(<c\\b[^>]*\\br="${col}\\d+"[^>]*>)([\\s\\S]*?)</c>`);
+    const m = rowXml.match(re);
+    if (!m) return 0; // missing/self-closing cell → treat as 0
+    if (/\bt="s"/.test(m[1])) return 0; // a string in a numeric column → 0
+    const v = m[2].match(/<v>([\s\S]*?)<\/v>/);
+    if (!v) return 0;
+    const f = parseFloat(v[1]);
+    return Number.isFinite(f) ? f : 0;
+  };
+
+  const rows: Array<{ body: string }> = [];
+  const rowRe = /<row\b[^>]*\br="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
+  let rm: RegExpExecArray | null;
+  const ordered: Array<{ n: number; body: string }> = [];
+  while ((rm = rowRe.exec(xml)) !== null) ordered.push({ n: parseInt(rm[1], 10), body: rm[2] });
+  ordered.sort((a, b) => a.n - b.n);
+  for (const o of ordered) rows.push({ body: o.body });
+
+  // Most-recent block per month (keyed by month abbr) → {sum, count}.
+  const acc = new Map<string, { sum: number; count: number }>();
+  let cur: { abbr: string; sum: number; count: number } | null = null;
+  const flush = () => { if (cur && cur.count > 0) acc.set(cur.abbr, { sum: cur.sum, count: cur.count }); };
+  for (const { body } of rows) {
+    const a3 = cellText(body, "A").trim().toUpperCase().slice(0, 3);
+    const b = cellText(body, "B").trim().toUpperCase();
+    if (MONTH_ABBRS.includes(a3)) { flush(); cur = { abbr: a3, sum: 0, count: 0 }; continue; }
+    if (!cur) continue;
+    if (b === "" || b === "EMPLOYEE" || b === "TOTAL") { flush(); cur = null; continue; }
+    const vals: Record<string, number> = {};
+    for (const c of numCols) vals[c] = cellNum(body, c);
+    const rate = rateFn(vals);
+    if (rate == null || !Number.isFinite(rate)) continue;
+    cur.sum += rate;
+    cur.count += 1;
+  }
+  flush();
+
+  return MONTH_ABBRS
+    .filter((abbr) => acc.has(abbr))
+    .map((abbr) => {
+      const a = acc.get(abbr)!;
+      return { monthAbbr: abbr, avgRate: a.sum / a.count, billers: a.count };
+    });
+}
+
+/** Append extra <row> XML just before </sheetData>. No-op for empty input. */
+export function appendRowsBeforeSheetClose(xml: string, rowsXml: string[]): string {
+  const body = rowsXml.filter(Boolean).join("");
+  if (!body) return xml;
+  return xml.replace("</sheetData>", body + "</sheetData>");
+}
+
+/**
+ * Remove a previously-appended auto-generated block (and everything after it)
+ * from <sheetData>, identified by a marker string carried in one of its cells.
+ * Idempotency helper: strip last run's table before appending a fresh one so it
+ * never accumulates. Handles the marker stored either as an inline string (how
+ * we write it) or — should Excel re-save the file — as a shared string. No-op
+ * when the marker is absent.
+ */
+export function stripRowsFromMarker(xml: string, marker: string, sharedStrings: string[]): string {
+  let idx = xml.indexOf(marker);
+  if (idx === -1) {
+    const ssIdx = sharedStrings.findIndex((s) => s.includes(marker));
+    if (ssIdx !== -1) {
+      const m = xml.match(new RegExp(`<c\\b[^>]*\\bt="s"[^>]*>\\s*<v>${ssIdx}</v>`));
+      if (m && m.index != null) idx = m.index;
+    }
+  }
+  if (idx === -1) return xml;
+  const rowStart = xml.lastIndexOf("<row", idx);
+  if (rowStart === -1) return xml;
+  const close = xml.indexOf("</sheetData>", rowStart);
+  if (close === -1) return xml;
+  return xml.slice(0, rowStart) + xml.slice(close);
+}
+
 /** Build a single <c> element */
 export function xmlCell(ref: string, value: number | string | null | undefined, opts?: { style?: string; formula?: string }): string {
   if (value === null || value === undefined) {
