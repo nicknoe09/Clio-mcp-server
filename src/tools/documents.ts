@@ -84,9 +84,33 @@ import {
 // col N (14) = that timekeeper's individual collected $ for the month.
 const FIRM_DASHBOARD_FILE_ID = "2199324794140";
 
-// Box folder the individual weekly goals sheets live in. The monthly goals
-// summary saves to the same folder.
+// Box folder the individual weekly goals sheets live in (their primary save
+// location, unchanged). Each weekly goals sheet is ALSO duplicated into the
+// Weekly Measureables folder below.
 const WEEKLY_GOALS_FOLDER_ID = "372923594239";
+
+// Traction > Measurables save destinations (EOS measurables). Weekly items go in
+// Weekly Measureables, monthly items in Monthly Measureables. (Box spells the
+// folders "Measureables".)
+const WEEKLY_MEASURABLES_FOLDER_ID = "390777368470";
+const MONTHLY_MEASURABLES_FOLDER_ID = "390781679459";
+
+// Best-effort copy of a generated buffer into a second Box folder, kept in sync
+// by name (versions an existing copy, creates it the first time). Never throws —
+// a failed duplicate must not break the primary save; the failure is returned.
+async function duplicateToFolder(buffer: Buffer, filename: string, folderId: string): Promise<any> {
+  try {
+    const existingId = await findBoxFileId(folderId, filename);
+    const dup = existingId
+      ? await uploadToBox({ buffer, filename, folderId, overwriteFileId: existingId })
+      : await createBoxFile({ buffer, filename, folderId });
+    return dup.uploaded
+      ? { uploaded: true, box_file_id: dup.box_file_id, box_url: dup.box_url }
+      : { uploaded: false, reason: (dup as any).reason };
+  } catch (e: any) {
+    return { uploaded: false, error: e?.message ?? String(e) };
+  }
+}
 
 
 
@@ -144,6 +168,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   expires_at?: string;
   reason?: string;
   note?: string;
+  weekly_measurables?: any;
 }> {
   const hoursPerDay = params.hours_per_day ?? 8;
   const startDate = `${params.year}-01-01`;
@@ -414,8 +439,10 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const boxFilename = `${initials} Goals ${params.year}.xlsx`;
     const folderId = params.box_folder_id || WEEKLY_GOALS_FOLDER_ID;
     const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
+    // Also duplicate the sheet into Weekly Measureables (kept in sync each run).
+    const weekly_measurables = await duplicateToFolder(buffer, boxFilename, WEEKLY_MEASURABLES_FOLDER_ID);
     if (result.uploaded) {
-      return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url };
+      return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url, weekly_measurables };
     }
     return {
       filename: boxFilename,
@@ -424,6 +451,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
       expires_at: result.expires_at,
       reason: result.reason,
       note: result.note,
+      weekly_measurables,
     };
   }
 
@@ -606,7 +634,8 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   const filename = `Monthly Goals Summary ${params.year}.xlsx`;
-  const folderId = params.box_folder_id || WEEKLY_GOALS_FOLDER_ID;
+  // Saves into Traction > Measurables > Monthly Measureables (a monthly measurable).
+  const folderId = params.box_folder_id || MONTHLY_MEASURABLES_FOLDER_ID;
 
   // Version the existing file, or create it the first time (same pattern as
   // the AR scorecard — uploadToBox alone never creates new files).
@@ -1149,10 +1178,10 @@ export function registerDocumentTools(server: McpServer): void {
     "download_monthly_goals_summary",
     "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
     "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
-    "Saves the workbook to the same Box folder as the weekly goals sheets (versioned on re-runs, created on first run).",
+    "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run).",
     {
       year: z.coerce.number().optional().describe("Year (defaults to current year)"),
-      box_folder_id: z.string().optional().describe("Box folder ID. Defaults to the weekly goals folder."),
+      box_folder_id: z.string().optional().describe("Box folder ID. Defaults to the Monthly Measureables folder."),
       close_threshold_pct: z.coerce.number().optional().describe("Percent of monthly goal that still counts as 'close' (yellow). Default 90."),
     },
     async (params) => {
@@ -2838,7 +2867,7 @@ export function registerDocumentTools(server: McpServer): void {
           const result = await uploadToBox({
             buffer: outputBuffer,
             filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
-            folderId: "348313592902",
+            folderId: MONTHLY_MEASURABLES_FOLDER_ID, // Traction > Measurables > Monthly Measureables
             overwriteFileId: DASHBOARD_FILE_ID,
           });
 
@@ -2984,7 +3013,7 @@ export function registerDocumentTools(server: McpServer): void {
     async (params) => {
       const SHEET = "YTD Collections by Matter";
       const DASHBOARD_FILE_ID = "2199324794140";
-      const FOLDER_ID = "348313592902";
+      const FOLDER_ID = MONTHLY_MEASURABLES_FOLDER_ID; // Traction > Measurables > Monthly Measureables
       try {
         const mNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
         const endDay = new Date(params.year, params.month, 0).getDate();
