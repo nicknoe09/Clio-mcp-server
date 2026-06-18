@@ -4,8 +4,9 @@ import ExcelJS from "exceljs";
 import { fetchAllPages } from "../clio/pagination";
 import { uploadToBox, createBoxFile, findBoxFileId, downloadFromBox } from "../utils/box";
 
-// Box folder that holds the firm's managed workbooks (same as the dashboard).
-const AR_SCORECARD_FOLDER = "348313592902";
+// Box folder that holds the AR Scorecard workbook: Traction > Measurables >
+// Weekly Measureables (an EOS weekly measurable). The file is versioned in place.
+const AR_SCORECARD_FOLDER = "390777368470";
 const AR_SCORECARD_FILENAME = "AR Scorecard.xlsx";
 
 const BILL_FIELDS =
