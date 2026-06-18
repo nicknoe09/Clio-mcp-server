@@ -24,6 +24,10 @@ import {
   parseSharedStrings,
   MONTH_ABBRS,
   findTabMonthBlock,
+  firmAvgRateByMonth,
+  maxRowNumber,
+  appendRowsBeforeSheetClose,
+  stripRowsFromMarker,
   xmlCell,
   xmlRow,
   STYLE_CUR,
@@ -1424,7 +1428,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -2383,6 +2387,83 @@ export function registerDocumentTools(server: McpServer): void {
           }
 
           // ============================================================
+          // Firm-average summary tables (Utilization / Realization)
+          // ============================================================
+          // Append a "Firm Average" table to the BOTTOM of each rate tab — the
+          // simple MEAN of the listed billers' own monthly rate (utilization =
+          // billable/available; realization = nondiscounted/total-billed). It is
+          // appended after the existing month blocks (never inserted mid-sheet,
+          // so the template's per-attorney rate formulas are left untouched) and
+          // refreshed in place each run via the marker below. Rates are recomputed
+          // from the hour columns (concrete values) rather than read from the
+          // rate-column FORMULAS, whose cached values are stale until Excel
+          // recalculates on open. Inactive rows (no hours / #DIV/0!) are excluded
+          // by the rate fns so they never drag the mean. Title row uses col A only
+          // (col B blank) so a later scan treats it as a block terminator, and the
+          // data rows carry month NAMES in col B (col A blank) so they are never
+          // mistaken for new month-block headers.
+          const FIRM_AVG_MARKER = "Firm Average (auto-generated";
+          const monthFull = (abbr: string) => MONTH_NAMES_FULL[MONTH_ABBRS.indexOf(abbr)] ?? abbr;
+          const buildFirmAvgRows = (
+            summary: Array<{ monthAbbr: string; avgRate: number; billers: number }>,
+            startRow: number,
+            title: string,
+            rateHeader: string,
+          ): string[] => {
+            const out: string[] = [];
+            out.push(xmlRow(startRow, [xmlCell(`A${startRow}`, title, { style: STYLE_BOLD })]));
+            const hr = startRow + 1;
+            out.push(xmlRow(hr, [
+              xmlCell(`B${hr}`, "Month", { style: STYLE_BOLD }),
+              xmlCell(`C${hr}`, rateHeader, { style: STYLE_BOLD }),
+              xmlCell(`D${hr}`, "# Billers", { style: STYLE_BOLD }),
+            ]));
+            summary.forEach((s, i) => {
+              const r = hr + 1 + i;
+              out.push(xmlRow(r, [
+                xmlCell(`B${r}`, monthFull(s.monthAbbr), { style: STYLE_BOLD }),
+                xmlCell(`C${r}`, Math.round(s.avgRate * 10000) / 10000, { style: STYLE_PCT }),
+                xmlCell(`D${r}`, s.billers, { style: STYLE_GEN }),
+              ]));
+            });
+            return out;
+          };
+          try {
+            if (utilXml && utilPatched > 0) {
+              const base = stripRowsFromMarker(utilXml, FIRM_AVG_MARKER, sharedStrings);
+              // Utilization rate = Billable (C) / Available Hours (F); a biller is
+              // "listed/active" this month if it tracked any time (C+D > 0).
+              const summary = firmAvgRateByMonth(base, sharedStrings, ["C", "D", "F"],
+                (v) => (v.C + v.D > 0 && v.F > 0 ? v.C / v.F : null));
+              if (summary.length) {
+                utilXml = appendRowsBeforeSheetClose(base, buildFirmAvgRows(
+                  summary, maxRowNumber(base) + 2,
+                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' utilization rate`,
+                  "Firm Avg Utilization Rate"));
+              } else {
+                utilXml = base;
+              }
+            }
+            if (realizXml && realizPatched > 0) {
+              const base = stripRowsFromMarker(realizXml, FIRM_AVG_MARKER, sharedStrings);
+              // Realization rate = Billed: Nondiscounted (D) / Total Billed (D+E);
+              // a biller is "listed/active" this month if it billed any hours.
+              const summary = firmAvgRateByMonth(base, sharedStrings, ["D", "E"],
+                (v) => (v.D + v.E > 0 ? v.D / (v.D + v.E) : null));
+              if (summary.length) {
+                realizXml = appendRowsBeforeSheetClose(base, buildFirmAvgRows(
+                  summary, maxRowNumber(base) + 2,
+                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' realization rate`,
+                  "Firm Avg Realization Rate"));
+              } else {
+                realizXml = base;
+              }
+            }
+          } catch (e: any) {
+            console.warn(`[dashboard] firm-average summary append skipped: ${e?.message ?? e}`);
+          }
+
+          // ============================================================
           // Patch Collection tab (Collected / Uncollected HOURS)
           // ============================================================
           // DEFAULT source = the Fee Allocation CSV already pulled above
@@ -2735,9 +2816,23 @@ export function registerDocumentTools(server: McpServer): void {
               "Bonus Tracker": addStyles(bonusTrackerXml),
               "Attorney Performance": addStyles(perfXml),
             };
-            if (utilXml && utilPatched > 0) out["Utilization"] = utilXml;
-            if (realizXml && realizPatched > 0) out["Realization"] = realizXml;
-            if (collectionXml && collectionPatched > 0) out["Collection"] = collectionXml;
+            // The patched Util/Realiz/Collection tabs are the ORIGINAL template
+            // XML plus our edits, so we must NOT run the full addStyles (its
+            // unstyled-cell regex would rewrite existing template cells). We only
+            // resolve the placeholder style tokens our appended firm-average rows
+            // carry; template cells never contain these sentinels, so this is a
+            // no-op on them.
+            const substTabPlaceholders = (xml: string): string => applyColors(
+              xml
+                .split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`)
+                .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
+                .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
+                .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
+                .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`),
+            );
+            if (utilXml && utilPatched > 0) out["Utilization"] = substTabPlaceholders(utilXml);
+            if (realizXml && realizPatched > 0) out["Realization"] = substTabPlaceholders(realizXml);
+            if (collectionXml && collectionPatched > 0) out["Collection"] = substTabPlaceholders(collectionXml);
             return out;
           }, deletedSheets);
           const result = await uploadToBox({
