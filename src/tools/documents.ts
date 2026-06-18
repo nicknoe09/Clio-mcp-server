@@ -1457,7 +1457,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -2438,25 +2438,40 @@ export function registerDocumentTools(server: McpServer): void {
             startRow: number,
             title: string,
             rateHeader: string,
+            goal?: { value: number; header: string },
           ): string[] => {
             const out: string[] = [];
             out.push(xmlRow(startRow, [xmlCell(`A${startRow}`, title, { style: STYLE_BOLD })]));
             const hr = startRow + 1;
-            out.push(xmlRow(hr, [
+            // Optional goal column sits between the actual rate and the biller count.
+            const billersCol = goal ? "E" : "D";
+            const header = [
               xmlCell(`B${hr}`, "Month", { style: STYLE_BOLD }),
               xmlCell(`C${hr}`, rateHeader, { style: STYLE_BOLD }),
-              xmlCell(`D${hr}`, "# Billers", { style: STYLE_BOLD }),
-            ]));
+            ];
+            if (goal) header.push(xmlCell(`D${hr}`, goal.header, { style: STYLE_BOLD }));
+            header.push(xmlCell(`${billersCol}${hr}`, "# Billers", { style: STYLE_BOLD }));
+            out.push(xmlRow(hr, header));
             summary.forEach((s, i) => {
               const r = hr + 1 + i;
-              out.push(xmlRow(r, [
+              const cells = [
                 xmlCell(`B${r}`, monthFull(s.monthAbbr), { style: STYLE_BOLD }),
                 xmlCell(`C${r}`, Math.round(s.avgRate * 10000) / 10000, { style: STYLE_PCT }),
-                xmlCell(`D${r}`, s.billers, { style: STYLE_GEN }),
-              ]));
+              ];
+              // Goal is a fixed firm target (same value every month) so the chart
+              // can plot actual vs goal.
+              if (goal) cells.push(xmlCell(`D${r}`, Math.round(goal.value * 10000) / 10000, { style: STYLE_PCT }));
+              cells.push(xmlCell(`${billersCol}${r}`, s.billers, { style: STYLE_GEN }));
+              out.push(xmlRow(r, cells));
             });
             return out;
           };
+          // Firm utilization goal = the simple mean of each biller's own
+          // utilization goal from the "2026 Goals" tab (attyGoals, col 3 = util
+          // goal). 0 when the goals tab wasn't found, in which case no goal column
+          // is written.
+          const utilGoalVals = Object.values(attyGoals).map((g) => g.utilGoal).filter((v) => Number.isFinite(v) && v > 0);
+          const firmUtilGoal = utilGoalVals.length ? utilGoalVals.reduce((s, v) => s + v, 0) / utilGoalVals.length : 0;
           try {
             if (utilXml && utilPatched > 0) {
               const base = stripRowsFromMarker(utilXml, FIRM_AVG_MARKER, sharedStrings);
@@ -2467,8 +2482,9 @@ export function registerDocumentTools(server: McpServer): void {
               if (summary.length) {
                 utilXml = appendRowsBeforeSheetClose(base, buildFirmAvgRows(
                   summary, maxRowNumber(base) + 2,
-                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' utilization rate`,
-                  "Firm Avg Utilization Rate"));
+                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' utilization rate vs goal`,
+                  "Firm Avg Utilization Rate",
+                  firmUtilGoal > 0 ? { value: firmUtilGoal, header: "Firm Avg Util Goal" } : undefined));
               } else {
                 utilXml = base;
               }
