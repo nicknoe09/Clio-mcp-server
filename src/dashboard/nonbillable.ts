@@ -11,11 +11,11 @@ export type NonbillableByMonth = Record<number, Record<number, NonbillableCats>>
 type CatKey = keyof NonbillableCats;
 // Each category maps to one OR MORE matter display-number prefixes. Website work
 // (matter 00316 "Romano & Sumner Website") rolls into Biz Dev per Rachel's split.
-const CATEGORY_PREFIXES: { key: CatKey; prefixes: string[] }[] = [
+export const CATEGORY_PREFIXES: { key: CatKey; prefixes: string[] }[] = [
   { key: "bizDev", prefixes: ["00706", "00316"] }, // ROMSUM Business Development + firm Website
   { key: "potentialClients", prefixes: ["00050"] }, // Potential Clients
   { key: "cle", prefixes: ["00707"] },              // Continuing Legal Education
-  { key: "otherAdmin", prefixes: ["00158"] },       // Other Admin
+  { key: "otherAdmin", prefixes: ["02888"] },       // Other Admin (matter 02888-Admin; 00158 never existed → pulled 0)
 ];
 
 /**
