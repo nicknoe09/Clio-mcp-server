@@ -78,18 +78,33 @@ export async function assertReportPeriod(reportId: number | string, wantStart: s
   return { start: meta?.start_date, end: meta?.end_date };
 }
 
-// Generate a PAYMENT-FILTERED Fee Allocation report for ONE month and return its rows.
-// filter_by_payment=true makes the date range filter by PAYMENT date (money actually
-// received in the period) rather than invoice issue date — the payment-received basis,
-// which also captures payments on prior-year invoices (the issue-date split dropped
-// them). Each row is a timekeeper's allocation on an invoice: "User" (working
-// timekeeper → col N), "Responsible Attorney" (→ col S), "Total Funds Collected".
-// Mirrors getClientActivityCSV's POST+poll+retry and verifies the period via
-// assertReportPeriod so a wrong-month report aborts instead of writing bad data.
-export async function genFeeAllocationByMonth(year: number, month: number): Promise<Record<string, string>[]> {
-  const start = `${year}-${String(month).padStart(2, "0")}-01`;
+// Generate a Fee Allocation report for a period and return its rows.
+//
+// filter_by_payment=true (DEFAULT) makes the date range filter by PAYMENT date
+// (money actually received in the period) rather than invoice issue date — the
+// payment-received basis, which also captures payments on prior-year invoices (the
+// issue-date split dropped them). This is what the COLLECTIONS columns use.
+//
+// filter_by_payment=false makes the date range filter by INVOICE ISSUE DATE (the
+// time that appeared on a bill issued in the period). This is what the BILLED $
+// column uses (see buildMonthlyBilled). Pass startOverride/endOverride to request
+// an arbitrary window (e.g. Jan 1 .. early-next-month, so late-issued bills that
+// belong to the prior month are captured and re-bucketed by adjusted issue date).
+//
+// Each row is a timekeeper's allocation on an invoice: "User" (working timekeeper →
+// col N), "Responsible Attorney", "Originating Attorney" (→ col V), "Billed Time",
+// "Billed Time Collected", "Issue Date". Mirrors getClientActivityCSV's
+// POST+poll+retry and verifies the period via assertReportPeriod so a wrong-period
+// report aborts instead of writing bad data.
+export async function genFeeAllocationByMonth(
+  year: number,
+  month: number,
+  opts: { filterByPayment?: boolean; startOverride?: string; endOverride?: string } = {},
+): Promise<Record<string, string>[]> {
+  const filterByPayment = opts.filterByPayment ?? true;
+  const start = opts.startOverride ?? `${year}-${String(month).padStart(2, "0")}-01`;
   const endDay = new Date(year, month, 0).getDate();
-  const end = `${year}-${String(month).padStart(2, "0")}-${endDay}`;
+  const end = opts.endOverride ?? `${year}-${String(month).padStart(2, "0")}-${endDay}`;
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const attempts = 3;
   let lastErr: any;
@@ -97,7 +112,7 @@ export async function genFeeAllocationByMonth(year: number, month: number): Prom
     let reportId: number | undefined;
     let state: string | undefined;
     try {
-      const gen = await rawPostSingle("/reports", { data: { kind: "fee_allocation", format: "csv", filter_by_payment: true, start_date: start, end_date: end } });
+      const gen = await rawPostSingle("/reports", { data: { kind: "fee_allocation", format: "csv", filter_by_payment: filterByPayment, start_date: start, end_date: end } });
       const rep = gen?.data ?? gen;
       reportId = rep?.id;
       state = rep?.state;

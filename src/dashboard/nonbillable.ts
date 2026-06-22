@@ -9,11 +9,13 @@ export type NonbillableCats = { bizDev: number; potentialClients: number; cle: n
 export type NonbillableByMonth = Record<number, Record<number, NonbillableCats>>;
 
 type CatKey = keyof NonbillableCats;
-const CATEGORY_PREFIXES: { key: CatKey; prefix: string }[] = [
-  { key: "bizDev", prefix: "00706" },           // ROMSUM Business Development
-  { key: "potentialClients", prefix: "00050" }, // Potential Clients
-  { key: "cle", prefix: "00707" },              // Continuing Legal Education
-  { key: "otherAdmin", prefix: "00158" },       // Other Admin
+// Each category maps to one OR MORE matter display-number prefixes. Website work
+// (matter 00316 "Romano & Sumner Website") rolls into Biz Dev per Rachel's split.
+const CATEGORY_PREFIXES: { key: CatKey; prefixes: string[] }[] = [
+  { key: "bizDev", prefixes: ["00706", "00316"] }, // ROMSUM Business Development + firm Website
+  { key: "potentialClients", prefixes: ["00050"] }, // Potential Clients
+  { key: "cle", prefixes: ["00707"] },              // Continuing Legal Education
+  { key: "otherAdmin", prefixes: ["00158"] },       // Other Admin
 ];
 
 /**
@@ -28,7 +30,8 @@ export async function buildNonbillableByMonth(year: number, month: number): Prom
   const matterCat: Record<number, CatKey> = {};
   for (const cm of CATEGORY_PREFIXES) {
     for (const mt of allMatters) {
-      if (String(mt.display_number || "").startsWith(cm.prefix)) matterCat[mt.id] = cm.key;
+      const dn = String(mt.display_number || "");
+      if (cm.prefixes.some((p) => dn.startsWith(p))) matterCat[mt.id] = cm.key;
     }
   }
 

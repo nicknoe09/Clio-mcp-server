@@ -3,6 +3,8 @@ import { buildRevenueByMonth } from "../dashboard/revenue";
 import { computeBonusData } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
+import { buildMonthlyBilled } from "../dashboard/billed";
+import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -1457,7 +1459,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections (cols N + S) come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, allocated by working timekeeper (col N individual) and responsible attorney (col S), written into ALL year-to-date month blocks (Jan through target). This is the payment-received basis: it captures payments on prior-year invoices and reconciles to Clio's Revenue Report; each month's report period is verified (assertReportPeriod) before it is written. (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) REWRITES the hours/billable/billed/write-off/discount columns for ALL year-to-date months (Jan through target) in '26 Compare', then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (00706/00050/00707/00158); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Nonbillable categories (Biz Dev / Potential Clients / CLE) come from a small targeted /activities query on just the admin matters; Other Admin is the remainder. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual') and by ORIGINATING attorney (col V 'Originating'). Fees from billers not on the roster are pooled into the 'NRB' row so Σ col N == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is the INVOICE-ISSUE-DATE basis (time that appeared on bills issued that month) with a configurable billing-month cutoff (billed_cutoff_day, default 7: bills issued in the first few days of a month roll back into the prior month's run). Contingency/flat-fee hours are backed out of col I (and therefore the para bonus). (fee_report_id still pins the cumulative Fee Allocation report used only for the Collection tab's collected/uncollected HOURS split.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable/nonbillable hours) and 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours), sourced from an auto-generated Clio Client Activity report for the target month — pass client_activity_report_id to use a specific pre-generated report instead. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from the Fee Allocation report already pulled (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — reliable since that report downloads cleanly; pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1468,6 +1470,8 @@ export function registerDocumentTools(server: McpServer): void {
       fee_report_id: z.coerce.number().optional().describe("Specific Clio Fee Allocation report ID for collections (cols N/S of 26 Compare). The report is cumulative YTD and is split by Issue Date month, so one report backfills every month's collections. Defaults to the latest completed Fee Allocation report."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
+      backfill_ytd: z.boolean().optional().describe("When true, (re)writes EVERY year-to-date month block (Jan..target) for collections and issue-date billed $; for HOURS it rewrites every month only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id) — the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: the report is a STATIC monthly snapshot — only the TARGET month is written and prior months are left untouched, so a closed month never changes retroactively on later runs."),
+      billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 7). Bills issued on days 1..cutoff of a month roll back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. cutoff=7 ⇒ May 27–Jun 7 all count as May). Run a month's snapshot after the cutoff day of the following month to capture late-issued bills."),
     },
     async (params) => {
       const jobId = `dash_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1480,6 +1484,10 @@ export function registerDocumentTools(server: McpServer): void {
       let _step = "init";
       try {
         const ROSTER = FIRM_ROSTER;
+        // STATIC SNAPSHOT semantics: by default only the TARGET month is written so a
+        // closed month never changes retroactively. backfill_ytd=true rewrites every
+        // YTD month (one-time historical correction).
+        const backfillYtd = params.backfill_ytd === true;
 
         const monthNames = MONTH_NAMES_FULL;
         const monthName = monthNames[params.month - 1];
@@ -1491,14 +1499,14 @@ export function registerDocumentTools(server: McpServer): void {
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
           billableDollars: number; billedDollars: number; writeOffs: number; lineDiscounts: number;
           bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
-          indivCollected: number; respCollected: number;
+          indivCollected: number; respCollected: number; origCollected: number;
         };
         type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
         const newPerUser = (): PerUserData => ({
           billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
           billableDollars: 0, billedDollars: 0, writeOffs: 0, lineDiscounts: 0,
           bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
-          indivCollected: 0, respCollected: 0,
+          indivCollected: 0, respCollected: 0, origCollected: 0,
         });
 
         // ---- Revenue (billed hours/$, write-offs, discounts) by month×user ----
@@ -1516,6 +1524,28 @@ export function registerDocumentTools(server: McpServer): void {
         // by month×user, from a targeted /activities query on the admin matters.
         _step = "building nonbillable categories";
         const catByMonth = await buildNonbillableByMonth(params.year, params.month);
+
+        // Months actually written: target only (static snapshot), or all YTD when
+        // backfilling. The data builders compute only these months to avoid pulling
+        // ~12 reports for a single-month update.
+        const writeMonths = backfillYtd
+          ? Array.from({ length: params.month }, (_, i) => i + 1)
+          : [params.month];
+
+        // Billed $ (col K) on the INVOICE-ISSUE-DATE basis (the time that appeared on
+        // a bill issued that month), with the 27th–7th billing-month roll-back so a
+        // month-straddling billing run stays grouped. Replaces the activity-month
+        // figure from the Revenue Report.
+        _step = "building billed $ (issue-date)";
+        const cutoffDay = params.billed_cutoff_day ?? 7;
+        const { billedByMonth, firmByMonth: billedFirmByMonth } =
+          await buildMonthlyBilled(params.year, params.month, ROSTER, { cutoffDay, months: writeMonths });
+
+        // Hours on contingency/flat-fee matters, to back out of col I (the hour
+        // tracker) and — since the para bonus reads col I — out of the para bonus too.
+        _step = "building excluded (contingency/flat) hours";
+        const excludedHrsByMonth = await buildExcludedHoursByMonth(params.year, params.month, { months: writeMonths });
+        console.log(`[Dashboard] billed-$ issue-date firm totals by month: ${JSON.stringify(Object.fromEntries(Object.entries(billedFirmByMonth).map(([m, v]) => [m, round2(v)])))}`);
 
         // ---- Fetch fee allocation CSV for collections (ALL months, per-month) ----
         // The Fee Allocation Report is CUMULATIVE (Jan 1 → report date), so it
@@ -1536,10 +1566,16 @@ export function registerDocumentTools(server: McpServer): void {
             const d = newPerUser();
             if (src) {
               d.billableHrs = src.billableHrs;
-              d.billedDollars = src.billedDollars;
               d.writeOffs = src.writeOffs;
               d.lineDiscounts = src.lineDiscounts;
             }
+            // Back contingency/flat-fee hours out of billable (col I) — they aren't
+            // "hours worked" for the tracker or the para bonus. Dollars are unaffected.
+            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
+            d.billableHrs = Math.max(0, d.billableHrs - excl);
+            // Billed $ (col K) = time billed on invoices ISSUED this billing month
+            // (issue-date basis), not the activity-month Revenue Report figure.
+            d.billedDollars = billedByMonth[m]?.[r.user_id] ?? 0;
             d.bizDev = cat?.bizDev ?? 0;
             d.potentialClients = cat?.potentialClients ?? 0;
             d.cle = cat?.cle ?? 0;
@@ -1671,6 +1707,8 @@ export function registerDocumentTools(server: McpServer): void {
           let tkUpdated = 0;
           let monthsSkipped = 0;
           for (const md of monthsData) {
+            // Static snapshot: skip prior months unless explicitly backfilling.
+            if (!backfillYtd && md.month !== params.month) continue;
             const block = md.month === params.month ? monthBlock : scanMonthBlock(compareSheet, md.monthName);
             if (!block) {
               console.warn(`[Dashboard] no month block for ${md.monthName} — skipping (run the tool with month=${md.month} to create it)`);
@@ -1717,24 +1755,52 @@ export function registerDocumentTools(server: McpServer): void {
           // write loop below AND the surgical compareXml patch both consume these
           // maps; the Bonus Tracker is derived from col N, so it picks these up too.
           _step = "generating payment-filtered Fee Allocation reports (per YTD month)";
-          const { indivByMonth: indivCollByMonth, respByMonth: respCollByMonth, firmYtd: collFirmYtd } =
-            await buildMonthlyCollections(params.year, params.month, ROSTER);
-          console.log(`[Dashboard] payment-filtered collections built: firm YTD received=$${collFirmYtd.toFixed(2)} (should reconcile to firm payments received; if it instead matches issue-date-2026 only, filter_by_payment was ignored)`);
+          const {
+            indivByMonth: indivCollByMonth, origByMonth: origCollByMonth,
+            nonRosterIndivByMonth: nrbIndivByMonth, nonRosterOrigByMonth: nrbOrigByMonth,
+            firmByMonth: collFirmFeesByMonth, firmYtd: collFirmYtd,
+          } = await buildMonthlyCollections(params.year, params.month, ROSTER, { months: writeMonths });
+          console.log(`[Dashboard] FEES-ONLY collections built: firm YTD fees received=$${collFirmYtd.toFixed(2)} (Billed Time Collected; excludes expenses/interest/tax)`);
+          // Collections write to: col N=14 "Collected Actual" (working timekeeper),
+          // col V=22 "Originating" (originating attorney). Non-roster billers go to the
+          // "NRB" row so Σ col N == Σ col V == firm fees. Col S (the old, misplaced
+          // collected write) is no longer written.
           let collCellsWritten = 0;
           for (let m = 1; m <= params.month; m++) {
+            if (!backfillYtd && m !== params.month) continue; // static snapshot
             const block = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!block) continue;
             for (const r of ROSTER) {
               const rowNum = block.map[r.initials.toUpperCase()];
               if (!rowNum) continue;
               const wsRow = compareSheet.getRow(rowNum);
-              wsRow.getCell(14).value = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
-              wsRow.getCell(19).value = round2(respCollByMonth[m]?.[r.user_id] ?? 0);
+              wsRow.getCell(14).value = round2(indivCollByMonth[m]?.[r.user_id] ?? 0); // N "Collected Actual"
+              wsRow.getCell(22).value = round2(origCollByMonth[m]?.[r.user_id] ?? 0);  // V "Originating"
               wsRow.commit();
               collCellsWritten++;
             }
+            // NRB ("Non-Roster Billers") line — aggregate collected fees from billers
+            // not on the roster (col N) and origination by non-roster attorneys (col V).
+            const nrbRow = block.map["NRB"];
+            if (nrbRow) {
+              const wsRow = compareSheet.getRow(nrbRow);
+              wsRow.getCell(14).value = round2(nrbIndivByMonth[m] ?? 0);
+              wsRow.getCell(22).value = round2(nrbOrigByMonth[m] ?? 0);
+              wsRow.commit();
+              collCellsWritten++;
+            } else if ((nrbIndivByMonth[m] ?? 0) > 0.005 || (nrbOrigByMonth[m] ?? 0) > 0.005) {
+              console.warn(`[Dashboard] ${monthNames[m - 1]}: non-roster collected fees (indiv=$${round2(nrbIndivByMonth[m] ?? 0)}, orig=$${round2(nrbOrigByMonth[m] ?? 0)}) have nowhere to go — add an 'NRB' row to this month block so col N and col V reconcile.`);
+            }
+            // Reconciliation: Σ col N (roster + NRB) and Σ col V (roster + NRB) must
+            // each equal the firm fees collected that month.
+            const sumN = ROSTER.reduce((s, r) => s + (indivCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbIndivByMonth[m] ?? 0);
+            const sumV = ROSTER.reduce((s, r) => s + (origCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbOrigByMonth[m] ?? 0);
+            const firm = collFirmFeesByMonth[m] ?? 0;
+            if (Math.abs(sumN - firm) > 0.05 || Math.abs(sumV - firm) > 0.05) {
+              console.warn(`[Dashboard] ${monthNames[m - 1]} collections reconciliation off: Σcol N=$${round2(sumN)} Σcol V=$${round2(sumV)} firm fees=$${round2(firm)}`);
+            }
           }
-          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=1..${params.month} (issue-date grouped, fee report)`);
+          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=${backfillYtd ? `1..${params.month}` : params.month} (fees-only; col N indiv + col V originating)`);
 
           _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
@@ -2225,17 +2291,15 @@ export function registerDocumentTools(server: McpServer): void {
           const sharedStrings = ssFile ? parseSharedStrings(await ssFile.async("string")) : [];
 
 
-          // Patch existing month data cells (cells that already exist in the XML)
-          // for EVERY backfilled YTD month — not just the target — so prior
-          // months get the fresh per-month aggregation written to "26 Compare"
-          // (matches the ExcelJS backfill loop above; mirrors its column rules).
-          // Collections (cols N=14, S=19) are target-month-only: the fee
-          // allocation CSV is single-period, so prior months' data has them
-          // zero and we must not overwrite their existing values.
+          // Patch existing month data cells (cells that already exist in the XML).
+          // STATIC SNAPSHOT: only the target month is written unless backfill_ytd is
+          // set (then every YTD month is rewritten). Mirrors the ExcelJS hours loop's
+          // column rules. Collections (cols N=14, V=22) are patched separately below.
           // The target month's rows may not exist yet when blockCreated — in
           // that case patchCell is a no-op and the blockCreated section below
           // writes those rows.
           for (const md of monthsData) {
+            if (!backfillYtd && md.month !== params.month) continue; // static snapshot
             const isTarget = md.month === params.month;
             const block = isTarget ? monthBlock : scanMonthBlock(compareSheet, md.monthName);
             if (!block) continue;
@@ -2253,9 +2317,8 @@ export function registerDocumentTools(server: McpServer): void {
                 [12, round2(d.writeOffs)], [13, round2(d.lineDiscounts)],
                 [17, round1(rd.respHrs)], [18, round2(rd.respBilled)],
               ];
-              // Collections (cols 14=N indiv, 19=S resp) are patched per-month
-              // for ALL YTD months in the dedicated loop below — not here — from
-              // the Issue-Date-grouped Fee Allocation CSV.
+              // Collections (col 14=N "Collected Actual", col 22=V "Originating") are
+              // patched in the dedicated per-month loop below — not here.
               for (const [col, val] of patches) {
                 compareXml = patchCell(compareXml, `${colLetter(col)}${row}`, val);
               }
@@ -2289,7 +2352,7 @@ export function registerDocumentTools(server: McpServer): void {
                 xmlCell(`N${row}`, d ? round2(d.indivCollected) : 0, { style: S.collected }),
                 xmlCell(`Q${row}`, rd ? round1(rd.respHrs) : 0, { style: S.respHrs }),
                 xmlCell(`R${row}`, rd ? round2(rd.respBilled) : 0, { style: S.respBilled }),
-                xmlCell(`S${row}`, d ? round2(d.respCollected) : 0, { style: S.respColl }),
+                xmlCell(`V${row}`, d ? round2(d.origCollected) : 0, { style: S.respColl }),
               ];
               newRowsXml.push(xmlRow(row, cells));
             }
@@ -2299,7 +2362,7 @@ export function registerDocumentTools(server: McpServer): void {
               const sr = monthBlock.sumRow;
               const first = monthBlock.firstRow;
               const last = monthBlock.lastRow;
-              const sumCells = [4,5,6,7,8,9,10,11,12,13,14,17,18,19].map(col =>
+              const sumCells = [4,5,6,7,8,9,10,11,12,13,14,17,18,22].map(col =>
                 xmlCell(`${colLetter(col)}${sr}`, null, { formula: `SUM(${colLetter(col)}${first}:${colLetter(col)}${last})` })
               );
               sumCells.unshift(xmlCell(`B${sr}`, monthName, { style: S.monthStr }));
@@ -2315,22 +2378,33 @@ export function registerDocumentTools(server: McpServer): void {
           // saved — the ExcelJS edits above only feed the in-memory bonus-tracker
           // derivation and color-coding. The Fee Allocation CSV is cumulative
           // (Jan 1 → report date), so we group it by Issue Date month and patch
-          // each month its own slice into EVERY YTD month block. This de-cumulates
-          // collections (fixes the April==May duplication) and backfills all prior
-          // months from the one cumulative report. Runs after the blockCreated
-          // insertion so a freshly-created target block's N/S cells exist to patch.
+          // each month its own slice. FEES-ONLY (Billed Time Collected): col N=14
+          // "Collected Actual" (working timekeeper) and col V=22 "Originating"
+          // (originating attorney); the "NRB" row absorbs non-roster billers so
+          // Σ col N == Σ col V == firm fees. Static snapshot: target-month-only unless
+          // backfill_ytd. Runs after blockCreated so a fresh target block's cells exist.
           let collCellsPatched = 0;
           const collFirmByMonth: Record<number, number> = {};
           for (let m = 1; m <= params.month; m++) {
+            if (!backfillYtd && m !== params.month) continue; // static snapshot
             const blk = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!blk) continue;
             for (const r of ROSTER) {
               const row = blk.map[r.initials.toUpperCase()];
               if (!row) continue;
               const iv = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
-              const rv = round2(respCollByMonth[m]?.[r.user_id] ?? 0);
-              compareXml = patchCell(compareXml, `N${row}`, iv);
-              compareXml = patchCell(compareXml, `S${row}`, rv);
+              const ov = round2(origCollByMonth[m]?.[r.user_id] ?? 0);
+              compareXml = patchCell(compareXml, `N${row}`, iv); // Collected Actual
+              compareXml = patchCell(compareXml, `V${row}`, ov); // Originating
+              collFirmByMonth[m] = round2((collFirmByMonth[m] ?? 0) + iv);
+              collCellsPatched++;
+            }
+            const nrbRow = blk.map["NRB"];
+            if (nrbRow) {
+              const iv = round2(nrbIndivByMonth[m] ?? 0);
+              const ov = round2(nrbOrigByMonth[m] ?? 0);
+              compareXml = patchCell(compareXml, `N${nrbRow}`, iv);
+              compareXml = patchCell(compareXml, `V${nrbRow}`, ov);
               collFirmByMonth[m] = round2((collFirmByMonth[m] ?? 0) + iv);
               collCellsPatched++;
             }
