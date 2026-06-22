@@ -18,6 +18,17 @@ export type BonusRow = {
 };
 export type BonusData = Record<string, { baseTarget: number; rows: BonusRow[] }>;
 
+// Sum collections for a (possibly multi-initial) associate/paralegal field.
+// Accepts a single initial ("AFL") or a comma/plus/slash list ("SAB,AFL").
+function sumByInitials(mc: Record<string, number>, field: string | undefined): number {
+  if (!field) return 0;
+  return field
+    .split(/[,+/]/)
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean)
+    .reduce((sum, ini) => sum + (mc[ini] || 0), 0);
+}
+
 /**
  * Compute per-attorney bonus rows from monthly collections.
  * @param monthCollections monthName -> initials -> collected $ (individual, col N)
@@ -47,10 +58,13 @@ export function computeBonusData(
       const mc = monthCollections[mn];
       if (!mc) { rows.push({ month: mn, collections: 0, ytd, bracket: "-", toNext: 0, bonusEarned: 0, cumBonus }); continue; }
 
-      // Attributed collections = own + associate + paralegal + MNH split
+      // Attributed collections = own + associate(s) + paralegal(s) + MNH split.
+      // associate/paralegal may list MULTIPLE initials (comma/plus/slash separated) —
+      // e.g. an attorney who keeps crediting a former paralegal's ongoing collections
+      // in addition to their current one (KES = "SAB,AFL").
       let collections = mc[atty.ini] || 0;
-      if (atty.associate) collections += mc[atty.associate] || 0;
-      if (atty.paralegal) collections += mc[atty.paralegal] || 0;
+      collections += sumByInitials(mc, atty.associate);
+      collections += sumByInitials(mc, atty.paralegal);
       if (mnhSplitAmong.includes(atty.ini)) {
         collections += (mc["MNH"] || 0) / mnhSplitAmong.length;
       }
