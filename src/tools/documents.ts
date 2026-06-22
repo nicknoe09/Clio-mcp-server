@@ -1816,7 +1816,7 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
             { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // paralegal AFL→SAB (Anna left); confirm Stacy's paraSalary
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
@@ -2016,7 +2016,7 @@ export function registerDocumentTools(server: McpServer): void {
 
           _step = "paralegal hours bonus";
           // ---- PARALEGAL HOURS BONUS SECTION ----
-          const PARALEGALS = ["ACA", "AFL", "AKG"];
+          const PARALEGALS = ["ACA", "SAB", "AKG"]; // AFL (Anna) replaced by SAB (Stacy); Anna stays in the rosters for history/tail collections
           const PARA_BONUS_TIERS = [
             { minHours: 133, bonus: 500 },
             { minHours: 121, bonus: 300 },

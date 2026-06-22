@@ -21,6 +21,12 @@ export const FIRM_ROSTER: RosterMember[] = [
   { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
   { initials: "KGV", name: "Gus Vlahadamis", user_id: 360049685 },
   { initials: "CTD", name: "Courteney Daniel", user_id: 359865560 },
+  // Stacy A. Bakri — Kenny's new paralegal (replacing Anna Lozano/AFL), starts ~June
+  // 2026. PLACEHOLDER user_id: she has no Clio account yet. Collections match by NAME
+  // and populate now, but her HOURS and NONBILLABLE cannot be attributed until this is
+  // replaced with her real Clio user_id (the /reports + /activities calls are keyed on
+  // user_id). MUST update before her June numbers are expected to appear.
+  { initials: "SAB", name: "Stacy Bakri", user_id: 999000001 },
 ];
 
 // Collections-only roster (27) — every timekeeper that has a row in the 26 Compare

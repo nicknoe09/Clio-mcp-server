@@ -98,9 +98,12 @@ describe("COLLECTIONS_ROSTER same-last-name disambiguation", () => {
     expect(sumN).toBe(agg.firm); // reconciles to firm fees
   });
 
-  it("roster has 27 unique initials and unique user_ids", () => {
-    expect(COLLECTIONS_ROSTER.length).toBe(27);
-    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.initials)).size).toBe(27);
-    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.user_id)).size).toBe(27);
+  it("roster has unique initials and unique user_ids (28 incl. Stacy/SAB)", () => {
+    expect(COLLECTIONS_ROSTER.length).toBe(28);
+    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.initials)).size).toBe(COLLECTIONS_ROSTER.length);
+    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.user_id)).size).toBe(COLLECTIONS_ROSTER.length);
+    // Stacy is wired in; Anna stays for history/tail collections.
+    expect(COLLECTIONS_ROSTER.find((r) => r.initials === "SAB")?.name).toBe("Stacy Bakri");
+    expect(COLLECTIONS_ROSTER.some((r) => r.initials === "AFL")).toBe(true);
   });
 });
