@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { aggregateMonthFees } from "../src/dashboard/collections";
-import type { RosterMember } from "../src/domain/roster";
+import { COLLECTIONS_ROSTER, type RosterMember } from "../src/domain/roster";
 
 const ROSTER: RosterMember[] = [
   { initials: "PAR", name: "Paul Romano", user_id: 1 },
@@ -59,5 +59,51 @@ describe("aggregateMonthFees", () => {
     const agg = aggregateMonthFees(rows, ROSTER);
     expect(agg.firm).toBe(0);
     expect(agg.indiv[1]).toBeUndefined();
+  });
+});
+
+describe("COLLECTIONS_ROSTER same-last-name disambiguation", () => {
+  const uid = (initials: string) => COLLECTIONS_ROSTER.find((r) => r.initials === initials)!.user_id;
+
+  it("routes shared last names (Noe, Hebert, Romano) to the correct individual row", () => {
+    const rows = [
+      row({ User: "Nicholas Noe", "Billed Time Collected": "100" }),
+      row({ User: "Grace Noe", "Billed Time Collected": "10" }),
+      row({ User: "Paul Romano", "Billed Time Collected": "200" }),
+      row({ User: "Silvana Romano", "Billed Time Collected": "20" }),
+      row({ User: "Lindsey Hebert", "Billed Time Collected": "30" }),
+      row({ User: "Sara Hebert", "Billed Time Collected": "40" }),
+      row({ User: "Joshua Dunegan", "Billed Time Collected": "7170" }),
+    ];
+    const agg = aggregateMonthFees(rows, COLLECTIONS_ROSTER);
+    expect(agg.indiv[uid("NRN")]).toBe(100);
+    expect(agg.indiv[uid("GKN")]).toBe(10);
+    expect(agg.indiv[uid("PAR")]).toBe(200);
+    expect(agg.indiv[uid("SPR")]).toBe(20);
+    expect(agg.indiv[uid("LSH")]).toBe(30);
+    expect(agg.indiv[uid("SKH")]).toBe(40);
+    expect(agg.indiv[uid("JAD")]).toBe(7170);
+    expect(agg.nonRosterIndiv).toBe(0);
+  });
+
+  it("a biller with no roster row (Merari) falls into the non-roster pool", () => {
+    const rows = [
+      row({ User: "Paul Romano", "Billed Time Collected": "500" }),
+      row({ User: "Merari Zambrano", "Billed Time Collected": "440" }),
+    ];
+    const agg = aggregateMonthFees(rows, COLLECTIONS_ROSTER);
+    expect(agg.indiv[uid("PAR")]).toBe(500);
+    expect(agg.nonRosterIndiv).toBe(440);
+    const sumN = Object.values(agg.indiv).reduce((s, v) => s + v, 0) + agg.nonRosterIndiv;
+    expect(sumN).toBe(agg.firm); // reconciles to firm fees
+  });
+
+  it("roster has unique initials and unique user_ids (28 incl. Stacy/SAB)", () => {
+    expect(COLLECTIONS_ROSTER.length).toBe(28);
+    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.initials)).size).toBe(COLLECTIONS_ROSTER.length);
+    expect(new Set(COLLECTIONS_ROSTER.map((r) => r.user_id)).size).toBe(COLLECTIONS_ROSTER.length);
+    // Stacy is wired in; Anna stays for history/tail collections.
+    expect(COLLECTIONS_ROSTER.find((r) => r.initials === "SAB")?.name).toBe("Stacy Bakri");
+    expect(COLLECTIONS_ROSTER.some((r) => r.initials === "AFL")).toBe(true);
   });
 });

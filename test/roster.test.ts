@@ -2,20 +2,21 @@ import { describe, it, expect } from "vitest";
 import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../src/domain/roster";
 
 describe("roster", () => {
-  it("FIRM_ROSTER has 12 unique members", () => {
-    expect(FIRM_ROSTER).toHaveLength(12);
-    expect(new Set(FIRM_ROSTER.map(r => r.user_id)).size).toBe(12);
-    expect(new Set(FIRM_ROSTER.map(r => r.initials)).size).toBe(12);
+  it("FIRM_ROSTER has 13 unique members (incl. Stacy/SAB)", () => {
+    expect(FIRM_ROSTER).toHaveLength(13);
+    expect(new Set(FIRM_ROSTER.map(r => r.user_id)).size).toBe(13);
+    expect(new Set(FIRM_ROSTER.map(r => r.initials)).size).toBe(13);
+    expect(FIRM_ROSTER.some(r => r.initials === "SAB")).toBe(true);
   });
   it("SCORECARD_ROSTER is FIRM minus Of-Counsel (KGV/CTD)", () => {
-    expect(SCORECARD_ROSTER).toHaveLength(10);
+    expect(SCORECARD_ROSTER).toHaveLength(FIRM_ROSTER.length - 2);
     const ini = SCORECARD_ROSTER.map(r => r.initials);
     expect(ini).not.toContain("KGV");
     expect(ini).not.toContain("CTD");
     expect(ini).toEqual(FIRM_ROSTER.filter(r => r.initials !== "KGV" && r.initials !== "CTD").map(r => r.initials));
   });
   it("INITIALS_BY_USER_ID covers the full roster", () => {
-    expect(Object.keys(INITIALS_BY_USER_ID)).toHaveLength(12);
+    expect(Object.keys(INITIALS_BY_USER_ID)).toHaveLength(FIRM_ROSTER.length);
     for (const r of FIRM_ROSTER) expect(INITIALS_BY_USER_ID[r.user_id]).toBe(r.initials);
   });
   it("month name arrays", () => {

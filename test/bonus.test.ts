@@ -32,6 +32,17 @@ describe("computeBonusData", () => {
     expect(data.X.baseTarget).toBe(275500);
   });
 
+  it("credits a multi-initial paralegal field (e.g. KES keeps Anna + Stacy)", () => {
+    const kes: BonusAttorney = { ini: "KES", salary: 0, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 0, legalAsst: 0, payroll: 0 };
+    const data = computeBonusData(
+      { January: { KES: 1000, TBS: 500, SAB: 200, AFL: 300 } },
+      [kes],
+      { firmOverhead: 0, numAttorneys: 1, brackets: BRACKETS, mnhSplitAmong: [] },
+    );
+    // own 1000 + associate TBS 500 + paralegals SAB 200 + AFL 300 = 2000
+    expect(data.KES.rows[0].collections).toBe(2000);
+  });
+
   it("MNH collections split equally among the configured initials", () => {
     const par: BonusAttorney = { ini: "PAR", salary: 100000, associate: "", paralegal: "", paraSalary: 0, legalAsst: 0, payroll: 0 };
     const data = computeBonusData(

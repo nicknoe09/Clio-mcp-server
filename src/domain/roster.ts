@@ -21,6 +21,38 @@ export const FIRM_ROSTER: RosterMember[] = [
   { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
   { initials: "KGV", name: "Gus Vlahadamis", user_id: 360049685 },
   { initials: "CTD", name: "Courteney Daniel", user_id: 359865560 },
+  // Stacy A. Bakri — Kenny's new paralegal (replacing Anna Lozano/AFL), starts ~June
+  // 2026. PLACEHOLDER user_id: she has no Clio account yet. Collections match by NAME
+  // and populate now, but her HOURS and NONBILLABLE cannot be attributed until this is
+  // replaced with her real Clio user_id (the /reports + /activities calls are keyed on
+  // user_id). MUST update before her June numbers are expected to appear.
+  { initials: "SAB", name: "Stacy Bakri", user_id: 999000001 },
+];
+
+// Collections-only roster (27) — every timekeeper that has a row in the 26 Compare
+// month blocks, including former/staff billers who still collect on old invoices.
+// Used ONLY for collections attribution (col N "Collected Actual" / col V
+// "Originating") so each biller's row is filled individually; hours/billed/bonus stay
+// on FIRM_ROSTER. Initials match the sheet's col C; names match Clio's "User" /
+// attorney fields. (Billers with collections but no sheet row — e.g. Merari Zambrano —
+// are intentionally absent and fall into the "NRB" safety-net row.)
+export const COLLECTIONS_ROSTER: RosterMember[] = [
+  ...FIRM_ROSTER,
+  { initials: "RT",  name: "Rachel Trevino",       user_id: 344119597 },
+  { initials: "ASI", name: "Alejandra Iriarte",    user_id: 359650460 },
+  { initials: "GKN", name: "Grace Noe",            user_id: 358992379 },
+  { initials: "LAK", name: "Lauren Amy Kutac",     user_id: 357646654 },
+  { initials: "CWW", name: "Carrie Wawarosky",     user_id: 359400169 },
+  { initials: "JAD", name: "Joshua Dunegan",       user_id: 359110445 },
+  { initials: "EDS", name: "Elissa Silguero",      user_id: 358180835 },
+  { initials: "MBY", name: "Mackenzie Yeager",     user_id: 358071005 },
+  { initials: "CJW", name: "Christopher Winiecki", user_id: 359138569 },
+  { initials: "NSJ", name: "Naiymah Jackson",      user_id: 359125955 },
+  { initials: "SKH", name: "Sara Hebert",          user_id: 357416614 },
+  { initials: "EAH", name: "Elizabeth Hagelstein", user_id: 357344674 },
+  { initials: "ASC", name: "Amy Coli",             user_id: 350677369 },
+  { initials: "SPR", name: "Silvana Romano",       user_id: 358076135 },
+  { initials: "LSH", name: "Lindsey Hebert",       user_id: 347911669 },
 ];
 
 // Development-meeting scorecard roster (10) — used by generate_firm_scorecard

@@ -7,7 +7,7 @@ import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
-import { FIRM_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
+import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
 import { border, $, makePara, makeDocxTable, pageBreak, spacer, h2, pageProps } from "../utils/docx";
 import { round2, round1, fmt } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -1484,6 +1484,11 @@ export function registerDocumentTools(server: McpServer): void {
       let _step = "init";
       try {
         const ROSTER = FIRM_ROSTER;
+        // Collections (col N "Collected Actual" / col V "Originating") are attributed
+        // across ALL 27 timekeeper rows in the sheet, not just the 12 comp-roster
+        // members — each biller's row is filled individually. Hours/billed/bonus/perf
+        // stay on FIRM_ROSTER (12). Billers with fees but no row fall into the NRB row.
+        const COLL_ROSTER = COLLECTIONS_ROSTER;
         // STATIC SNAPSHOT semantics: by default only the TARGET month is written so a
         // closed month never changes retroactively. backfill_ytd=true rewrites every
         // YTD month (one-time historical correction).
@@ -1759,7 +1764,7 @@ export function registerDocumentTools(server: McpServer): void {
             indivByMonth: indivCollByMonth, origByMonth: origCollByMonth,
             nonRosterIndivByMonth: nrbIndivByMonth, nonRosterOrigByMonth: nrbOrigByMonth,
             firmByMonth: collFirmFeesByMonth, firmYtd: collFirmYtd,
-          } = await buildMonthlyCollections(params.year, params.month, ROSTER, { months: writeMonths });
+          } = await buildMonthlyCollections(params.year, params.month, COLL_ROSTER, { months: writeMonths });
           console.log(`[Dashboard] FEES-ONLY collections built: firm YTD fees received=$${collFirmYtd.toFixed(2)} (Billed Time Collected; excludes expenses/interest/tax)`);
           // Collections write to: col N=14 "Collected Actual" (working timekeeper),
           // col V=22 "Originating" (originating attorney). Non-roster billers go to the
@@ -1770,7 +1775,7 @@ export function registerDocumentTools(server: McpServer): void {
             if (!backfillYtd && m !== params.month) continue; // static snapshot
             const block = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!block) continue;
-            for (const r of ROSTER) {
+            for (const r of COLL_ROSTER) {
               const rowNum = block.map[r.initials.toUpperCase()];
               if (!rowNum) continue;
               const wsRow = compareSheet.getRow(rowNum);
@@ -1793,8 +1798,8 @@ export function registerDocumentTools(server: McpServer): void {
             }
             // Reconciliation: Σ col N (roster + NRB) and Σ col V (roster + NRB) must
             // each equal the firm fees collected that month.
-            const sumN = ROSTER.reduce((s, r) => s + (indivCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbIndivByMonth[m] ?? 0);
-            const sumV = ROSTER.reduce((s, r) => s + (origCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbOrigByMonth[m] ?? 0);
+            const sumN = COLL_ROSTER.reduce((s, r) => s + (indivCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbIndivByMonth[m] ?? 0);
+            const sumV = COLL_ROSTER.reduce((s, r) => s + (origCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbOrigByMonth[m] ?? 0);
             const firm = collFirmFeesByMonth[m] ?? 0;
             if (Math.abs(sumN - firm) > 0.05 || Math.abs(sumV - firm) > 0.05) {
               console.warn(`[Dashboard] ${monthNames[m - 1]} collections reconciliation off: Σcol N=$${round2(sumN)} Σcol V=$${round2(sumV)} firm fees=$${round2(firm)}`);
@@ -1811,7 +1816,7 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
             { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's ongoing collections in perpetuity; paraSalary = Stacy's (confirm)
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
@@ -2011,7 +2016,7 @@ export function registerDocumentTools(server: McpServer): void {
 
           _step = "paralegal hours bonus";
           // ---- PARALEGAL HOURS BONUS SECTION ----
-          const PARALEGALS = ["ACA", "AFL", "AKG"];
+          const PARALEGALS = ["ACA", "SAB", "AKG"]; // AFL (Anna) replaced by SAB (Stacy); Anna stays in the rosters for history/tail collections
           const PARA_BONUS_TIERS = [
             { minHours: 133, bonus: 500 },
             { minHours: 121, bonus: 300 },
@@ -2389,7 +2394,7 @@ export function registerDocumentTools(server: McpServer): void {
             if (!backfillYtd && m !== params.month) continue; // static snapshot
             const blk = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!blk) continue;
-            for (const r of ROSTER) {
+            for (const r of COLL_ROSTER) {
               const row = blk.map[r.initials.toUpperCase()];
               if (!row) continue;
               const iv = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
