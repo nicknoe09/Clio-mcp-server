@@ -7,45 +7,97 @@ import { genFeeAllocationByMonth, matchRosterUser, matchRosterResponsible } from
 import type { RosterMember } from "../domain/roster";
 
 export type MonthlyCollections = {
-  // month (1-12) -> user_id -> collected $ (individual, by working timekeeper → col N)
+  // month (1-12) -> user_id -> collected fees $ (individual, by working timekeeper → col N "Collected Actual")
   indivByMonth: Record<number, Record<number, number>>;
-  // month (1-12) -> responsible-attorney user_id -> collected $ (→ col S)
+  // month (1-12) -> ORIGINATING-attorney user_id -> collected fees $ (→ col V "Originating")
+  origByMonth: Record<number, Record<number, number>>;
+  // month (1-12) -> responsible-attorney user_id -> collected fees $ (legacy col S rollup)
   respByMonth: Record<number, Record<number, number>>;
-  // firm-wide YTD total collected (reconciliation signal)
+  // month -> collected fees $ from billers NOT on the roster (→ the "NRB" line, col N)
+  nonRosterIndivByMonth: Record<number, number>;
+  // month -> collected fees $ originated by attorneys NOT on the roster (→ the "NRB" line, col V)
+  nonRosterOrigByMonth: Record<number, number>;
+  // month -> firm-wide collected fees $ (reconciliation target: Σ col N == Σ col V == this)
+  firmByMonth: Record<number, number>;
+  // firm-wide YTD total collected fees (reconciliation signal)
   firmYtd: number;
 };
 
 const collNum = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
 
+export type MonthFeeAgg = {
+  indiv: Record<number, number>;        // working timekeeper (col N) → fees
+  orig: Record<number, number>;         // originating attorney (col V) → fees
+  resp: Record<number, number>;         // responsible attorney (legacy col S) → fees
+  nonRosterIndiv: number;               // fees by non-roster working timekeepers (→ NRB col N)
+  nonRosterOrig: number;                // fees originated by non-roster attorneys (→ NRB col V)
+  firm: number;                         // firm-wide fees collected (Σ indiv+NRB == Σ orig+NRB == this)
+};
+
+/**
+ * Pure aggregation of ONE month's Fee Allocation rows into the FEES-ONLY collections
+ * splits used by 26 Compare. Uses "Billed Time Collected" (excludes collected
+ * expenses / interest / tax). Non-roster timekeepers and non-roster originating
+ * attorneys are pooled so Σ col N (+NRB) == Σ col V (+NRB) == firm fees.
+ */
+export function aggregateMonthFees(rows: Record<string, string>[], roster: RosterMember[]): MonthFeeAgg {
+  const agg: MonthFeeAgg = { indiv: {}, orig: {}, resp: {}, nonRosterIndiv: 0, nonRosterOrig: 0, firm: 0 };
+  for (const r of rows) {
+    const collected = collNum(r["Billed Time Collected"]);
+    if (!collected) continue;
+    agg.firm += collected;
+    const uid = matchRosterUser(r["User"] || "", roster);
+    if (uid != null) agg.indiv[uid] = (agg.indiv[uid] ?? 0) + collected;
+    else agg.nonRosterIndiv += collected;
+    const oid = matchRosterResponsible(r["Originating Attorney"] || "", roster);
+    if (oid != null) agg.orig[oid] = (agg.orig[oid] ?? 0) + collected;
+    else agg.nonRosterOrig += collected;
+    const rid = matchRosterResponsible(r["Responsible Attorney"] || "", roster);
+    if (rid != null) agg.resp[rid] = (agg.resp[rid] ?? 0) + collected;
+  }
+  return agg;
+}
+
 /**
  * Build per-month collections on the PAYMENT-RECEIVED basis: one payment-filtered
  * Fee Allocation report per month (Jan..month) = money actually received that
- * month, allocated by working timekeeper (col N individual) and Responsible
- * Attorney (col S). Captures payments on prior-year invoices and reconciles to
- * Clio's Revenue Report; each report's period is guarded inside
+ * month. FEES ONLY: uses "Billed Time Collected" (not "Total Funds Collected",
+ * which also includes collected expense reimbursements + interest + tax — the cause
+ * of the dashboard running slightly higher than Rachel's). Allocated by:
+ *   - working timekeeper  → col N "Collected Actual"
+ *   - Originating Attorney → col V "Originating"
+ *   - Responsible Attorney → legacy col S rollup
+ * Collected fees whose timekeeper / originating attorney is NOT on the roster are
+ * summed into nonRoster*ByMonth (the "NRB" line), so Σ col N == Σ col V == firm
+ * fees by construction. Each report's period is guarded inside
  * genFeeAllocationByMonth (assertReportPeriod), so a wrong-period report aborts.
  */
 export async function buildMonthlyCollections(
   year: number,
   month: number,
   roster: RosterMember[],
+  opts: { months?: number[] } = {},
 ): Promise<MonthlyCollections> {
+  const months = opts.months ?? Array.from({ length: month }, (_, i) => i + 1);
   const indivByMonth: Record<number, Record<number, number>> = {};
+  const origByMonth: Record<number, Record<number, number>> = {};
   const respByMonth: Record<number, Record<number, number>> = {};
+  const nonRosterIndivByMonth: Record<number, number> = {};
+  const nonRosterOrigByMonth: Record<number, number> = {};
+  const firmByMonth: Record<number, number> = {};
   let firmYtd = 0;
-  for (let m = 1; m <= month; m++) {
+  for (const m of months) {
     let feeRows: Record<string, string>[] = [];
     try { feeRows = await genFeeAllocationByMonth(year, m); }
     catch (e: any) { console.warn(`[Dashboard] payment-filtered fee allocation failed for ${year}-${String(m).padStart(2, "0")}: ${e?.message ?? e}`); }
-    for (const r of feeRows) {
-      const collected = collNum(r["Total Funds Collected"]);
-      if (!collected) continue;
-      firmYtd += collected;
-      const uid = matchRosterUser(r["User"] || "", roster);
-      if (uid != null) { const slot = (indivByMonth[m] ??= {}); slot[uid] = (slot[uid] ?? 0) + collected; }
-      const rid = matchRosterResponsible(r["Responsible Attorney"] || "", roster);
-      if (rid != null) { const slot = (respByMonth[m] ??= {}); slot[rid] = (slot[rid] ?? 0) + collected; }
-    }
+    const agg = aggregateMonthFees(feeRows, roster);
+    if (Object.keys(agg.indiv).length) indivByMonth[m] = agg.indiv;
+    if (Object.keys(agg.orig).length) origByMonth[m] = agg.orig;
+    if (Object.keys(agg.resp).length) respByMonth[m] = agg.resp;
+    nonRosterIndivByMonth[m] = agg.nonRosterIndiv;
+    nonRosterOrigByMonth[m] = agg.nonRosterOrig;
+    firmByMonth[m] = agg.firm;
+    firmYtd += agg.firm;
   }
-  return { indivByMonth, respByMonth, firmYtd };
+  return { indivByMonth, origByMonth, respByMonth, nonRosterIndivByMonth, nonRosterOrigByMonth, firmByMonth, firmYtd };
 }
