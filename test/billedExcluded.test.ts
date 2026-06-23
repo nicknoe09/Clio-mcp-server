@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { adjustedBillingMonth } from "../src/dashboard/billed";
-import { isExcludedBillingMethod } from "../src/dashboard/excludedHours";
+import {
+  isExcludedBillingMethod,
+  classifyFeePlaceholders,
+  type ContingencyEntry,
+} from "../src/dashboard/excludedHours";
 
 describe("adjustedBillingMonth (27th–7th billing-month rule, cutoff=7)", () => {
   const cut = 7;
@@ -48,5 +52,49 @@ describe("isExcludedBillingMethod (contingency / flat-fee)", () => {
     expect(isExcludedBillingMethod("")).toBe(false);
     expect(isExcludedBillingMethod(undefined)).toBe(false);
     expect(isExcludedBillingMethod(null)).toBe(false);
+  });
+});
+
+describe("classifyFeePlaceholders (1-hour off-rate fee dumps only)", () => {
+  // user 1 bills at $450/hr; user 2 at $350/hr.
+  const base: ContingencyEntry[] = [
+    { uid: 1, month: 1, hours: 2.4, rate: 450 },  // real worked time
+    { uid: 1, month: 1, hours: 0.6, rate: 450 },  // real worked time
+    { uid: 2, month: 1, hours: 3.0, rate: 350 },  // real worked time
+  ];
+
+  it("excludes a 1h entry priced at the whole fee (rate ≠ standard)", () => {
+    const out = classifyFeePlaceholders([...base, { uid: 1, month: 1, hours: 1.0, rate: 30000 }]);
+    expect(out[1]?.[1]).toBeCloseTo(1.0, 5);
+    // user 2 had no dump
+    expect(out[1]?.[2]).toBeUndefined();
+  });
+
+  it("keeps real worked time on contingency/flat matters (multi-hour, any rate)", () => {
+    const out = classifyFeePlaceholders(base);
+    expect(out).toEqual({});
+  });
+
+  it("keeps a legitimate 1.0h entry billed at the standard rate", () => {
+    const out = classifyFeePlaceholders([...base, { uid: 1, month: 2, hours: 1.0, rate: 450 }]);
+    expect(out[2]).toBeUndefined();
+  });
+
+  it("the dump does not get to define the standard rate", () => {
+    // Only a 1h $25k entry plus one real $450 entry → standard stays $450, dump excluded.
+    const out = classifyFeePlaceholders([
+      { uid: 9, month: 3, hours: 1.0, rate: 25000 },
+      { uid: 9, month: 3, hours: 1.7, rate: 450 },
+    ]);
+    expect(out[3]?.[9]).toBeCloseTo(1.0, 5);
+  });
+
+  it("falls back to a high-rate ceiling when the user has no other entry to compare", () => {
+    // Only a lone 1h $40k entry — no standard rate inferable → still flagged via fallback.
+    const lone = classifyFeePlaceholders([{ uid: 5, month: 1, hours: 1.0, rate: 40000 }]);
+    expect(lone[1]?.[5]).toBeCloseTo(1.0, 5);
+    // A lone 1h entry at a plausible hourly rate is NOT flagged (can't prove it's a dump).
+    const plausible = classifyFeePlaceholders([{ uid: 6, month: 1, hours: 1.0, rate: 450 }]);
+    expect(plausible).toEqual({});
   });
 });
