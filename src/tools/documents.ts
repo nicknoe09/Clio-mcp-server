@@ -1470,7 +1470,7 @@ export function registerDocumentTools(server: McpServer): void {
       fee_report_id: z.coerce.number().optional().describe("Specific Clio Fee Allocation report ID for collections (cols N/S of 26 Compare). The report is cumulative YTD and is split by Issue Date month, so one report backfills every month's collections. Defaults to the latest completed Fee Allocation report."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
-      backfill_ytd: z.boolean().optional().describe("When true, (re)writes EVERY year-to-date month block (Jan..target) for collections and issue-date billed $; for HOURS it rewrites every month only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id) — the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: the report is a STATIC monthly snapshot — only the TARGET month is written and prior months are left untouched, so a closed month never changes retroactively on later runs."),
+      backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. NOTE: COLLECTIONS (col N/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
       billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 7). Bills issued on days 1..cutoff of a month roll back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. cutoff=7 ⇒ May 27–Jun 7 all count as May). Run a month's snapshot after the cutoff day of the following month to capture late-issued bills."),
     },
     async (params) => {
@@ -1489,9 +1489,12 @@ export function registerDocumentTools(server: McpServer): void {
         // members — each biller's row is filled individually. Hours/billed/bonus/perf
         // stay on FIRM_ROSTER (12). Billers with fees but no row fall into the NRB row.
         const COLL_ROSTER = COLLECTIONS_ROSTER;
-        // STATIC SNAPSHOT semantics: by default only the TARGET month is written so a
-        // closed month never changes retroactively. backfill_ytd=true rewrites every
-        // YTD month (one-time historical correction).
+        // STATIC SNAPSHOT semantics apply to the HOURS / BILLED columns only: by default
+        // only the TARGET month's hours/billed are written so a closed month's snapshot
+        // never changes retroactively. backfill_ytd=true rewrites every YTD month's
+        // hours/billed (one-time historical correction). COLLECTIONS (col N/V) are exempt
+        // — they're always refreshed for every YTD month (payment-date basis keeps moving),
+        // regardless of backfill_ytd, so a re-dated payment is never double-counted.
         const backfillYtd = params.backfill_ytd === true;
 
         const monthNames = MONTH_NAMES_FULL;
@@ -1534,12 +1537,21 @@ export function registerDocumentTools(server: McpServer): void {
         _step = "building nonbillable categories";
         const catByMonth = await buildNonbillableByMonth(params.year, params.month);
 
-        // Months actually written: target only (static snapshot), or all YTD when
-        // backfilling. The data builders compute only these months to avoid pulling
-        // ~12 reports for a single-month update.
+        // Months actually written for the HOURS / BILLED snapshot (cols D–M, Q/R):
+        // target only (static snapshot), or all YTD when backfilling. These columns are
+        // activity-/issue-date based and don't move once a month closes, so re-running a
+        // prior month would needlessly disturb a frozen snapshot (and pull ~12 reports).
         const writeMonths = backfillYtd
           ? Array.from({ length: params.month }, (_, i) => i + 1)
           : [params.month];
+
+        // COLLECTIONS (cols N/V) are different: they're payment-date based, and cash keeps
+        // moving after a month closes (late payments, reversals, re-dates, re-allocations).
+        // A payment that re-dates across a month boundary would be DOUBLE-COUNTED if the
+        // prior month stayed frozen while the new month picked it up. So collections are
+        // ALWAYS refreshed for every YTD month (by current payment date) — each payment
+        // then lands in exactly one month. This is independent of backfill_ytd.
+        const collMonths = Array.from({ length: params.month }, (_, i) => i + 1);
 
         // Billed $ (col K) and Billable Hours (col I) on the INVOICE-ISSUE-DATE basis
         // (what appeared on a bill issued that month), with the 27th–7th billing-month
@@ -1782,7 +1794,7 @@ export function registerDocumentTools(server: McpServer): void {
             indivByMonth: indivCollByMonth, origByMonth: origCollByMonth,
             nonRosterIndivByMonth: nrbIndivByMonth, nonRosterOrigByMonth: nrbOrigByMonth,
             firmByMonth: collFirmFeesByMonth, firmYtd: collFirmYtd,
-          } = await buildMonthlyCollections(params.year, params.month, COLL_ROSTER, { months: writeMonths });
+          } = await buildMonthlyCollections(params.year, params.month, COLL_ROSTER, { months: collMonths });
           console.log(`[Dashboard] FEES-ONLY collections built: firm YTD fees received=$${collFirmYtd.toFixed(2)} (Billed Time Collected; excludes expenses/interest/tax)`);
           // Collections write to: col N=14 "Collected Actual" (working timekeeper),
           // col V=22 "Originating" (originating attorney). Non-roster billers go to the
@@ -1790,7 +1802,9 @@ export function registerDocumentTools(server: McpServer): void {
           // collected write) is no longer written.
           let collCellsWritten = 0;
           for (let m = 1; m <= params.month; m++) {
-            if (!backfillYtd && m !== params.month) continue; // static snapshot
+            // No static-snapshot skip: collections are refreshed for every YTD month on
+            // every run (payment-date basis), so a re-dated/reversed payment is counted
+            // in exactly one month and never double-credited across a month boundary.
             const block = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!block) continue;
             for (const r of COLL_ROSTER) {
@@ -1823,7 +1837,7 @@ export function registerDocumentTools(server: McpServer): void {
               console.warn(`[Dashboard] ${monthNames[m - 1]} collections reconciliation off: Σcol N=$${round2(sumN)} Σcol V=$${round2(sumV)} firm fees=$${round2(firm)}`);
             }
           }
-          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=${backfillYtd ? `1..${params.month}` : params.month} (fees-only; col N indiv + col V originating)`);
+          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=1..${params.month} (always-refreshed, fees-only; col N indiv + col V originating)`);
 
           _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
@@ -2408,12 +2422,15 @@ export function registerDocumentTools(server: McpServer): void {
           // each month its own slice. FEES-ONLY (Billed Time Collected): col N=14
           // "Collected Actual" (working timekeeper) and col V=22 "Originating"
           // (originating attorney); the "NRB" row absorbs non-roster billers so
-          // Σ col N == Σ col V == firm fees. Static snapshot: target-month-only unless
-          // backfill_ytd. Runs after blockCreated so a fresh target block's cells exist.
+          // Σ col N == Σ col V == firm fees. ALWAYS refreshed for every YTD month (not a
+          // static snapshot) so payment-date drift never double-credits across a boundary.
+          // Runs after blockCreated so a fresh target block's cells exist.
           let collCellsPatched = 0;
           const collFirmByMonth: Record<number, number> = {};
           for (let m = 1; m <= params.month; m++) {
-            if (!backfillYtd && m !== params.month) continue; // static snapshot
+            // No static-snapshot skip: collections are refreshed for every YTD month on
+            // every run (payment-date basis), so a re-dated/reversed payment is counted
+            // in exactly one month and never double-credited across a month boundary.
             const blk = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
             if (!blk) continue;
             for (const r of COLL_ROSTER) {
