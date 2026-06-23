@@ -42,11 +42,11 @@ export const COLLECTIONS_ROSTER: RosterMember[] = [
   { initials: "ASI", name: "Alejandra Iriarte",    user_id: 359650460 },
   { initials: "GKN", name: "Grace Noe",            user_id: 358992379 },
   { initials: "LAK", name: "Lauren Amy Kutac",     user_id: 357646654 },
-  { initials: "CWW", name: "Carrie Wawarosky",     user_id: 359400169 },
+  { initials: "CWW", name: "Christopher Winiecki", user_id: 359138569 }, // Rachel files Christopher's collections under "CWW"
   { initials: "JAD", name: "Joshua Dunegan",       user_id: 359110445 },
   { initials: "EDS", name: "Elissa Silguero",      user_id: 358180835 },
   { initials: "MBY", name: "Mackenzie Yeager",     user_id: 358071005 },
-  { initials: "CJW", name: "Christopher Winiecki", user_id: 359138569 },
+  { initials: "CJW", name: "Carrie Wawarosky",     user_id: 359400169 }, // ...and Carrie under "CJW" (initials swapped vs the Clio names)
   { initials: "NSJ", name: "Naiymah Jackson",      user_id: 359125955 },
   { initials: "SKH", name: "Sara Hebert",          user_id: 357416614 },
   { initials: "EAH", name: "Elizabeth Hagelstein", user_id: 357344674 },

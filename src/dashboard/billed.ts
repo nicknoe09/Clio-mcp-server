@@ -1,11 +1,16 @@
 // ============================================================
-// Billed-$ builder (INVOICE ISSUE DATE basis) for the 26 Compare "Billed $ (Time)"
-// column (col K). Replaces the old activity-month Revenue Report figure: col K must
-// reflect the time that appeared on a bill ISSUED that month, regardless of when
-// the work was done, and must stay static once the month's bills are out.
+// Billed builder (INVOICE ISSUE DATE basis) for two 26 Compare columns:
+//   - Billed $ (col K): time that appeared on a bill ISSUED that month ("Billed Time")
+//   - Billable Hours (col I): hours that appeared on a bill ISSUED that month
+//     ("Billed Hours") — Rachel counts only hours on issued invoices, not unbilled WIP.
+// Both come from the SAME per-month Fee Allocation report (filter_by_payment=false,
+// so the date range filters by invoice issue date), so col I and col K are on the
+// same basis and stay static once the month's bills are out.
 //
-// Source: a Fee Allocation report with filter_by_payment=false (date range filters
-// by INVOICE ISSUE DATE), summing "Billed Time" per working timekeeper.
+// Contingency/flat-fee matters: their DOLLARS still count in Billed $ (col K), but
+// their HOURS are excluded from col I (and therefore the para bonus, which reads
+// col I) — Rachel's contingency "one hour" allocation entries aren't real worked
+// hours. Matters are classified by billing_method via isExcludedBillingMethod.
 //
 // Billing-month rule (firm-specific): a billing run straddles month-end — bills are
 // sometimes issued in the last day or two of a month rather than the 1st of the
@@ -16,16 +21,27 @@
 // captured, then re-bucket by adjusted issue date.
 // ============================================================
 import { genFeeAllocationByMonth, matchRosterUser } from "../clio/reportCsv";
+import { fetchAllPages } from "../clio/pagination";
+import { isExcludedBillingMethod } from "./excludedHours";
 import type { RosterMember } from "../domain/roster";
 
 export type MonthlyBilled = {
-  // month (1-12) -> user_id -> billed $ (time billed on invoices issued in that billing month)
+  // month (1-12) -> user_id -> billed $ (time billed on invoices issued in that billing month) → col K
   billedByMonth: Record<number, Record<number, number>>;
+  // month (1-12) -> user_id -> billed HOURS on issued invoices, excl. contingency/flat → col I
+  billedHoursByMonth: Record<number, Record<number, number>>;
   // month -> firm-wide billed $ (all rows, incl. non-roster billers) for reconciliation/logging
   firmByMonth: Record<number, number>;
 };
 
 const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
+
+// Leading matter number from a display string ("02614-Nishikawa…" → "02614"); used to
+// match a Fee Allocation row's "Matter" against the contingency/flat matter set.
+function matterNumber(s: string): string {
+  const m = /^\s*(\d+)/.exec(s || "");
+  return m ? m[1] : "";
+}
 
 /**
  * Map a Fee Allocation "Issue Date" (MM/DD/YYYY) to the billing month it belongs to,
@@ -70,27 +86,46 @@ export async function buildMonthlyBilled(
   const end = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(endDate.getDate()).padStart(2, "0")}`;
 
   const billedByMonth: Record<number, Record<number, number>> = {};
+  const billedHoursByMonth: Record<number, Record<number, number>> = {};
   const firmByMonth: Record<number, number> = {};
+
+  // Contingency/flat-fee matter numbers — their hours are excluded from col I.
+  const excludedMatterNums = new Set<string>();
+  try {
+    const matters = await fetchAllPages<any>("/matters", { fields: "id,display_number,billing_method" });
+    for (const mt of matters) {
+      if (isExcludedBillingMethod(mt.billing_method)) excludedMatterNums.add(matterNumber(String(mt.display_number || "")));
+    }
+  } catch (e: any) {
+    console.warn(`[Dashboard] could not load matters for contingency/flat exclusion: ${e?.message ?? e}`);
+  }
 
   let rows: Record<string, string>[] = [];
   try {
     rows = await genFeeAllocationByMonth(year, month, { filterByPayment: false, startOverride: start, endOverride: end });
   } catch (e: any) {
-    console.warn(`[Dashboard] issue-date fee allocation (billed $) failed for ${start}..${end}: ${e?.message ?? e}`);
+    console.warn(`[Dashboard] issue-date fee allocation (billed) failed for ${start}..${end}: ${e?.message ?? e}`);
   }
 
   for (const r of rows) {
     const adj = adjustedBillingMonth(r["Issue Date"] || "", cutoffDay);
     if (!adj || adj.year !== year || !keep.has(adj.month)) continue;
-    const billed = num(r["Billed Time"]);
-    if (!billed) continue;
-    firmByMonth[adj.month] = (firmByMonth[adj.month] ?? 0) + billed;
     const uid = matchRosterUser(r["User"] || "", roster);
-    if (uid != null) {
-      const slot = (billedByMonth[adj.month] ??= {});
-      slot[uid] = (slot[uid] ?? 0) + billed;
+    const billed = num(r["Billed Time"]);
+    if (billed) {
+      firmByMonth[adj.month] = (firmByMonth[adj.month] ?? 0) + billed;
+      if (uid != null) {
+        const slot = (billedByMonth[adj.month] ??= {});
+        slot[uid] = (slot[uid] ?? 0) + billed;
+      }
+    }
+    // Billable HOURS (col I): exclude contingency/flat matters' hours; dollars above keep them.
+    const billedHrs = num(r["Billed Hours"]);
+    if (billedHrs && uid != null && !excludedMatterNums.has(matterNumber(r["Matter"] || ""))) {
+      const slot = (billedHoursByMonth[adj.month] ??= {});
+      slot[uid] = (slot[uid] ?? 0) + billedHrs;
     }
   }
 
-  return { billedByMonth, firmByMonth };
+  return { billedByMonth, billedHoursByMonth, firmByMonth };
 }
