@@ -5,6 +5,7 @@ import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
+import { buildWorkedBillableHoursByMonth } from "../dashboard/workedHours";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -1564,10 +1565,16 @@ export function registerDocumentTools(server: McpServer): void {
           await buildMonthlyBilled(params.year, params.month, ROSTER, { cutoffDay, months: writeMonths });
         console.log(`[Dashboard] billed-$ issue-date firm totals by month: ${JSON.stringify(Object.fromEntries(Object.entries(billedFirmByMonth).map(([m, v]) => [m, round2(v)])))}`);
 
-        // Hours on contingency/flat-fee matters, to back out of WORKED billable hours
-        // (used by the paralegal hours bonus). These aren't "hours worked" for the
-        // bonus. Does not affect col I (issue-date billed hours) or col K (billed $).
-        _step = "building excluded (contingency/flat) hours";
+        // Billable Hours (col I) = billable hours WORKED each month, summed from time
+        // entries by work date (the firm's definition; reproduces the reference where
+        // the Revenue Report's billed+unbilled overcounts). Real contingency/flat
+        // worked time is included; only the 1h fee placeholders below are removed.
+        _step = "building worked billable hours (time entries)";
+        const workedBillableByMonth = await buildWorkedBillableHoursByMonth(params.year, params.month, ROSTER, { months: writeMonths });
+
+        // Synthetic 1-hour fee-placeholder hours (on contingency/flat matters) to back
+        // out of col I and the paralegal hours bonus — these aren't real worked time.
+        _step = "building excluded (fee-placeholder) hours";
         const excludedHrsByMonth = await buildExcludedHoursByMonth(params.year, params.month, { months: writeMonths });
 
         // ---- Assemble per-month bundles (only the months we have revenue for) ----
@@ -1584,14 +1591,14 @@ export function registerDocumentTools(server: McpServer): void {
               d.lineDiscounts = src.lineDiscounts; // col M — from Revenue Report
             }
             // Billable Hrs (col I) = ALL billable hours WORKED this month (activity/
-            // work-date basis, billed or not), per the firm's definition — NOT the
-            // invoice-issue-date "Billed Hours" (which tracked billed-$ movements and
-            // ran low whenever worked time was still unbilled WIP). The only thing
-            // removed is Rachel's synthetic 1-hour contingency/flat fee-placeholder
-            // entries (excludedHrsByMonth); real worked time on contingency/flat
-            // matters still counts.
+            // work-date basis, billed or not), per the firm's definition — a TIME-ENTRY
+            // sum (workedBillableByMonth), NOT the Revenue Report's Billed+Unbilled
+            // hours (which is issue-date billed + WIP and overcounts hours worked when
+            // prior-month work is billed this month). The only thing removed is Rachel's
+            // synthetic 1-hour contingency/flat fee-placeholder entries
+            // (excludedHrsByMonth); real worked time on contingency/flat matters counts.
             const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
-            d.workedBillableHrs = Math.max(0, (src?.billableHrs ?? 0) - excl);
+            d.workedBillableHrs = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
             d.billableHrs = d.workedBillableHrs;
             // Billed $ (col K) = "Billed Time" on invoices issued this billing month.
             d.billedDollars = billedByMonth[m]?.[r.user_id] ?? 0;
