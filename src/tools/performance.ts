@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, downloadReport } from "../clio/pagination";
-import { getFeeAllocationCSV } from "../clio/reportCsv";
+import { fetchAllPages, downloadReport, rawPostSingle, rawGetSingle } from "../clio/pagination";
+import { getFeeAllocationCSV, genFeeAllocationByMonth, assertReportPeriod, parseCSV } from "../clio/reportCsv";
 
 const TIME_FIELDS =
   "id,date,quantity,rounded_quantity,price,total,note,billed,matter{id,display_number,description},user{id,name}";
@@ -800,6 +800,139 @@ export function registerPerformanceTools(server: McpServer): void {
           }],
           isError: true,
         };
+      }
+    }
+  );
+
+  // get_monthly_fee_allocation
+  // Unlike get_fee_allocation (which reads the latest CUMULATIVE scheduled report and
+  // ignores the date range), this GENERATES a fresh Fee Allocation report scoped to a
+  // single month, so per-month numbers are real. Built for reconciling month-specific
+  // collections (e.g. a payment-date boundary) — wraps the same genFeeAllocationByMonth
+  // the dashboard uses for its collections/billed columns.
+  server.tool(
+    "get_monthly_fee_allocation",
+    "Per-month Fee Allocation by timekeeper from a FRESHLY GENERATED report scoped to ONE month (use this instead of get_fee_allocation when you need accurate month-specific numbers — get_fee_allocation reads the latest cumulative scheduled report and does NOT honor the date range). basis='payment' (default) = money RECEIVED that month (payment date); basis='issue' = time BILLED on invoices issued that month (issue date). Returns per-timekeeper collected, billed $, and billed hours.",
+    {
+      year: z.coerce.number().describe("Year, e.g. 2026"),
+      month: z.coerce.number().describe("Month, 1-12"),
+      basis: z.enum(["payment", "issue"]).optional().default("payment").describe("payment = received that month; issue = billed on invoices issued that month"),
+      user_name: z.string().optional().describe("Filter to a timekeeper by partial name match"),
+    },
+    async (params) => {
+      try {
+        const rows = await genFeeAllocationByMonth(params.year, params.month, { filterByPayment: params.basis !== "issue" });
+        const filtered = params.user_name
+          ? rows.filter((r) => (r["User"] ?? "").toLowerCase().includes(params.user_name!.toLowerCase()))
+          : rows;
+        const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
+        const totals: Record<string, { billed_hours: number; billed_time: number; time_collected: number; total_collected: number; invoices: number }> = {};
+        for (const r of filtered) {
+          const user = r["User"] ?? "Unknown";
+          const u = (totals[user] ??= { billed_hours: 0, billed_time: 0, time_collected: 0, total_collected: 0, invoices: 0 });
+          u.billed_hours += num(r["Billed Hours"]);
+          u.billed_time += num(r["Billed Time"]);
+          u.time_collected += num(r["Billed Time Collected"]);
+          u.total_collected += num(r["Total Funds Collected"]);
+          u.invoices++;
+        }
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        const timekeepers = Object.entries(totals)
+          .map(([name, u]) => ({
+            name,
+            billed_hours: round2(u.billed_hours),
+            billed_time_value: round2(u.billed_time),
+            time_collected: round2(u.time_collected),
+            total_collected: round2(u.total_collected),
+            invoices: u.invoices,
+          }))
+          .sort((a, b) => (params.basis === "issue" ? b.billed_time_value - a.billed_time_value : b.total_collected - a.total_collected));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              source: `Clio Fee Allocation Report (freshly generated, ${params.basis === "issue" ? "issue-date" : "payment-date"} basis)`,
+              basis: params.basis ?? "payment",
+              period: { year: params.year, month: params.month },
+              rows_in_period: filtered.length,
+              firm_time_collected: round2(timekeepers.reduce((s, t) => s + t.time_collected, 0)),
+              firm_total_collected: round2(timekeepers.reduce((s, t) => s + t.total_collected, 0)),
+              firm_billed_time: round2(timekeepers.reduce((s, t) => s + t.billed_time_value, 0)),
+              timekeeper_count: timekeepers.length,
+              timekeepers,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }], isError: true };
+      }
+    }
+  );
+
+  // get_monthly_revenue
+  // Generates a fresh classic Revenue Report scoped to ONE timekeeper + month and returns
+  // the write-offs (Credit Notes) vs line-discounts (Discounted Time) split — the source
+  // of the dashboard's col L/M. Built for reconciling write-off divergences (whether an
+  // amount is a credit note / write-off vs a line-level discount).
+  server.tool(
+    "get_monthly_revenue",
+    "Per-month classic Revenue Report for ONE timekeeper: billed $, billable hours, write-offs (Credit Notes) and line discounts (Discounted Time). This is the source of the dashboard's Write-offs (col L) and Discounts (col M). Use to reconcile a write-off divergence (credit-note vs line-discount classification). Scoped to a single user to stay fast.",
+    {
+      year: z.coerce.number().describe("Year, e.g. 2026"),
+      month: z.coerce.number().describe("Month, 1-12"),
+      user_id: z.coerce.number().describe("Timekeeper user ID (required)"),
+    },
+    async (params) => {
+      try {
+        const monthStart = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
+        const endDay = new Date(params.year, params.month, 0).getDate();
+        const monthEnd = `${params.year}-${String(params.month).padStart(2, "0")}-${endDay}`;
+        const gen = await rawPostSingle("/reports", { data: { kind: "revenue", format: "csv", start_date: monthStart, end_date: monthEnd, user: { id: params.user_id } } });
+        const rep = gen?.data ?? gen;
+        const rid = rep?.id;
+        let state = rep?.state;
+        const deadline = Date.now() + 150000;
+        while (rid && !["completed", "failed", "empty"].includes(state) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 4000));
+          try { const s = await rawGetSingle(`/reports/${rid}`, { fields: "id,state" }); state = (s?.data ?? s)?.state; }
+          catch { /* transient — keep polling */ }
+        }
+        if (state !== "completed") throw new Error(`revenue report ${rid} did not complete (state=${state})`);
+        await assertReportPeriod(rid, monthStart, `revenue report (user ${params.user_id})`);
+        const rows = parseCSV(await downloadReport(rid));
+        const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]/g, "")) || 0;
+        let billedDollars = 0, billedHours = 0, unbilledHours = 0, writeOffs = 0, lineDiscounts = 0;
+        const matters: Array<{ matter: string; billed_time: number; credit_notes: number; discounted_time: number }> = [];
+        for (const row of rows) {
+          if (!row["Matter Number"]) continue; // skip TOTAL row
+          const bt = num(row["Billed Time"]), cn = num(row["Credit Notes"]), dt = num(row["Discounted Time"]);
+          billedDollars += bt;
+          billedHours += num(row["Billed Hours"]);
+          unbilledHours += num(row["Unbilled Hours"]);
+          writeOffs += cn;
+          lineDiscounts += dt;
+          if (cn || dt) matters.push({ matter: `${row["Matter Number"]} ${row["Matter Description"] ?? ""}`.trim(), billed_time: Math.round(bt * 100) / 100, credit_notes: Math.round(cn * 100) / 100, discounted_time: Math.round(dt * 100) / 100 });
+        }
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              source: "Clio classic Revenue Report (freshly generated, activity-month basis)",
+              period: { year: params.year, month: params.month },
+              user_id: params.user_id,
+              billed_dollars: round2(billedDollars),
+              billable_hours: round2(billedHours + unbilledHours),
+              billed_hours: round2(billedHours),
+              unbilled_hours: round2(unbilledHours),
+              write_offs_credit_notes: round2(writeOffs),
+              line_discounts_discounted_time: round2(lineDiscounts),
+              matters_with_writeoff_or_discount: matters,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }], isError: true };
       }
     }
   );
