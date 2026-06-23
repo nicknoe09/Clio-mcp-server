@@ -106,4 +106,20 @@ describe("COLLECTIONS_ROSTER same-last-name disambiguation", () => {
     expect(COLLECTIONS_ROSTER.find((r) => r.initials === "SAB")?.name).toBe("Stacy Bakri");
     expect(COLLECTIONS_ROSTER.some((r) => r.initials === "AFL")).toBe(true);
   });
+
+  it("CWW/CJW are mapped to the rows Rachel uses (Christopher→CWW, Carrie→CJW)", () => {
+    // Rachel files Christopher Winiecki's collections under CWW and Carrie's under CJW,
+    // which is swapped vs the Clio names. Pin it so the attribution can't regress.
+    expect(COLLECTIONS_ROSTER.find((r) => r.initials === "CWW")?.name).toBe("Christopher Winiecki");
+    expect(COLLECTIONS_ROSTER.find((r) => r.initials === "CJW")?.name).toBe("Carrie Wawarosky");
+    // And aggregateMonthFees routes each Clio User name to the right initials' row.
+    const rows = [
+      row({ User: "Christopher Winiecki", "Billed Time Collected": "8657.70" }),
+      row({ User: "Carrie Wawarosky", "Billed Time Collected": "70" }),
+    ];
+    const agg = aggregateMonthFees(rows, COLLECTIONS_ROSTER);
+    const uidOf = (ini: string) => COLLECTIONS_ROSTER.find((r) => r.initials === ini)!.user_id;
+    expect(agg.indiv[uidOf("CWW")]).toBe(8657.7); // Christopher → CWW row
+    expect(agg.indiv[uidOf("CJW")]).toBe(70);     // Carrie → CJW row
+  });
 });
