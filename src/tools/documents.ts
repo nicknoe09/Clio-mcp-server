@@ -4,6 +4,7 @@ import { computeBonusData } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
+import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -1501,13 +1502,17 @@ export function registerDocumentTools(server: McpServer): void {
 
         type PerUserData = {
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
+          // workedBillableHrs = billable hours WORKED that month (activity basis, contingency/flat
+          // excluded). col I now shows issue-date billed hours, so this is tracked separately to
+          // feed the paralegal HOURS bonus, which rewards hours worked, not hours billed on invoices.
+          workedBillableHrs: number;
           billableDollars: number; billedDollars: number; writeOffs: number; lineDiscounts: number;
           bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
           indivCollected: number; respCollected: number; origCollected: number;
         };
         type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
         const newPerUser = (): PerUserData => ({
-          billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0,
+          billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0, workedBillableHrs: 0,
           billableDollars: 0, billedDollars: 0, writeOffs: 0, lineDiscounts: 0,
           bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
           indivCollected: 0, respCollected: 0, origCollected: 0,
@@ -1547,6 +1552,12 @@ export function registerDocumentTools(server: McpServer): void {
           await buildMonthlyBilled(params.year, params.month, ROSTER, { cutoffDay, months: writeMonths });
         console.log(`[Dashboard] billed-$ issue-date firm totals by month: ${JSON.stringify(Object.fromEntries(Object.entries(billedFirmByMonth).map(([m, v]) => [m, round2(v)])))}`);
 
+        // Hours on contingency/flat-fee matters, to back out of WORKED billable hours
+        // (used by the paralegal hours bonus). These aren't "hours worked" for the
+        // bonus. Does not affect col I (issue-date billed hours) or col K (billed $).
+        _step = "building excluded (contingency/flat) hours";
+        const excludedHrsByMonth = await buildExcludedHoursByMonth(params.year, params.month, { months: writeMonths });
+
         // ---- Fetch fee allocation CSV for collections (ALL months, per-month) ----
         // The Fee Allocation Report is CUMULATIVE (Jan 1 → report date), so it
         // carries every month's collections. We group rows by Issue Date month
@@ -1572,6 +1583,10 @@ export function registerDocumentTools(server: McpServer): void {
             // (issue-date "Billed Hours", contingency/flat excluded) — NOT the
             // activity-month Billed+Unbilled figure (which double-counted unbilled WIP).
             d.billableHrs = billedHoursByMonth[m]?.[r.user_id] ?? 0;
+            // Worked billable hours (activity basis, contingency/flat excluded) — the
+            // pre-issue-date col I figure. Drives the paralegal HOURS bonus only.
+            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
+            d.workedBillableHrs = Math.max(0, (src?.billableHrs ?? 0) - excl);
             // Billed $ (col K) = "Billed Time" on invoices issued this billing month.
             d.billedDollars = billedByMonth[m]?.[r.user_id] ?? 0;
             d.bizDev = cat?.bizDev ?? 0;
@@ -1586,6 +1601,16 @@ export function registerDocumentTools(server: McpServer): void {
           monthsData.push({ month: m, monthName: monthNames[m - 1], data: md, respData: mrd });
         }
         console.log(`[Dashboard] revenue source: ${revLabel}; months_built=${monthsData.length}`);
+
+        // Worked billable hours by monthName→initials, for the paralegal HOURS bonus
+        // (which must use hours worked, not the issue-date billed hours now in col I).
+        // Only covers months built this run; the bonus falls back to the sheet's col I
+        // for any other month (run with backfill_ytd to cover all YTD months).
+        const workedHrsByMonthIni: Record<string, Record<string, number>> = {};
+        for (const b of monthsData) {
+          const slot = (workedHrsByMonthIni[b.monthName] ??= {});
+          for (const r of ROSTER) slot[r.initials.toUpperCase()] = b.data[r.user_id]?.workedBillableHrs ?? 0;
+        }
 
         // The target-month bundle is used by the billed-$ content guard and the
         // Attorney Performance tab below.
@@ -2016,15 +2041,19 @@ export function registerDocumentTools(server: McpServer): void {
             { minHours: 110, bonus: 100 },
           ];
 
-          // Gather billable hours (col I) from all month blocks
-          const monthBillableHrs: Record<string, Record<string, number>> = {}; // month -> initials -> hours
+          // Paralegal hours bonus rewards hours WORKED, not the issue-date billed hours
+          // in col I. Use this run's in-memory worked-hours for months built now; for any
+          // other month fall back to the sheet's col I (legacy/best-available).
+          const monthBillableHrs: Record<string, Record<string, number>> = {}; // month -> initials -> WORKED hours
           for (let mi = 0; mi < 12; mi++) {
             const mn = monthNames[mi];
             const block = scanMonthBlock(compareSheet, mn);
             if (!block) continue;
             monthBillableHrs[mn] = {};
             for (const [ini, rowNum] of Object.entries(block.map)) {
-              const val = compareSheet.getRow(rowNum).getCell(9).value; // col I = billable hours
+              const worked = workedHrsByMonthIni[mn]?.[ini];
+              if (worked != null) { monthBillableHrs[mn][ini] = worked; continue; }
+              const val = compareSheet.getRow(rowNum).getCell(9).value; // col I fallback
               monthBillableHrs[mn][ini] = typeof val === "number" ? val : (parseFloat(String(val)) || 0);
             }
           }
@@ -2041,7 +2070,7 @@ export function registerDocumentTools(server: McpServer): void {
             const col = 2 + pi * 3;
             trackerSheet.getRow(paraStartRow).getCell(col).value = PARALEGALS[pi];
             trackerSheet.getRow(paraStartRow).getCell(col).font = { bold: true, size: 12 };
-            trackerSheet.getRow(paraHeaderRow).getCell(col).value = "Billable Hrs";
+            trackerSheet.getRow(paraHeaderRow).getCell(col).value = "Worked Hrs";
             trackerSheet.getRow(paraHeaderRow).getCell(col + 1).value = "Tier";
             trackerSheet.getRow(paraHeaderRow).getCell(col + 2).value = "Bonus";
           }
@@ -2782,7 +2811,7 @@ export function registerDocumentTools(server: McpServer): void {
           for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
             const col = 2 + pi * 3;
             paraTitleCells.push(xmlCell(`${colLetter(col)}${paraStart}`, XML_PARALEGALS[pi], { style: STYLE_BOLD }));
-            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`,   "Billable Hrs", { style: STYLE_BOLD }));
+            paraHdrCells.push(xmlCell(`${colLetter(col)}${paraHdr}`,   "Worked Hrs", { style: STYLE_BOLD }));
             paraHdrCells.push(xmlCell(`${colLetter(col+1)}${paraHdr}`, "Tier",         { style: STYLE_BOLD }));
             paraHdrCells.push(xmlCell(`${colLetter(col+2)}${paraHdr}`, "Bonus",        { style: STYLE_BOLD }));
           }
