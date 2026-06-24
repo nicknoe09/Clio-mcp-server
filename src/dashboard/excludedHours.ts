@@ -34,11 +34,12 @@ export function isExcludedBillingMethod(method: string | undefined | null): bool
 }
 
 /**
- * True when a matter's "Contingency" yes/no custom field is set. Clio returns
- * custom_field_values as an array of { value, custom_field:{ name } } (older shapes
- * expose field_name directly); we match the field by name "Contingency" (case-
- * insensitive) and read its truthy value. This is the firm's source of truth for
- * contingency status — NOT billing_method, which mislabels these matters "hourly".
+ * True when a matter's "Contingency" yes/no custom field is set. We fetch
+ * custom_field_values as { field_name, value }; we match the field by name
+ * "Contingency" (case-insensitive) and read its truthy value. (The matcher also
+ * accepts a nested custom_field:{ name } shape for safety.) This is the firm's source
+ * of truth for contingency status — NOT billing_method, which mislabels these
+ * matters "hourly".
  */
 export function isContingencyMatter(matter: any): boolean {
   const cfvs = matter?.custom_field_values;
@@ -120,9 +121,22 @@ export async function buildExcludedHoursByMonth(
   const months = new Set(opts.months ?? Array.from({ length: month }, (_, i) => i + 1));
   const maxMonth = Math.max(...months);
   const monthEnd = `${year}-${String(maxMonth).padStart(2, "0")}-${String(new Date(year, maxMonth, 0).getDate()).padStart(2, "0")}`;
-  const allMatters = await fetchAllPages<any>("/matters", {
-    fields: "id,display_number,billing_method,custom_field_values{id,field_name,value,custom_field{id,name}}",
-  });
+  // Fetch matters with the "Contingency" custom field. Use a conservative field set:
+  // Clio 400s on an over-nested spec (the `custom_field{...}` association inside
+  // custom_field_values triggered a 400), so request only the flat fields the matcher
+  // needs — `field_name` carries the custom field's name, `value` its yes/no value. If
+  // Clio still rejects the custom-field spec, fall back to billing_method only so this
+  // step degrades gracefully instead of failing the whole dashboard run.
+  let allMatters: any[];
+  try {
+    allMatters = await fetchAllPages<any>("/matters", {
+      fields: "id,display_number,billing_method,custom_field_values{field_name,value}",
+    });
+  } catch (e: any) {
+    const status = e?.response?.status ?? e?.message ?? e;
+    console.warn(`[Dashboard] /matters custom_field_values fetch failed (${status}); falling back to billing_method only for contingency detection`);
+    allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number,billing_method" });
+  }
 
   // Contingency from the "Contingency" custom field (reliable); flat-fee from
   // billing_method (reliable for flat). billing_method's "contingency" is NOT trusted.
