@@ -869,6 +869,68 @@ export function registerPerformanceTools(server: McpServer): void {
     }
   );
 
+  // get_fee_allocation_detail
+  // The ROW-LEVEL companion to get_monthly_fee_allocation. That tool collapses the
+  // Fee Allocation Report into per-timekeeper totals; this one returns the underlying
+  // rows VERBATIM — one row per (timekeeper × invoice) — so the report can be diffed
+  // line-by-line against an external source (e.g. the Box fee-allocation workbook) to
+  // find exactly which invoices are present/missing/off. Same freshly-generated,
+  // single-month report as get_monthly_fee_allocation (basis='payment' = money received
+  // that month by payment date; basis='issue' = time billed on invoices issued that
+  // month). The full CSV column set is returned untouched (invoice number, matter,
+  // responsible/originating attorney, issue date, etc.) plus summed totals for the
+  // numeric columns so a reconciliation total is available without re-summing.
+  server.tool(
+    "get_fee_allocation_detail",
+    "Row-level Fee Allocation Report for ONE month — the per-invoice detail behind get_monthly_fee_allocation (which only returns per-timekeeper totals). Each row is one timekeeper's allocation on one invoice, returned VERBATIM with every CSV column (invoice number, matter, User, Responsible/Originating Attorney, Billed Hours, Billed Time, Billed Time Collected, Total Funds Collected, Issue Date). Use this to reconcile the report line-by-line against an external file and find which invoices are missing or off. basis='payment' (default) = money RECEIVED that month (payment date); basis='issue' = time BILLED on invoices issued that month (issue date). Optionally filter to one timekeeper by partial name match.",
+    {
+      year: z.coerce.number().describe("Year, e.g. 2026"),
+      month: z.coerce.number().describe("Month, 1-12"),
+      basis: z.enum(["payment", "issue"]).optional().default("payment").describe("payment = received that month; issue = billed on invoices issued that month"),
+      user_name: z.string().optional().describe("Filter to a timekeeper by partial name match (matches the report's 'User' column)"),
+    },
+    async (params) => {
+      try {
+        const rows = await genFeeAllocationByMonth(params.year, params.month, { filterByPayment: params.basis !== "issue" });
+        const filtered = params.user_name
+          ? rows.filter((r) => (r["User"] ?? "").toLowerCase().includes(params.user_name!.toLowerCase()))
+          : rows;
+        const columns = rows.length ? Object.keys(rows[0]) : [];
+        // Sum every column that parses as a number (currency/parenthesized-negative
+        // aware) so a reconciliation control total is available for each numeric column
+        // without the caller re-summing. Non-numeric columns are simply absent here.
+        const num = (x: string | undefined) => parseFloat((x ?? "").replace(/[$,()]/g, "")) || 0;
+        const isNumeric = (x: string | undefined) => x != null && x.trim() !== "" && /^[-(]?\$?[\d,]+(\.\d+)?\)?$/.test(x.trim());
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        const column_totals: Record<string, number> = {};
+        for (const col of columns) {
+          let any = false, sum = 0;
+          for (const r of filtered) {
+            if (isNumeric(r[col])) { any = true; sum += num(r[col]); }
+          }
+          if (any) column_totals[col] = round2(sum);
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              source: `Clio Fee Allocation Report (freshly generated, ${params.basis === "issue" ? "issue-date" : "payment-date"} basis)`,
+              basis: params.basis ?? "payment",
+              period: { year: params.year, month: params.month },
+              user_name_filter: params.user_name ?? null,
+              columns,
+              row_count: filtered.length,
+              column_totals,
+              rows: filtered,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }], isError: true };
+      }
+    }
+  );
+
   // get_monthly_revenue
   // Generates a fresh classic Revenue Report scoped to ONE timekeeper + month and returns
   // the write-offs (Credit Notes) vs line-discounts (Discounted Time) split — the source
