@@ -12,13 +12,18 @@
 // earlier design sourced col I from this report's issue-date "Billed Hours", which made
 // it track billed-$ movements and run low on unbilled WIP; that path was removed.
 //
-// Billing-month rule (firm-specific): a billing run straddles month-end — bills are
-// sometimes issued in the last day or two of a month rather than the 1st of the
-// next. So bills issued on days 1..cutoffDay of a month roll back into the PRIOR
-// month (e.g. with cutoffDay=7, May 27 → Jun 7 all count as May). Days after the
-// cutoff stay in their calendar month. Pull a window that runs through the first
-// cutoffDay days of the month AFTER the target so those late-issued bills are
-// captured, then re-bucket by adjusted issue date.
+// Billing-month rule (firm-specific): by DEFAULT (cutoffDay=0) the Billed $ column
+// buckets each bill by its CALENDAR issue month — no roll-back. This matches Rachel's
+// reference, which counts a bill in the month its invoice is dated.
+//
+// A positive cutoffDay is OPT-IN, for when a billing run straddles month-end (bills
+// issued in the first days of the next month rather than the 1st): with cutoffDay=N,
+// bills issued on days 1..N of a month roll back into the PRIOR month (e.g. cutoffDay=7
+// ⇒ May 27 → Jun 7 all count as May). Days after the cutoff stay in their calendar
+// month. When cutoffDay>0 the pull runs through the first cutoffDay days of the month
+// AFTER the target so those late-issued bills are captured, then re-buckets by adjusted
+// issue date; with cutoffDay=0 the window ends on the target month's last day and
+// nothing rolls back.
 // ============================================================
 import { genFeeAllocationByMonth, matchRosterUser } from "../clio/reportCsv";
 import type { RosterMember } from "../domain/roster";
@@ -63,7 +68,7 @@ export async function buildMonthlyBilled(
   roster: RosterMember[],
   opts: { cutoffDay?: number; months?: number[] } = {},
 ): Promise<MonthlyBilled> {
-  const cutoffDay = opts.cutoffDay ?? 7;
+  const cutoffDay = opts.cutoffDay ?? 0;
   const months = (opts.months ?? Array.from({ length: month }, (_, i) => i + 1)).slice().sort((a, b) => a - b);
   const keep = new Set(months);
   const minMonth = months[0];
