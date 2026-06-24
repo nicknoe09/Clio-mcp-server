@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { adjustedBillingMonth } from "../src/dashboard/billed";
 import {
   isExcludedBillingMethod,
+  isContingencyMatter,
   classifyFeePlaceholders,
   type ContingencyEntry,
 } from "../src/dashboard/excludedHours";
@@ -52,6 +53,27 @@ describe("isExcludedBillingMethod (contingency / flat-fee)", () => {
     expect(isExcludedBillingMethod("")).toBe(false);
     expect(isExcludedBillingMethod(undefined)).toBe(false);
     expect(isExcludedBillingMethod(null)).toBe(false);
+  });
+});
+
+describe("isContingencyMatter (Contingency yes/no custom field, not billing_method)", () => {
+  it("flags a matter whose 'Contingency' custom field is true (boolean or yes-string)", () => {
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: true, custom_field: { name: "Contingency" } }] })).toBe(true);
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: "Yes", custom_field: { name: "Contingency" } }] })).toBe(true);
+    // case-insensitive field name, older field_name shape
+    expect(isContingencyMatter({ custom_field_values: [{ value: "true", field_name: "contingency" }] })).toBe(true);
+  });
+  it("does NOT rely on billing_method — a contingency matter labeled 'hourly' is caught by the field, and 'hourly' alone is not", () => {
+    // Teachworth-style: contingency in reality, 'hourly' in Clio, flagged via the field
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: true, custom_field: { name: "Contingency" } }] })).toBe(true);
+    // hourly with no/false flag → not contingency
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: false, custom_field: { name: "Contingency" } }] })).toBe(false);
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: "No", custom_field: { name: "Contingency" } }] })).toBe(false);
+  });
+  it("returns false when the field is absent or custom_field_values missing", () => {
+    expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: "X", custom_field: { name: "Practice Area" } }] })).toBe(false);
+    expect(isContingencyMatter({ billing_method: "hourly" })).toBe(false);
+    expect(isContingencyMatter({})).toBe(false);
   });
 });
 

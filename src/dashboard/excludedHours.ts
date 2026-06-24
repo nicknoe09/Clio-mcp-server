@@ -15,6 +15,12 @@
 // against, a 1.0h entry priced above FALLBACK_MAX_HOURLY_RATE is treated as a dump.
 // Detection is scoped to contingency/flat-fee matters (where these placeholders live)
 // to avoid catching a legitimate reduced-rate 1.0h entry on a normal hourly matter.
+//
+// Identifying contingency matters: Clio's `billing_method` field is UNRELIABLE — many
+// real contingency matters are set to "hourly" in Clio (e.g. the Teachworth estate
+// litigation). The firm marks them with a yes/no custom field named "Contingency"
+// instead, so we key off that (isContingencyMatter). Flat-fee matters are still taken
+// from billing_method (isExcludedBillingMethod), which is reliable for those.
 // ============================================================
 import { fetchAllPages } from "../clio/pagination";
 
@@ -25,6 +31,27 @@ export type ExcludedHoursByMonth = Record<number, Record<number, number>>;
 export function isExcludedBillingMethod(method: string | undefined | null): boolean {
   const m = String(method || "").toLowerCase();
   return m.includes("conting") || m.includes("flat") || m === "fixed";
+}
+
+/**
+ * True when a matter's "Contingency" yes/no custom field is set. Clio returns
+ * custom_field_values as an array of { value, custom_field:{ name } } (older shapes
+ * expose field_name directly); we match the field by name "Contingency" (case-
+ * insensitive) and read its truthy value. This is the firm's source of truth for
+ * contingency status — NOT billing_method, which mislabels these matters "hourly".
+ */
+export function isContingencyMatter(matter: any): boolean {
+  const cfvs = matter?.custom_field_values;
+  if (!Array.isArray(cfvs)) return false;
+  for (const cf of cfvs) {
+    const name = String(cf?.custom_field?.name ?? cf?.field_name ?? cf?.name ?? "").toLowerCase().trim();
+    if (name !== "contingency") continue;
+    const v = cf?.value;
+    if (v === true) return true;
+    const s = String(v ?? "").toLowerCase().trim();
+    return s === "true" || s === "yes" || s === "y" || s === "1" || s === "checked";
+  }
+  return false;
 }
 
 // A 1.0h entry whose rate exceeds this is treated as a fee placeholder even when the
@@ -80,9 +107,10 @@ export function classifyFeePlaceholders(entries: ContingencyEntry[]): ExcludedHo
 
 /**
  * Fee-placeholder hours by month×user, for months 1..`month`. Resolve the
- * contingency/flat-fee matter set from billing_method, pull their billable TimeEntries,
- * infer each timekeeper's standard rate, then sum ONLY the 1.0h entries whose rate
- * doesn't match it (Rachel's synthetic fee dumps).
+ * contingency/flat-fee matter set (contingency via the "Contingency" custom field,
+ * flat via billing_method), pull their billable TimeEntries, infer each timekeeper's
+ * standard rate, then sum ONLY the 1.0h entries whose rate doesn't match it (Rachel's
+ * synthetic fee dumps).
  */
 export async function buildExcludedHoursByMonth(
   year: number,
@@ -92,16 +120,22 @@ export async function buildExcludedHoursByMonth(
   const months = new Set(opts.months ?? Array.from({ length: month }, (_, i) => i + 1));
   const maxMonth = Math.max(...months);
   const monthEnd = `${year}-${String(maxMonth).padStart(2, "0")}-${String(new Date(year, maxMonth, 0).getDate()).padStart(2, "0")}`;
-  const allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number,billing_method" });
+  const allMatters = await fetchAllPages<any>("/matters", {
+    fields: "id,display_number,billing_method,custom_field_values{id,field_name,value,custom_field{id,name}}",
+  });
 
-  const seenMethods: Record<string, number> = {};
+  // Contingency from the "Contingency" custom field (reliable); flat-fee from
+  // billing_method (reliable for flat). billing_method's "contingency" is NOT trusted.
+  let byCustomField = 0, byBillingMethod = 0;
   const excluded = new Set<number>();
   for (const mt of allMatters) {
-    const method = mt.billing_method;
-    seenMethods[String(method || "(none)")] = (seenMethods[String(method || "(none)")] ?? 0) + 1;
-    if (isExcludedBillingMethod(method)) excluded.add(mt.id);
+    const isContingency = isContingencyMatter(mt);
+    const isFlat = isExcludedBillingMethod(mt.billing_method) && !String(mt.billing_method || "").toLowerCase().includes("conting");
+    if (isContingency) byCustomField++;
+    if (isFlat) byBillingMethod++;
+    if (isContingency || isFlat) excluded.add(mt.id);
   }
-  console.log(`[Dashboard] billing_method distribution: ${JSON.stringify(seenMethods)}; contingency/flat matters=${excluded.size}`);
+  console.log(`[Dashboard] contingency/flat matters=${excluded.size} (contingency via custom field=${byCustomField}, flat via billing_method=${byBillingMethod})`);
 
   const hoursOf = (a: any) => (a.rounded_quantity ?? a.quantity ?? 0) / 3600;
   const rateOf = (a: any) => Number(a.price) || 0;
