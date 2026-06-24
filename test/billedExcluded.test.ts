@@ -39,6 +39,12 @@ describe("adjustedBillingMonth (27th–7th billing-month rule, cutoff=7)", () =>
     expect(adjustedBillingMonth("06/02/2026", 1)).toEqual({ year: 2026, month: 6 }); // day 2 > cutoff 1 → stays
     expect(adjustedBillingMonth("06/01/2026", 1)).toEqual({ year: 2026, month: 5 }); // day 1 ≤ cutoff 1 → rolls back
   });
+  it("cutoff=0 (the default) disables roll-back — every bill buckets by calendar issue month", () => {
+    expect(adjustedBillingMonth("05/01/2026", 0)).toEqual({ year: 2026, month: 5 }); // day 1, no roll-back
+    expect(adjustedBillingMonth("05/31/2026", 0)).toEqual({ year: 2026, month: 5 });
+    expect(adjustedBillingMonth("06/01/2026", 0)).toEqual({ year: 2026, month: 6 }); // stays June, not May
+    expect(adjustedBillingMonth("01/01/2026", 0)).toEqual({ year: 2026, month: 1 }); // no cross-year roll-back
+  });
 });
 
 describe("isExcludedBillingMethod (contingency / flat-fee)", () => {
