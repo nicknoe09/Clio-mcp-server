@@ -4,32 +4,34 @@
 // Fills the gap left by get_bills (which only exposes bill-level paid/outstanding
 // TOTALS) and the Fee Allocation report (current-state collections only). Each row
 // from Clio's /allocations endpoint is ONE payment (or credit) applied to ONE bill:
-// the queryable per-payment record. A single client payment split across several
-// bills shows up as several allocation rows sharing the same parent `payment.id`.
+// the queryable per-payment record.
 //
 // Voids/reversals: when a payment is voided in Clio its allocations are reversed,
-// which surfaces here as reversing rows (negative `amount`) and/or a distinct
-// allocation `type`. Pass include_reversals=false to drop non-positive rows when you
-// only want money that actually landed.
+// which surfaces here as reversing rows (negative `amount`). Pass
+// include_reversals=false to drop non-positive rows when you only want money that
+// actually landed.
 //
 // Trust-side cash movement (IOLTA deposits/withdrawals) is a SEPARATE surface — see
 // get_matter_financial_summary / get_trust_balances, which read /bank_transactions.
+//
+// FIELD SET: verified against the live Clio /allocations endpoint. Clio 400s the
+// WHOLE request if any single field is invalid, so only fields confirmed valid are
+// requested. `type` and `payment` are NOT valid allocation fields (Clio: "type,
+// payment are not valid fields"), so the parent-payment grouping isn't available
+// here — `is_reversal` is derived from the amount sign instead.
 // ============================================================
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 
-// Conservative, high-confidence field set. If Clio rejects a field it returns a 400
-// naming the offending field; the catch block surfaces that as `clio_error` so the
-// set can be trimmed without guesswork (same approach as debug_bill_fields).
 const ALLOCATION_FIELDS =
-  "id,date,amount,type,bill{id,number,state}," +
-  "matter{id,display_number},contact{id,name},payment{id,date,amount}";
+  "id,date,amount,bill{id,number,state}," +
+  "matter{id,display_number},contact{id,name}";
 
 export function registerPaymentTools(server: McpServer): void {
   server.tool(
     "get_payments",
-    "Query INDIVIDUAL payments/credits applied to bills (Clio allocations) — the per-payment detail get_bills doesn't expose. Each row is one payment applied to one bill, with `amount`, `date`, `type`, the `bill`/`matter`/`contact`, and the parent `payment` (one client payment split across bills shares a `payment.id`). Filter by matter, contact, bill, or date range. Voided/reversed payments surface as reversing rows (negative `amount`); set include_reversals=false to drop them.",
+    "Query INDIVIDUAL payments/credits applied to bills (Clio allocations) — the per-payment detail get_bills doesn't expose. Each row is one payment applied to one bill, with `amount`, `date`, and the `bill`/`matter`/`contact`. Filter by matter, contact, bill, or date range. Voided/reversed payments surface as reversing rows (negative `amount`, flagged `is_reversal`); set include_reversals=false to drop them.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       contact_id: z.coerce.number().optional().describe("Filter by contact/client ID"),
@@ -64,12 +66,10 @@ export function registerPaymentTools(server: McpServer): void {
           id: a.id,
           date: a.date,
           amount: a.amount,
-          type: a.type ?? null,
           is_reversal: (a.amount ?? 0) < 0,
           bill: a.bill ? { id: a.bill.id, number: a.bill.number ?? null, state: a.bill.state ?? null } : null,
           matter: a.matter ?? null,
           contact: a.contact ?? null,
-          payment: a.payment ? { id: a.payment.id, date: a.payment.date ?? null, amount: a.payment.amount ?? null } : null,
         }));
 
         const total = Math.round(
