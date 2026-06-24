@@ -5,7 +5,7 @@ import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
-import { buildWorkedBillableHoursByMonth } from "../dashboard/workedHours";
+import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard/workedHours";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -1507,10 +1507,13 @@ export function registerDocumentTools(server: McpServer): void {
 
         type PerUserData = {
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
-          // workedBillableHrs = billable hours WORKED that month (activity basis, contingency/flat
-          // excluded). col I now shows issue-date billed hours, so this is tracked separately to
-          // feed the paralegal HOURS bonus, which rewards hours worked, not hours billed on invoices.
+          // workedBillableHrs = billable hours WORKED that month — now identical to the
+          // DERIVED col I (totalWorkedHrs − nonbillableHrs). Feeds the paralegal HOURS
+          // bonus, which rewards hours worked, not hours billed on invoices.
           workedBillableHrs: number;
+          // totalWorkedHrs = ALL hours worked that month by work date (col J anchor).
+          // Billable (col I) is derived as totalWorkedHrs − nonbillableHrs.
+          totalWorkedHrs: number;
           billableDollars: number; billedDollars: number; writeOffs: number; lineDiscounts: number;
           bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
           indivCollected: number; respCollected: number; origCollected: number;
@@ -1518,6 +1521,7 @@ export function registerDocumentTools(server: McpServer): void {
         type MonthBundle = { month: number; monthName: string; data: Record<number, PerUserData>; respData: Record<number, { respHrs: number; respBilled: number }> };
         const newPerUser = (): PerUserData => ({
           billableHrs: 0, nonbillableHrs: 0, billedHrs: 0, unbilledHrs: 0, workedBillableHrs: 0,
+          totalWorkedHrs: 0,
           billableDollars: 0, billedDollars: 0, writeOffs: 0, lineDiscounts: 0,
           bizDev: 0, potentialClients: 0, cle: 0, otherAdmin: 0,
           indivCollected: 0, respCollected: 0, origCollected: 0,
@@ -1569,8 +1573,12 @@ export function registerDocumentTools(server: McpServer): void {
         // entries by work date (the firm's definition; reproduces the reference where
         // the Revenue Report's billed+unbilled overcounts). Real contingency/flat
         // worked time is included; only the 1h fee placeholders below are removed.
-        _step = "building worked billable hours (time entries)";
-        const workedBillableByMonth = await buildWorkedBillableHoursByMonth(params.year, params.month, ROSTER, { months: writeMonths });
+        _step = "building worked hours (time entries: total + flag-based billable)";
+        // total    = ALL worked time entries by work date (= manual Activities total).
+        // billable = legacy flag-based view (non_billable !== true), used only as a
+        //            reconciliation cross-check — col I is DERIVED as total − nonbillable.
+        const { total: totalWorkedByMonth, billable: workedBillableByMonth } =
+          await buildWorkedHoursSplitByMonth(params.year, params.month, ROSTER, { months: writeMonths });
 
         // Synthetic 1-hour fee-placeholder hours (on contingency/flat matters) to back
         // out of col I and the paralegal hours bonus — these aren't real worked time.
@@ -1590,24 +1598,29 @@ export function registerDocumentTools(server: McpServer): void {
               d.writeOffs = src.writeOffs;       // col L — from Revenue Report
               d.lineDiscounts = src.lineDiscounts; // col M — from Revenue Report
             }
-            // Billable Hrs (col I) = ALL billable hours WORKED this month (activity/
-            // work-date basis, billed or not), per the firm's definition — a TIME-ENTRY
-            // sum (workedBillableByMonth), NOT the Revenue Report's Billed+Unbilled
-            // hours (which is issue-date billed + WIP and overcounts hours worked when
-            // prior-month work is billed this month). The only thing removed is Rachel's
-            // synthetic 1-hour contingency/flat fee-placeholder entries
-            // (excludedHrsByMonth); real worked time on contingency/flat matters counts.
-            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
-            d.workedBillableHrs = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
-            d.billableHrs = d.workedBillableHrs;
             // Billed $ (col K) = "Billed Time" on invoices issued this billing month.
             d.billedDollars = billedByMonth[m]?.[r.user_id] ?? 0;
+            // Nonbillable (col H) = sum of the four tracked admin categories (Rachel's
+            // definition) — computed first because Billable is derived FROM it.
             d.bizDev = cat?.bizDev ?? 0;
             d.potentialClients = cat?.potentialClients ?? 0;
             d.cle = cat?.cle ?? 0;
             d.otherAdmin = cat?.otherAdmin ?? 0;
-            // Total nonbillable = sum of the four tracked categories (Rachel's definition).
             d.nonbillableHrs = d.bizDev + d.potentialClients + d.cle + d.otherAdmin;
+            // Hours columns, anchored on the firm's definition Billable = Total − Nonbillable:
+            //   Total worked (col J) = ALL time entries WORKED this month (work-date basis,
+            //     billed or not) = the number a manual Activities search / get_user_productivity
+            //     shows. Rachel's synthetic 1-hour contingency/flat fee-placeholders
+            //     (excludedHrsByMonth) are backed out — they aren't real worked time.
+            //   Billable (col I) = Total − Nonbillable, DERIVED. This guarantees
+            //     col I + col H == col J by construction and makes col I robust to admin
+            //     time logged WITHOUT the non_billable flag (the bug that inflated col I to
+            //     the Revenue Report's issue-date value). Real worked time on contingency/
+            //     flat matters stays in Billable (those matters aren't admin categories).
+            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
+            d.totalWorkedHrs = Math.max(0, (totalWorkedByMonth[m]?.[r.user_id] ?? 0) - excl);
+            d.billableHrs = deriveHoursPartition(d.totalWorkedHrs, d.nonbillableHrs).billable;
+            d.workedBillableHrs = d.billableHrs; // paralegal HOURS bonus uses the same reconciled figure
             md[r.user_id] = d;
             mrd[r.user_id] = respByMonth[m]?.[r.user_id] ?? { respHrs: 0, respBilled: 0 };
           }
@@ -1628,6 +1641,33 @@ export function registerDocumentTools(server: McpServer): void {
         // The target-month bundle is used by the billed-$ content guard and the
         // Attorney Performance tab below.
         const targetBundle = monthsData.find((b) => b.month === params.month)!;
+
+        // ---- HOURS RECONCILIATION GUARD (cols I/H/J) ----
+        // col I is now DERIVED (Total − Nonbillable). Cross-check it against the LEGACY
+        // flag-based billable (entries where non_billable !== true). A material gap means
+        // admin/nonbillable time isn't carrying the non_billable flag in Clio — the exact
+        // condition that previously let admin hours be double-counted (once as billable,
+        // once as nonbillable) and inflated col I/J. Also flag the impossible partition
+        // (nonbillable > total, which clamps billable to 0). Warn loudly; never silently
+        // ship a drift. Mirrors the collections Σcol N == firm-fees reconciliation below.
+        {
+          const m = params.month;
+          let firmTotal = 0;
+          for (const r of ROSTER) {
+            const d = targetBundle.data[r.user_id];
+            if (!d) continue;
+            firmTotal += d.totalWorkedHrs;
+            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
+            const flagBillable = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
+            const delta = flagBillable - d.billableHrs; // flag-based minus derived
+            if (d.nonbillableHrs > d.totalWorkedHrs + 0.05) {
+              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: nonbillable ${round1(d.nonbillableHrs)}h EXCEEDS total worked ${round1(d.totalWorkedHrs)}h — billable clamped to 0. Admin-matter pull and total-worked pull disagree on scope.`);
+            } else if (Math.abs(delta) > 2.0) {
+              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: flag-based billable=${round1(flagBillable)}h vs derived (total−nonbillable)=${round1(d.billableHrs)}h (Δ${round1(delta)}h). Likely admin/nonbillable time logged WITHOUT the non_billable flag — col I uses the derived figure (correct), but the gap is worth a look.`);
+            }
+          }
+          console.log(`[Dashboard] worked-hours firm total ${monthName}: ${round1(firmTotal)}h (col J basis = manual Activities total)`);
+        }
 
         // Collections (cols N/S) are written per-month from the cumulative Fee
         // Allocation CSV AFTER the main write loop below — see the per-month
