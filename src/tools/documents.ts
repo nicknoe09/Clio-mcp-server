@@ -1583,7 +1583,7 @@ export function registerDocumentTools(server: McpServer): void {
         // Synthetic 1-hour fee-placeholder hours (on contingency/flat matters) to back
         // out of col I and the paralegal hours bonus — these aren't real worked time.
         _step = "building excluded (fee-placeholder) hours";
-        const excludedHrsByMonth = await buildExcludedHoursByMonth(params.year, params.month, { months: writeMonths });
+        const excludedHrsByMonth = await buildExcludedHoursByMonth(params.year, params.month, ROSTER, { months: writeMonths });
 
         // ---- Assemble per-month bundles (only the months we have revenue for) ----
         const monthsData: MonthBundle[] = [];
