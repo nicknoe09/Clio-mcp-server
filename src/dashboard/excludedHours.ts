@@ -8,51 +8,105 @@
 // placeholder hours aren't real worked time, so we subtract them from col I (their
 // DOLLARS still count in billed $ / collections).
 //
-// IMPORTANT (corrected rule): we do NOT exclude all contingency/flat-fee time — only
-// the 1.0h entries that don't correspond to the timekeeper's hourly rate. A
-// timekeeper's standard rate is inferred from their own non-1h billable entries on
-// these matters (the dump can't define the standard); when none exist to compare
-// against, a 1.0h entry priced above FALLBACK_MAX_HOURLY_RATE is treated as a dump.
-// Detection is scoped to contingency/flat-fee matters (where these placeholders live)
-// to avoid catching a legitimate reduced-rate 1.0h entry on a normal hourly matter.
+// TWO-STEP, MATTER-AUGMENTED DETECTION (the corrected rule):
+//   Step 1 — CANDIDATES: a SINGLE one-hour billable entry whose rate doesn't correspond
+//     to the timekeeper's standard hourly rate. (A timekeeper's standard rate is the
+//     modal rate among their own non-1h billable entries; when none exist to compare
+//     against, a 1.0h entry priced above FALLBACK_MAX_HOURLY_RATE is treated as a dump.)
+//   Step 2 — MATTER GATE: a candidate is stripped ONLY if its matter is actually a
+//     fee-based matter — contingency, a flat-fee practice area (Estate Planning /
+//     Corporate), or flagged with the "Flat Fee" custom field. Otherwise it PASSES
+//     THROUGH. This is what protects legitimate capped-rate hourly work: e.g. NRN's
+//     court-appointed Appointment / Guardianship matters are billed at a $400/hr cap
+//     (≠ his standard rate) but are real hourly time on hourly matters, so they are NOT
+//     stripped. Rate mismatch alone is not enough — the matter must be fee-based.
 //
-// Identifying contingency matters: Clio's `billing_method` field is UNRELIABLE — many
-// real contingency matters are set to "hourly" in Clio (e.g. the Teachworth estate
-// litigation). The firm marks them with a yes/no custom field named "Contingency"
-// instead, so we key off that (isContingencyMatter). Flat-fee matters are still taken
-// from billing_method (isExcludedBillingMethod), which is reliable for those.
+// Matter details are fetched ONLY for the matters that own a candidate entry (not the
+// whole matter list), and a per-matter lookup failure FAILS SAFE toward inclusion (the
+// entry is NOT stripped). Contingency / Flat Fee come from yes/no custom fields (Clio's
+// billing_method is unreliable — it labels real contingency matters "hourly"); the
+// flat-fee practice areas come from practice_area{name}.
 // ============================================================
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle } from "../clio/pagination";
+import type { RosterMember } from "../domain/roster";
 
 // month (1-12) -> user_id -> placeholder (fee-dump) hours to back out of worked billable
 export type ExcludedHoursByMonth = Record<number, Record<number, number>>;
 
-/** A matter's billing_method counts as excluded when it is contingency or flat-fee. */
+/**
+ * Flat-fee practice areas (exact practice_area{name} strings as they appear in Clio,
+ * confirmed against the firm's matters). Work on these is billed as a fixed fee, so a
+ * 1.0h off-rate entry on one is a fee placeholder. Gated/hourly areas (Appointment,
+ * Guardianship, Probate, Estate Litigation, …) are deliberately NOT here — that work is
+ * hourly even when billed at a court-capped rate.
+ */
+export const FLAT_FEE_PRACTICE_AREAS = new Set<string>(["Estate Planning", "Corporate"]);
+
+/**
+ * A matter's billing_method counts as excluded when it is contingency or flat-fee.
+ * RETAINED as a pure helper (and unit-tested), but NO LONGER used to decide stripping —
+ * billing_method mislabels real contingency matters "hourly" and can't distinguish
+ * capped-rate hourly work from flat-fee work. The matter gate now uses the Contingency /
+ * Flat Fee custom fields + practice area instead (see matterQualifiesForStrip).
+ */
 export function isExcludedBillingMethod(method: string | undefined | null): boolean {
   const m = String(method || "").toLowerCase();
   return m.includes("conting") || m.includes("flat") || m === "fixed";
 }
 
 /**
- * True when a matter's "Contingency" yes/no custom field is set. We fetch
- * custom_field_values as { field_name, value }; we match the field by name
- * "Contingency" (case-insensitive) and read its truthy value. (The matcher also
- * accepts a nested custom_field:{ name } shape for safety.) This is the firm's source
- * of truth for contingency status — NOT billing_method, which mislabels these
- * matters "hourly".
+ * True when a matter's yes/no custom field `fieldNameLower` (compared case-insensitively)
+ * is set to a truthy value. We read custom_field_values as { field_name, value } (and
+ * also accept a nested custom_field:{ name } shape for safety) and treat
+ * true/"true"/"yes"/"y"/"1"/"checked" as yes. A matter that simply doesn't carry the
+ * field (e.g. "Flat Fee", which doesn't exist in Clio yet) returns false — no error.
  */
-export function isContingencyMatter(matter: any): boolean {
+function hasYesCustomField(matter: any, fieldNameLower: string): boolean {
   const cfvs = matter?.custom_field_values;
   if (!Array.isArray(cfvs)) return false;
   for (const cf of cfvs) {
     const name = String(cf?.custom_field?.name ?? cf?.field_name ?? cf?.name ?? "").toLowerCase().trim();
-    if (name !== "contingency") continue;
+    if (name !== fieldNameLower) continue;
     const v = cf?.value;
     if (v === true) return true;
     const s = String(v ?? "").toLowerCase().trim();
     return s === "true" || s === "yes" || s === "y" || s === "1" || s === "checked";
   }
   return false;
+}
+
+/**
+ * True when a matter's "Contingency" yes/no custom field is set. The firm's source of
+ * truth for contingency status — NOT billing_method, which mislabels these matters
+ * "hourly".
+ */
+export function isContingencyMatter(matter: any): boolean {
+  return hasYesCustomField(matter, "contingency");
+}
+
+/**
+ * True when a matter's "Flat Fee" yes/no custom field is set. This field does NOT exist
+ * in Clio yet (it's being added); until then no matter carries it and this returns false
+ * for everyone, gracefully. Built in now so the gate picks it up automatically once the
+ * field is created — matching the existing Contingency comparison pattern exactly.
+ */
+export function isFlatFeeMatter(matter: any): boolean {
+  return hasYesCustomField(matter, "flat fee");
+}
+
+/** True when a matter's practice_area{name} is a flat-fee practice area. */
+export function isFlatFeePracticeArea(matter: any): boolean {
+  return FLAT_FEE_PRACTICE_AREAS.has(String(matter?.practice_area?.name ?? "").trim());
+}
+
+/**
+ * The matter gate: a 1.0h off-rate candidate is a fee placeholder (strip it) ONLY when
+ * its matter is fee-based — contingency, a flat-fee practice area, or "Flat Fee"-flagged.
+ * Legitimate capped-rate hourly work (e.g. court-appointed Appointment/Guardianship at
+ * $400/hr) fails all three and PASSES THROUGH.
+ */
+export function matterQualifiesForStrip(matter: any): boolean {
+  return isContingencyMatter(matter) || isFlatFeePracticeArea(matter) || isFlatFeeMatter(matter);
 }
 
 // A 1.0h entry whose rate exceeds this is treated as a fee placeholder even when the
@@ -63,23 +117,17 @@ const FALLBACK_MAX_HOURLY_RATE = 1500;
 const ONE_HOUR_TOLERANCE = 0.05;  // hours — "single hour" entry
 const RATE_MATCH_TOLERANCE = 1;   // dollars — "corresponds to the hourly rate"
 
-// One billable time entry on a contingency/flat-fee matter, reduced to the fields the
-// fee-placeholder test needs. `rate` is the per-hour price; `hours` the duration.
+const isOneHour = (h: number) => Math.abs(h - 1) < ONE_HOUR_TOLERANCE;
+
+// One billable time entry reduced to the fields the fee-placeholder test needs.
+// `rate` is the per-hour price; `hours` the duration.
 export type ContingencyEntry = { uid: number; month: number; hours: number; rate: number };
+// A candidate entry also carries the matter, so the matter gate can be applied per entry.
+export type PlaceholderCandidate = ContingencyEntry & { matterId: number };
 
-/**
- * PURE detection of Rachel's synthetic fee placeholders among contingency/flat-fee
- * entries. A placeholder is a SINGLE one-hour entry whose rate doesn't correspond to
- * the timekeeper's standard hourly rate; everything else (multi-hour work, 1.0h work at
- * the standard rate) is real worked time and is NOT excluded. The standard rate is the
- * modal rate among that timekeeper's non-1h billable entries (so a dump can't define
- * the standard); when none exist, a 1.0h entry over FALLBACK_MAX_HOURLY_RATE is a dump.
- * Returns the placeholder HOURS to back out, by month×user.
- */
-export function classifyFeePlaceholders(entries: ContingencyEntry[]): ExcludedHoursByMonth {
-  const isOneHour = (h: number) => Math.abs(h - 1) < ONE_HOUR_TOLERANCE;
-
-  // Per-user standard rate = modal rate among non-1h, positive-rate entries.
+/** Per-user standard rate = modal rate among non-1h, positive-rate entries (a 1.0h dump
+ *  can't define the standard). */
+export function standardRateByUser(entries: ContingencyEntry[]): Record<number, number> {
   const rateCounts: Record<number, Map<number, number>> = {};
   for (const e of entries) {
     if (isOneHour(e.hours) || e.rate <= 0) continue;
@@ -93,13 +141,30 @@ export function classifyFeePlaceholders(entries: ContingencyEntry[]): ExcludedHo
     for (const [rate, count] of rateCounts[uid]) if (count > bestCount) { bestCount = count; best = rate; }
     standardRate[uid] = best;
   }
+  return standardRate;
+}
 
+/**
+ * Step 1 (rate test only): is this a 1.0h entry whose rate doesn't correspond to the
+ * timekeeper's standard hourly rate? Candidates still have to pass the matter gate
+ * before they're actually stripped.
+ */
+export function isFeePlaceholderRate(hours: number, rate: number, std: number | undefined): boolean {
+  if (!isOneHour(hours)) return false;
+  return std ? Math.abs(rate - std) > RATE_MATCH_TOLERANCE : rate > FALLBACK_MAX_HOURLY_RATE;
+}
+
+/**
+ * PURE rate-only detection of fee placeholders (no matter awareness). Sums the 1.0h
+ * off-rate entries by month×user. RETAINED for unit tests and as the rate-test building
+ * block; the production path (buildExcludedHoursByMonth) layers the matter gate on top
+ * so capped-rate hourly work isn't caught.
+ */
+export function classifyFeePlaceholders(entries: ContingencyEntry[]): ExcludedHoursByMonth {
+  const std = standardRateByUser(entries);
   const out: ExcludedHoursByMonth = {};
   for (const e of entries) {
-    if (!isOneHour(e.hours)) continue;
-    const std = standardRate[e.uid];
-    const isDump = std ? Math.abs(e.rate - std) > RATE_MATCH_TOLERANCE : e.rate > FALLBACK_MAX_HOURLY_RATE;
-    if (!isDump) continue;
+    if (!isFeePlaceholderRate(e.hours, e.rate, std[e.uid])) continue;
     const slot = (out[e.month] ??= {});
     slot[e.uid] = (slot[e.uid] ?? 0) + e.hours;
   }
@@ -107,76 +172,83 @@ export function classifyFeePlaceholders(entries: ContingencyEntry[]): ExcludedHo
 }
 
 /**
- * Fee-placeholder hours by month×user, for months 1..`month`. Resolve the
- * contingency/flat-fee matter set (contingency via the "Contingency" custom field,
- * flat via billing_method), pull their billable TimeEntries, infer each timekeeper's
- * standard rate, then sum ONLY the 1.0h entries whose rate doesn't match it (Rachel's
- * synthetic fee dumps).
+ * Fee-placeholder hours by month×user, for months 1..`month`. Pull each roster member's
+ * billable TimeEntries, identify 1.0h off-rate CANDIDATES, then fetch matter details ONLY
+ * for the matters that own a candidate and strip a candidate only if its matter is
+ * fee-based (contingency / flat-fee practice area / "Flat Fee" custom field). A per-matter
+ * lookup failure fails safe toward inclusion (NOT stripped).
  */
 export async function buildExcludedHoursByMonth(
   year: number,
   month: number,
+  roster: RosterMember[],
   opts: { months?: number[] } = {},
 ): Promise<ExcludedHoursByMonth> {
   const months = new Set(opts.months ?? Array.from({ length: month }, (_, i) => i + 1));
   const maxMonth = Math.max(...months);
   const monthEnd = `${year}-${String(maxMonth).padStart(2, "0")}-${String(new Date(year, maxMonth, 0).getDate()).padStart(2, "0")}`;
-  // Fetch matters with the "Contingency" custom field. Use a conservative field set:
-  // Clio 400s on an over-nested spec (the `custom_field{...}` association inside
-  // custom_field_values triggered a 400), so request only the flat fields the matcher
-  // needs — `field_name` carries the custom field's name, `value` its yes/no value. If
-  // Clio still rejects the custom-field spec, fall back to billing_method only so this
-  // step degrades gracefully instead of failing the whole dashboard run.
-  let allMatters: any[];
-  try {
-    allMatters = await fetchAllPages<any>("/matters", {
-      fields: "id,display_number,billing_method,custom_field_values{field_name,value}",
-    });
-  } catch (e: any) {
-    const status = e?.response?.status ?? e?.message ?? e;
-    console.warn(`[Dashboard] /matters custom_field_values fetch failed (${status}); falling back to billing_method only for contingency detection`);
-    allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number,billing_method" });
-  }
-
-  // Contingency from the "Contingency" custom field (reliable); flat-fee from
-  // billing_method (reliable for flat). billing_method's "contingency" is NOT trusted.
-  let byCustomField = 0, byBillingMethod = 0;
-  const excluded = new Set<number>();
-  for (const mt of allMatters) {
-    const isContingency = isContingencyMatter(mt);
-    const isFlat = isExcludedBillingMethod(mt.billing_method) && !String(mt.billing_method || "").toLowerCase().includes("conting");
-    if (isContingency) byCustomField++;
-    if (isFlat) byBillingMethod++;
-    if (isContingency || isFlat) excluded.add(mt.id);
-  }
-  console.log(`[Dashboard] contingency/flat matters=${excluded.size} (contingency via custom field=${byCustomField}, flat via billing_method=${byBillingMethod})`);
-
   const hoursOf = (a: any) => (a.rounded_quantity ?? a.quantity ?? 0) / 3600;
   const rateOf = (a: any) => Number(a.price) || 0;
 
-  // Collect billable entries on contingency/flat matters within the window, then let
-  // the pure classifier decide which 1.0h entries are fee placeholders.
-  const entries: ContingencyEntry[] = [];
-  for (const mid of excluded) {
-    const acts = await fetchAllPages<any>("/activities", {
-      type: "TimeEntry",
-      fields: "id,date,quantity,rounded_quantity,price,total,non_billable,user{id}",
-      matter_id: mid,
-      created_since: `${year}-01-01T00:00:00+00:00`,
-    });
+  // Step 0 — pull each roster member's billable time entries in the window (one pull per
+  // member, scoped by user_id), carrying rate + matter so candidates can be matter-gated.
+  const entries: PlaceholderCandidate[] = [];
+  for (const r of roster) {
+    let acts: any[] = [];
+    try {
+      acts = await fetchAllPages<any>("/activities", {
+        type: "TimeEntry",
+        fields: "id,date,quantity,rounded_quantity,price,non_billable,matter{id},user{id}",
+        user_id: r.user_id,
+        created_since: `${year}-01-01T00:00:00+00:00`,
+      });
+    } catch (e: any) {
+      console.warn(`[Dashboard] fee-placeholder activity pull failed for ${r.initials}: ${e?.message ?? e}`);
+      continue;
+    }
     for (const a of acts) {
       if (a.non_billable === true) continue; // only entries that are in col I to begin with
       if (a.date < `${year}-01-01` || a.date > monthEnd) continue;
       const m = parseInt(String(a.date).slice(5, 7), 10);
       if (!m || !months.has(m)) continue;
       const uid = a.user?.id;
-      if (!uid) continue;
-      entries.push({ uid, month: m, hours: hoursOf(a), rate: rateOf(a) });
+      const matterId = a.matter?.id;
+      if (!uid || !matterId) continue;
+      entries.push({ uid, month: m, hours: hoursOf(a), rate: rateOf(a), matterId });
     }
   }
 
-  const out = classifyFeePlaceholders(entries);
-  const dumps = Object.values(out).reduce((s, byUser) => s + Object.keys(byUser).length, 0);
-  console.log(`[Dashboard] contingency/flat fee-placeholder (1h off-rate) entries excluded from col I: ${dumps} user-months`);
+  // Step 1 — candidates: 1.0h entries whose rate doesn't match the timekeeper's standard
+  // (standard inferred from ALL their billable work, so it's the real modal hourly rate).
+  const std = standardRateByUser(entries);
+  const candidates = entries.filter((e) => isFeePlaceholderRate(e.hours, e.rate, std[e.uid]));
+
+  // Step 2 — fetch matter details ONLY for the matters that own a candidate (deduped).
+  // Per-matter failure (timeout/404/…) fails safe: the matter stays absent below, so its
+  // candidates are NOT stripped.
+  const candidateMatterIds = [...new Set(candidates.map((c) => c.matterId))];
+  const matterById = new Map<number, any>();
+  for (const mid of candidateMatterIds) {
+    try {
+      const res = await rawGetSingle(`/matters/${mid}`, {
+        fields: "id,practice_area{name},custom_field_values{field_name,value}",
+      });
+      matterById.set(mid, res?.data ?? res);
+    } catch (e: any) {
+      console.warn(`[Dashboard] candidate matter ${mid} lookup failed (${e?.response?.status ?? e?.message ?? e}); NOT stripping its 1h entries (fail safe to inclusion)`);
+    }
+  }
+
+  // Step 3 — strip a candidate only if its matter is fee-based; otherwise pass through.
+  const out: ExcludedHoursByMonth = {};
+  let stripped = 0, passedThrough = 0;
+  for (const c of candidates) {
+    const matter = matterById.get(c.matterId);
+    if (!matter || !matterQualifiesForStrip(matter)) { passedThrough++; continue; }
+    const slot = (out[c.month] ??= {});
+    slot[c.uid] = (slot[c.uid] ?? 0) + c.hours;
+    stripped++;
+  }
+  console.log(`[Dashboard] fee-placeholder candidates=${candidates.length}, candidate matters looked up=${candidateMatterIds.length}, stripped=${stripped}, passed through (legit hourly)=${passedThrough}`);
   return out;
 }

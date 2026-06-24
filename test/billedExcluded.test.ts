@@ -3,6 +3,9 @@ import { adjustedBillingMonth } from "../src/dashboard/billed";
 import {
   isExcludedBillingMethod,
   isContingencyMatter,
+  isFlatFeeMatter,
+  isFlatFeePracticeArea,
+  matterQualifiesForStrip,
   classifyFeePlaceholders,
   type ContingencyEntry,
 } from "../src/dashboard/excludedHours";
@@ -74,6 +77,51 @@ describe("isContingencyMatter (Contingency yes/no custom field, not billing_meth
     expect(isContingencyMatter({ billing_method: "hourly", custom_field_values: [{ value: "X", custom_field: { name: "Practice Area" } }] })).toBe(false);
     expect(isContingencyMatter({ billing_method: "hourly" })).toBe(false);
     expect(isContingencyMatter({})).toBe(false);
+  });
+});
+
+describe("isFlatFeePracticeArea (Estate Planning / Corporate, exact Clio strings)", () => {
+  it("flags the flat-fee practice areas", () => {
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Estate Planning" } })).toBe(true);
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Corporate" } })).toBe(true);
+  });
+  it("does NOT flag gated/hourly practice areas (where capped-rate hourly work lives)", () => {
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Appointment" } })).toBe(false);
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Guardianship" } })).toBe(false);
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Probate" } })).toBe(false);
+    expect(isFlatFeePracticeArea({ practice_area: { name: "Estate Litigation" } })).toBe(false);
+    expect(isFlatFeePracticeArea({})).toBe(false);
+    expect(isFlatFeePracticeArea({ practice_area: null })).toBe(false);
+  });
+});
+
+describe("isFlatFeeMatter (Flat Fee custom field — does not exist in Clio yet)", () => {
+  it("returns false gracefully when the field is absent (the current state)", () => {
+    expect(isFlatFeeMatter({ practice_area: { name: "Estate Planning" }, custom_field_values: [{ value: "Yes", field_name: "Contingency" }] })).toBe(false);
+    expect(isFlatFeeMatter({})).toBe(false);
+    expect(isFlatFeeMatter({ custom_field_values: [] })).toBe(false);
+  });
+  it("flags it once the field exists and is Yes/true (future-proof)", () => {
+    expect(isFlatFeeMatter({ custom_field_values: [{ value: "Yes", field_name: "Flat Fee" }] })).toBe(true);
+    expect(isFlatFeeMatter({ custom_field_values: [{ value: true, custom_field: { name: "Flat Fee" } }] })).toBe(true);
+    expect(isFlatFeeMatter({ custom_field_values: [{ value: "No", field_name: "Flat Fee" }] })).toBe(false);
+  });
+});
+
+describe("matterQualifiesForStrip (the matter gate)", () => {
+  it("strips contingency, flat-fee practice areas, and Flat Fee-flagged matters", () => {
+    expect(matterQualifiesForStrip({ billing_method: "hourly", custom_field_values: [{ value: "Yes", field_name: "Contingency" }] })).toBe(true);
+    expect(matterQualifiesForStrip({ billing_method: "hourly", practice_area: { name: "Estate Planning" } })).toBe(true);
+    expect(matterQualifiesForStrip({ billing_method: "hourly", practice_area: { name: "Corporate" } })).toBe(true);
+    expect(matterQualifiesForStrip({ custom_field_values: [{ value: true, field_name: "Flat Fee" }] })).toBe(true);
+  });
+  it("PASSES THROUGH capped-rate hourly work — NRN's court-appointed Appointment/Guardianship", () => {
+    // hourly billing, gated practice area, no Contingency/Flat Fee flag → must NOT strip,
+    // even though the $400/hr cap makes a 1.0h entry's rate differ from NRN's standard.
+    const appointment = { billing_method: "hourly", practice_area: { name: "Appointment" }, custom_field_values: [] };
+    const guardianship = { billing_method: "hourly", practice_area: { name: "Guardianship" } };
+    expect(matterQualifiesForStrip(appointment)).toBe(false);
+    expect(matterQualifiesForStrip(guardianship)).toBe(false);
   });
 });
 
