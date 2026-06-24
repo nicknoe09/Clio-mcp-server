@@ -18,26 +18,37 @@
 import { fetchAllPages } from "../clio/pagination";
 import type { RosterMember } from "../domain/roster";
 
-// month (1-12) -> user_id -> billable hours worked that month (activity/work date)
+// month (1-12) -> user_id -> hours worked that month (activity/work date)
 export type WorkedHoursByMonth = Record<number, Record<number, number>>;
 
+// Two parallel views from a single /activities pull:
+//   total    = ALL worked time entries (billable + nonbillable), by work date — the
+//              figure a manual Activities search / get_user_productivity shows.
+//   billable = entries where the entry-level non_billable flag !== true (the LEGACY,
+//              flag-based view). Kept only as a reconciliation signal: col I is now
+//              DERIVED as total − admin-category nonbillable (see documents.ts), which
+//              is robust to admin time that was logged without the non_billable flag.
+export type WorkedHoursSplit = { total: WorkedHoursByMonth; billable: WorkedHoursByMonth };
+
 /**
- * Billable hours worked by month×user for months 1..`month`, summed from /activities
- * TimeEntry rows by their work date (rounded_quantity, the billed-increment hours).
- * One pull per roster member (scoped by user_id), counting only billable entries
- * (non_billable !== true) — admin/nonbillable time is excluded by that flag.
+ * Worked hours by month×user for months 1..`month`, summed from /activities TimeEntry
+ * rows by their work date (rounded_quantity, the billed-increment hours). One pull per
+ * roster member (scoped by user_id). Returns BOTH the total (all entries) and the
+ * legacy flag-based billable split in a single pass, so the dashboard can derive
+ * billable from total AND cross-check against the flag without a second round-trip.
  */
-export async function buildWorkedBillableHoursByMonth(
+export async function buildWorkedHoursSplitByMonth(
   year: number,
   month: number,
   roster: RosterMember[],
   opts: { months?: number[] } = {},
-): Promise<WorkedHoursByMonth> {
+): Promise<WorkedHoursSplit> {
   const months = new Set(opts.months ?? Array.from({ length: month }, (_, i) => i + 1));
   const maxMonth = Math.max(...months);
   const monthEnd = `${year}-${String(maxMonth).padStart(2, "0")}-${String(new Date(year, maxMonth, 0).getDate()).padStart(2, "0")}`;
 
-  const out: WorkedHoursByMonth = {};
+  const total: WorkedHoursByMonth = {};
+  const billable: WorkedHoursByMonth = {};
   for (const r of roster) {
     let acts: any[] = [];
     try {
@@ -48,17 +59,51 @@ export async function buildWorkedBillableHoursByMonth(
         created_since: `${year}-01-01T00:00:00+00:00`,
       });
     } catch (e: any) {
-      console.warn(`[Dashboard] worked-billable-hours pull failed for ${r.initials}: ${e?.message ?? e}`);
+      console.warn(`[Dashboard] worked-hours pull failed for ${r.initials}: ${e?.message ?? e}`);
       continue;
     }
     for (const a of acts) {
-      if (a.non_billable === true) continue; // billable worked time only (admin matters are non_billable)
       if (a.date < `${year}-01-01` || a.date > monthEnd) continue;
       const m = parseInt(String(a.date).slice(5, 7), 10);
       if (!m || !months.has(m)) continue;
-      const slot = (out[m] ??= {});
-      slot[r.user_id] = (slot[r.user_id] ?? 0) + (a.rounded_quantity ?? a.quantity ?? 0) / 3600;
+      const hrs = (a.rounded_quantity ?? a.quantity ?? 0) / 3600;
+      (total[m] ??= {})[r.user_id] = (total[m][r.user_id] ?? 0) + hrs;
+      if (a.non_billable !== true) {
+        (billable[m] ??= {})[r.user_id] = (billable[m][r.user_id] ?? 0) + hrs;
+      }
     }
   }
-  return out;
+  return { total, billable };
+}
+
+/**
+ * The firm's hours partition for the 26 Compare dashboard: Billable (col I) is DERIVED
+ * as Total worked (col J) − Nonbillable admin categories (col H), clamped at 0. Deriving
+ * it (rather than running a second flag-based query) guarantees col I + col H == col J ==
+ * the work-date total a manual Activities search shows, and makes col I immune to admin
+ * time logged without the non_billable flag (which otherwise gets counted as both
+ * billable and nonbillable). `clamped` flags the impossible case (nonbillable > total).
+ */
+export function deriveHoursPartition(
+  totalWorked: number,
+  nonbillable: number,
+): { billable: number; total: number; clamped: boolean } {
+  return {
+    billable: Math.max(0, totalWorked - nonbillable),
+    total: totalWorked,
+    clamped: nonbillable > totalWorked,
+  };
+}
+
+/**
+ * Legacy flag-based billable-hours view (entries where non_billable !== true).
+ * Retained for backward compatibility; delegates to buildWorkedHoursSplitByMonth.
+ */
+export async function buildWorkedBillableHoursByMonth(
+  year: number,
+  month: number,
+  roster: RosterMember[],
+  opts: { months?: number[] } = {},
+): Promise<WorkedHoursByMonth> {
+  return (await buildWorkedHoursSplitByMonth(year, month, roster, opts)).billable;
 }
