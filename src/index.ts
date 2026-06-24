@@ -26,6 +26,7 @@ import { registerExpenseTools } from "./tools/expenses";
 import { registerContactTools } from "./tools/contacts";
 import { registerTaskTools } from "./tools/tasks";
 import { registerBillTools } from "./tools/bills";
+import { registerPaymentTools } from "./tools/payments";
 import { registerARTools } from "./tools/ar";
 import { registerPerformanceTools } from "./tools/performance";
 import { registerReconcileTools } from "./tools/reconcile";
@@ -77,6 +78,9 @@ function createMcpServer(): McpServer {
 
     registerBillTools(server);
     console.log("[MCP] registerBillTools OK");
+
+    registerPaymentTools(server);
+    console.log("[MCP] registerPaymentTools OK");
 
     registerARTools(server);
     console.log("[MCP] registerARTools OK");

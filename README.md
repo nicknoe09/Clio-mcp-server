@@ -97,6 +97,7 @@ curl http://localhost:3000/health
 | `get_contacts` | Search contacts by name or email |
 | `get_tasks` | Tasks with status/assignee/due date filters |
 | `get_bills` | Bills with state/date filters and aging flags |
+| `get_payments` | Individual payments/credits applied to bills (Clio allocations), incl. reversals |
 | `get_ar_aging` | Full AR aging report with bucket grouping |
 | `get_wip_report` | Work-in-progress report with aging flags |
 | `get_trust_balances` | Trust/IOLTA balances with low-balance and dormancy flags |
