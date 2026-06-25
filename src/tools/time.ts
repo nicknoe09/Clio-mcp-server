@@ -4,7 +4,7 @@ import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../c
 import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
 
 const TIME_ENTRY_FIELDS =
-  "id,date,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
+  "id,date,created_at,updated_at,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
 
 export function registerTimeTools(server: McpServer): void {
   // get_time_entries
@@ -56,6 +56,8 @@ export function registerTimeTools(server: McpServer): void {
         const formatted = entries.map((e: any) => ({
           id: e.id,
           date: e.date,
+          created_at: e.created_at ?? null,
+          updated_at: e.updated_at ?? null,
           hours: Math.round(((e.rounded_quantity || e.quantity) / 3600) * 100) / 100,
           rate: e.price,
           amount: Math.round((((e.rounded_quantity || e.quantity) / 3600) * (e.price || 0)) * 100) / 100,
@@ -180,6 +182,8 @@ export function registerTimeTools(server: McpServer): void {
           byMatter[mid].entries.push({
             id: e.id,
             date: e.date,
+            created_at: e.created_at ?? null,
+            updated_at: e.updated_at ?? null,
             hours: Math.round(hours * 100) / 100,
             rate: e.price,
             amount: Math.round(value * 100) / 100,
