@@ -747,9 +747,34 @@ export           const colLetter = (c: number): string => {
             if (m) {
               const open = m[1].replace(/\s+t="[^"]*"/g, ""); // numeric write: drop t="s"/"e"/"str"
               let inner = m[2];
+              // Drop any stale formula in the cell so an open-time recalc can't
+              // overwrite the value we're writing (e.g. a "Total" column that used
+              // to be a formula referencing a now-stale source). A plain value cell
+              // has no <f>, so this is a no-op for the usual data-cell writes.
+              inner = inner.replace(/<f\b[^>]*\/>/g, "").replace(/<f\b[^>]*>[\s\S]*?<\/f>/g, "");
               if (/<v>/.test(inner)) inner = inner.replace(/<v>[\s\S]*?<\/v>/, `<v>${val}</v>`);
               else inner += `<v>${val}</v>`;
               return xml.replace(fullRe, `${open}${inner}${m[3]}`);
             }
             return xml;
+          }
+
+          // Read a cell's value as a string from worksheet XML (resolves shared
+          // strings; returns the cached value for a formula cell). Returns "" when
+          // the cell is absent or empty. Mirrors findTabMonthBlock's internal cell
+          // reader so callers can pull an existing value (e.g. the "Available Hours"
+          // column) to compute a dependent column before writing it back.
+          export function readCell(xml: string, ref: string, sharedStrings: string[]): string {
+            const re = new RegExp(`(<c\\b[^>]*\\br="${ref}"[^>]*>)([\\s\\S]*?)</c>`);
+            const m = xml.match(re);
+            if (!m) return "";
+            const open = m[1], inner = m[2];
+            const t = inner.match(/<t\b[^>]*>([\s\S]*?)<\/t>/);
+            if (t) return xmlUnesc(t[1]);
+            const v = inner.match(/<v>([\s\S]*?)<\/v>/);
+            if (v) {
+              if (/\bt="s"/.test(open)) { const i = parseInt(v[1], 10); return sharedStrings[i] ?? ""; }
+              return v[1];
+            }
+            return "";
           }
