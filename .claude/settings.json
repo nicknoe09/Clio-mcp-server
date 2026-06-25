@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Clio_MCP__download_dashboard_update",
+      "mcp__Clio_MCP__get_dashboard_status"
+    ]
+  }
+}
