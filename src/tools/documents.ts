@@ -1567,8 +1567,11 @@ export function registerDocumentTools(server: McpServer): void {
         // assembly loop below — NOT this issue-date report.)
         _step = "building billed $ (issue-date)";
         const cutoffDay = params.billed_cutoff_day ?? 0;
+        // Keyed by COLL_ROSTER (not just FIRM_ROSTER) so billers who have a row on the
+        // chart but aren't on the comp roster (CWW, JAD, RT, ASI, …) resolve to their
+        // OWN col K; firmByMonth still totals every row so the NRB remainder is exact.
         const { billedByMonth, firmByMonth: billedFirmByMonth } =
-          await buildMonthlyBilled(params.year, params.month, ROSTER, { cutoffDay, months: writeMonths });
+          await buildMonthlyBilled(params.year, params.month, COLL_ROSTER, { cutoffDay, months: writeMonths });
         console.log(`[Dashboard] billed-$ issue-date firm totals by month: ${JSON.stringify(Object.fromEntries(Object.entries(billedFirmByMonth).map(([m, v]) => [m, round2(v)])))}`);
 
         // Billable Hours (col I) = billable hours WORKED each month, summed from time
@@ -2497,6 +2500,41 @@ export function registerDocumentTools(server: McpServer): void {
             }
           }
           console.log(`[Dashboard] collections patched to compareXml: cells=${collCellsPatched} per-month-indiv-firm=${JSON.stringify(collFirmByMonth)}`);
+
+          // ---- PER-MONTH BILLED $ : non-roster billers + NRB (col K=11) ----
+          // Billed $ follows the SAME attribution rule as collections: a biller WITH a
+          // row on the chart gets their own col K; every biller WITHOUT a row (and any
+          // unknown biller) is pooled into the NRB row, so Σ col K == firm billed.
+          // billedByMonth is keyed by COLL_ROSTER, so non-FIRM_ROSTER billers resolve to
+          // their own rows; FIRM_ROSTER cells were already patched above (re-patched here
+          // with the identical billedByMonth value — idempotent). STATIC SNAPSHOT: same
+          // writeMonths gating as the main billed write (target month only unless
+          // backfill_ytd), NOT the all-YTD collections cadence.
+          let billedCellsPatched = 0;
+          const billedColByMonth: Record<number, number> = {};
+          for (const m of writeMonths) {
+            const blk = m === params.month ? monthBlock : scanMonthBlock(compareSheet, monthNames[m - 1]);
+            if (!blk) continue;
+            let placed = 0;
+            for (const r of COLL_ROSTER) {
+              const row = blk.map[r.initials.toUpperCase()];
+              if (!row) continue; // no row → absorbed by NRB via the remainder below
+              const bv = round2(billedByMonth[m]?.[r.user_id] ?? 0);
+              compareXml = patchCell(compareXml, `K${row}`, bv);
+              placed = round2(placed + bv);
+              billedCellsPatched++;
+            }
+            const nrbBilled = round2((billedFirmByMonth[m] ?? 0) - placed);
+            const nrbRow = blk.map["NRB"];
+            if (nrbRow) {
+              compareXml = patchCell(compareXml, `K${nrbRow}`, nrbBilled);
+              billedCellsPatched++;
+            } else if (Math.abs(nrbBilled) > 0.005) {
+              console.warn(`[Dashboard] ${monthNames[m - 1]}: non-roster billed $${nrbBilled} has nowhere to go — add an 'NRB' row so col K reconciles to firm billed $${round2(billedFirmByMonth[m] ?? 0)}.`);
+            }
+            billedColByMonth[m] = round2(placed + (nrbRow ? nrbBilled : 0));
+          }
+          console.log(`[Dashboard] billed-$ non-roster/NRB patched to compareXml: cells=${billedCellsPatched} per-month-col-K-total=${JSON.stringify(billedColByMonth)}`);
 
           // ============================================================
           // Patch Utilization / Realization tabs from Client Activity CSV
