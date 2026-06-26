@@ -68,7 +68,6 @@ curl http://localhost:3000/health
    At minimum: `DATABASE_URL` (the `noe_app` public-proxy URL), `APP_KEK_B64` (identical to the platform),
    `MS_TENANT_ID`, `MS_CLIENT_ID` (+ `MS_CLIENT_SECRET` if confidential), `MCP_AUDIENCE`, `MCP_SCOPE_NAME`,
    `ALLOWED_EMAILS`/`ALLOWED_EMAIL_DOMAINS`, `CLIO_CLIENT_ID`, `CLIO_CLIENT_SECRET`, and `PUBLIC_BASE_URL`.
-   Set `UPLOAD_SECRET` too if you use the [binary upload endpoint](#binary-upload-endpoint-post-upload).
 5. Deploy
 6. Test: `curl https://your-railway-url.up.railway.app/health` (expect `"transport":"streamable-http"`)
 
@@ -90,9 +89,11 @@ It reuses the same Box upload code as the dashboard updater (`uploadToBox` /
 `createBoxFile`), so a remote client can `curl -F` raw bytes instead of base64-ing a
 binary into an MCP tool argument.
 
-**Auth:** send the shared secret in the `X-Upload-Secret` header, compared in constant
-time to the `UPLOAD_SECRET` env var. If `UPLOAD_SECRET` is unset the endpoint rejects
-every request (fail closed). A mismatch returns `401`.
+**Auth:** the **same per-user Microsoft Bearer JWT** the `/mcp` transport requires —
+send `Authorization: Bearer <token>`. The token is validated against Microsoft's JWKS
+(issuer/audience/scope) and checked against the onboarding allowlist; anything else
+returns `401`. There is no separate secret to manage. (Obtain a token the same way the
+Claude.ai connector does — via the `/authorize` + `/token` OAuth flow.)
 
 **Form fields:**
 
@@ -120,14 +121,14 @@ omitted it. On a Box failure the route returns `502` with `{ "ok": false, "error
 ```bash
 # Create a NEW file in a Box folder
 curl -X POST https://your-railway-url.up.railway.app/upload \
-  -H "X-Upload-Secret: $UPLOAD_SECRET" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -F "file=@./report.pdf" \
   -F "parent_folder_id=390781679459" \
   -F "file_name=Q2 Report.pdf"
 
 # Upload a NEW VERSION of an existing Box file
 curl -X POST https://your-railway-url.up.railway.app/upload \
-  -H "X-Upload-Secret: $UPLOAD_SECRET" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -F "file=@./report.pdf" \
   -F "overwrite_file_id=1234567890"
 ```
