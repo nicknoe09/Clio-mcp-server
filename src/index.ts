@@ -38,6 +38,7 @@ import { registerAuditTools } from "./tools/audit";
 import { registerAuditTimeTools } from "./tools/auditTime";
 import { registerReviewTools } from "./tools/review";
 import { registerMorningReportTools } from "./tools/morningReport";
+import { registerCustomActionTools } from "./tools/customActions";
 import { registerVersionTools } from "./tools/version";
 import reviewRouter from "./routes/review";
 import { getDownload } from "./utils/downloadStore";
@@ -106,6 +107,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerAuditTimeTools OK");
     registerMorningReportTools(server);
     console.log("[MCP] registerMorningReportTools OK");
+    registerCustomActionTools(server);
+    console.log("[MCP] registerCustomActionTools OK");
     registerReviewTools(server);
     console.log("[MCP] registerReviewTools OK");
     registerVersionTools(server);
