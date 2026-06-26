@@ -73,3 +73,38 @@ describe("POST /upload", () => {
     expect(body.error).toMatch(/no-box-user-authenticated/);
   });
 });
+
+describe("POST /version", () => {
+  it("401 when secret missing/wrong", async () => {
+    const r = await fetch(`${base}/version`, { method: "POST", body: form({ file_id: "123" }) });
+    expect(r.status).toBe(401);
+  });
+
+  it("400 when file_id missing", async () => {
+    const r = await fetch(`${base}/version`, {
+      method: "POST", headers: { "X-Upload-Secret": "test-secret" }, body: form({}),
+    });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toMatch(/file_id/);
+  });
+
+  it("400 when file part missing", async () => {
+    const r = await fetch(`${base}/version`, {
+      method: "POST", headers: { "X-Upload-Secret": "test-secret" },
+      body: form({ file_id: "123" }, false),
+    });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toMatch(/file/);
+  });
+
+  it("valid request reaches Box layer (502 fallback when no Box user)", async () => {
+    const r = await fetch(`${base}/version`, {
+      method: "POST", headers: { "X-Upload-Secret": "test-secret" },
+      body: form({ file_id: "2310830265427" }),
+    });
+    expect(r.status).toBe(502);
+    const body = await r.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toMatch(/no-box-user-authenticated/);
+  });
+});

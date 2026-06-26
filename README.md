@@ -135,6 +135,27 @@ curl -X POST https://your-railway-url.up.railway.app/upload \
 > The uploading Box account is the one connected via `/box/oauth/start`. If no Box
 > account is connected the endpoint returns `502`.
 
+### `POST /version` — version an existing file (one-shot)
+
+Symmetric with `/upload` but dedicated to the version case, so the call is a clean
+one-shot — just `file_id` + `file` (no `parent_folder_id` / "exactly one of" rule).
+Same auth (`X-Upload-Secret`), same 50 MB limit, same JSON response. Under the hood it
+calls Box's version endpoint (`POST upload.box.com/api/2.0/files/{id}/content`) — the
+same path `/upload` takes when given `overwrite_file_id`.
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `file_id` | yes | Box file id to upload a new version of. |
+| `file` | yes | The new binary. |
+| `file_name` | no | Name to store as; falls back to the multipart filename. |
+
+```bash
+curl -X POST https://your-railway-url.up.railway.app/version \
+  -H "X-Upload-Secret: $UPLOAD_SECRET" \
+  -F "file=@./petition.docx" \
+  -F "file_id=2310830265427"
+```
+
 ## Tool Reference
 
 | Tool | Description |
