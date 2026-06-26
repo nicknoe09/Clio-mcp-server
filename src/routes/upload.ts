@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import multer from "multer";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { uploadToBox, createBoxFile } from "../utils/box";
-import { requireMicrosoftUser } from "../auth/requireUser";
 
 // =====================================================================
 // POST /upload — authenticated binary upload → Box (create or version).
@@ -17,9 +17,8 @@ import { requireMicrosoftUser } from "../auth/requireUser";
 //
 // Exactly one of overwrite_file_id / parent_folder_id is required.
 //
-// Auth: the same per-user Microsoft Bearer JWT the /mcp transport requires
-// (Authorization: Bearer <token>), enforced by requireMicrosoftUser — no
-// separate shared secret to manage.
+// Auth: header X-Upload-Secret, constant-time compared to env UPLOAD_SECRET.
+// Fails closed (401) if UPLOAD_SECRET is unset.
 //
 // The Box work reuses the dashboard updater's helpers (utils/box.ts):
 // uploadToBox(overwriteFileId) for versions, createBoxFile() for new files.
@@ -37,10 +36,29 @@ const memUpload = multer({
   limits: { fileSize: MAX_UPLOAD_BYTES },
 }).single("file");
 
-// requireMicrosoftUser runs first (rejecting unauthenticated callers before we
-// parse the potentially large body); the multipart handler runs only once the
-// Bearer JWT has been verified and allowlisted.
-router.post("/upload", requireMicrosoftUser, (req: Request, res: Response) => {
+// Constant-time secret check. Hashing both sides to a fixed-width digest keeps
+// the comparison constant-time regardless of input length (timingSafeEqual
+// throws on length mismatch) and avoids leaking the secret's length.
+function secretMatches(req: Request): boolean {
+  const expected = process.env.UPLOAD_SECRET;
+  if (!expected) {
+    console.error("[Upload] UPLOAD_SECRET is not set — rejecting all uploads (fail closed)");
+    return false;
+  }
+  const provided = req.headers["x-upload-secret"];
+  if (typeof provided !== "string" || !provided) return false;
+  const a = createHash("sha256").update(provided).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+router.post("/upload", (req: Request, res: Response) => {
+  // Auth before parsing the (potentially large) body so a bad secret is cheap.
+  if (!secretMatches(req)) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+
   memUpload(req, res, async (err: any) => {
     if (err) {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
