@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
 import JSZip from "jszip";
 
 const BILL_FIELDS =
@@ -848,5 +848,150 @@ export function registerBillTools(server: McpServer): void {
         };
       }
     }
+  );
+
+  // ============================================================
+  //  probe_billing_write_apis — DIAGNOSTIC, non-destructive
+  // ============================================================
+  // Question this answers: does Clio's v4 API expose ANY endpoint that
+  // generates/creates a bill (so we could build a "generate a bill" tool),
+  // and what does POST /matters require (so we can build create_matter
+  // correctly, incl. the matter-level custom-rate field)?
+  //
+  // SAFETY: this NEVER creates a real bill or matter. It probes existence
+  // by reading HTTP status codes, not by submitting valid payloads:
+  //   - Bill-generation candidates are POSTed an intentionally INVALID body
+  //     (empty data, or a nonexistent matter id -1). Clio's response tells
+  //     us about the ROUTE, not about any created object:
+  //       404 → route does not exist (no such endpoint)
+  //       405 → route exists but POST is not allowed (read-only resource)
+  //       422 / 400 → route EXISTS and reached validation (proves it's real),
+  //                   but our deliberately-bad payload was rejected → nothing made
+  //   - The matter-create probe POSTs `{data:{}}` (no client). Clio requires a
+  //     client, so this 422s and surfaces the required/accepted field names in
+  //     the error body — without creating a matter.
+  //   - The matter-schema read is a plain GET of one existing matter to reveal
+  //     the real field names (custom_rate, billing fields, etc.).
+  server.tool(
+    "probe_billing_write_apis",
+    "Diagnostic (non-destructive). Probes whether Clio's v4 API exposes any bill-generation/creation endpoint, and discovers what POST /matters requires. Reads HTTP status codes from deliberately-invalid payloads (empty body / nonexistent matter id) so NO bill or matter is ever created: 404 = route absent, 405 = route exists but not POST-able, 422/400 = route exists and reached validation. Also GETs one existing matter to reveal the real field schema (custom_rate, billing fields) for building create_matter. Run this before building matter/bill write tools.",
+    {
+      existing_matter_id: z
+        .coerce
+        .number()
+        .optional()
+        .describe("Optional: a real matter ID to (a) read its full field schema and (b) test the /matters/{id}/bills POST route. If omitted, the first matter returned by /matters is used."),
+    },
+    async (params) => {
+      const out: any = {
+        note: "Non-destructive. POST probes use invalid payloads; a 422/400 means the ROUTE EXISTS but nothing was created. 404 = no such route, 405 = route exists but POST not allowed.",
+        bill_generation_candidates: [],
+        matter_create_probe: null,
+        matter_schema: null,
+      };
+
+      // Resolve a matter id for the per-matter bill route + schema read.
+      let matterId = params.existing_matter_id ?? null;
+      if (matterId === null) {
+        try {
+          const matters = await fetchAllPages<any>("/matters", { fields: "id" }, 1);
+          matterId = matters[0]?.id ?? null;
+        } catch {
+          /* leave null; per-matter probe will be skipped */
+        }
+      }
+
+      // 1) Candidate bill-generation/creation routes. Empty/invalid bodies only.
+      const billCandidates: Array<{ path: string; body: any }> = [
+        { path: "/bills", body: { data: {} } },
+        { path: "/bill_generation_requests", body: { data: { matter: { id: -1 } } } },
+        { path: "/bill_generations", body: { data: { matter: { id: -1 } } } },
+        { path: "/draft_bills", body: { data: { matter: { id: -1 } } } },
+      ];
+      if (matterId !== null) {
+        billCandidates.push({ path: `/matters/${matterId}/bills`, body: { data: {} } });
+      }
+
+      for (const c of billCandidates) {
+        try {
+          const res = await rawPostSingle(c.path, c.body);
+          // A 2xx here would be surprising — surface it loudly so we can
+          // immediately clean up if anything was actually created.
+          out.bill_generation_candidates.push({
+            path: c.path,
+            status: 200,
+            route_exists: true,
+            WARNING: "Returned 2xx to an invalid payload — inspect response; a bill/object MAY have been created.",
+            response: res?.data ?? res,
+          });
+        } catch (e: any) {
+          const status = e?.response?.status ?? null;
+          out.bill_generation_candidates.push({
+            path: c.path,
+            status,
+            route_exists: status !== 404 && status !== null,
+            interpretation:
+              status === 404 ? "No such route — endpoint does not exist."
+              : status === 405 ? "Route exists but POST is not allowed (read-only resource)."
+              : status === 422 || status === 400 ? "Route EXISTS and reached validation — bill generation MAY be possible with a valid payload."
+              : status === 403 ? "Route exists but forbidden for this token's permissions."
+              : "Unexpected — see clio_error.",
+            clio_error:
+              typeof e?.response?.data === "string"
+                ? e.response.data.slice(0, 400)
+                : e?.response?.data,
+          });
+        }
+      }
+
+      // 2) POST /matters with no client → 422 reveals required/accepted fields.
+      try {
+        const res = await rawPostSingle("/matters", { data: {} });
+        out.matter_create_probe = {
+          status: 200,
+          route_exists: true,
+          WARNING: "POST /matters with empty data returned 2xx — a matter MAY have been created; inspect/delete.",
+          response: res?.data ?? res,
+        };
+      } catch (e: any) {
+        const status = e?.response?.status ?? null;
+        out.matter_create_probe = {
+          status,
+          route_exists: status !== 404 && status !== null,
+          interpretation:
+            status === 422 || status === 400 ? "POST /matters EXISTS — create_matter is buildable. The clio_error below lists required/accepted fields."
+            : status === 404 ? "No POST /matters route (unexpected)."
+            : status === 405 ? "Route exists but POST not allowed (unexpected)."
+            : "See clio_error.",
+          clio_error:
+            typeof e?.response?.data === "string"
+              ? e.response.data.slice(0, 600)
+              : e?.response?.data,
+        };
+      }
+
+      // 3) Read one existing matter (no fields param = Clio's default set) to
+      // reveal real field names for create_matter (custom_rate, billing, etc.).
+      if (matterId !== null) {
+        try {
+          const res = await rawGetSingle(`/matters/${matterId}`);
+          const data = res?.data ?? res;
+          out.matter_schema = {
+            sampled_matter_id: matterId,
+            default_field_keys: data && typeof data === "object" ? Object.keys(data) : null,
+            sample: data,
+          };
+        } catch (e: any) {
+          out.matter_schema = {
+            sampled_matter_id: matterId,
+            error: e?.response?.status ?? String(e),
+          };
+        }
+      } else {
+        out.matter_schema = { error: "No matter id available to sample." };
+      }
+
+      return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
+    },
   );
 }
