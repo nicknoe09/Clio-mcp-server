@@ -6,6 +6,7 @@ import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard/workedHours";
+import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, type UtilHours } from "../dashboard/rateTabs";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
@@ -1475,6 +1476,7 @@ export function registerDocumentTools(server: McpServer): void {
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
       backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. The 'Utilization', 'Realization', and 'Collection' rate tabs follow this same cadence — target month only by default, or every YTD month block when backfill_ytd=true (Realization and Collection generate one Clio report per month when backfilling). NOTE: COLLECTIONS (col N/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
       billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 0 = no roll-back: each bill is counted in its CALENDAR issue month, matching Rachel's reference). Set to a positive N to roll bills issued on days 1..N of a month back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. N=7 ⇒ May 27–Jun 7 all count as May); if you do, run the month's snapshot after day N of the following month to capture those late-issued bills."),
+      rate_tabs_only: z.boolean().optional().describe("RATE-TABS-ONLY refresh. When true, ONLY the 'Utilization', 'Realization', and 'Collection' tabs are rewritten for every month Jan..month, and NOTHING ELSE in the workbook is touched — 26 Compare, Bonus, Attorney Performance and all other sheets are preserved byte-for-byte. Utilization is sourced by READING 26 Compare's existing Billable (col I) / Nonbillable (col H) for each month (no /activities pull, no revenue report needed) and reshaping them (Billable, Nonbillable, Total=Billable+Nonbillable, Untracked=Available−Total) — so Utilization stays exactly consistent with 26 Compare. Realization comes from a per-month Client Activity report and Collection from a per-month Fee Allocation report (the same per-month sources the full build uses). Use this to fix/backfill the rate tabs for closed months WITHOUT retroactively rewriting 26 Compare's frozen snapshots. Ignores backfill_ytd / revenue_csv_box_file_id / billed_cutoff_day (not relevant to this path). pass client_activity_report_id to reuse a pre-generated Client Activity report for the TARGET month's Realization."),
     },
     async (params) => {
       const jobId = `dash_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1505,6 +1507,208 @@ export function registerDocumentTools(server: McpServer): void {
         const monthStart = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
         const endDay = new Date(params.year, params.month, 0).getDate();
         const monthEnd = `${params.year}-${String(params.month).padStart(2, "0")}-${endDay}`;
+
+        // ============================================================
+        // RATE-TABS-ONLY refresh (rate_tabs_only=true)
+        // ============================================================
+        // Rewrite ONLY Utilization / Realization / Collection for Jan..month and
+        // touch nothing else in the workbook. Utilization is sourced by READING
+        // 26 Compare's existing Billable (col I) / Nonbillable (col H) — no
+        // /activities pull, no revenue report — so it stays exactly consistent
+        // with 26 Compare; Realization/Collection use their own per-month reports.
+        // surgicalWriteXlsx only writes the sheets we return, so 26 Compare and
+        // every other tab are preserved byte-for-byte.
+        if (params.rate_tabs_only === true) {
+          _step = "rate-tabs-only: loading workbook";
+          const fileBuffer = await sanitizeXlsxBuffer(await downloadFromBox(FIRM_DASHBOARD_FILE_ID));
+          const wb = new ExcelJS.Workbook();
+          await wb.xlsx.load(fileBuffer as any);
+          const compareSheet = wb.getWorksheet("26 Compare");
+          if (!compareSheet) throw new Error("Sheet '26 Compare' not found in dashboard workbook.");
+
+          // 26 Compare hours by month name → initials → {billable (col I=9), nonbillable (col H=8)}.
+          // Single pass: a month name in col B starts a block; any other non-empty
+          // col B (e.g. "2026 Totals") ends it; data rows carry initials in col C.
+          _step = "rate-tabs-only: reading 26 Compare hours";
+          const monthNameSet = new Set(monthNames);
+          const hoursByMonthName: Record<string, Record<string, { billable: number; nonbillable: number }>> = {};
+          let curMonth: string | null = null;
+          compareSheet.eachRow((row) => {
+            const b = String(row.getCell(2).value ?? "").trim();
+            if (monthNameSet.has(b)) { curMonth = b; (hoursByMonthName[b] ??= {}); return; }
+            if (b) { curMonth = null; return; }
+            if (!curMonth) return;
+            const ini = String(row.getCell(3).value ?? "").trim().toUpperCase();
+            if (!ini || hoursByMonthName[curMonth][ini]) return; // first row per initials wins
+            const num = (c: number) => { const v = row.getCell(c).value; return typeof v === "number" ? v : (parseFloat(String(v)) || 0); };
+            hoursByMonthName[curMonth][ini] = { billable: num(9), nonbillable: num(8) };
+          });
+
+          // Firm utilization goal from "2026 Goals" (col 3), for the Util firm-avg goal column.
+          const goalsSheet = wb.getWorksheet("2026 Goals ") || wb.getWorksheet("2026 Goals");
+          const utilGoals: number[] = [];
+          if (goalsSheet) {
+            for (let r = 3; r <= 15; r++) {
+              const ini = String(goalsSheet.getRow(r).getCell(1).value ?? "").trim().toUpperCase();
+              if (!ini || ini === "TOTAL") continue;
+              const g = Number(goalsSheet.getRow(r).getCell(3).value) || 0;
+              if (Number.isFinite(g) && g > 0) utilGoals.push(g);
+            }
+          }
+          const firmUtilGoal = utilGoals.length ? utilGoals.reduce((s, v) => s + v, 0) / utilGoals.length : 0;
+
+          _step = "rate-tabs-only: opening rate-tab XML";
+          const origZip = await JSZip.loadAsync(fileBuffer);
+          const compareSheetMap = await getZipSheetMap(origZip);
+          const ssFile = origZip.file("xl/sharedStrings.xml");
+          const sharedStrings = ssFile ? parseSharedStrings(await ssFile.async("string")) : [];
+
+          const rosterRT = FIRM_ROSTER;
+          const nameToUid = new Map<string, number>(rosterRT.map((r) => [r.name.toLowerCase(), r.user_id]));
+          const initialsAliases: Record<string, string> = { JBP: "JPB" };
+          const initialsToUid: Record<string, number> = {};
+          for (const r of rosterRT) initialsToUid[r.initials.toUpperCase()] = r.user_id;
+          const rtMonths = Array.from({ length: params.month }, (_, i) => i + 1);
+
+          let utilXml: string | undefined, realizXml: string | undefined, collectionXml: string | undefined;
+          let utilPatched = 0, realizPatched = 0, collectionPatched = 0;
+          let clientActivityReportId: number | undefined;
+          let clientActivityErr: string | undefined, realizationErr: string | undefined;
+
+          // -- Utilization -- from 26 Compare col I/H (read-only; no Clio pull)
+          _step = "rate-tabs-only: patch Utilization";
+          const utilPath = compareSheetMap["Utilization"];
+          if (utilPath) {
+            try {
+              utilXml = await origZip.file(utilPath)!.async("string");
+              for (const m of rtMonths) {
+                const byIni = hoursByMonthName[monthNames[m - 1]];
+                if (!byIni) continue;
+                const byUid: UtilHours = {};
+                for (const r of rosterRT) {
+                  const h = byIni[r.initials.toUpperCase()];
+                  if (h) byUid[r.user_id] = h;
+                }
+                const res = patchUtilizationBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, byUid, initialsToUid, initialsAliases);
+                utilXml = res.xml;
+                utilPatched += res.patched;
+              }
+              if (utilPatched > 0) utilXml = appendUtilizationFirmAvg(utilXml, sharedStrings, firmUtilGoal);
+            } catch (e: any) {
+              clientActivityErr = e?.message ?? String(e);
+              console.error("[dashboard] rate-tabs-only Utilization failed:", clientActivityErr);
+            }
+          }
+
+          // -- Realization -- per-month Client Activity report
+          _step = "rate-tabs-only: patch Realization";
+          const realizPath = compareSheetMap["Realization"];
+          if (realizPath) {
+            try { realizXml = await origZip.file(realizPath)!.async("string"); } catch { realizXml = undefined; }
+          }
+          if (realizXml) {
+            for (const m of rtMonths) {
+              const mStart = `${params.year}-${String(m).padStart(2, "0")}-01`;
+              const mEnd = `${params.year}-${String(m).padStart(2, "0")}-${String(new Date(params.year, m, 0).getDate()).padStart(2, "0")}`;
+              try {
+                const ca = await getClientActivityCSV({ start_date: mStart, end_date: mEnd, reportId: m === params.month ? params.client_activity_report_id : undefined, pollSeconds: 180 });
+                if (m === params.month) clientActivityReportId = ca.report.id;
+                const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const block = findTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
+                if (!block) continue;
+                for (const { row, ini } of block.attorneys) {
+                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
+                  if (!uid) continue;
+                  const a = agg[uid];
+                  if (!a) continue;
+                  realizXml = patchCell(realizXml, `D${row}`, round1(a.billedNondiscHrs));
+                  realizXml = patchCell(realizXml, `E${row}`, round1(a.billedDiscHrs));
+                  realizXml = patchCell(realizXml, `F${row}`, round1(a.unbilledHrs));
+                  realizPatched++;
+                }
+              } catch (e: any) {
+                const msg = `${MONTH_ABBRS[m - 1]}: ${e?.message ?? e}`;
+                clientActivityErr = clientActivityErr ? `${clientActivityErr}; ${msg}` : msg;
+                console.error(`[dashboard] rate-tabs-only Realization failed (${MONTH_ABBRS[m - 1]}):`, e?.message ?? e);
+              }
+            }
+            if (realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings);
+          }
+
+          // -- Collection -- per-month Fee Allocation report (issue basis)
+          _step = "rate-tabs-only: patch Collection";
+          const collPath = compareSheetMap["Collection"];
+          if (collPath) {
+            try { collectionXml = await origZip.file(collPath)!.async("string"); } catch (e: any) { collectionXml = undefined; realizationErr = e?.message ?? String(e); }
+          }
+          if (collectionXml) {
+            for (const m of rtMonths) {
+              try {
+                const rows = await genFeeAllocationByMonth(params.year, m, { filterByPayment: false });
+                const collAgg = aggregateFeeAllocationCollectionHrs(rows, rosterRT);
+                const block = findTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
+                if (!block) continue;
+                for (const { row, ini } of block.attorneys) {
+                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
+                  if (!uid) continue;
+                  const c = collAgg[uid];
+                  if (!c) continue;
+                  collectionXml = patchCell(collectionXml, `C${row}`, round1(c.collectedHrs));
+                  collectionXml = patchCell(collectionXml, `D${row}`, round1(c.uncollectedHrs));
+                  collectionPatched++;
+                }
+              } catch (e: any) {
+                const msg = `${MONTH_ABBRS[m - 1]}: ${e?.message ?? e}`;
+                realizationErr = realizationErr ? `${realizationErr}; ${msg}` : msg;
+                console.error(`[dashboard] rate-tabs-only Collection failed (${MONTH_ABBRS[m - 1]}):`, e?.message ?? e);
+              }
+            }
+          }
+
+          // Write back ONLY the patched rate tabs. surgicalWriteXlsx leaves every
+          // other sheet (26 Compare, Bonus, Attorney Performance, …) untouched.
+          _step = "rate-tabs-only: surgical write + upload";
+          const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
+            const subst = (xml: string): string => xml
+              .split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`)
+              .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
+              .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`);
+            const out: Record<string, string> = {};
+            if (utilXml && utilPatched > 0) out["Utilization"] = subst(utilXml);
+            if (realizXml && realizPatched > 0) out["Realization"] = subst(realizXml);
+            if (collectionXml && collectionPatched > 0) out["Collection"] = subst(collectionXml);
+            return out;
+          }, new Set<string>());
+
+          const result = await uploadToBox({
+            buffer: outputBuffer,
+            filename: `${params.year} Firm Dashboard - Claude Version 2.xlsx`,
+            folderId: MONTHLY_MEASURABLES_FOLDER_ID,
+            overwriteFileId: FIRM_DASHBOARD_FILE_ID,
+          });
+
+          const rtPayload: any = {
+            mode: "rate_tabs_only",
+            months: `${monthNames[0]}–${monthName}`,
+            note: "Only Utilization / Realization / Collection were rewritten; 26 Compare and all other tabs were left untouched.",
+            utilization_patched: utilPatched,
+            realization_patched: realizPatched,
+            collection_patched: collectionPatched,
+            collection_source: "fee_allocation_monthly",
+            client_activity_report_id: clientActivityReportId,
+            utilization_source: "26 Compare cols I/H (read-only)",
+            tabs: {
+              utilization: utilPatched > 0 ? "ok" : (clientActivityErr ? "failed" : "skipped"),
+              realization: realizPatched > 0 ? "ok" : (clientActivityErr ? "failed" : "skipped"),
+              collection: collectionPatched > 0 ? "ok" : (realizationErr ? "failed" : "skipped"),
+            },
+            ...(clientActivityErr ? { realization_error: clientActivityErr } : {}),
+            ...(realizationErr ? { collection_error: realizationErr } : {}),
+          };
+          if (result.uploaded) { rtPayload.success = true; rtPayload.box_file_id = result.box_file_id; rtPayload.box_url = result.box_url; }
+          else { rtPayload.success = false; rtPayload.direct_download_url = result.direct_download_url; rtPayload.reason = result.reason; }
+          return { content: [{ type: "text" as const, text: JSON.stringify(rtPayload) }] };
+        }
 
         type PerUserData = {
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
@@ -2593,23 +2797,14 @@ export function registerDocumentTools(server: McpServer): void {
               for (const m of rateTabMonths) {
                 const bundle = monthsData.find((b) => b.month === m);
                 if (!bundle) continue; // no hours data this month (classic default covers target only)
-                const block = findTabMonthBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
-                if (!block) continue;
-                for (const { row, ini } of block.attorneys) {
-                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
-                  if (!uid) continue;
-                  const tb = bundle.data[uid];
-                  if (!tb) continue;
-                  const total = round1(tb.billableHrs + tb.nonbillableHrs);
-                  utilXml = patchCell(utilXml, `C${row}`, round1(tb.billableHrs));    // worked billable (= col I)
-                  utilXml = patchCell(utilXml, `D${row}`, round1(tb.nonbillableHrs)); // admin nonbillable (= col H)
-                  utilXml = patchCell(utilXml, `E${row}`, total);                     // Total = billable + nonbillable
-                  const avail = parseFloat(readCell(utilXml, `F${row}`, sharedStrings));
-                  if (Number.isFinite(avail)) {
-                    utilXml = patchCell(utilXml, `G${row}`, round1(Math.max(0, avail - total))); // Untracked
-                  }
-                  utilPatched++;
+                const byUid: UtilHours = {};
+                for (const r of ROSTER) {
+                  const tb = bundle.data[r.user_id];
+                  if (tb) byUid[r.user_id] = { billable: tb.billableHrs, nonbillable: tb.nonbillableHrs };
                 }
+                const res = patchUtilizationBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, byUid, initialsToUid, initialsAliases);
+                utilXml = res.xml;
+                utilPatched += res.patched;
               }
             } catch (e: any) {
               clientActivityErr = e?.message ?? String(e);
@@ -2678,79 +2873,17 @@ export function registerDocumentTools(server: McpServer): void {
           // (col B blank) so a later scan treats it as a block terminator, and the
           // data rows carry month NAMES in col B (col A blank) so they are never
           // mistaken for new month-block headers.
-          const FIRM_AVG_MARKER = "Firm Average (auto-generated";
-          const monthFull = (abbr: string) => MONTH_NAMES_FULL[MONTH_ABBRS.indexOf(abbr)] ?? abbr;
-          const buildFirmAvgRows = (
-            summary: Array<{ monthAbbr: string; avgRate: number; billers: number }>,
-            startRow: number,
-            title: string,
-            rateHeader: string,
-            goal?: { value: number; header: string },
-          ): string[] => {
-            const out: string[] = [];
-            out.push(xmlRow(startRow, [xmlCell(`A${startRow}`, title, { style: STYLE_BOLD })]));
-            const hr = startRow + 1;
-            // Optional goal column sits between the actual rate and the biller count.
-            const billersCol = goal ? "E" : "D";
-            const header = [
-              xmlCell(`B${hr}`, "Month", { style: STYLE_BOLD }),
-              xmlCell(`C${hr}`, rateHeader, { style: STYLE_BOLD }),
-            ];
-            if (goal) header.push(xmlCell(`D${hr}`, goal.header, { style: STYLE_BOLD }));
-            header.push(xmlCell(`${billersCol}${hr}`, "# Billers", { style: STYLE_BOLD }));
-            out.push(xmlRow(hr, header));
-            summary.forEach((s, i) => {
-              const r = hr + 1 + i;
-              const cells = [
-                xmlCell(`B${r}`, monthFull(s.monthAbbr), { style: STYLE_BOLD }),
-                xmlCell(`C${r}`, Math.round(s.avgRate * 10000) / 10000, { style: STYLE_PCT }),
-              ];
-              // Goal is a fixed firm target (same value every month) so the chart
-              // can plot actual vs goal.
-              if (goal) cells.push(xmlCell(`D${r}`, Math.round(goal.value * 10000) / 10000, { style: STYLE_PCT }));
-              cells.push(xmlCell(`${billersCol}${r}`, s.billers, { style: STYLE_GEN }));
-              out.push(xmlRow(r, cells));
-            });
-            return out;
-          };
           // Firm utilization goal = the simple mean of each biller's own
           // utilization goal from the "2026 Goals" tab (attyGoals, col 3 = util
           // goal). 0 when the goals tab wasn't found, in which case no goal column
-          // is written.
+          // is written. The summary append (strip prior marker → recompute the
+          // per-month firm-mean rate from the hour columns → re-append) lives in
+          // ../dashboard/rateTabs so the rate-tabs-only path shares it exactly.
           const utilGoalVals = Object.values(attyGoals).map((g) => g.utilGoal).filter((v) => Number.isFinite(v) && v > 0);
           const firmUtilGoal = utilGoalVals.length ? utilGoalVals.reduce((s, v) => s + v, 0) / utilGoalVals.length : 0;
           try {
-            if (utilXml && utilPatched > 0) {
-              const base = stripRowsFromMarker(utilXml, FIRM_AVG_MARKER, sharedStrings);
-              // Utilization rate = Billable (C) / Available Hours (F); a biller is
-              // "listed/active" this month if it tracked any time (C+D > 0).
-              const summary = firmAvgRateByMonth(base, sharedStrings, ["C", "D", "F"],
-                (v) => (v.C + v.D > 0 && v.F > 0 ? v.C / v.F : null));
-              if (summary.length) {
-                utilXml = appendRowsBeforeSheetClose(base, buildFirmAvgRows(
-                  summary, maxRowNumber(base) + 2,
-                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' utilization rate vs goal`,
-                  "Firm Avg Utilization Rate",
-                  firmUtilGoal > 0 ? { value: firmUtilGoal, header: "Firm Avg Util Goal" } : undefined));
-              } else {
-                utilXml = base;
-              }
-            }
-            if (realizXml && realizPatched > 0) {
-              const base = stripRowsFromMarker(realizXml, FIRM_AVG_MARKER, sharedStrings);
-              // Realization rate = Billed: Nondiscounted (D) / Total Billed (D+E);
-              // a biller is "listed/active" this month if it billed any hours.
-              const summary = firmAvgRateByMonth(base, sharedStrings, ["D", "E"],
-                (v) => (v.D + v.E > 0 ? v.D / (v.D + v.E) : null));
-              if (summary.length) {
-                realizXml = appendRowsBeforeSheetClose(base, buildFirmAvgRows(
-                  summary, maxRowNumber(base) + 2,
-                  `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' realization rate`,
-                  "Firm Avg Realization Rate"));
-              } else {
-                realizXml = base;
-              }
-            }
+            if (utilXml && utilPatched > 0) utilXml = appendUtilizationFirmAvg(utilXml, sharedStrings, firmUtilGoal);
+            if (realizXml && realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings);
           } catch (e: any) {
             console.warn(`[dashboard] firm-average summary append skipped: ${e?.message ?? e}`);
           }
