@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Pool, PoolClient } from "pg";
 import { ENV } from "../utils/env";
 import { decryptToken, encryptToken, tokenAad, EncryptedField } from "./crypto";
@@ -196,6 +197,125 @@ export async function updateClioTokens(
       ]
     );
   });
+}
+
+// =====================================================================
+// Box integration (per-user) — mirrors the Clio token functions above, but
+// against the `box` provider row and a `box`-scoped AAD. Written + connected on
+// the noe-reminders /setup page; read here so per-user uploads act as the
+// acting attorney's own Box account instead of one shared service account.
+//
+// Consumed by the /upload + /version per-user path (Phase 2). Adding the data
+// layer here first keeps that change small and keeps this the single place that
+// touches the vault.
+// =====================================================================
+
+export interface BoxTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: Date | null;
+}
+
+/**
+ * Read + decrypt this user's Box tokens. Returns null when the user has no
+ * `box` integration row (Box not connected on the platform yet).
+ */
+export async function getBoxTokens(userId: string): Promise<BoxTokens | null> {
+  const row = await withTenant(userId, async (client) => {
+    const res = await client.query(
+      `SELECT access_token_ct, access_token_nonce, access_token_dek_ct,
+              refresh_token_ct, refresh_token_nonce, refresh_token_dek_ct, expires_at
+         FROM user_integrations
+        WHERE provider = 'box'
+        LIMIT 1`
+    );
+    return res.rows[0] ?? null;
+  });
+
+  if (!row) return null;
+
+  const accessField: EncryptedField = {
+    ct: toBuffer(row.access_token_ct),
+    nonce: toBuffer(row.access_token_nonce),
+    dekCt: toBuffer(row.access_token_dek_ct),
+  };
+  const refreshField: EncryptedField = {
+    ct: toBuffer(row.refresh_token_ct),
+    nonce: toBuffer(row.refresh_token_nonce),
+    dekCt: toBuffer(row.refresh_token_dek_ct),
+  };
+
+  const accessToken = decryptToken(accessField, tokenAad(userId, "access_token", "box"));
+  const refreshToken = decryptToken(refreshField, tokenAad(userId, "refresh_token", "box"));
+  const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
+  return { accessToken, refreshToken, expiresAt };
+}
+
+/**
+ * Re-encrypt + persist refreshed Box tokens back to the vault. Box rotates
+ * (single-use) refresh tokens, so whichever side refreshes MUST write the new
+ * pair back immediately — this is that write-back for the Clio server.
+ */
+export async function updateBoxTokens(
+  userId: string,
+  accessToken: string,
+  refreshToken: string,
+  expiresAt: Date | null
+): Promise<void> {
+  const access = encryptToken(accessToken, tokenAad(userId, "access_token", "box"));
+  const refresh = encryptToken(refreshToken, tokenAad(userId, "refresh_token", "box"));
+
+  await withTenant(userId, async (client) => {
+    await client.query(
+      `UPDATE user_integrations
+          SET access_token_ct = $1, access_token_nonce = $2, access_token_dek_ct = $3,
+              refresh_token_ct = $4, refresh_token_nonce = $5, refresh_token_dek_ct = $6,
+              expires_at = $7, updated_at = now()
+        WHERE provider = 'box'`,
+      [access.ct, access.nonce, access.dekCt, refresh.ct, refresh.nonce, refresh.dekCt, expiresAt]
+    );
+  });
+}
+
+export interface UploadKeyOwner {
+  userId: string;
+  email: string;
+}
+
+/**
+ * Resolve a presented per-user upload key (the X-Upload-Secret on /upload) to
+ * its owning attorney. The plaintext key is never stored — we look up its
+ * SHA-256 in the `upload_keys` table (no RLS; queried by hash before the user
+ * is known, like `users`). Revoked keys (`revoked_at` set) never match.
+ *
+ * Returns null on no match. If the table doesn't exist yet (noe-reminders side
+ * not deployed), that's also "no match" so callers can fall back cleanly.
+ */
+export async function resolveUploadKey(presentedKey: string): Promise<UploadKeyOwner | null> {
+  if (!presentedKey) return null;
+  const keyHash = createHash("sha256").update(presentedKey, "utf8").digest("hex");
+  try {
+    const res = await withRetry(() =>
+      pool().query(
+        `SELECT k.user_id, u.email
+           FROM upload_keys k
+           JOIN users u ON u.id = k.user_id
+          WHERE k.key_hash = $1 AND k.revoked_at IS NULL
+          LIMIT 1`,
+        [keyHash]
+      )
+    );
+    if (res.rows.length === 0) return null;
+    return { userId: String(res.rows[0].user_id), email: String(res.rows[0].email) };
+  } catch (err) {
+    // 42P01 = undefined_table: the upload_keys table isn't provisioned yet.
+    // Treat as "no per-user key" so the route can fall back without erroring.
+    if ((err as NodeJS.ErrnoException)?.code === "42P01") {
+      console.warn("[vault] upload_keys table not present yet — no per-user upload keys resolvable.");
+      return null;
+    }
+    throw err;
+  }
 }
 
 /**

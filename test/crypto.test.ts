@@ -51,6 +51,22 @@ describe("crypto parity with platform AES-256-GCM envelope encryption", () => {
     expect(tokenAad("42", "refresh_token")).toBe("noe-reminders:42:clio:refresh_token");
   });
 
+  it("scopes the AAD by provider (clio default, box explicit)", () => {
+    // Default provider stays clio for backward compatibility.
+    expect(tokenAad("42", "access_token")).toBe("noe-reminders:42:clio:access_token");
+    // Box gets its own provider segment.
+    expect(tokenAad("42", "access_token", "box")).toBe("noe-reminders:42:box:access_token");
+    expect(tokenAad("42", "refresh_token", "box")).toBe("noe-reminders:42:box:refresh_token");
+  });
+
+  it("round-trips a box-scoped token but won't cross-decrypt with clio's AAD", () => {
+    const boxAad = tokenAad("7", "access_token", "box");
+    const enc = encryptToken("box-access-token-VALUE", boxAad);
+    expect(decryptToken(enc, boxAad)).toBe("box-access-token-VALUE");
+    // Same field + user but clio provider must NOT decrypt a box token.
+    expect(() => decryptToken(enc, tokenAad("7", "access_token", "clio"))).toThrow();
+  });
+
   it("round-trips encrypt -> decrypt", () => {
     const aad = tokenAad("99", "access_token");
     const secret = "a-fresh-clio-token-🔐-with-unicode";

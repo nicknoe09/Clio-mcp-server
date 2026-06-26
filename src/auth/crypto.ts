@@ -14,7 +14,9 @@ import { ENV } from "../utils/env";
  *     Node's GCM keeps the tag separate, so we split ct = [data || tag] and
  *     call setAuthTag(tag) on decrypt, and Buffer.concat([data, tag]) on encrypt.
  *   - The wrapped DEK is stored as [nonce(12) || ct || tag(16)] with AAD "dek".
- *   - Token AAD is `noe-reminders:${userId}:clio:<field>`.
+ *   - Token AAD is `noe-reminders:${userId}:<provider>:<field>` (provider was
+ *     historically always "clio"; it is now explicit so Box — and any future
+ *     integration — gets its own AAD and can't be cross-decrypted with Clio).
  */
 
 const TAG_LEN = 16;
@@ -29,8 +31,12 @@ function kek(): Buffer {
   return key;
 }
 
-export function tokenAad(userId: string, field: "access_token" | "refresh_token"): string {
-  return `noe-reminders:${userId}:clio:${field}`;
+export function tokenAad(
+  userId: string,
+  field: "access_token" | "refresh_token",
+  provider: string = "clio",
+): string {
+  return `noe-reminders:${userId}:${provider}:${field}`;
 }
 
 /** AES-256-GCM decrypt where the ciphertext has the auth tag appended. */
