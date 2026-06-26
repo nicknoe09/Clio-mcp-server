@@ -994,4 +994,159 @@ export function registerBillTools(server: McpServer): void {
       return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
     },
   );
+
+  // ============================================================
+  //  issue_matter_draft_bill — find a matter's draft and issue it
+  // ============================================================
+  // Clio's API cannot GENERATE a bill (no POST route — confirmed by
+  // probe_billing_write_apis: /bills, /bill_generation_requests, etc. all
+  // 404). The draft must be created in the Clio UI ("Generate Bill" on the
+  // matter). What the API CAN do is move an existing draft forward, so this
+  // tool automates the next step by matter: locate the matter's draft bill(s)
+  // and issue the chosen one (draft → awaiting_payment, or → awaiting_approval
+  // if the firm uses the approval step). Wraps the same PATCH as
+  // set_bill_state, but keyed off matter_id so the caller needn't know the
+  // bill ID. Refuses to guess when a matter has multiple drafts.
+  server.tool(
+    "issue_matter_draft_bill",
+    "Issue a matter's existing DRAFT bill (draft → awaiting_payment, or → awaiting_approval). NOTE: Clio's API cannot generate/create the draft itself — there is no bill-creation endpoint — so the draft must already exist (create it in the Clio UI via 'Generate Bill' on the matter). This tool finds the matter's draft and moves it forward. If the matter has no draft, it says so. If it has multiple drafts, it lists them and asks you to pass bill_id. Use get_bills for full bill detail.",
+    {
+      matter_id: z.coerce.number().describe("Clio matter ID whose draft bill should be issued."),
+      bill_id: z.coerce.number().optional().describe("Optional: the specific draft bill ID to issue. Required only when the matter has more than one draft bill."),
+      target_state: z
+        .enum(["awaiting_payment", "awaiting_approval"])
+        .optional()
+        .default("awaiting_payment")
+        .describe("State to move the draft to. Default 'awaiting_payment' (issue the bill). Use 'awaiting_approval' if your firm routes bills through an approval step first."),
+    },
+    async (params) => {
+      try {
+        // Find the matter's draft bills.
+        const drafts = await fetchAllPages<any>("/bills", {
+          fields: "id,number,subject,state,total,balance,issued_at,matters{id,display_number}",
+          matter_id: params.matter_id,
+          state: "draft",
+        });
+
+        if (drafts.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                matter_id: params.matter_id,
+                context: "no_draft_bill",
+                message: `Matter ${params.matter_id} has no draft bill to issue. Clio's API can't generate one — open the matter in the Clio UI and click "Generate Bill" to create the draft, then run this tool again.`,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Pick the target draft.
+        let target: any;
+        if (params.bill_id !== undefined) {
+          target = drafts.find((b: any) => b.id === params.bill_id);
+          if (!target) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  matter_id: params.matter_id,
+                  context: "bill_not_a_draft_on_matter",
+                  message: `Bill ${params.bill_id} is not a draft on matter ${params.matter_id}. Drafts on this matter: ${drafts.map((b: any) => b.id).join(", ") || "none"}.`,
+                  draft_bills: drafts.map((b: any) => ({ id: b.id, number: b.number, total: b.total })),
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+        } else if (drafts.length > 1) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                matter_id: params.matter_id,
+                context: "multiple_drafts",
+                message: `Matter ${params.matter_id} has ${drafts.length} draft bills. Pass bill_id to choose which one to issue.`,
+                draft_bills: drafts.map((b: any) => ({
+                  id: b.id, number: b.number, subject: b.subject ?? null, total: b.total, balance: b.balance,
+                })),
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        } else {
+          target = drafts[0];
+        }
+
+        // Issue it via the same PATCH set_bill_state uses.
+        try {
+          await rawPatchSingle(`/bills/${target.id}`, { data: { state: params.target_state } });
+        } catch (err: any) {
+          const status = err.response?.status || err.statusCode;
+          let interpretation = "Unknown error";
+          if (status === 422) interpretation = "Clio rejected the transition — the draft may be incomplete (e.g. no billable line items) or the target state isn't reachable from draft for this firm's settings.";
+          else if (status === 403) interpretation = "Forbidden — insufficient permissions to issue bills.";
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                matter_id: params.matter_id,
+                bill_id: target.id,
+                attempted_transition: `draft → ${params.target_state}`,
+                status,
+                interpretation,
+                message: err.message,
+                clio_error: err.response?.data,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Read back to confirm.
+        const afterResp = await rawGetSingle(`/bills/${target.id}`, { fields: BILL_FIELDS });
+        const after = afterResp.data;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              matter_id: params.matter_id,
+              bill_id: target.id,
+              transition: `draft → ${after?.state}`,
+              bill: {
+                id: target.id,
+                number: after?.number ?? target.number,
+                state: after?.state,
+                total: after?.total ?? target.total,
+                balance: after?.balance ?? target.balance,
+                matter: after?.matters?.[0] ?? target.matters?.[0] ?? null,
+              },
+              message: `Bill ${after?.number || target.id} on matter ${params.matter_id} issued: draft → ${after?.state}.`,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              matter_id: params.matter_id,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
 }
