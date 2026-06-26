@@ -149,6 +149,7 @@ curl -X POST https://your-railway-url.up.railway.app/upload \
 | `get_expenses` | Expense entries with filters |
 | `get_unbilled_expenses` | Unbilled expenses grouped by matter |
 | `get_contacts` | Search contacts by name or email |
+| `create_contact` | Create a client/contact (Person or Company); returns the id to use as `create_matter`'s `client_id` |
 | `get_tasks` | Tasks with status/assignee/due date filters |
 | `get_bills` | Bills with state/date filters and aging flags |
 | `get_payments` | Individual payments/credits applied to bills (Clio allocations), incl. reversals |
