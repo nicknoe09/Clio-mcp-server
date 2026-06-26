@@ -42,6 +42,9 @@ export interface UploadSuccess {
   size_kb: number;
   elapsed_ms: number;
   via: "direct_version" | "conflict_lookup_version";
+  // Box version sequence number (etag) of the file after this upload, when Box
+  // returned it. Undefined if Box omitted it from the response.
+  version?: string;
 }
 
 export interface UploadFallback {
@@ -135,6 +138,7 @@ export async function createBoxFile(opts: {
       size_kb,
       elapsed_ms: 0,
       via: "direct_version",
+      version: meta.etag,
     };
   } catch (err: any) {
     const status = err?.response?.status;
@@ -182,6 +186,7 @@ export async function uploadToBox(opts: {
         size_kb,
         elapsed_ms,
         via: "direct_version",
+        version: meta.etag,
       };
     } catch (err: any) {
       const status = err?.response?.status;
@@ -248,6 +253,7 @@ export async function uploadToBox(opts: {
           size_kb,
           elapsed_ms,
           via: "conflict_lookup_version",
+          version: meta.etag,
         };
       } catch (vErr: any) {
         const vStatus = vErr?.response?.status;

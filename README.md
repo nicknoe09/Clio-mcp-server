@@ -68,6 +68,7 @@ curl http://localhost:3000/health
    At minimum: `DATABASE_URL` (the `noe_app` public-proxy URL), `APP_KEK_B64` (identical to the platform),
    `MS_TENANT_ID`, `MS_CLIENT_ID` (+ `MS_CLIENT_SECRET` if confidential), `MCP_AUDIENCE`, `MCP_SCOPE_NAME`,
    `ALLOWED_EMAILS`/`ALLOWED_EMAIL_DOMAINS`, `CLIO_CLIENT_ID`, `CLIO_CLIENT_SECRET`, and `PUBLIC_BASE_URL`.
+   Set `UPLOAD_SECRET` too if you use the [binary upload endpoint](#binary-upload-endpoint-post-upload).
 5. Deploy
 6. Test: `curl https://your-railway-url.up.railway.app/health` (expect `"transport":"streamable-http"`)
 
@@ -80,6 +81,59 @@ curl http://localhost:3000/health
    via `/.well-known/oauth-protected-resource` and runs the OAuth flow through
    `/authorize` + `/token`).
 5. Only allowlisted attorneys who have connected Clio on the platform can use the tools.
+
+## Binary Upload Endpoint (`POST /upload`)
+
+A plain `multipart/form-data` route for streaming a binary file (`.docx` / `.pdf` /
+`.xlsx`) straight into Box — created as a new file or versioned onto an existing one.
+It reuses the same Box upload code as the dashboard updater (`uploadToBox` /
+`createBoxFile`), so a remote client can `curl -F` raw bytes instead of base64-ing a
+binary into an MCP tool argument.
+
+**Auth:** send the shared secret in the `X-Upload-Secret` header, compared in constant
+time to the `UPLOAD_SECRET` env var. If `UPLOAD_SECRET` is unset the endpoint rejects
+every request (fail closed). A mismatch returns `401`.
+
+**Form fields:**
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `file` | yes | The binary, parsed in memory (50 MB max — Box's single-shot cap; larger → `413`). |
+| `overwrite_file_id` | one of these two | Upload a **new version** of this existing Box file. |
+| `parent_folder_id` | one of these two | Create a **new** Box file in this folder. |
+| `file_name` | no | Name to store as; falls back to the multipart filename. |
+
+Provide **exactly one** of `overwrite_file_id` / `parent_folder_id` (neither or both →
+`400`).
+
+**Response** (`200`):
+
+```json
+{ "ok": true, "file_id": "1234567890", "file_name": "report.pdf", "version": "3", "size": 81920 }
+```
+
+`version` is Box's version sequence number (etag) after the upload, or `null` if Box
+omitted it. On a Box failure the route returns `502` with `{ "ok": false, "error": ... }`.
+
+**Examples:**
+
+```bash
+# Create a NEW file in a Box folder
+curl -X POST https://your-railway-url.up.railway.app/upload \
+  -H "X-Upload-Secret: $UPLOAD_SECRET" \
+  -F "file=@./report.pdf" \
+  -F "parent_folder_id=390781679459" \
+  -F "file_name=Q2 Report.pdf"
+
+# Upload a NEW VERSION of an existing Box file
+curl -X POST https://your-railway-url.up.railway.app/upload \
+  -H "X-Upload-Secret: $UPLOAD_SECRET" \
+  -F "file=@./report.pdf" \
+  -F "overwrite_file_id=1234567890"
+```
+
+> The uploading Box account is the one connected via `/box/oauth/start`. If no Box
+> account is connected the endpoint returns `502`.
 
 ## Tool Reference
 

@@ -40,6 +40,7 @@ import { registerReviewTools } from "./tools/review";
 import { registerMorningReportTools } from "./tools/morningReport";
 import { registerVersionTools } from "./tools/version";
 import reviewRouter from "./routes/review";
+import uploadRouter from "./routes/upload";
 import { getDownload } from "./utils/downloadStore";
 
 const BASE_URL = ENV.PUBLIC_BASE_URL.replace(/\/$/, "");
@@ -320,6 +321,9 @@ app.get("/download/:token", (req, res) => {
 
 // --- Review UI Routes ---
 app.use(reviewRouter);
+
+// --- Binary upload → Box (auth via X-Upload-Secret; see routes/upload.ts) ---
+app.use(uploadRouter);
 
 // --- Box OAuth (unchanged — out of scope) ---
 app.get("/box/oauth/start", (_req, res) => {

@@ -11,6 +11,10 @@ export interface BoxFileMetadata {
   name: string;
   size: number;
   sha1: string;
+  // Box's version sequence number for the file (e.g. "0" for a brand-new file,
+  // bumped on each new version). Returned on every file object; surfaced so the
+  // /upload route can report which version it just wrote.
+  etag?: string;
   parent?: { id: string; name: string };
 }
 
