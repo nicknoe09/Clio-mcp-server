@@ -52,6 +52,7 @@ import {
   sanitizeXlsxBuffer,
   colLetter,
   patchCell,
+  readCell,
 } from "../utils/xlsx";
 
 // ========== SHARED HELPERS ==========
@@ -1461,7 +1462,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual') and by ORIGINATING attorney (col V 'Originating'). Fees from billers not on the roster are pooled into the 'NRB' row so Σ col N == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL billable hours WORKED that month (activity/work-date basis, billed or not — from the Revenue Report), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour entries whose rate doesn't match the timekeeper's standard hourly rate); real worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the target month's row in the 'Utilization' tab (billable = worked billable hours; nonbillable = admin-matter hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted admin nonbillable and collapsed it to ~0) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from an auto-generated Clio Client Activity report for the target month) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab. ALSO patches the target month's row in the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report for the target month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source it from a specific pre-generated Realization report. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual') and by ORIGINATING attorney (col V 'Originating'). Fees from billers not on the roster are pooled into the 'NRB' row so Σ col N == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL billable hours WORKED that month (activity/work-date basis, billed or not — from the Revenue Report), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour entries whose rate doesn't match the timekeeper's standard hourly rate); real worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the 'Utilization' tab (billable = worked billable hours; nonbillable = admin-matter hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted admin nonbillable and collapsed it to ~0; the Total and Untracked columns are recomputed from Billable+Nonbillable so they can't drift from the patched hours) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from auto-generated Clio Client Activity reports — one per month patched) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab (target month only). ALSO patches the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report per patched month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source the target month from a specific pre-generated Realization report. All three rate tabs honor backfill_ytd: a normal run patches only the TARGET month's block, while backfill_ytd=true re-derives EVERY YTD month block (generating one Client Activity / Fee Allocation report per month) — use it for a one-time historical correction of stale months. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1472,7 +1473,7 @@ export function registerDocumentTools(server: McpServer): void {
       fee_report_id: z.coerce.number().optional().describe("Deprecated / ignored. Previously pinned a cumulative Fee Allocation report for the Collection tab's collected/uncollected HOURS split; the Collection tab now generates its own single-month Fee Allocation report for the target month. 26 Compare collections (cols N/V) always use per-month payment-filtered reports."),
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
-      backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. NOTE: COLLECTIONS (col N/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
+      backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. The 'Utilization', 'Realization', and 'Collection' rate tabs follow this same cadence — target month only by default, or every YTD month block when backfill_ytd=true (Realization and Collection generate one Clio report per month when backfilling). NOTE: COLLECTIONS (col N/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
       billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 0 = no roll-back: each bill is counted in its CALENDAR issue month, matching Rachel's reference). Set to a positive N to roll bills issued on days 1..N of a month back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. N=7 ⇒ May 27–Jun 7 all count as May); if you do, run the month's snapshot after day N of the following month to capture those late-issued bills."),
     },
     async (params) => {
@@ -2537,13 +2538,18 @@ export function registerDocumentTools(server: McpServer): void {
           console.log(`[Dashboard] billed-$ non-roster/NRB patched to compareXml: cells=${billedCellsPatched} per-month-col-K-total=${JSON.stringify(billedColByMonth)}`);
 
           // ============================================================
-          // Patch Utilization / Realization tabs from Client Activity CSV
+          // Patch Utilization / Realization tabs
           // ============================================================
-          // The Client Activity report exposes every time entry's billed/unbilled
-          // state plus enough info to detect line-level discounts (Q*P vs Total).
-          // We patch ONLY the target month's block on each tab — prior months
-          // remain as-entered (matches the patch-only invariant from PR #70).
-          _step = "patch util/realiz from client activity";
+          // The Realization tab needs per-time-entry billed/unbilled state plus the
+          // line-discount split (Q*P vs Total), which the Client Activity report
+          // provides. These tabs are month-blocked, so we patch EVERY month in
+          // writeMonths — the target month only on a normal run, or all YTD when
+          // backfill_ytd=true. (Before this, the rate tabs only ever patched the
+          // single target month, so any month last written by older code — e.g. the
+          // Collection Feb/Mar cumulative blow-up — stayed frozen and drifted from
+          // Clio. Backfilling re-derives every YTD month from current per-month
+          // sources.)
+          _step = "patch util/realiz tabs";
           let utilXml: string | undefined, realizXml: string | undefined, collectionXml: string | undefined;
           let utilPatched = 0, realizPatched = 0, collectionPatched = 0;
           let clientActivityReportId: number | undefined;
@@ -2551,58 +2557,95 @@ export function registerDocumentTools(server: McpServer): void {
           let realizationReportId: number | undefined;
           let realizationErr: string | undefined;
           let collectionSource: string | undefined;
-          try {
-            const ca = await getClientActivityCSV({
-              start_date: monthStart, end_date: monthEnd,
-              reportId: params.client_activity_report_id,
-              pollSeconds: 180,
-            });
-            clientActivityReportId = ca.report.id;
-            // Map full name → user_id (case-insensitive). JBP/JPB initials alias
-            // handled separately at row-match time.
-            const nameToUid = new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id]));
-            const agg = aggregateClientActivity(ca.rows, nameToUid);
-            // 3-letter month label (JAN/FEB/.../DEC) used in col A of Util/Realiz/Collection.
-            const monthAbbr = MONTH_ABBRS[params.month - 1];
-            // Per-tab initials aliases. The Utilization tab has a typo: "JBP"
-            // instead of "JPB" for Jonathan Barbee. Map both to JPB so the
-            // patch hits the right row regardless.
-            const initialsAliases: Record<string, string> = { JBP: "JPB" };
-            const initialsToUid: Record<string, number> = {};
-            for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
-            // -- Utilization patch -- (target cols C=billable, D=nonbillable)
-            // Source from the SAME data as 26 Compare cols I (worked billable hours)
-            // and H (admin-matter nonbillable), NOT the Client Activity report. The
-            // Client Activity nonbillable test (Price==0) missed the firm's admin-
-            // matter time (those entries carry a rate), collapsing Utilization
-            // nonbillable to ~0; the targeted admin-matter query (catByMonth, summed
-            // into nonbillableHrs) is the figure that already reconciles on 26 Compare.
-            const utilPath = compareSheetMap["Utilization"];
-            if (utilPath) {
+          // Months to (re)write on the rate tabs: target only, or all YTD when
+          // backfilling — identical to the HOURS/BILLED snapshot cadence.
+          const rateTabMonths = writeMonths;
+          // Map full name → user_id (case-insensitive). JBP/JPB initials alias
+          // handled separately at row-match time.
+          const nameToUid = new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id]));
+          // Per-tab initials aliases. The Utilization tab has a typo: "JBP" instead
+          // of "JPB" for Jonathan Barbee. Map both to JPB so the patch hits the
+          // right row regardless.
+          const initialsAliases: Record<string, string> = { JBP: "JPB" };
+          const initialsToUid: Record<string, number> = {};
+          for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
+          const monthBounds = (m: number) => ({
+            start: `${params.year}-${String(m).padStart(2, "0")}-01`,
+            end: `${params.year}-${String(m).padStart(2, "0")}-${String(new Date(params.year, m, 0).getDate()).padStart(2, "0")}`,
+          });
+
+          // -- Utilization patch -- (cols C=billable, D=nonbillable, E=Total, G=Untracked)
+          // Sourced from the SAME data as 26 Compare cols I (worked billable hours)
+          // and H (admin-matter nonbillable), NOT the Client Activity report — its
+          // Price==0 nonbillable test missed rated admin-matter time and collapsed
+          // Utilization nonbillable to ~0; catByMonth (summed into nonbillableHrs) is
+          // the figure that already reconciles on 26 Compare. Total (E) and Untracked
+          // (G) are rewritten from the patched figures so they can't drift from
+          // Billable/Nonbillable (the partner rows had stale pre-fix Totals like Mar
+          // PAR 282 vs the correct 252.8+70.6=323.4): Total = Billable + Nonbillable;
+          // Untracked = max(0, Available − Total), reading the row's existing
+          // Available (col F). The Utilization Rate (col H) is the template's own
+          // =Billable/Available formula and is left untouched.
+          const utilPath = compareSheetMap["Utilization"];
+          if (utilPath) {
+            try {
               utilXml = await origZip.file(utilPath)!.async("string");
-              const block = findTabMonthBlock(utilXml, monthAbbr, sharedStrings, ["C", "D"]);
-              if (block) {
+              for (const m of rateTabMonths) {
+                const bundle = monthsData.find((b) => b.month === m);
+                if (!bundle) continue; // no hours data this month (classic default covers target only)
+                const block = findTabMonthBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
+                if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
-                  const realIni = initialsAliases[ini] ?? ini;
-                  const uid = initialsToUid[realIni];
+                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
                   if (!uid) continue;
-                  const tb = targetBundle.data[uid];
+                  const tb = bundle.data[uid];
                   if (!tb) continue;
+                  const total = round1(tb.billableHrs + tb.nonbillableHrs);
                   utilXml = patchCell(utilXml, `C${row}`, round1(tb.billableHrs));    // worked billable (= col I)
                   utilXml = patchCell(utilXml, `D${row}`, round1(tb.nonbillableHrs)); // admin nonbillable (= col H)
+                  utilXml = patchCell(utilXml, `E${row}`, total);                     // Total = billable + nonbillable
+                  const avail = parseFloat(readCell(utilXml, `F${row}`, sharedStrings));
+                  if (Number.isFinite(avail)) {
+                    utilXml = patchCell(utilXml, `G${row}`, round1(Math.max(0, avail - total))); // Untracked
+                  }
                   utilPatched++;
                 }
               }
+            } catch (e: any) {
+              clientActivityErr = e?.message ?? String(e);
+              console.error("[dashboard] Utilization tab patch failed:", clientActivityErr);
             }
-            // -- Realization patch -- (target cols D/E/F = billed-nondisc/disc/unbilled hrs)
-            const realizPath = compareSheetMap["Realization"];
-            if (realizPath) {
+          }
+
+          // -- Realization patch -- (cols D/E/F = billed-nondisc/disc/unbilled hrs)
+          // Per month, from an auto-generated Client Activity report scoped to that
+          // month. Each month is fetched + patched independently so one month's
+          // report failure doesn't abort the rest; the target month can reuse a
+          // pre-generated report via client_activity_report_id.
+          const realizPath = compareSheetMap["Realization"];
+          if (realizPath) {
+            try {
               realizXml = await origZip.file(realizPath)!.async("string");
-              const block = findTabMonthBlock(realizXml, monthAbbr, sharedStrings, ["D", "E", "F"]);
-              if (block) {
+            } catch (e: any) {
+              realizXml = undefined;
+              clientActivityErr = clientActivityErr ?? (e?.message ?? String(e));
+            }
+          }
+          if (realizXml) {
+            for (const m of rateTabMonths) {
+              const { start: mStart, end: mEnd } = monthBounds(m);
+              try {
+                const ca = await getClientActivityCSV({
+                  start_date: mStart, end_date: mEnd,
+                  reportId: m === params.month ? params.client_activity_report_id : undefined,
+                  pollSeconds: 180,
+                });
+                if (m === params.month) clientActivityReportId = ca.report.id;
+                const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const block = findTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
+                if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
-                  const realIni = initialsAliases[ini] ?? ini;
-                  const uid = initialsToUid[realIni];
+                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
                   if (!uid) continue;
                   const a = agg[uid];
                   if (!a) continue;
@@ -2611,11 +2654,12 @@ export function registerDocumentTools(server: McpServer): void {
                   realizXml = patchCell(realizXml, `F${row}`, round1(a.unbilledHrs));
                   realizPatched++;
                 }
+              } catch (e: any) {
+                const msg = `${MONTH_ABBRS[m - 1]}: ${e?.message ?? e}`;
+                clientActivityErr = clientActivityErr ? `${clientActivityErr}; ${msg}` : msg;
+                console.error(`[dashboard] Realization tab patch failed (${MONTH_ABBRS[m - 1]}):`, e?.message ?? e);
               }
             }
-          } catch (e: any) {
-            clientActivityErr = e?.message ?? String(e);
-            console.error("[dashboard] Client Activity tab patch failed:", clientActivityErr);
           }
 
           // ============================================================
@@ -2714,41 +2758,47 @@ export function registerDocumentTools(server: McpServer): void {
           // ============================================================
           // Patch Collection tab (Collected / Uncollected HOURS)
           // ============================================================
-          // DEFAULT source = a SINGLE-MONTH Fee Allocation report for the target
-          // month (filter_by_payment=false → invoices issued that month), whose
+          // Per month (rateTabMonths), from a SINGLE-MONTH Fee Allocation report for
+          // that month (filter_by_payment=false → invoices issued that month), whose
           // per-User Billed Hours are split into collected vs uncollected by the
           // Billed Time Collected/Outstanding dollar ratio. This replaces the old
           // cumulative (Jan 1 → report date) Fee Allocation CSV, which was summed
-          // with NO month filter and therefore wrote a running YTD total into each
-          // month's block (the Feb/Mar blow-up). It mirrors the per-month basis the
-          // 26 Compare collections (col N) already use and reconcile on.
-          // If realization_report_id is explicitly passed, use that report instead.
+          // with NO month filter and wrote a running YTD total into each month's
+          // block (the Feb/Mar blow-up). It mirrors the per-month basis the 26
+          // Compare collections (col N) already use and reconcile on. Each month is
+          // generated + patched independently so one month's failure doesn't abort
+          // the rest. If realization_report_id is passed it sources the TARGET month
+          // from that Realization report (it only covers the target month).
           _step = "patch collection (per-month fee allocation)";
-          try {
-            let collAgg: Record<number, RealizCollectionsAgg>;
-            if (params.realization_report_id) {
-              const rr = await getRealizationReportCSV({ start_date: monthStart, end_date: monthEnd, reportId: params.realization_report_id });
-              realizationReportId = rr.report.id;
-              collectionSource = "realization_report";
-              collAgg = aggregateRealizationCollections(rr.rows, new Map<string, number>(ROSTER.map(r => [r.name.toLowerCase(), r.user_id])));
-            } else {
-              collectionSource = "fee_allocation_monthly";
-              const monthFeeRows = await genFeeAllocationByMonth(params.year, params.month, { filterByPayment: false });
-              collAgg = aggregateFeeAllocationCollectionHrs(monthFeeRows, ROSTER);
-            }
-            const monthAbbr = MONTH_ABBRS[params.month - 1];
-            const initialsAliases: Record<string, string> = { JBP: "JPB" };
-            const initialsToUid: Record<string, number> = {};
-            for (const r of ROSTER) initialsToUid[r.initials.toUpperCase()] = r.user_id;
-            // -- Collection patch -- (target cols C=collected $, D=uncollected $)
-            const collPath = compareSheetMap["Collection"];
-            if (collPath) {
+          const collPath = compareSheetMap["Collection"];
+          if (collPath) {
+            try {
               collectionXml = await origZip.file(collPath)!.async("string");
-              const block = findTabMonthBlock(collectionXml, monthAbbr, sharedStrings, ["C", "D"]);
-              if (block) {
+            } catch (e: any) {
+              collectionXml = undefined;
+              realizationErr = e?.message ?? String(e);
+            }
+          }
+          if (collectionXml) {
+            for (const m of rateTabMonths) {
+              const { start: mStart, end: mEnd } = monthBounds(m);
+              try {
+                let collAgg: Record<number, RealizCollectionsAgg>;
+                if (params.realization_report_id && m === params.month) {
+                  const rr = await getRealizationReportCSV({ start_date: mStart, end_date: mEnd, reportId: params.realization_report_id });
+                  realizationReportId = rr.report.id;
+                  collectionSource = "realization_report";
+                  collAgg = aggregateRealizationCollections(rr.rows, nameToUid);
+                } else {
+                  collectionSource = collectionSource === "realization_report" ? collectionSource : "fee_allocation_monthly";
+                  const monthFeeRows = await genFeeAllocationByMonth(params.year, m, { filterByPayment: false });
+                  collAgg = aggregateFeeAllocationCollectionHrs(monthFeeRows, ROSTER);
+                }
+                // -- Collection patch -- (cols C=collected hrs, D=uncollected hrs)
+                const block = findTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
+                if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
-                  const realIni = initialsAliases[ini] ?? ini;
-                  const uid = initialsToUid[realIni];
+                  const uid = initialsToUid[initialsAliases[ini] ?? ini];
                   if (!uid) continue;
                   const c = collAgg[uid];
                   if (!c) continue;
@@ -2757,11 +2807,12 @@ export function registerDocumentTools(server: McpServer): void {
                   collectionXml = patchCell(collectionXml, `D${row}`, round1(c.uncollectedHrs));
                   collectionPatched++;
                 }
+              } catch (e: any) {
+                const msg = `${MONTH_ABBRS[m - 1]}: ${e?.message ?? e}`;
+                realizationErr = realizationErr ? `${realizationErr}; ${msg}` : msg;
+                console.error(`[dashboard] Collection tab patch failed (${MONTH_ABBRS[m - 1]}):`, e?.message ?? e);
               }
             }
-          } catch (e: any) {
-            realizationErr = e?.message ?? String(e);
-            console.error("[dashboard] Collection tab patch failed:", realizationErr);
           }
 
           // --- Build new sheet XMLs from data ---
