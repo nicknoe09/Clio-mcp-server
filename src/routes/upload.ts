@@ -121,4 +121,78 @@ router.post("/upload", (req: Request, res: Response) => {
   });
 });
 
+// =====================================================================
+// POST /version — upload a NEW VERSION of an existing Box file.
+//
+// Symmetric with /upload but for the version case only, so the call is a
+// clean one-shot (no parent_folder_id / "exactly one of" rule):
+//
+//   field  file_id    Box file id to version — REQUIRED
+//   field  file       the new binary — REQUIRED
+//   field  file_name  name to store as (falls back to the multipart filename)
+//
+// This is the same path /upload takes when given overwrite_file_id —
+// uploadToBox(overwriteFileId) → boxUploadNewVersion →
+// POST upload.box.com/api/2.0/files/{id}/content. Auth + limits identical.
+// =====================================================================
+router.post("/version", (req: Request, res: Response) => {
+  if (!secretMatches(req)) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return;
+  }
+
+  memUpload(req, res, async (err: any) => {
+    if (err) {
+      if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+        res.status(413).json({ ok: false, error: `file exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit` });
+        return;
+      }
+      res.status(400).json({ ok: false, error: `multipart parse failed: ${err?.message ?? String(err)}` });
+      return;
+    }
+
+    const file = (req as any).file as { buffer: Buffer; originalname: string } | undefined;
+    if (!file) {
+      res.status(400).json({ ok: false, error: "missing 'file' part in multipart body" });
+      return;
+    }
+
+    const fileId = String(req.body?.file_id ?? "").trim();
+    if (!fileId) {
+      res.status(400).json({ ok: false, error: "missing file_id" });
+      return;
+    }
+
+    const fileName = (String(req.body?.file_name ?? "").trim()) || file.originalname;
+    if (!fileName) {
+      res.status(400).json({ ok: false, error: "missing file_name (and no multipart filename to fall back to)" });
+      return;
+    }
+
+    const buffer = file.buffer;
+
+    try {
+      // folderId is unused on the version path (uploadToBox only touches it if
+      // the target file 404s — i.e. file_id is wrong/deleted, which then 502s).
+      const result = await uploadToBox({ buffer, filename: fileName, folderId: "", overwriteFileId: fileId });
+
+      if (!result.uploaded) {
+        res.status(502).json({ ok: false, error: result.reason, note: result.note });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        file_id: result.box_file_id,
+        file_name: result.filename,
+        version: result.version ?? null,
+        size: buffer.length,
+      });
+    } catch (e: any) {
+      console.error(`[Upload] /version unexpected failure file_id=${fileId}: ${e?.message ?? e}`);
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+});
+
 export default router;
