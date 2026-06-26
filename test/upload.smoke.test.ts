@@ -3,18 +3,18 @@ import express from "express";
 import type { Server } from "node:http";
 
 // Mock the Microsoft token verifier so auth is deterministic and offline:
-// Bearer "good" → allowlisted user; anything else → rejected.
+// Bearer "good" → allowlisted user, "app" → allowlisted app, else rejected.
 vi.mock("../src/auth/microsoft", () => {
   class AuthError extends Error {
     constructor(public code: string, msg: string) { super(msg); }
   }
   return {
     AuthError,
-    verifyMicrosoftToken: vi.fn(async (token: string) => {
-      if (token === "good") return { email: "test@allowed.com" };
+    verifyUploadCaller: vi.fn(async (token: string) => {
+      if (token === "good") return { kind: "user", subject: "test@allowed.com" };
+      if (token === "app") return { kind: "app", subject: "client-123" };
       throw new AuthError("invalid_token", "bad token");
     }),
-    isEmailAllowed: vi.fn(() => true),
   };
 });
 
@@ -81,7 +81,7 @@ describe("POST /upload", () => {
     expect((await r.json()).error).toMatch(/file/);
   });
 
-  it("valid request reaches Box layer (502 fallback when no Box user)", async () => {
+  it("valid USER token reaches Box layer (502 fallback when no Box user)", async () => {
     const r = await fetch(`${base}/upload`, {
       method: "POST", headers: AUTH, body: form({ parent_folder_id: "123" }),
     });
@@ -91,5 +91,15 @@ describe("POST /upload", () => {
     const body = await r.json();
     expect(body.ok).toBe(false);
     expect(body.error).toMatch(/no-box-user-authenticated/);
+  });
+
+  it("valid APP (client-credentials) token is accepted and reaches Box layer", async () => {
+    const r = await fetch(`${base}/upload`, {
+      method: "POST", headers: { Authorization: "Bearer app" }, body: form({ parent_folder_id: "123" }),
+    });
+    // An app-only token authenticates the same as a user token — proves the
+    // identity-less machine path is open.
+    expect(r.status).toBe(502);
+    expect((await r.json()).error).toMatch(/no-box-user-authenticated/);
   });
 });

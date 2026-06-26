@@ -89,11 +89,17 @@ It reuses the same Box upload code as the dashboard updater (`uploadToBox` /
 `createBoxFile`), so a remote client can `curl -F` raw bytes instead of base64-ing a
 binary into an MCP tool argument.
 
-**Auth:** the **same per-user Microsoft Bearer JWT** the `/mcp` transport requires —
-send `Authorization: Bearer <token>`. The token is validated against Microsoft's JWKS
-(issuer/audience/scope) and checked against the onboarding allowlist; anything else
-returns `401`. There is no separate secret to manage. (Obtain a token the same way the
-Claude.ai connector does — via the `/authorize` + `/token` OAuth flow.)
+**Auth:** `Authorization: Bearer <Microsoft token>`, validated against Microsoft's JWKS
+(issuer/audience/scope); anything else returns `401`. No separate secret to manage. Two
+kinds of token are accepted:
+
+- **Delegated user token** — the same identity the `/mcp` transport uses (obtain it the
+  way the Claude.ai connector does, via `/authorize` + `/token`). Gated by the email
+  allowlist.
+- **App-only token** (OAuth 2.0 **client credentials**) — for unattended / machine
+  callers (a sandbox, a cron job) that have no interactive user. Gated by
+  `ALLOWED_APP_IDS`. See [Machine-to-machine setup](#machine-to-machine-app-only-uploads)
+  below.
 
 **Form fields:**
 
@@ -135,6 +141,43 @@ curl -X POST https://your-railway-url.up.railway.app/upload \
 
 > The uploading Box account is the one connected via `/box/oauth/start`. If no Box
 > account is connected the endpoint returns `502`.
+
+### Machine-to-machine (app-only) uploads
+
+For an unattended caller with no interactive user (a sandbox, a scheduled job), use an
+**app-only client-credentials token** instead of a user token. One-time setup in Entra:
+
+1. **Expose an app role** on the API app registration (the one whose id is `MCP_AUDIENCE`):
+   App registrations → *your API app* → **App roles** → add a role with **Value =**
+   `MCP_SCOPE_NAME` (e.g. `mcp.access`) and **Allowed member types = Applications**.
+   (App-only tokens carry permissions in `roles[]`, not `scp` — a delegated scope alone
+   is not enough.)
+2. **Grant it to the caller app** (its own app registration, or a new one): API
+   permissions → Add a permission → *My APIs* → your API app → **Application permissions**
+   → check `mcp.access` → **Grant admin consent**.
+3. **Allowlist the caller** on this server: set `ALLOWED_APP_IDS` to the caller app's
+   client id (comma-separated for several). If unset, any app holding the role is allowed
+   (a warning is logged).
+
+The caller then mints a token with the client-credentials grant and calls `/upload`
+exactly as above — the client secret stays in the caller's secret store and is rotated/
+revoked centrally in Entra; nothing secret lives in this server:
+
+```bash
+# 1. Get an app-only token (client credentials) for the MCP API audience
+MS_TOKEN=$(curl -s -X POST \
+  "https://login.microsoftonline.com/$MS_TENANT_ID/oauth2/v2.0/token" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=$CALLER_CLIENT_ID" \
+  -d "client_secret=$CALLER_CLIENT_SECRET" \
+  -d "scope=$MCP_AUDIENCE/.default" | jq -r .access_token)
+
+# 2. Upload with it (identical to the user-token case)
+curl -X POST https://your-railway-url.up.railway.app/upload \
+  -H "Authorization: Bearer $MS_TOKEN" \
+  -F "file=@./petition.docx" \
+  -F "parent_folder_id=390781679459"
+```
 
 ## Tool Reference
 

@@ -1,23 +1,23 @@
 import { Request, Response, NextFunction } from "express";
 import { ENV } from "../utils/env";
-import { verifyMicrosoftToken, isEmailAllowed, AuthError } from "./microsoft";
+import { verifyUploadCaller, AuthError } from "./microsoft";
 
 const BASE_URL = ENV.PUBLIC_BASE_URL.replace(/\/$/, "");
 
-// Express requests that have passed requireMicrosoftUser carry the verified,
-// allowlisted email.
+// Express requests that have passed requireMicrosoftUser carry the verified
+// caller: a user's email, or an app (client) id for client-credentials tokens.
 export interface AuthedRequest extends Request {
-  userEmail?: string;
+  caller?: { kind: "user" | "app"; subject: string };
 }
 
 /**
- * Express middleware enforcing the same per-user Microsoft Bearer identity the
- * /mcp transport uses: validate `Authorization: Bearer <Microsoft v2 JWT>`
- * against Microsoft's JWKS (issuer/audience/scope), check the onboarding
- * allowlist, and attach `req.userEmail`. Responds 401 on any failure.
- *
- * Used by plain HTTP routes (e.g. POST /upload) that need authentication but
- * not the full per-request Clio-token context the /mcp handler builds.
+ * Express middleware for machine-to-machine HTTP routes (POST /upload) that need
+ * authentication but not the full per-request Clio-token context the /mcp
+ * handler builds. Validates `Authorization: Bearer <Microsoft token>` and
+ * accepts EITHER a delegated user token (gated by the email allowlist) OR an
+ * app-only client-credentials token (gated by ALLOWED_APP_IDS) — so an
+ * identity-less sandbox can authenticate non-interactively without a shared
+ * secret. Attaches `req.caller`; responds 401 on any failure.
  */
 export async function requireMicrosoftUser(
   req: AuthedRequest,
@@ -39,21 +39,13 @@ export async function requireMicrosoftUser(
     return;
   }
 
-  let email: string;
   try {
-    ({ email } = await verifyMicrosoftToken(token));
+    req.caller = await verifyUploadCaller(token);
   } catch (err) {
-    console.warn(`[auth] upload token rejected: ${err instanceof AuthError ? err.code : "invalid_token"}`);
+    console.warn(`[auth] upload caller rejected: ${err instanceof AuthError ? err.code : "invalid_token"}`);
     send401();
     return;
   }
 
-  if (!isEmailAllowed(email)) {
-    console.warn("[auth] upload — authenticated email is not on the onboarding allowlist");
-    send401();
-    return;
-  }
-
-  req.userEmail = email;
   next();
 }

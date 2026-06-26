@@ -34,6 +34,12 @@ export const ENV = {
     get MCP_SCOPE_NAME() { return getEnv("MCP_SCOPE_NAME"); },
     get ALLOWED_EMAILS() { return process.env.ALLOWED_EMAILS ?? ""; },
     get ALLOWED_EMAIL_DOMAINS() { return process.env.ALLOWED_EMAIL_DOMAINS ?? ""; },
+    // Comma-separated Microsoft app (client) IDs allowed to call machine-to-
+    // machine routes (POST /upload) with an app-only client-credentials token.
+    // App-only tokens carry no user/email, so they're gated by appid here
+    // instead of the email allowlist. Empty = allow any app that already holds
+    // the required app role (logged as a warning), mirroring ALLOWED_EMAILS.
+    get ALLOWED_APP_IDS() { return process.env.ALLOWED_APP_IDS ?? ""; },
 
     // --- Box (unchanged — out of scope) ---
     get BOX_CLIENT_ID() { return getEnv("BOX_CLIENT_ID", ""); },

@@ -53,10 +53,11 @@ function extractEmail(payload: JWTPayload): string {
 }
 
 /**
- * Verify a Microsoft v2 access token. Throws AuthError on any failure
- * (signature, issuer, audience, expiry, missing scope, missing email).
+ * Verify signature + issuer + audience + required scope/role, returning the
+ * validated payload. Throws AuthError on any failure. This is the shared core;
+ * callers decide what identity they need from the payload (user email vs app).
  */
-export async function verifyMicrosoftToken(token: string): Promise<{ email: string }> {
+export async function verifyMicrosoftJwtPayload(token: string): Promise<JWTPayload> {
   let payload: JWTPayload;
   try {
     ({ payload } = await jwtVerify(token, JWKS, {
@@ -87,12 +88,75 @@ export async function verifyMicrosoftToken(token: string): Promise<{ email: stri
     throw new AuthError("insufficient_scope", "Token is missing the required scope");
   }
 
+  return payload;
+}
+
+/**
+ * Verify a Microsoft v2 access token carrying a USER identity (the /mcp path).
+ * Throws AuthError on any failure (signature, issuer, audience, expiry,
+ * missing scope, missing email).
+ */
+export async function verifyMicrosoftToken(token: string): Promise<{ email: string }> {
+  const payload = await verifyMicrosoftJwtPayload(token);
   const email = extractEmail(payload);
   if (!email) {
     throw new AuthError("invalid_token", "Token has no email/preferred_username/upn claim");
   }
-
   return { email };
+}
+
+/** The app (client) id of an app-only token: `azp` (v2) or `appid` (v1). */
+function extractAppId(payload: JWTPayload): string {
+  return String((payload as any).azp ?? (payload as any).appid ?? "").trim();
+}
+
+/**
+ * Allowlist for machine callers (app-only client-credentials tokens), keyed by
+ * app/client id. If ALLOWED_APP_IDS is unset, allow any app that already holds
+ * the required app role (warn once) — mirrors isEmailAllowed's open default.
+ */
+let warnedOpenAppAllowlist = false;
+export function isAppAllowed(appId: string): boolean {
+  const ids = ENV.ALLOWED_APP_IDS.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (ids.length === 0) {
+    if (!warnedOpenAppAllowlist) {
+      console.warn(
+        "[auth] ALLOWED_APP_IDS is not set — allowing ANY app that holds the required role to call machine routes."
+      );
+      warnedOpenAppAllowlist = true;
+    }
+    return true;
+  }
+  return appId !== "" && ids.includes(appId.toLowerCase());
+}
+
+export type Caller =
+  | { kind: "user"; subject: string }
+  | { kind: "app"; subject: string };
+
+/**
+ * Verify a token for a machine-to-machine route (POST /upload) that accepts
+ * EITHER a delegated USER token or an app-only client-credentials token.
+ * A user token (has email) is gated by the email allowlist; an app token (no
+ * user, identified by appid) is gated by the app-id allowlist. Throws
+ * AuthError (code "forbidden") when verified but not allowlisted.
+ */
+export async function verifyUploadCaller(token: string): Promise<Caller> {
+  const payload = await verifyMicrosoftJwtPayload(token);
+  const email = extractEmail(payload);
+  if (email) {
+    if (!isEmailAllowed(email)) {
+      throw new AuthError("forbidden", "Authenticated email is not on the onboarding allowlist");
+    }
+    return { kind: "user", subject: email };
+  }
+  // No user claims → app-only (client-credentials) token. The required app role
+  // was already verified by verifyMicrosoftJwtPayload; gate the app id too.
+  const appId = extractAppId(payload);
+  if (!isAppAllowed(appId)) {
+    throw new AuthError("forbidden", `App ${appId || "<unknown>"} is not on the ALLOWED_APP_IDS allowlist`);
+  }
+  return { kind: "app", subject: appId };
 }
 
 /**
