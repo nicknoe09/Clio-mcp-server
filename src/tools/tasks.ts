@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { getActingClioUserId } from "../clio/actingUser";
 
 const TASK_FIELDS =
   "id,name,description,due_at,status,matter{id,display_number},assignee{id,name}";
@@ -94,7 +95,7 @@ export function registerTaskTools(server: McpServer): void {
         .default("Normal")
         .describe("Task priority (High, Normal, Low)"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      assignee_id: z.coerce.number().optional().describe("Assign to a user by ID"),
+      assignee_id: z.coerce.number().optional().describe("Assign to a user by ID. Defaults to YOU (the acting attorney) when omitted; pass another user's id to assign it to them."),
       is_private: z.boolean().optional().default(false).describe("Whether the task is private"),
       statute_of_limitations: z.boolean().optional().default(false).describe("Whether this is a statute of limitations task"),
     },
@@ -112,7 +113,11 @@ export function registerTaskTools(server: McpServer): void {
         if (params.description) body.data.description = params.description;
         if (params.due_at) body.data.due_at = params.due_at;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
-        if (params.assignee_id) body.data.assignee = { id: params.assignee_id, type: "User" };
+        // Default the assignee to the acting attorney when none is given, so a
+        // task isn't left unassigned or booked under a guessed id. Assigning to
+        // a colleague stays a normal explicit operation.
+        const assigneeId = params.assignee_id ?? (await getActingClioUserId());
+        body.data.assignee = { id: assigneeId, type: "User" };
 
         const result = await rawPostSingle("/tasks", body);
 
