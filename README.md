@@ -185,6 +185,7 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 | `list_custom_fields` | List Clio CustomField definitions firm-wide (Matter / Contact / Activity / Bill etc.) |
 | `get_matter_custom_field_values` | Read the custom field values set on a specific matter (picklist/contact labels auto-resolved) |
 | `find_matters_by_custom_field` | Find matters by a CustomField value via ONE bulk paginated query (avoids per-matter brute force) |
+| `set_matter_custom_field_value` | Write/update/clear a single Matter CustomField value (handles picklist label lookup, checkbox booleans, contact ids, etc.) |
 
 ## Troubleshooting
 

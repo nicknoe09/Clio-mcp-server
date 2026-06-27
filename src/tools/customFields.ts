@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle } from "../clio/pagination";
 
 // CustomField definitions live in Clio's /custom_fields resource. Each
 // CustomField has a parent_type (Matter / Contact / Activity / Bill / etc.)
@@ -483,6 +483,248 @@ export function registerCustomFieldTools(server: McpServer): void {
               },
               count: formatted.length,
               custom_field_values: formatted,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "set_matter_custom_field_value",
+    "Write a single Matter CustomField value — create, update, or clear it. Looks up the CustomField by `field_name` (parent_type=Matter) to get its id and field_type, resolves the input value into the wire shape Clio expects, then PATCHes /matters/{id} with the right add/update/_destroy semantics. Reads the matter back and returns the new value. Per-field-type input handling: checkbox accepts true/false; picklist accepts EITHER the option label (string, case-insensitive) OR the option id (number); contact accepts the contact_id (number); date/text/currency/numeric/email/url pass through as a string. Pass `null` to clear an existing value (deletes the CustomFieldValue from the matter). Use list_custom_fields to discover available field names and types before writing.",
+    {
+      matter_id: z.coerce.number().describe("Clio matter ID"),
+      field_name: z.string().describe("Exact name of the Matter CustomField to set, e.g. 'Contingency', 'Bill Frequency', 'Cause No.'. Case-sensitive."),
+      value: z
+        .union([z.string(), z.number(), z.boolean(), z.null()])
+        .describe("New value. For checkbox: true/false. For picklist: option label (string, case-insensitive) or option id (number). For contact: contact_id (number). For text/date/currency/etc.: string. Pass null to delete the value from the matter."),
+    },
+    async (params) => {
+      try {
+        // Step 1: Find the CustomField definition by name. We need its id,
+        // field_type, and (for picklist) its options so we can resolve a
+        // label to an option_id if the caller passed a label.
+        const matterFields = await fetchAllPages<any>("/custom_fields", {
+          fields: "id,name,field_type,picklist_options{id,option}",
+          parent_type: "Matter",
+        });
+        const field = matterFields.find(
+          (f: any) => f.name === params.field_name && !f.deleted,
+        );
+        if (!field) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: true,
+                message: `No Matter CustomField named "${params.field_name}". Use list_custom_fields(parent_type="Matter") to see valid names.`,
+                context: "custom_field_not_found",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Step 2: Read the matter's existing CFVs so we can decide create
+        // vs update (and to find the CFV id to PATCH if updating).
+        const beforeResp = await rawGetSingle(`/matters/${params.matter_id}`, {
+          fields:
+            "id,display_number,description,custom_field_values{id,field_name,value}",
+        });
+        const matter = beforeResp.data;
+        if (!matter) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: true,
+                message: `Matter ${params.matter_id} not found.`,
+              }),
+            }],
+            isError: true,
+          };
+        }
+        const existingCfv = (matter.custom_field_values || []).find(
+          (cfv: any) => cfv.field_name === params.field_name,
+        );
+
+        // Step 3: Resolve the input value into the wire shape Clio expects.
+        // OpenAPI types `value` as a string; Clio coerces by field_type on
+        // the server side. So we stringify, but we also do field-type-aware
+        // validation/resolution first (e.g. picklist label → option_id).
+        const fieldType = field.field_type as string;
+        let wireValue: string | null = null;
+        if (params.value === null) {
+          // Clearing: handled below via _destroy on the existing CFV.
+        } else if (fieldType === "checkbox") {
+          if (typeof params.value !== "boolean") {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `Field "${params.field_name}" is a checkbox; value must be true or false (got ${typeof params.value}).`,
+                  context: "value_type_mismatch",
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          wireValue = params.value ? "true" : "false";
+        } else if (fieldType === "picklist") {
+          const opts = Array.isArray(field.picklist_options)
+            ? field.picklist_options
+            : [];
+          let optionId: number | null = null;
+          if (typeof params.value === "number") {
+            const opt = opts.find((o: any) => o.id === params.value);
+            optionId = opt?.id ?? null;
+          } else if (typeof params.value === "string") {
+            const lower = params.value.toLowerCase();
+            const opt = opts.find(
+              (o: any) =>
+                typeof o.option === "string" && o.option.toLowerCase() === lower,
+            );
+            optionId = opt?.id ?? null;
+          }
+          if (optionId === null) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `Value "${params.value}" doesn't match any option on picklist "${params.field_name}". Valid options: ${opts.map((o: any) => o.option).filter(Boolean).join(" | ")}`,
+                  context: "picklist_option_not_found",
+                  valid_options: opts.map((o: any) => ({ id: o.id, option: o.option })),
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          wireValue = String(optionId);
+        } else if (fieldType === "contact") {
+          if (typeof params.value !== "number") {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `Field "${params.field_name}" is a contact field; value must be a contact_id (number).`,
+                  context: "value_type_mismatch",
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          wireValue = String(params.value);
+        } else {
+          // text_line, text_area, date, currency, numeric, email, url
+          wireValue =
+            typeof params.value === "string"
+              ? params.value
+              : String(params.value);
+        }
+
+        // Step 4: Build the PATCH body. Clio merges custom_field_values: the
+        // entries we send are added/updated, others stay untouched. For
+        // clears we set _destroy: true on the existing CFV.
+        const cfvEntry: any = {
+          custom_field: { id: field.id },
+        };
+        if (params.value === null) {
+          if (!existingCfv) {
+            // Nothing to clear — already absent.
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: true,
+                  no_change: true,
+                  message: `Field "${params.field_name}" was already not set on matter ${params.matter_id}. No PATCH sent.`,
+                  matter: {
+                    id: matter.id,
+                    display_number: matter.display_number,
+                  },
+                }, null, 2),
+              }],
+            };
+          }
+          cfvEntry.id = existingCfv.id;
+          cfvEntry._destroy = true;
+        } else {
+          if (existingCfv) cfvEntry.id = existingCfv.id;
+          cfvEntry.value = wireValue;
+        }
+        const body = { data: { custom_field_values: [cfvEntry] } };
+
+        // Step 5: PATCH the matter.
+        try {
+          await rawPatchSingle(`/matters/${params.matter_id}`, body);
+        } catch (err: any) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                matter_id: params.matter_id,
+                field_name: params.field_name,
+                status: err.response?.status,
+                message: err.message,
+                clio_error: err.response?.data,
+                request_body: body,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Step 6: Read back to confirm the new state.
+        const afterResp = await rawGetSingle(`/matters/${params.matter_id}`, {
+          fields:
+            "id,display_number,description,custom_field_values{id,field_name,value}",
+        });
+        const afterMatter = afterResp.data;
+        const afterCfv = (afterMatter?.custom_field_values || []).find(
+          (cfv: any) => cfv.field_name === params.field_name,
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              matter: {
+                id: afterMatter?.id ?? matter.id,
+                display_number: afterMatter?.display_number ?? matter.display_number,
+                description: afterMatter?.description ?? matter.description,
+              },
+              field: {
+                id: field.id,
+                name: field.name,
+                field_type: field.field_type,
+              },
+              action:
+                params.value === null
+                  ? "cleared"
+                  : existingCfv
+                    ? "updated"
+                    : "created",
+              before: existingCfv ? { id: existingCfv.id, value: existingCfv.value } : null,
+              after: afterCfv ? { id: afterCfv.id, value: afterCfv.value } : null,
             }, null, 2),
           }],
         };
