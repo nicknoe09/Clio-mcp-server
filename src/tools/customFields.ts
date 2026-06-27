@@ -117,6 +117,240 @@ export function registerCustomFieldTools(server: McpServer): void {
   );
 
   server.tool(
+    "find_matters_by_custom_field",
+    "Find matters whose CustomField value matches a given criterion — without brute-forcing per-matter lookups. Clio's /matters endpoint has NO server-side filter for custom_field_values, but it DOES support expanding `custom_field_values{id,field_name,value}` inline on the matter list response. So this tool runs ONE paginated `/matters?fields=...,custom_field_values{...}` query (3-4 calls for a ~500-matter firm) and filters client-side. Use this instead of looping through `get_matter_custom_field_values` per matter — that costs ~N HTTP calls instead of ~3. Returns the matching matters with `id`, `display_number`, `description`, `status`, `responsible_attorney`, `client`, plus the matched field's raw `value` and resolved `value_label` (picklist text, contact name, or Yes/No for checkbox). Picklist + contact labels are resolved via the same bulk-lookup path get_matter_custom_field_values uses.",
+    {
+      field_name: z.string().describe("Exact name of the CustomField to filter on, e.g. 'Contingency', 'Bill Frequency', 'Cause No.'. Case-sensitive."),
+      expected_value: z
+        .union([z.string(), z.number(), z.boolean()])
+        .optional()
+        .describe("Optional. The value to filter for. Pass true/false for checkbox fields, the picklist OPTION LABEL (string, case-insensitive) or option id (number) for picklist fields, the contact id (number) for contact fields, and the exact string for text fields. Omit to return ALL matters that have this field SET to any non-null value (useful for sparse fields)."),
+      status: z
+        .enum(["open", "closed", "pending", "all"])
+        .optional()
+        .default("open")
+        .describe("Filter matters by status before the custom-field filter is applied. Default 'open' (most invoice-review use cases)."),
+    },
+    async (params) => {
+      try {
+        // Step 1: Bulk fetch matters with custom_field_values expanded. ONE
+        // paginated query covers the whole open-matter set in 3-4 calls,
+        // vs the ~N calls a per-matter loop would burn.
+        const queryParams: Record<string, any> = {
+          fields:
+            "id,display_number,description,status,responsible_attorney{id,name},client{id,name},practice_area{name},billing_method,custom_field_values{id,field_name,value}",
+        };
+        if (params.status !== "all") queryParams.status = params.status;
+
+        const matters = await fetchAllPages<any>("/matters", queryParams);
+
+        // Step 2: First-pass filter — find matters where field_name appears in
+        // custom_field_values. (Sparse fields: matters that don't have the
+        // field instantiated won't appear in their cfvs array at all.)
+        const parseFieldType = (id: unknown): string | null => {
+          if (typeof id !== "string") return null;
+          const idx = id.indexOf("-");
+          return idx > 0 ? id.slice(0, idx) : null;
+        };
+        type MatterMatch = {
+          matter: any;
+          cfv: any;
+          field_type: string | null;
+        };
+        const firstPass: MatterMatch[] = [];
+        for (const m of matters) {
+          const cfvs: any[] = m.custom_field_values || [];
+          const hit = cfvs.find((cfv) => cfv.field_name === params.field_name);
+          if (hit) firstPass.push({ matter: m, cfv: hit, field_type: parseFieldType(hit.id) });
+        }
+
+        // Step 3: Apply expected_value filter (if any). For checkbox/numeric/
+        // contact, compare directly. For picklist, allow callers to pass
+        // either the option id (number) or the option label (string).
+        // For text fields, exact string match.
+        const exp = params.expected_value;
+        const wantsValueMatch = exp !== undefined && exp !== null;
+
+        // For picklist label-string match, we need to resolve options.
+        let picklistFieldByName: Map<string, any> | null = null;
+        if (
+          wantsValueMatch &&
+          typeof exp === "string" &&
+          firstPass.some((m) => m.field_type === "picklist")
+        ) {
+          const cfFields = await fetchAllPages<any>("/custom_fields", {
+            fields: "id,name,field_type,picklist_options{id,option}",
+            parent_type: "Matter",
+          });
+          picklistFieldByName = new Map<string, any>();
+          for (const f of cfFields) {
+            if (f.field_type === "picklist" && Array.isArray(f.picklist_options)) {
+              picklistFieldByName.set(f.name, f);
+            }
+          }
+        }
+
+        const matchesExpected = (m: MatterMatch): boolean => {
+          if (!wantsValueMatch) {
+            // No expected_value provided → match any non-null value.
+            return m.cfv.value !== null && m.cfv.value !== undefined;
+          }
+          const v = m.cfv.value;
+          if (v === null || v === undefined) return false;
+          if (m.field_type === "checkbox" && typeof exp === "boolean") {
+            return v === exp;
+          }
+          if (m.field_type === "picklist") {
+            if (typeof exp === "number") return v === exp;
+            if (typeof exp === "string" && picklistFieldByName) {
+              const field = picklistFieldByName.get(params.field_name);
+              const opt = field?.picklist_options?.find(
+                (o: any) =>
+                  typeof o.option === "string" &&
+                  o.option.toLowerCase() === exp.toLowerCase(),
+              );
+              return opt ? v === opt.id : false;
+            }
+            return false;
+          }
+          if (m.field_type === "contact" && typeof exp === "number") {
+            return v === exp;
+          }
+          // text_line, text_area, date, currency, numeric, email, url
+          if (typeof exp === "string" && typeof v === "string") {
+            return v === exp;
+          }
+          if (typeof exp === "number" && typeof v === "number") {
+            return v === exp;
+          }
+          return false;
+        };
+
+        const matched = firstPass.filter(matchesExpected);
+
+        // Step 4: Resolve labels for the matched set. Reuse the same bulk-
+        // lookup pattern get_matter_custom_field_values uses.
+        const contactIds = new Set<number>();
+        for (const m of matched) {
+          if (m.field_type === "contact" && typeof m.cfv.value === "number") {
+            contactIds.add(m.cfv.value);
+          }
+        }
+        const hasMatchedPicklist = matched.some((m) => m.field_type === "picklist");
+
+        const [picklistFieldsForLabels, contactRecords] = await Promise.all([
+          hasMatchedPicklist && !picklistFieldByName
+            ? fetchAllPages<any>("/custom_fields", {
+                fields: "id,name,field_type,picklist_options{id,option}",
+                parent_type: "Matter",
+              })
+            : Promise.resolve(
+                picklistFieldByName
+                  ? Array.from(picklistFieldByName.values())
+                  : [],
+              ),
+          Promise.all(
+            Array.from(contactIds).map(async (cid) => {
+              try {
+                const cr = await rawGetSingle(`/contacts/${cid}`, {
+                  fields: "id,name",
+                });
+                return cr.data && typeof cr.data.id === "number"
+                  ? { id: cr.data.id, name: cr.data.name as string | undefined }
+                  : null;
+              } catch {
+                return null;
+              }
+            }),
+          ),
+        ]);
+
+        const finalPicklistFieldByName =
+          picklistFieldByName ??
+          new Map<string, any>(
+            (picklistFieldsForLabels as any[])
+              .filter(
+                (f) =>
+                  f.field_type === "picklist" && Array.isArray(f.picklist_options),
+              )
+              .map((f) => [f.name, f]),
+          );
+        const contactNameById = new Map<number, string>();
+        for (const c of contactRecords) {
+          if (c && c.name) contactNameById.set(c.id, c.name);
+        }
+
+        const formatted = matched.map(({ matter, cfv, field_type }) => {
+          const value = cfv.value ?? null;
+          let valueLabel: string | null = null;
+          if (value !== null) {
+            if (field_type === "picklist") {
+              const field = finalPicklistFieldByName.get(params.field_name);
+              const opt = Array.isArray(field?.picklist_options)
+                ? field.picklist_options.find((o: any) => o.id === value)
+                : undefined;
+              valueLabel = opt?.option ?? null;
+            } else if (field_type === "contact") {
+              valueLabel =
+                typeof value === "number" ? contactNameById.get(value) ?? null : null;
+            } else if (field_type === "checkbox") {
+              valueLabel = value === true ? "Yes" : value === false ? "No" : null;
+            }
+          }
+          return {
+            id: matter.id,
+            display_number: matter.display_number,
+            description: matter.description,
+            status: matter.status,
+            billing_method: matter.billing_method ?? null,
+            practice_area: matter.practice_area?.name ?? null,
+            responsible_attorney: matter.responsible_attorney
+              ? { id: matter.responsible_attorney.id, name: matter.responsible_attorney.name }
+              : null,
+            client: matter.client
+              ? { id: matter.client.id, name: matter.client.name }
+              : null,
+            field_name: cfv.field_name,
+            field_type,
+            value,
+            value_label: valueLabel,
+          };
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              filter: {
+                field_name: params.field_name,
+                expected_value: params.expected_value ?? null,
+                status: params.status ?? "open",
+              },
+              matters_scanned: matters.length,
+              matters_with_field_set: firstPass.length,
+              count: formatted.length,
+              matters: formatted,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
     "get_matter_custom_field_values",
     "Get the custom field values set on a specific matter, with picklist option labels and contact names auto-resolved. Returns each value's id, field_name, field_type, raw value, and a human-readable value_label (when applicable — picklist option text, contact name, or 'Yes'/'No' for checkboxes). Use list_custom_fields to discover the schema (which fields exist firm-wide); use this tool to see what's actually set on one matter.",
     {
