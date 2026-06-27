@@ -20,6 +20,11 @@ export interface UserContext {
   // initialize/tools-list still work and only Clio-touching tools fail, with a
   // clear, user-actionable message.
   clioError?: string;
+  // The acting attorney's Clio user id (NOT the vault userId above), resolved
+  // lazily from /users/who_am_i and cached for the rest of the request. Lets
+  // write tools attribute actions to whoever is actually calling instead of a
+  // caller-supplied (and easily wrong) id. See clio/actingUser.ts.
+  clioUserId?: number;
 }
 
 export const als = new AsyncLocalStorage<UserContext>();
