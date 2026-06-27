@@ -25,6 +25,10 @@ export interface UserContext {
   // write tools attribute actions to whoever is actually calling instead of a
   // caller-supplied (and easily wrong) id. See clio/actingUser.ts.
   clioUserId?: number;
+  // The acting attorney's full Clio identity (id/email/name) from who_am_i,
+  // cached per request. Used by the central write guard to verify the Clio
+  // token actually belongs to the signed-in attorney. See clio/pagination.ts.
+  clioIdentity?: { id: number; email: string; name: string };
 }
 
 export const als = new AsyncLocalStorage<UserContext>();

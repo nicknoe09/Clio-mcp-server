@@ -1,5 +1,6 @@
 import { ENV } from "../utils/env";
 import { getAccessToken } from "../utils/tokenStore";
+import { getContext } from "../auth/identity";
 import { refreshAccessToken } from "./auth";
 import { withBackoff } from "./rateLimit";
 import https from "https";
@@ -139,6 +140,74 @@ export async function rawGetSingle(
       throw err;
     }
   });
+}
+
+// =====================================================================
+// Identity guard — make sure the Clio token actually belongs to the
+// signed-in attorney before any WRITE, so a misprovisioned token (e.g. a
+// user's vault row holding someone else's Clio tokens) can't silently
+// record actions under the wrong person. Clio attributes a created object
+// to the token owner, so the only defense is verifying the token owner.
+// =====================================================================
+
+export class IdentityMismatchError extends Error {
+  constructor(public readonly msEmail: string, public readonly clioEmail: string) {
+    super(
+      `Your Clio connection belongs to ${clioEmail}, but you signed in as ${msEmail}. ` +
+        `No action was taken — reconnect Clio on the platform /setup so actions are recorded under your own account.`
+    );
+    this.name = "IdentityMismatchError";
+  }
+}
+
+/** Pure mismatch check (unit-testable). Unknown/missing emails → not a mismatch (fail-open). */
+export function isIdentityMismatch(msEmail: string | undefined, clioEmail: string | undefined): boolean {
+  const a = (msEmail ?? "").trim().toLowerCase();
+  const b = (clioEmail ?? "").trim().toLowerCase();
+  if (!a || !b) return false;
+  return a !== b;
+}
+
+/** Resolve + cache the acting attorney's Clio identity (who_am_i) for this request. */
+export async function getActingClioIdentity(): Promise<{ id: number; email: string; name: string }> {
+  const ctx = getContext();
+  if (!ctx) {
+    throw new Error("No user context: Clio identity is only available inside an authenticated /mcp request.");
+  }
+  if (ctx.clioIdentity) return ctx.clioIdentity;
+  const me = await rawGetSingle("/users/who_am_i", { fields: "id,name,email" });
+  const u = me?.data ?? me;
+  const identity = {
+    id: Number(u?.id),
+    email: String(u?.email ?? "").trim().toLowerCase(),
+    name: String(u?.name ?? ""),
+  };
+  ctx.clioIdentity = identity;
+  if (Number.isFinite(identity.id)) ctx.clioUserId = identity.id;
+  return identity;
+}
+
+/**
+ * Block a WRITE when the Clio token owner doesn't match the signed-in attorney.
+ * Fail-OPEN: any inability to verify (no context, who_am_i error, missing
+ * email) lets the write proceed — the guard only ever blocks on a CONFIRMED
+ * email mismatch. Disable entirely with DISABLE_CLIO_IDENTITY_GUARD=true.
+ */
+async function assertActingClioIdentity(): Promise<void> {
+  if (process.env.DISABLE_CLIO_IDENTITY_GUARD === "true") return;
+  const ctx = getContext();
+  if (!ctx || !ctx.userEmail) return; // no signed-in identity to compare against
+  let clioEmail: string;
+  try {
+    clioEmail = (await getActingClioIdentity()).email;
+  } catch (e: any) {
+    console.warn(`[identity-guard] verification skipped (who_am_i failed): ${e?.message ?? e}`);
+    return; // fail open — never block a write because the check itself failed
+  }
+  if (isIdentityMismatch(ctx.userEmail, clioEmail)) {
+    console.error(`[identity-guard] BLOCKED write: signed-in=${ctx.userEmail.toLowerCase()} clio_token_owner=${clioEmail}`);
+    throw new IdentityMismatchError(ctx.userEmail.trim().toLowerCase(), clioEmail);
+  }
 }
 
 /**
@@ -298,6 +367,7 @@ export async function rawPostSingle(
   url: string,
   body: any
 ): Promise<any> {
+  await assertActingClioIdentity();
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 
@@ -368,6 +438,7 @@ export async function rawPatchSingle(
   url: string,
   body: any
 ): Promise<any> {
+  await assertActingClioIdentity();
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 
@@ -433,6 +504,7 @@ function rawHttpDelete(fullUrl: string): Promise<any> {
  * DELETE a resource in Clio. Returns the full JSON response body (usually empty).
  */
 export async function rawDeleteSingle(url: string): Promise<any> {
+  await assertActingClioIdentity();
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 

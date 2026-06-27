@@ -1,5 +1,4 @@
-import { getContext } from "../auth/identity";
-import { rawGetSingle } from "./pagination";
+import { getActingClioIdentity } from "./pagination";
 
 /**
  * Who is actually making this request, in Clio terms.
@@ -16,20 +15,12 @@ import { rawGetSingle } from "./pagination";
  * /users/who_am_i and cached on the ALS context.
  */
 
-/** Resolve + cache the acting attorney's Clio user id for this request. */
+/** Resolve the acting attorney's Clio user id for this request (cached via who_am_i). */
 export async function getActingClioUserId(): Promise<number> {
-  const ctx = getContext();
-  if (!ctx) {
-    throw new Error("No user context: the acting Clio user is only available inside an authenticated /mcp request.");
-  }
-  if (ctx.clioUserId != null) return ctx.clioUserId;
-
-  const me = await rawGetSingle("/users/who_am_i", { fields: "id" });
-  const id = Number((me as any)?.data?.id ?? (me as any)?.id);
+  const id = (await getActingClioIdentity()).id;
   if (!Number.isFinite(id)) {
     throw new Error("Could not resolve the acting Clio user (GET /users/who_am_i returned no id).");
   }
-  ctx.clioUserId = id;
   return id;
 }
 
