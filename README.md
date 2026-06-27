@@ -182,6 +182,8 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 | `get_realization_rate` | Billed vs worked value by timekeeper and matter |
 | `get_timekeeper_realization` | Deep per-attorney: worked, billed, collected, effective rate |
 | `reconcile_statement` | Match bank transactions against Clio expenses |
+| `list_custom_fields` | List Clio CustomField definitions firm-wide (Matter / Contact / Activity / Bill etc.) |
+| `get_matter_custom_field_values` | Read the custom field values set on a specific matter |
 
 ## Troubleshooting
 

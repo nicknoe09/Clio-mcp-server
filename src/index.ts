@@ -32,6 +32,7 @@ import { registerPerformanceTools } from "./tools/performance";
 import { registerReconcileTools } from "./tools/reconcile";
 import { registerScorecardTools } from "./tools/scorecard";
 import { registerCalendarTools } from "./tools/calendar";
+import { registerCustomFieldTools } from "./tools/customFields";
 import { registerCalcTools } from "./tools/calc";
 import { registerDocumentTools } from "./tools/documents";
 import { registerAuditTools } from "./tools/audit";
@@ -97,6 +98,8 @@ function createMcpServer(): McpServer {
     console.log("[MCP] registerScorecardTools OK");
     registerCalendarTools(server);
     console.log("[MCP] registerCalendarTools OK");
+    registerCustomFieldTools(server);
+    console.log("[MCP] registerCustomFieldTools OK");
     registerCalcTools(server);
     console.log("[MCP] registerCalcTools OK");
     registerDocumentTools(server);
