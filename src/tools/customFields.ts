@@ -118,7 +118,7 @@ export function registerCustomFieldTools(server: McpServer): void {
 
   server.tool(
     "get_matter_custom_field_values",
-    "Get the custom field values set on a specific matter. Returns each value's id, field_name, and value, along with the matter context (id, display_number, description). Use list_custom_fields to discover the schema (which fields exist firm-wide, their types and parent types); use this tool to see what's actually set on one matter.",
+    "Get the custom field values set on a specific matter, with picklist option labels and contact names auto-resolved. Returns each value's id, field_name, field_type, raw value, and a human-readable value_label (when applicable — picklist option text, contact name, or 'Yes'/'No' for checkboxes). Use list_custom_fields to discover the schema (which fields exist firm-wide); use this tool to see what's actually set on one matter.",
     {
       matter_id: z.coerce.number().describe("Clio matter ID"),
     },
@@ -144,11 +144,100 @@ export function registerCustomFieldTools(server: McpServer): void {
           };
         }
         const cfvs: any[] = matter.custom_field_values || [];
-        const formatted = cfvs.map((cfv) => ({
-          id: cfv.id,
-          field_name: cfv.field_name ?? null,
-          value: cfv.value ?? null,
-        }));
+
+        // Parse field_type from the CFV id prefix. Clio formats CFV ids as
+        // "{field_type}-{numeric_id}" (e.g. "picklist-1532667664",
+        // "text_line-7375737049", "contact-428026490"). Splitting on the
+        // first "-" gives the type; the field_type names themselves never
+        // contain "-" per Clio's enum.
+        const parseFieldType = (id: unknown): string | null => {
+          if (typeof id !== "string") return null;
+          const idx = id.indexOf("-");
+          return idx > 0 ? id.slice(0, idx) : null;
+        };
+
+        // Determine which lookups are needed.
+        const hasPicklist = cfvs.some(
+          (cfv) => parseFieldType(cfv.id) === "picklist" && cfv.value !== null && cfv.value !== undefined,
+        );
+        const contactIds = new Set<number>();
+        for (const cfv of cfvs) {
+          if (
+            parseFieldType(cfv.id) === "contact" &&
+            typeof cfv.value === "number"
+          ) {
+            contactIds.add(cfv.value);
+          }
+        }
+
+        // Parallel resolution:
+        //   - Matter CustomFields with picklist_options (one bulk call, only if needed)
+        //   - Each referenced contact in parallel (each is a tiny per-contact GET)
+        const [matterCustomFields, contactRecords] = await Promise.all([
+          hasPicklist
+            ? fetchAllPages<any>("/custom_fields", {
+                fields: "id,name,field_type,picklist_options{id,option}",
+                parent_type: "Matter",
+              })
+            : Promise.resolve([] as any[]),
+          Promise.all(
+            Array.from(contactIds).map(async (cid) => {
+              try {
+                const cr = await rawGetSingle(`/contacts/${cid}`, {
+                  fields: "id,name",
+                });
+                return cr.data && typeof cr.data.id === "number"
+                  ? { id: cr.data.id, name: cr.data.name as string | undefined }
+                  : null;
+              } catch {
+                return null;
+              }
+            }),
+          ),
+        ]);
+
+        // Build lookup maps.
+        const picklistFieldByName = new Map<string, any>();
+        for (const f of matterCustomFields) {
+          if (f.field_type === "picklist" && Array.isArray(f.picklist_options)) {
+            picklistFieldByName.set(f.name, f);
+          }
+        }
+        const contactNameById = new Map<number, string>();
+        for (const c of contactRecords) {
+          if (c && c.name) contactNameById.set(c.id, c.name);
+        }
+
+        // Resolve each value's human-readable label where applicable.
+        const formatted = cfvs.map((cfv) => {
+          const fieldType = parseFieldType(cfv.id);
+          let valueLabel: string | null = null;
+          const value = cfv.value ?? null;
+          if (value !== null) {
+            if (fieldType === "picklist") {
+              const field = picklistFieldByName.get(cfv.field_name);
+              const opt = Array.isArray(field?.picklist_options)
+                ? field.picklist_options.find((o: any) => o.id === value)
+                : undefined;
+              valueLabel = opt?.option ?? null;
+            } else if (fieldType === "contact") {
+              valueLabel =
+                typeof value === "number" ? contactNameById.get(value) ?? null : null;
+            } else if (fieldType === "checkbox") {
+              valueLabel = value === true ? "Yes" : value === false ? "No" : null;
+            }
+            // text_line, text_area, currency, date, numeric, email, url:
+            // value IS the human-readable representation; no separate label.
+          }
+          return {
+            id: cfv.id,
+            field_name: cfv.field_name ?? null,
+            field_type: fieldType,
+            value,
+            value_label: valueLabel,
+          };
+        });
+
         return {
           content: [{
             type: "text" as const,
