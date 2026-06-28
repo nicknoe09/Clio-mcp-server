@@ -166,7 +166,7 @@ export function registerMatterTools(server: McpServer): void {
   // can be matter-wide (matter_rate) and/or per-timekeeper (user_rates).
   server.tool(
     "create_matter",
-    "Open (create) a new matter in Clio via POST /matters. Requires client_id (the matter's client — an existing contact). All other fields are optional: description, status, open_date, billing_method, practice_area_id, responsible_attorney_id, originating_attorney_id. Custom intake fields (e.g. Cause #, Court, Bill Frequency, Paralegal) can be set in the same call via custom_fields. Per-timekeeper billing rates can be set via user_rates (e.g. $300 for one attorney, $250 for another) — written through Clio's custom_rate association with a POST-then-PATCH, so if the rate PATCH fails the matter is still created and the rate error is reported. Each user_rates entry needs a user_id and a rate; Clio requires a user per rate (no user-less matter-wide rate). Use list_custom_fields(parent_type='Matter') for fields, get_contacts for client_id, and get_users for attorney/timekeeper user IDs. Reads the matter back after creation; surfaces Clio validation errors verbatim.",
+    "Open (create) a new matter in Clio via POST /matters. Requires client_id (the matter's client — an existing contact). All other fields are optional: description, status, open_date, billing_method, practice_area_id, responsible_attorney_id, originating_attorney_id. Custom intake fields (e.g. Cause #, Court, Bill Frequency, Paralegal) can be set in the same call via custom_fields. Per-timekeeper HOURLY billing rates can be set via user_rates (e.g. $300 for one attorney, $250 for another) — written through Clio's custom_rate association with a POST-then-PATCH, so if the rate PATCH fails the matter is still created and the rate error is reported. Each user_rates entry needs a user_id and a rate; Clio requires a user per rate (no user-less matter-wide rate). Use list_custom_fields(parent_type='Matter') for fields, get_contacts for client_id, and get_users for attorney/timekeeper user IDs. Reads the matter back after creation; surfaces Clio validation errors verbatim.",
     {
       client_id: z.coerce.number().describe("REQUIRED. Clio contact ID of the matter's client. Find via get_contacts."),
       description: z.string().optional().describe("Matter description / name (e.g. 'Smith v. Jones — Personal Injury')."),
@@ -183,20 +183,15 @@ export function registerMatterTools(server: McpServer): void {
       practice_area_id: z.coerce.number().optional().describe("Practice area ID to assign. (Clio references practice areas by ID, not name.)"),
       responsible_attorney_id: z.coerce.number().optional().describe("Clio user ID of the responsible attorney. Find via get_users."),
       originating_attorney_id: z.coerce.number().optional().describe("Clio user ID of the originating attorney. Find via get_users."),
-      rate_type: z
-        .enum(["hourly", "flat"])
-        .optional()
-        .default("hourly")
-        .describe("Type of rate for user_rates. 'hourly' (default) → Clio HourlyRate; 'flat' → FlatRate (a flat fee; Clio flips billing_method to 'flat' as a side effect)."),
       user_rates: z
         .array(
           z.object({
             user_id: z.coerce.number().describe("Clio user ID of the timekeeper. Find via get_users."),
-            rate: z.coerce.number().describe("This user's rate on this matter, e.g. 300 or 250."),
+            rate: z.coerce.number().describe("This user's hourly rate on this matter, e.g. 300 or 250."),
           }),
         )
         .optional()
-        .describe("Per-timekeeper rates on the matter, e.g. [{user_id: 123, rate: 300}, {user_id: 456, rate: 250}]. Each entry maps a user to their own rate (Clio's custom_rate.rates array). Clio requires a user per rate — there is no user-less matter-wide rate."),
+        .describe("Per-timekeeper HOURLY rates on the matter, e.g. [{user_id: 123, rate: 300}, {user_id: 456, rate: 250}]. Each entry maps a user to their own rate (Clio's custom_rate.rates array). Clio requires a user per rate — there is no user-less matter-wide rate."),
       custom_fields: z
         .array(
           z.object({
@@ -265,7 +260,6 @@ export function registerMatterTools(server: McpServer): void {
         // The matter already exists at this point, so a rate failure does NOT
         // undo creation — we report it alongside the created matter instead.
         const ratePayload = buildCustomRatePayload({
-          rate_type: params.rate_type,
           user_rates: params.user_rates as UserRate[] | undefined,
         });
         let rateResult: any = null;
@@ -365,27 +359,21 @@ export function registerMatterTools(server: McpServer): void {
   // changing them, or when create_matter's rate PATCH failed.
   server.tool(
     "set_matter_rate",
-    "Set per-timekeeper billing rate(s) on an existing matter via Clio's custom_rate association (PATCH /matters/{id}). Provide user_rates — one entry per timekeeper, each with a user_id and a rate (e.g. $300 for one attorney and $250 for another). At least one entry is required; Clio requires a user per rate (there is no user-less matter-wide rate). rate_type selects 'hourly' (HourlyRate, default) or 'flat' (FlatRate — a flat fee, which flips the matter's billing_method to 'flat'). NOTE: the top-level billing_method field cannot be set directly — Clio always saves 'hourly' unless a FlatRate custom_rate is applied. Reads the matter back and returns billing_method (a 'flat' result confirms a FlatRate took). Use get_users to find user IDs.",
+    "Set per-timekeeper HOURLY billing rate(s) on an existing matter via Clio's custom_rate association (PATCH /matters/{id}). Provide user_rates — one entry per timekeeper, each with a user_id and a rate (e.g. $300 for one attorney and $250 for another). At least one entry is required; Clio requires a user per rate (there is no user-less matter-wide rate). Rates are hourly: the matter stays on hourly billing so per-timekeeper attribution (collections-by-user) is preserved. NOTE: the top-level billing_method field cannot be set directly — Clio ignores it. Reads the matter back and returns billing_method. Use get_users to find user IDs.",
     {
       matter_id: z.coerce.number().describe("Clio matter ID to set the rate on."),
-      rate_type: z
-        .enum(["hourly", "flat"])
-        .optional()
-        .default("hourly")
-        .describe("'hourly' (default) → HourlyRate; 'flat' → FlatRate (flat fee; flips billing_method to 'flat')."),
       user_rates: z
         .array(
           z.object({
             user_id: z.coerce.number().describe("Clio user ID of the timekeeper. Find via get_users."),
-            rate: z.coerce.number().describe("This user's rate on this matter, e.g. 300 or 250."),
+            rate: z.coerce.number().describe("This user's hourly rate on this matter, e.g. 300 or 250."),
           }),
         )
         .min(1)
-        .describe("Per-timekeeper rates (at least one), e.g. [{user_id: 123, rate: 300}, {user_id: 456, rate: 250}]. Each entry needs a user_id and a rate."),
+        .describe("Per-timekeeper hourly rates (at least one), e.g. [{user_id: 123, rate: 300}, {user_id: 456, rate: 250}]. Each entry needs a user_id and a rate."),
     },
     async (params) => {
       const ratePayload = buildCustomRatePayload({
-        rate_type: params.rate_type,
         user_rates: params.user_rates as UserRate[],
       });
       if (!ratePayload) {
