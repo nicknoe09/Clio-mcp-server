@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle, rawPostSingle } from "../clio/pagination";
+import { resolveCustomFieldsForCreate, type CustomFieldInput } from "../clio/customFieldResolver";
 
 const CONTACT_FIELDS =
   "id,name,first_name,last_name,type,email_addresses,phone_numbers";
@@ -11,7 +12,8 @@ const CONTACT_CREATE_READBACK_FIELDS =
   "id,name,first_name,last_name,type,company{id,name}," +
   "email_addresses{name,address,default_email}," +
   "phone_numbers{name,number,default_number}," +
-  "addresses{name,street,city,province,postal_code,country}";
+  "addresses{name,street,city,province,postal_code,country}," +
+  "custom_field_values{id,field_name,value}";
 
 export function registerContactTools(server: McpServer): void {
   // get_users — list all firm users with IDs
@@ -154,7 +156,7 @@ export function registerContactTools(server: McpServer): void {
   // what was created; Clio validation errors are surfaced verbatim.
   server.tool(
     "create_contact",
-    "Create a new contact (client) in Clio via POST /contacts. A Clio 'client' is just a contact, and create_matter's client_id is a contact ID — so use this to create the client, then pass the returned id to create_matter. For type='Person' provide first_name and/or last_name; for type='Company' provide name. Email, phone, and address are optional. Reads the contact back after creation and returns it; surfaces Clio validation errors verbatim.",
+    "Create a new contact (client) in Clio via POST /contacts. A Clio 'client' is just a contact, and create_matter's client_id is a contact ID — so use this to create the client, then pass the returned id to create_matter. For type='Person' provide first_name and/or last_name; for type='Company' provide name. Email, phone, and address are optional. Custom intake fields (e.g. Category, Referral Source, Referred By) can be set in the same call via custom_fields — pass each by field_name (or custom_field_id) with its value; picklists accept the option label or option id, contact fields accept a contact id. Use list_custom_fields(parent_type='Contact') to discover available fields. Reads the contact back after creation and returns it; surfaces Clio validation errors verbatim.",
     {
       type: z
         .enum(["Person", "Company"])
@@ -185,6 +187,25 @@ export function registerContactTools(server: McpServer): void {
         .optional()
         .default("Work")
         .describe("Label for the address (e.g. 'Work', 'Home', 'Billing'). Defaults to 'Work'."),
+      custom_fields: z
+        .array(
+          z.object({
+            field_name: z
+              .string()
+              .optional()
+              .describe("Exact Contact CustomField name (case-sensitive), e.g. 'Category', 'Referral Source', 'Referred By'."),
+            custom_field_id: z
+              .coerce
+              .number()
+              .optional()
+              .describe("Contact CustomField id, if known. Used instead of field_name."),
+            value: z
+              .union([z.string(), z.number(), z.boolean()])
+              .describe("Value to set. Picklist: option label (string) or option id (number). Contact field: contact id (number). Checkbox: true/false. Text/date/etc.: string."),
+          }),
+        )
+        .optional()
+        .describe("Custom intake fields to set on the contact (e.g. Category=Ward, Referral Source, Referred By=court contact). Each entry needs field_name or custom_field_id plus a value. Resolution is validated against the firm's Contact custom fields before the contact is created; if any entry is invalid the contact is NOT created and the errors are returned."),
     },
     async (params) => {
       // Validate the type-specific required fields up front so the caller gets a
@@ -209,6 +230,31 @@ export function registerContactTools(server: McpServer): void {
       }
 
       try {
+        // Resolve custom intake fields BEFORE creating, so a bad field name or
+        // picklist option aborts cleanly instead of leaving a half-configured
+        // contact behind. Picklist labels are resolved to option ids here.
+        let resolvedCustomFields: Awaited<ReturnType<typeof resolveCustomFieldsForCreate>> | null = null;
+        if (params.custom_fields && params.custom_fields.length > 0) {
+          resolvedCustomFields = await resolveCustomFieldsForCreate(
+            "Contact",
+            params.custom_fields as CustomFieldInput[],
+          );
+          if (resolvedCustomFields.errors.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: "One or more custom_fields could not be resolved; the contact was NOT created.",
+                  context: "custom_field_resolution_failed",
+                  custom_field_errors: resolvedCustomFields.errors,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+        }
+
         const data: Record<string, any> = { type: params.type };
         if (params.type === "Person") {
           if (params.first_name !== undefined) data.first_name = params.first_name;
@@ -244,6 +290,10 @@ export function registerContactTools(server: McpServer): void {
           data.addresses = [address];
         }
 
+        if (resolvedCustomFields && resolvedCustomFields.entries.length > 0) {
+          data.custom_field_values = resolvedCustomFields.entries;
+        }
+
         const result = await rawPostSingle("/contacts", { data });
         const created = result?.data ?? result;
 
@@ -277,7 +327,9 @@ export function registerContactTools(server: McpServer): void {
                     email_addresses: contact?.email_addresses ?? [],
                     phone_numbers: contact?.phone_numbers ?? [],
                     addresses: contact?.addresses ?? [],
+                    custom_field_values: contact?.custom_field_values ?? [],
                   },
+                  custom_fields_set: resolvedCustomFields?.resolved ?? [],
                   next_step: "Pass this contact's id as create_matter's client_id to open a matter for this client.",
                 },
                 null,
@@ -289,7 +341,7 @@ export function registerContactTools(server: McpServer): void {
       } catch (err: any) {
         const status = err.response?.status;
         let interpretation: string | undefined;
-        if (status === 422) interpretation = "Clio rejected the contact. Most often a required field is missing or malformed (Person needs first_name/last_name, Company needs name), or company_id is not a valid Company contact. See clio_error for the specific field.";
+        if (status === 422) interpretation = "Clio rejected the contact. Most often a required field is missing or malformed (Person needs first_name/last_name, Company needs name), company_id is not a valid Company contact, or a custom_field_values entry is invalid. See clio_error for the specific field.";
         else if (status === 404) interpretation = "A referenced resource was not found (check company_id).";
         else if (status === 403) interpretation = "Forbidden — the token lacks permission to create contacts.";
         return {

@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle, rawPostSingle } from "../clio/pagination";
+import { resolveCustomFieldsForCreate, type CustomFieldInput } from "../clio/customFieldResolver";
 
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
@@ -10,7 +11,7 @@ const MATTER_FIELDS =
 const MATTER_CREATE_READBACK_FIELDS =
   "id,display_number,description,status,open_date,billing_method," +
   "client{id,name},responsible_attorney{id,name},originating_attorney{id,name}," +
-  "practice_area{id,name}";
+  "practice_area{id,name},custom_field_values{id,field_name,value}";
 
 export function registerMatterTools(server: McpServer): void {
   // get_matters
@@ -164,7 +165,7 @@ export function registerMatterTools(server: McpServer): void {
   // silently dropped — so a wrong field shape is visible, not hidden.
   server.tool(
     "create_matter",
-    "Open (create) a new matter in Clio via POST /matters. Requires client_id (the matter's client — an existing contact). All other fields are optional: description, status, open_date, billing_method, practice_area_id, responsible_attorney_id, originating_attorney_id, and (opt-in/experimental) custom_rate. Reads the matter back after creation and returns it; surfaces Clio validation errors verbatim. Use get_contacts to find a client_id and get_users to find attorney user IDs.",
+    "Open (create) a new matter in Clio via POST /matters. Requires client_id (the matter's client — an existing contact). All other fields are optional: description, status, open_date, billing_method, practice_area_id, responsible_attorney_id, originating_attorney_id, and (opt-in/experimental) custom_rate. Custom intake fields (e.g. Cause #, Court, Bill Frequency, Paralegal, per-user hourly rate) can be set in the same call via custom_fields — pass each by field_name (or custom_field_id) with its value; picklists like Court accept the option label or option id, contact fields like Paralegal accept a contact id. Use list_custom_fields(parent_type='Matter') to discover available fields. Reads the matter back after creation and returns it; surfaces Clio validation errors verbatim. Use get_contacts to find a client_id and get_users to find attorney user IDs.",
     {
       client_id: z.coerce.number().describe("REQUIRED. Clio contact ID of the matter's client. Find via get_contacts."),
       description: z.string().optional().describe("Matter description / name (e.g. 'Smith v. Jones — Personal Injury')."),
@@ -186,9 +187,53 @@ export function registerMatterTools(server: McpServer): void {
         .number()
         .optional()
         .describe("OPT-IN / EXPERIMENTAL: matter-level custom hourly rate. Sent as data.custom_rate; field shape is pending probe_billing_write_apis confirmation, so if Clio rejects it the error is surfaced verbatim. Omit unless you specifically need a matter-level rate."),
+      custom_fields: z
+        .array(
+          z.object({
+            field_name: z
+              .string()
+              .optional()
+              .describe("Exact Matter CustomField name (case-sensitive), e.g. 'Cause #', 'Court', 'Bill Frequency', 'Paralegal'."),
+            custom_field_id: z
+              .coerce
+              .number()
+              .optional()
+              .describe("Matter CustomField id, if known. Used instead of field_name."),
+            value: z
+              .union([z.string(), z.number(), z.boolean()])
+              .describe("Value to set. Picklist (e.g. Court, Bill Frequency): option label (string) or option id (number). Contact field (e.g. Paralegal): contact id (number). Checkbox: true/false. Text/currency/date/etc.: string."),
+          }),
+        )
+        .optional()
+        .describe("Custom intake fields to set on the matter (e.g. Cause #, Court, Bill Frequency=Monthly, Paralegal, per-user hourly rate). Each entry needs field_name or custom_field_id plus a value. Resolution is validated against the firm's Matter custom fields before the matter is created; if any entry is invalid the matter is NOT created and the errors are returned."),
     },
     async (params) => {
       try {
+        // Resolve custom intake fields BEFORE creating, so a bad field name or
+        // picklist option aborts cleanly instead of leaving a half-configured
+        // matter behind. Picklist labels are resolved to option ids here.
+        let resolvedCustomFields: Awaited<ReturnType<typeof resolveCustomFieldsForCreate>> | null = null;
+        if (params.custom_fields && params.custom_fields.length > 0) {
+          resolvedCustomFields = await resolveCustomFieldsForCreate(
+            "Matter",
+            params.custom_fields as CustomFieldInput[],
+          );
+          if (resolvedCustomFields.errors.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: "One or more custom_fields could not be resolved; the matter was NOT created.",
+                  context: "custom_field_resolution_failed",
+                  custom_field_errors: resolvedCustomFields.errors,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+        }
+
         const data: Record<string, any> = {
           client: { id: params.client_id },
           status: params.status,
@@ -200,6 +245,9 @@ export function registerMatterTools(server: McpServer): void {
         if (params.responsible_attorney_id !== undefined) data.responsible_attorney = { id: params.responsible_attorney_id };
         if (params.originating_attorney_id !== undefined) data.originating_attorney = { id: params.originating_attorney_id };
         if (params.custom_rate !== undefined) data.custom_rate = params.custom_rate;
+        if (resolvedCustomFields && resolvedCustomFields.entries.length > 0) {
+          data.custom_field_values = resolvedCustomFields.entries;
+        }
 
         const result = await rawPostSingle("/matters", { data });
         const created = result?.data ?? result;
@@ -236,7 +284,9 @@ export function registerMatterTools(server: McpServer): void {
                     responsible_attorney: matter?.responsible_attorney ?? null,
                     originating_attorney: matter?.originating_attorney ?? null,
                     practice_area: matter?.practice_area ?? null,
+                    custom_field_values: matter?.custom_field_values ?? [],
                   },
+                  custom_fields_set: resolvedCustomFields?.resolved ?? [],
                 },
                 null,
                 2
@@ -247,7 +297,7 @@ export function registerMatterTools(server: McpServer): void {
       } catch (err: any) {
         const status = err.response?.status;
         let interpretation: string | undefined;
-        if (status === 422) interpretation = "Clio rejected the matter. Most often: client_id is not a valid contact, or a field value (e.g. custom_rate, billing_method, practice_area_id) is invalid. See clio_error for the specific field.";
+        if (status === 422) interpretation = "Clio rejected the matter. Most often: client_id is not a valid contact, or a field value (e.g. custom_rate, billing_method, practice_area_id, a custom_field_values entry) is invalid. See clio_error for the specific field.";
         else if (status === 404) interpretation = "A referenced resource was not found (check client_id / attorney IDs / practice_area_id).";
         else if (status === 403) interpretation = "Forbidden — the token lacks permission to create matters.";
         return {
