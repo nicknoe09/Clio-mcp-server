@@ -1,4 +1,6 @@
-import { boxUploadFile, boxUploadNewVersion, boxDownloadFile, boxDeleteFile, boxFindFileInFolder } from "../box/client";
+import { boxUploadFile, boxUploadNewVersion, boxUploadFileWithToken, boxUploadNewVersionWithToken, boxDownloadFile, boxDeleteFile, boxFindFileInFolder } from "../box/client";
+import { refreshBoxTokensRaw } from "../box/auth";
+import { getBoxTokens, updateBoxTokens } from "../auth/vault";
 import { getBoxRegisteredUsers } from "./tokenStore";
 import { registerDownload, mimeForFilename } from "./downloadStore";
 
@@ -145,6 +147,60 @@ export async function createBoxFile(opts: {
     const boxMsg = err?.response?.data?.message ?? err?.message ?? "unknown";
     return fallback(buffer, filename, `create_failed status=${status ?? "?"} msg=${boxMsg}`);
   }
+}
+
+/**
+ * Per-user upload: act as a SPECIFIC attorney's Box account, using their Box
+ * token from the platform vault (not the shared service account). On a 401 the
+ * token is refreshed against Box and the rotated pair is written BACK to the
+ * vault (never the local store / Railway env). Returns a discriminated result
+ * like uploadToBox; all failures resolve to { uploaded: false } so the route
+ * surfaces a clean error rather than throwing.
+ */
+export async function uploadToBoxAsUser(opts: {
+  buffer: Buffer;
+  filename: string;
+  userId: string;
+  target: { create: string } | { version: string };
+}): Promise<
+  | { uploaded: true; box_file_id: string; filename: string; version?: string }
+  | { uploaded: false; reason: string }
+> {
+  const { buffer, filename, userId, target } = opts;
+
+  const tokens = await getBoxTokens(userId);
+  if (!tokens) {
+    return { uploaded: false, reason: "box-not-connected-for-user (connect Box on the platform /setup)" };
+  }
+
+  const attempt = (accessToken: string) =>
+    "version" in target
+      ? boxUploadNewVersionWithToken(buffer, filename, target.version, accessToken)
+      : boxUploadFileWithToken(buffer, filename, target.create, accessToken);
+
+  let meta: { id: string; etag?: string };
+  try {
+    meta = await attempt(tokens.accessToken);
+  } catch (err: any) {
+    if (err?.response?.status !== 401) {
+      const status = err?.response?.status;
+      const boxMsg = err?.response?.data?.message ?? err?.message ?? "unknown";
+      return { uploaded: false, reason: `box_upload_failed status=${status ?? "?"} msg=${boxMsg}` };
+    }
+    // Access token expired — refresh against Box, persist the rotated pair to
+    // the vault, and retry once.
+    try {
+      const refreshed = await refreshBoxTokensRaw(tokens.refreshToken);
+      const expiresAt = refreshed.expires_in ? new Date(Date.now() + refreshed.expires_in * 1000) : null;
+      await updateBoxTokens(userId, refreshed.access_token, refreshed.refresh_token ?? tokens.refreshToken, expiresAt);
+      meta = await attempt(refreshed.access_token);
+    } catch (e2: any) {
+      const status = e2?.response?.status;
+      const boxMsg = e2?.response?.data?.message ?? e2?.message ?? "unknown";
+      return { uploaded: false, reason: `box_reauth_failed status=${status ?? "?"} msg=${boxMsg} (reconnect Box on /setup)` };
+    }
+  }
+  return { uploaded: true, box_file_id: meta.id, filename, version: meta.etag };
 }
 
 /**

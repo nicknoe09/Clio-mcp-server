@@ -1,6 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import express from "express";
 import type { Server } from "node:http";
+
+// No per-user upload key in these tests → resolveUploadKey returns null, so the
+// route uses the shared-secret path (no DB needed).
+vi.mock("../src/auth/vault", () => ({ resolveUploadKey: vi.fn(async () => null) }));
+
 import uploadRouter from "../src/routes/upload";
 
 let server: Server;

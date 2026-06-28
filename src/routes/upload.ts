@@ -1,27 +1,29 @@
 import { Router, Request, Response } from "express";
 import multer from "multer";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { uploadToBox, createBoxFile } from "../utils/box";
+import { uploadToBox, createBoxFile, uploadToBoxAsUser } from "../utils/box";
+import { resolveUploadKey } from "../auth/vault";
 
 // =====================================================================
-// POST /upload — authenticated binary upload → Box (create or version).
+// POST /upload and /version — authenticated binary upload → Box.
 //
 // A plain multipart/form-data route so an external client can stream raw
-// bytes (curl -F) instead of base64-ing a binary into a tool argument:
+// bytes (curl -F) instead of base64-ing a binary into a tool argument.
 //
 //   field  file               the binary (.docx/.pdf/.xlsx) — REQUIRED
-//   field  overwrite_file_id  Box file id → upload a NEW VERSION of it
-//   field  parent_folder_id   Box folder id → create a NEW file in it
-//   field  file_name          name to store as (falls back to the
-//                              multipart filename)
+//   field  parent_folder_id   Box folder id → create a NEW file (/upload)
+//   field  overwrite_file_id  Box file id   → upload a NEW VERSION (/upload)
+//   field  file_id            Box file id   → upload a NEW VERSION (/version)
+//   field  file_name          name to store as (falls back to the filename)
 //
-// Exactly one of overwrite_file_id / parent_folder_id is required.
-//
-// Auth: header X-Upload-Secret, constant-time compared to env UPLOAD_SECRET.
-// Fails closed (401) if UPLOAD_SECRET is unset.
-//
-// The Box work reuses the dashboard updater's helpers (utils/box.ts):
-// uploadToBox(overwriteFileId) for versions, createBoxFile() for new files.
+// Auth (X-Upload-Secret header), two kinds of credential:
+//   1. A PER-USER upload key (resolveUploadKey → owning attorney). The upload
+//      runs as THAT attorney's own Box account, using their Box token from the
+//      platform vault. This is the per-user path.
+//   2. The legacy shared UPLOAD_SECRET → the shared service Box account
+//      (getBoxRegisteredUsers()[0]). Kept as a fallback.
+// A per-user key takes precedence; if the upload_keys table isn't provisioned
+// yet, resolveUploadKey returns null and we fall back to the shared secret.
 // =====================================================================
 
 const router = Router();
@@ -30,19 +32,16 @@ const router = Router();
 // API, which this route does not implement — reject them up front.
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
 
-// In-memory parsing: we hand the buffer straight to Box, never touching disk.
 const memUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_UPLOAD_BYTES },
 }).single("file");
 
-// Constant-time secret check. Hashing both sides to a fixed-width digest keeps
-// the comparison constant-time regardless of input length (timingSafeEqual
-// throws on length mismatch) and avoids leaking the secret's length.
-function secretMatches(req: Request): boolean {
+// Constant-time check of the presented secret against the shared UPLOAD_SECRET.
+function sharedSecretMatches(req: Request): boolean {
   const expected = process.env.UPLOAD_SECRET;
   if (!expected) {
-    console.error("[Upload] UPLOAD_SECRET is not set — rejecting all uploads (fail closed)");
+    console.error("[Upload] UPLOAD_SECRET is not set — shared-secret path disabled (fail closed)");
     return false;
   }
   const provided = req.headers["x-upload-secret"];
@@ -52,147 +51,132 @@ function secretMatches(req: Request): boolean {
   return timingSafeEqual(a, b);
 }
 
-router.post("/upload", (req: Request, res: Response) => {
-  // Auth before parsing the (potentially large) body so a bad secret is cheap.
-  if (!secretMatches(req)) {
-    res.status(401).json({ ok: false, error: "unauthorized" });
-    return;
-  }
+type Auth = { kind: "user"; userId: string } | { kind: "shared" };
+type Target = { create: string } | { version: string };
 
-  memUpload(req, res, async (err: any) => {
-    if (err) {
-      if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-        res.status(413).json({ ok: false, error: `file exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit` });
+// Resolve who the request acts as: a per-user upload key (→ that attorney) or
+// the shared secret (→ service account). Null = unauthorized.
+async function resolveUploadAuth(req: Request): Promise<Auth | null> {
+  const presented = req.headers["x-upload-secret"];
+  if (typeof presented === "string" && presented) {
+    try {
+      const owner = await resolveUploadKey(presented);
+      if (owner) return { kind: "user", userId: owner.userId };
+    } catch (e: any) {
+      // Vault unavailable / lookup failed — don't lock out the shared path.
+      console.error(`[Upload] upload-key lookup failed, falling back to shared secret: ${e?.message ?? e}`);
+    }
+  }
+  if (sharedSecretMatches(req)) return { kind: "shared" };
+  return null;
+}
+
+async function dispatchToBox(
+  auth: Auth,
+  buffer: Buffer,
+  filename: string,
+  target: Target
+): Promise<
+  | { uploaded: true; box_file_id: string; filename: string; version?: string }
+  | { uploaded: false; reason?: string; note?: string }
+> {
+  if (auth.kind === "user") {
+    return uploadToBoxAsUser({ buffer, filename, userId: auth.userId, target });
+  }
+  // Shared service account (legacy).
+  return "version" in target
+    ? uploadToBox({ buffer, filename, folderId: "", overwriteFileId: target.version })
+    : createBoxFile({ buffer, filename, folderId: target.create });
+}
+
+// Shared route body: auth → parse multipart → derive target → upload → respond.
+function makeUploadHandler(
+  deriveTarget: (body: any) => Target | { error: string }
+) {
+  return (req: Request, res: Response) => {
+    (async () => {
+      // Auth from the header before parsing the (potentially large) body.
+      const auth = await resolveUploadAuth(req);
+      if (!auth) {
+        res.status(401).json({ ok: false, error: "unauthorized" });
         return;
       }
-      res.status(400).json({ ok: false, error: `multipart parse failed: ${err?.message ?? String(err)}` });
-      return;
-    }
 
-    const file = (req as any).file as { buffer: Buffer; originalname: string } | undefined;
-    if (!file) {
-      res.status(400).json({ ok: false, error: "missing 'file' part in multipart body" });
-      return;
-    }
+      memUpload(req, res, async (err: any) => {
+        if (err) {
+          if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+            res.status(413).json({ ok: false, error: `file exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit` });
+            return;
+          }
+          res.status(400).json({ ok: false, error: `multipart parse failed: ${err?.message ?? String(err)}` });
+          return;
+        }
 
-    const overwriteFileId = String(req.body?.overwrite_file_id ?? "").trim() || undefined;
-    const parentFolderId = String(req.body?.parent_folder_id ?? "").trim() || undefined;
-    // Exactly one target must be given (both set or both unset → ambiguous).
+        const file = (req as any).file as { buffer: Buffer; originalname: string } | undefined;
+        if (!file) {
+          res.status(400).json({ ok: false, error: "missing 'file' part in multipart body" });
+          return;
+        }
+
+        const target = deriveTarget(req.body ?? {});
+        if ("error" in target) {
+          res.status(400).json({ ok: false, error: target.error });
+          return;
+        }
+
+        const fileName = (String(req.body?.file_name ?? "").trim()) || file.originalname;
+        if (!fileName) {
+          res.status(400).json({ ok: false, error: "missing file_name (and no multipart filename to fall back to)" });
+          return;
+        }
+
+        const buffer = file.buffer;
+        try {
+          const result = await dispatchToBox(auth, buffer, fileName, target);
+          if (!result.uploaded) {
+            res.status(502).json({ ok: false, error: result.reason, note: result.note });
+            return;
+          }
+          res.json({
+            ok: true,
+            file_id: result.box_file_id,
+            file_name: result.filename,
+            version: result.version ?? null,
+            size: buffer.length,
+            acted_as: auth.kind, // "user" = the attorney's own Box; "shared" = service account
+          });
+        } catch (e: any) {
+          console.error(`[Upload] unexpected failure filename=${fileName}: ${e?.message ?? e}`);
+          res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+        }
+      });
+    })().catch((e: any) => {
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    });
+  };
+}
+
+// POST /upload — create (parent_folder_id) OR version (overwrite_file_id); exactly one.
+router.post(
+  "/upload",
+  makeUploadHandler((body): Target | { error: string } => {
+    const overwriteFileId = String(body?.overwrite_file_id ?? "").trim() || undefined;
+    const parentFolderId = String(body?.parent_folder_id ?? "").trim() || undefined;
     if (!!overwriteFileId === !!parentFolderId) {
-      res.status(400).json({ ok: false, error: "provide exactly one of overwrite_file_id or parent_folder_id" });
-      return;
+      return { error: "provide exactly one of overwrite_file_id or parent_folder_id" };
     }
+    return overwriteFileId ? { version: overwriteFileId } : { create: parentFolderId! };
+  })
+);
 
-    const fileName = (String(req.body?.file_name ?? "").trim()) || file.originalname;
-    if (!fileName) {
-      res.status(400).json({ ok: false, error: "missing file_name (and no multipart filename to fall back to)" });
-      return;
-    }
-
-    const buffer = file.buffer;
-
-    try {
-      // Version an existing file, or create a new one — reusing the same Box
-      // helpers the dashboard updater uses. folderId is unused on the version
-      // path (uploadToBox only touches it if the target file 404s).
-      const result = overwriteFileId
-        ? await uploadToBox({ buffer, filename: fileName, folderId: "", overwriteFileId })
-        : await createBoxFile({ buffer, filename: fileName, folderId: parentFolderId! });
-
-      if (!result.uploaded) {
-        // Box upload failed; uploadToBox/createBoxFile produced a fallback
-        // download link, which is useless to a remote client that just sent
-        // us the bytes — surface the reason as an error instead.
-        res.status(502).json({ ok: false, error: result.reason, note: result.note });
-        return;
-      }
-
-      res.json({
-        ok: true,
-        file_id: result.box_file_id,
-        file_name: result.filename,
-        version: result.version ?? null,
-        size: buffer.length,
-      });
-    } catch (e: any) {
-      console.error(`[Upload] unexpected failure filename=${fileName}: ${e?.message ?? e}`);
-      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
-    }
-  });
-});
-
-// =====================================================================
-// POST /version — upload a NEW VERSION of an existing Box file.
-//
-// Symmetric with /upload but for the version case only, so the call is a
-// clean one-shot (no parent_folder_id / "exactly one of" rule):
-//
-//   field  file_id    Box file id to version — REQUIRED
-//   field  file       the new binary — REQUIRED
-//   field  file_name  name to store as (falls back to the multipart filename)
-//
-// This is the same path /upload takes when given overwrite_file_id —
-// uploadToBox(overwriteFileId) → boxUploadNewVersion →
-// POST upload.box.com/api/2.0/files/{id}/content. Auth + limits identical.
-// =====================================================================
-router.post("/version", (req: Request, res: Response) => {
-  if (!secretMatches(req)) {
-    res.status(401).json({ ok: false, error: "unauthorized" });
-    return;
-  }
-
-  memUpload(req, res, async (err: any) => {
-    if (err) {
-      if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-        res.status(413).json({ ok: false, error: `file exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit` });
-        return;
-      }
-      res.status(400).json({ ok: false, error: `multipart parse failed: ${err?.message ?? String(err)}` });
-      return;
-    }
-
-    const file = (req as any).file as { buffer: Buffer; originalname: string } | undefined;
-    if (!file) {
-      res.status(400).json({ ok: false, error: "missing 'file' part in multipart body" });
-      return;
-    }
-
-    const fileId = String(req.body?.file_id ?? "").trim();
-    if (!fileId) {
-      res.status(400).json({ ok: false, error: "missing file_id" });
-      return;
-    }
-
-    const fileName = (String(req.body?.file_name ?? "").trim()) || file.originalname;
-    if (!fileName) {
-      res.status(400).json({ ok: false, error: "missing file_name (and no multipart filename to fall back to)" });
-      return;
-    }
-
-    const buffer = file.buffer;
-
-    try {
-      // folderId is unused on the version path (uploadToBox only touches it if
-      // the target file 404s — i.e. file_id is wrong/deleted, which then 502s).
-      const result = await uploadToBox({ buffer, filename: fileName, folderId: "", overwriteFileId: fileId });
-
-      if (!result.uploaded) {
-        res.status(502).json({ ok: false, error: result.reason, note: result.note });
-        return;
-      }
-
-      res.json({
-        ok: true,
-        file_id: result.box_file_id,
-        file_name: result.filename,
-        version: result.version ?? null,
-        size: buffer.length,
-      });
-    } catch (e: any) {
-      console.error(`[Upload] /version unexpected failure file_id=${fileId}: ${e?.message ?? e}`);
-      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
-    }
-  });
-});
+// POST /version — version an existing file (one-shot): just file_id + file.
+router.post(
+  "/version",
+  makeUploadHandler((body): Target | { error: string } => {
+    const fileId = String(body?.file_id ?? "").trim();
+    if (!fileId) return { error: "missing file_id" };
+    return { version: fileId };
+  })
+);
 
 export default router;

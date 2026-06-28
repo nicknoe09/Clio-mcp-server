@@ -90,9 +90,18 @@ It reuses the same Box upload code as the dashboard updater (`uploadToBox` /
 `createBoxFile`), so a remote client can `curl -F` raw bytes instead of base64-ing a
 binary into an MCP tool argument.
 
-**Auth:** send the shared secret in the `X-Upload-Secret` header, compared in constant
-time to the `UPLOAD_SECRET` env var. If `UPLOAD_SECRET` is unset the endpoint rejects
-every request (fail closed). A mismatch returns `401`.
+**Auth:** send a secret in the `X-Upload-Secret` header. It's resolved as one of two
+credentials (a mismatch on both returns `401`):
+
+- A **per-user upload key** (issued per attorney on the platform `/setup`, looked up by
+  hash in `upload_keys`). The upload then runs as **that attorney's own Box account**,
+  using their Box token from the vault. The response includes `"acted_as": "user"`.
+- The legacy **shared `UPLOAD_SECRET`** (constant-time compared) → the shared service Box
+  account. Response includes `"acted_as": "shared"`.
+
+A per-user key takes precedence; if `upload_keys` isn't provisioned yet, the shared
+secret is used. Setting neither (or an unset `UPLOAD_SECRET` with no matching key)
+rejects all requests.
 
 **Form fields:**
 

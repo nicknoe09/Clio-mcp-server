@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { getActingClioUserId } from "../clio/actingUser";
 
 const CALENDAR_FIELDS =
   "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color}";
@@ -206,8 +207,8 @@ Event types (use event_type_id or event_type name):
       location: z.string().optional().describe("Event location"),
       all_day: z.boolean().optional().default(false).describe("Whether this is an all-day event"),
       matter_id: z.coerce.number().optional().describe("Link to a Clio matter by ID"),
-      calendar_owner_id: z.coerce.number().optional().describe("**Calendar ID** (NOT user ID) — Clio's calendar_owner field expects the numeric ID of a Calendar resource. Use list_calendars to discover IDs. To assign to a user's personal calendar, prefer assign_to_user_id (next param) which looks the right calendar up automatically. If neither is provided, defaults to the NRN - Claude Created calendar (ID " + NRN_CALENDARS.NRN_CLAUDE + ")."),
-      assign_to_user_id: z.coerce.number().optional().describe("Convenience: provide a Clio User ID, and the tool will look up that user's personal calendar (via list_calendars / creator filter) and use its calendar_id automatically. Overrides calendar_owner_id when both are set. If the user has no calendar visible to the firm OAuth user, the call fails before any event is created (with a clear error) rather than silently falling back to the NRN Claude default."),
+      calendar_owner_id: z.coerce.number().optional().describe("**Calendar ID** (NOT user ID) — Clio's calendar_owner field expects the numeric ID of a Calendar resource. Use list_calendars to discover IDs. To assign to a user's personal calendar, prefer assign_to_user_id (next param) which looks the right calendar up automatically. If neither is provided, defaults to YOUR OWN (the acting attorney's) personal calendar."),
+      assign_to_user_id: z.coerce.number().optional().describe("Convenience: provide a Clio User ID, and the tool will look up that user's personal calendar (via list_calendars / creator filter) and use its calendar_id automatically. Overrides calendar_owner_id when both are set. If the user has no calendar visible to the firm OAuth user, the call fails before any event is created (with a clear error) rather than silently falling back to a default."),
       recurrence_rule: z.string().optional().describe(
         "RRULE for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=MONTHLY;BYMONTHDAY=15')"
       ),
@@ -230,9 +231,12 @@ Event types (use event_type_id or event_type name):
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
         // Resolve calendar_owner. Priority:
-        //   1. assign_to_user_id (look up user's primary calendar; fail loudly if not found)
+        //   1. assign_to_user_id (look up that user's primary calendar)
         //   2. calendar_owner_id (explicit Calendar ID)
-        //   3. NRN_CALENDARS.NRN_CLAUDE (default fallback)
+        //   3. DEFAULT → the ACTING attorney's own primary calendar (not a
+        //      hardcoded calendar — that silently put everyone's events on one
+        //      person's calendar). Fail loudly if it can't be resolved rather
+        //      than misattributing.
         let calendarOwnerId: number;
         if (params.assign_to_user_id !== undefined) {
           const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
@@ -254,7 +258,23 @@ Event types (use event_type_id or event_type name):
         } else if (params.calendar_owner_id !== undefined) {
           calendarOwnerId = params.calendar_owner_id;
         } else {
-          calendarOwnerId = NRN_CALENDARS.NRN_CLAUDE;
+          const actingId = await getActingClioUserId();
+          const resolved = await findUserPrimaryCalendarId(actingId);
+          if (resolved === null) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: `Could not find your own calendar (acting Clio user ${actingId}), so the event was not created (to avoid putting it on the wrong calendar). Pass calendar_owner_id with the desired Calendar ID, or assign_to_user_id, or check list_calendars.`,
+                  context: "acting_user_calendar_not_found",
+                  acting_user_id: actingId,
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+          calendarOwnerId = resolved;
         }
         body.data.calendar_owner = { id: calendarOwnerId };
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;

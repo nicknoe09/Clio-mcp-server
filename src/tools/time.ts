@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
 import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
+import { resolveActingUserId, AttributionError } from "../clio/actingUser";
 
 const TIME_ENTRY_FIELDS =
   "id,date,created_at,updated_at,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -1089,10 +1090,11 @@ export function registerTimeTools(server: McpServer): void {
   // create_time_entry
   server.tool(
     "create_time_entry",
-    "Create a new time entry in Clio. Requires a date, user (timekeeper), matter, and duration. Optionally set the hourly rate and description. The entry is created as non-billable if rate is 0 or omitted, billable otherwise.",
+    "Create a new time entry in Clio. Requires a date, matter, and duration; the timekeeper defaults to YOU (the acting attorney) — omit user_id to log your own time. To log time for a DIFFERENT timekeeper you must pass their user_id AND set on_behalf_of=true (a guard against accidentally booking time under the wrong person). Optionally set the hourly rate and description. The entry is non-billable if rate is 0 or omitted, billable otherwise.",
     {
       date: z.string().describe("Date for the time entry (YYYY-MM-DD)"),
-      user_id: z.coerce.number().describe("Clio user ID of the timekeeper"),
+      user_id: z.coerce.number().optional().describe("Clio user ID of the timekeeper. Omit to log your own time (default). To log for someone else, pass their id AND set on_behalf_of=true."),
+      on_behalf_of: z.boolean().optional().default(false).describe("Set true to deliberately log time for a timekeeper OTHER than yourself (requires user_id). Leave false/omitted for your own time."),
       matter_id: z.coerce.number().describe("Clio matter ID to log time against"),
       hours: z.coerce.number().describe("Duration in decimal hours (e.g. 1.5 for 1h30m)"),
       note: z.string().optional().describe("Description/narrative for the time entry"),
@@ -1109,12 +1111,25 @@ export function registerTimeTools(server: McpServer): void {
           };
         }
 
+        // Attribute to the acting attorney by default; a different timekeeper
+        // requires on_behalf_of=true (guards against misattributing billable
+        // time to the wrong person).
+        let timekeeperId: number;
+        try {
+          timekeeperId = await resolveActingUserId(params.user_id, params.on_behalf_of);
+        } catch (e: any) {
+          if (e instanceof AttributionError) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: e.message }) }], isError: true };
+          }
+          throw e;
+        }
+
         const body: any = {
           data: {
             type: "TimeEntry",
             date: params.date,
             quantity,
-            user: { id: params.user_id },
+            user: { id: timekeeperId },
             matter: { id: params.matter_id },
           },
         };
@@ -1137,7 +1152,7 @@ export function registerTimeTools(server: McpServer): void {
               rate: entry.price,
               note: entry.note,
               matter_id: params.matter_id,
-              user_id: params.user_id,
+              user_id: timekeeperId,
             }, null, 2),
           }],
         };
