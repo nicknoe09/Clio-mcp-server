@@ -17,28 +17,31 @@ import { rawGetSingle, rawPatchSingle } from "./pagination";
 // MUST name a user (or group) — a user-less "matter-wide" rate is rejected
 // ("A user or a group is required for a custom 'HourlyRate'" / "User can't be
 // blank"). So rates are always per-user here. The association is applied via
-// PATCH on an existing matter, so the create flow is POST-then-PATCH. Setting
-// a FlatRate flips the matter's billing_method to "flat" as a side effect
-// (observable via get_matter) — an HourlyRate leaves it "hourly".
+// PATCH on an existing matter, so the create flow is POST-then-PATCH.
+//
+// Rates are HOURLY only. Clio's FlatRate would flip the matter's
+// billing_method to "flat" and collapse it to a single flat fee, which
+// destroys per-timekeeper attribution (collections-by-user). The firm tracks
+// flat-fee matters with a custom field instead and keeps billing hourly, so a
+// flat rate type is intentionally NOT supported here.
 
 export type UserRate = { user_id: number; rate: number };
 
 export type CustomRateInput = {
-  /** "hourly" → HourlyRate, "flat" → FlatRate. Defaults to "hourly". */
-  rate_type?: "hourly" | "flat";
   /** Per-timekeeper rates, e.g. [{ user_id: 123, rate: 300 }]. Required (≥1). */
   user_rates?: UserRate[];
 };
 
 export type CustomRatePayload = {
-  type: "HourlyRate" | "FlatRate";
+  type: "HourlyRate";
   rates: Array<{ user: { id: number }; rate: number }>;
 };
 
 /**
  * Build the custom_rate association object from per-user input, or return null
  * when there are no user rates to set. Pure (no I/O) so it can be unit-tested.
- * Each entry names a user — Clio requires a user (or group) per rate.
+ * Each entry names a user — Clio requires a user (or group) per rate. Always
+ * HourlyRate (see note above).
  */
 export function buildCustomRatePayload(input: CustomRateInput): CustomRatePayload | null {
   const rates = (input.user_rates ?? []).map((ur) => ({
@@ -46,10 +49,7 @@ export function buildCustomRatePayload(input: CustomRateInput): CustomRatePayloa
     rate: ur.rate,
   }));
   if (rates.length === 0) return null;
-  return {
-    type: input.rate_type === "flat" ? "FlatRate" : "HourlyRate",
-    rates,
-  };
+  return { type: "HourlyRate", rates };
 }
 
 // Field set for reading a matter's rate state back. billing_method always

@@ -4,24 +4,19 @@ import { buildCustomRatePayload } from "../src/clio/matterRate";
 describe("buildCustomRatePayload", () => {
   it("returns null when no user rates are given", () => {
     expect(buildCustomRatePayload({})).toBeNull();
-    expect(buildCustomRatePayload({ rate_type: "hourly" })).toBeNull();
     expect(buildCustomRatePayload({ user_rates: [] })).toBeNull();
   });
 
-  it("builds a single per-user hourly rate by default", () => {
+  it("builds a single per-user hourly rate", () => {
     expect(buildCustomRatePayload({ user_rates: [{ user_id: 123, rate: 300 }] })).toEqual({
       type: "HourlyRate",
       rates: [{ user: { id: 123 }, rate: 300 }],
     });
   });
 
-  it("maps rate_type 'flat' to FlatRate", () => {
-    expect(
-      buildCustomRatePayload({ rate_type: "flat", user_rates: [{ user_id: 1, rate: 5000 }] }),
-    ).toEqual({
-      type: "FlatRate",
-      rates: [{ user: { id: 1 }, rate: 5000 }],
-    });
+  it("always uses HourlyRate (no flat type)", () => {
+    const payload = buildCustomRatePayload({ user_rates: [{ user_id: 1, rate: 500 }] });
+    expect(payload?.type).toBe("HourlyRate");
   });
 
   it("builds multiple per-user rates in order", () => {

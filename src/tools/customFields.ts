@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawPatchSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
 
 // CustomField definitions live in Clio's /custom_fields resource. Each
 // CustomField has a parent_type (Matter / Contact / Activity / Bill / etc.)
@@ -18,6 +18,134 @@ const CUSTOM_FIELD_FIELDS =
   "id,name,parent_type,field_type,displayed,deleted,required,display_order";
 
 export function registerCustomFieldTools(server: McpServer): void {
+  // ============================================================
+  //  create_custom_field — define a new CustomField (POST /custom_fields)
+  // ============================================================
+  // Creates a new CustomField DEFINITION (the field itself, firm-wide), not a
+  // value on a record. For picklist fields, the choices are created inline via
+  // picklist_options. Reads the field back (with option ids) so the caller can
+  // immediately reference it. Note: there is NO API to add options to an
+  // existing picklist via this tool — supply them all at creation.
+  server.tool(
+    "create_custom_field",
+    "Create a new CustomField DEFINITION in Clio (POST /custom_fields) — the field itself, firm-wide, not a value on a record. Requires name, parent_type (e.g. 'Matter', 'Contact'), and field_type (e.g. 'checkbox', 'text_line', 'text_area', 'picklist', 'currency', 'date', 'numeric', 'email', 'url'). For field_type='picklist', pass picklist_options as the list of choice labels (created inline). displayed (default true) controls whether it shows in the Clio UI; required (default false) makes it mandatory. Reads the field back and returns its id (and picklist option ids). Use this to add, e.g., a 'Flat Fee' checkbox on Matter. Surfaces Clio validation errors verbatim.",
+    {
+      name: z.string().describe("The field's display name, e.g. 'Flat Fee'. Case-sensitive; this is what custom_fields/set_matter_custom_field_value reference by field_name."),
+      parent_type: z
+        .string()
+        .describe("Resource the field attaches to. Common: 'Matter', 'Contact', 'Activity', 'Bill'. Case-sensitive PascalCase."),
+      field_type: z
+        .enum([
+          "text_line",
+          "text_area",
+          "picklist",
+          "checkbox",
+          "currency",
+          "date",
+          "numeric",
+          "email",
+          "url",
+        ])
+        .describe("The field's data type. Use 'checkbox' for a yes/no flag (e.g. Flat Fee), 'picklist' for a fixed choice list (supply picklist_options), 'text_line' for short free text, 'currency'/'numeric'/'date' as appropriate."),
+      picklist_options: z
+        .array(z.string())
+        .optional()
+        .describe("For field_type='picklist' ONLY: the choice labels to create, e.g. ['Flat Fee','Hourly','Contingency']. Order is preserved. Ignored for non-picklist types."),
+      displayed: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Whether the field is shown in the Clio UI. Default true."),
+      required: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Whether the field is required. Default false."),
+    },
+    async (params) => {
+      if (params.field_type === "picklist" && (!params.picklist_options || params.picklist_options.length === 0)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: "field_type='picklist' requires picklist_options (one or more choice labels). There is no API to add options to a picklist after creation via this tool, so supply them all now.",
+              context: "picklist_options_required",
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+      try {
+        const data: Record<string, any> = {
+          name: params.name,
+          parent_type: params.parent_type,
+          field_type: params.field_type,
+          displayed: params.displayed,
+          required: params.required,
+        };
+        if (params.field_type === "picklist" && params.picklist_options) {
+          data.picklist_options = params.picklist_options.map((option) => ({ option }));
+        }
+
+        const result = await rawPostSingle("/custom_fields", { data });
+        const created = result?.data ?? result;
+
+        // Read back with picklist options so the caller gets the option ids
+        // (needed to set picklist values by id).
+        let readback: any = null;
+        if (created?.id) {
+          try {
+            const rb = await rawGetSingle(`/custom_fields/${created.id}`, {
+              fields: "id,name,parent_type,field_type,displayed,required,deleted,picklist_options{id,option}",
+            });
+            readback = rb?.data ?? rb;
+          } catch {
+            /* non-fatal: fall back to the POST response */
+          }
+        }
+
+        const field = readback ?? created;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              created: true,
+              custom_field: {
+                id: field?.id,
+                name: field?.name ?? null,
+                parent_type: field?.parent_type ?? null,
+                field_type: field?.field_type ?? null,
+                displayed: field?.displayed ?? null,
+                required: field?.required ?? null,
+                picklist_options: field?.picklist_options ?? [],
+              },
+              next_step: `Set this field on a record via custom_fields (create_contact/create_matter) or set_matter_custom_field_value, using field_name "${field?.name ?? params.name}".`,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        const status = err.response?.status;
+        let interpretation: string | undefined;
+        if (status === 422) interpretation = "Clio rejected the field. Check parent_type (PascalCase, e.g. 'Matter') and field_type are valid, and that the name isn't a duplicate. See clio_error.";
+        else if (status === 403) interpretation = "Forbidden — the token lacks permission to create custom fields.";
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status,
+              interpretation,
+              clio_error: err.response?.data,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
   server.tool(
     "list_custom_fields",
     "List Clio CustomField definitions firm-wide. Returns each field's id, name, parent_type (Matter / Contact / Activity / Bill / etc.), field_type (text_line / picklist / date / currency / checkbox / numeric / email / url / etc.), displayed, required, and display_order. Use this to discover what custom fields the firm has configured. To see VALUES on a specific matter, use get_matter_custom_field_values.",
