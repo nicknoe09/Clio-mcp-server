@@ -23,7 +23,7 @@ export function registerNoteTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "Clio server-side wildcard search over note subject/detail (case-insensitive). E.g. 'FF'. Omit to scan all notes of the given type and rely on `contains`.",
+          "Clio server-side wildcard search over note subject/detail (case-insensitive). E.g. 'FF'. NOTE: Clio's query is a relevance search capped at ~200 rows; if it returns a full page the tool automatically re-runs a complete cursor-paginated scan and filters by this term client-side (scan_mode='full_scan_fallback'). Omit to scan all notes of the given type and rely on `contains`.",
         ),
       contains: z
         .string()
@@ -55,7 +55,28 @@ export function registerNoteTools(server: McpServer): void {
         if (query) params.query = query;
         if (matter_id) params.matter_id = matter_id;
 
-        const notes = await fetchAllPages<any>("/notes", params);
+        // Clio's `query` is a relevance-ranked full-text search: it returns at
+        // most ONE page (~200 rows) and provides no `next` cursor, so
+        // fetchAllPages stops after the first page and silently truncates.
+        // (A query-less scan paginates correctly over every note.) So when a
+        // `query` run comes back as a full page, we can't trust it to be
+        // complete — re-run as a full cursor-paginated scan and apply `query`
+        // as a client-side case-insensitive substring filter instead.
+        const CLIO_PAGE_SIZE = 200;
+        let notes = await fetchAllPages<any>("/notes", params);
+        let scan_mode: "full_scan" | "server_query" | "full_scan_fallback" =
+          query ? "server_query" : "full_scan";
+
+        if (query && notes.length >= CLIO_PAGE_SIZE) {
+          const fullParams: Record<string, any> = { type, fields: NOTE_FIELDS };
+          if (matter_id) fullParams.matter_id = matter_id;
+          const all = await fetchAllPages<any>("/notes", fullParams);
+          const q = query.toLowerCase();
+          notes = all.filter((n: any) =>
+            `${n.subject ?? ""}\n${n.detail ?? ""}`.toLowerCase().includes(q),
+          );
+          scan_mode = "full_scan_fallback";
+        }
 
         // Optional client-side refine. Build a matcher from `contains`.
         let matcher: ((s: string) => boolean) | null = null;
@@ -103,6 +124,10 @@ export function registerNoteTools(server: McpServer): void {
                   type,
                   query: query ?? null,
                   contains: contains ?? null,
+                  // 'server_query' = Clio relevance search (may be capped at one
+                  // page); 'full_scan_fallback' = query truncated so we scanned
+                  // every note client-side; 'full_scan' = no query, full scan.
+                  scan_mode,
                   notes_scanned: notes.length,
                   count: matches.length,
                   notes: matches,
