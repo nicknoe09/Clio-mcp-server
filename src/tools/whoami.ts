@@ -3,8 +3,7 @@ import { rawGetSingle } from "../clio/pagination";
 import { getContext } from "../auth/identity";
 
 const WHO_AM_I_FIELDS =
-  "id,name,first_name,last_name,email,enabled,subscription_type,roles," +
-  "account{id,name},default_calendar";
+  "id,name,first_name,last_name,email,enabled,subscription_type,account{id,name}";
 
 export function registerWhoAmITools(server: McpServer): void {
   server.tool(
@@ -31,7 +30,6 @@ export function registerWhoAmITools(server: McpServer): void {
           email: u.email,
           enabled: u.enabled,
           role: u.subscription_type,
-          roles: u.roles,
           account: u.account,
         };
       } catch (err: any) {
