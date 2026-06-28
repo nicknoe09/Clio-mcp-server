@@ -68,18 +68,30 @@ async function doRefresh(userEmail: string): Promise<string> {
     throw new Error(`No Box refresh token for ${userEmail}. Complete Box OAuth flow at /box/oauth/start`);
   }
 
+  const { access_token, refresh_token } = await refreshBoxTokensRaw(refreshToken);
+  await persistBoxTokens(userEmail, access_token, refresh_token ?? refreshToken);
+  return access_token;
+}
+
+/**
+ * Exchange a Box refresh token for a fresh token pair WITHOUT persisting
+ * anywhere. Used by the vault-backed per-user upload path, which persists the
+ * rotated pair back to the platform vault (updateBoxTokens) rather than the
+ * local token store. Box rotates refresh tokens (single-use), so the caller
+ * MUST persist the returned refresh_token immediately.
+ */
+export async function refreshBoxTokensRaw(
+  refreshToken: string
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
+  if (!refreshToken) throw new Error("No Box refresh token available for this user.");
   const params = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: ENV.BOX_CLIENT_ID,
     client_secret: ENV.BOX_CLIENT_SECRET,
   });
-
   const response = await axios.post(BOX_TOKEN_URL, params.toString(), {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
   });
-
-  const { access_token, refresh_token } = response.data;
-  await persistBoxTokens(userEmail, access_token, refresh_token ?? refreshToken);
-  return access_token;
+  return response.data;
 }

@@ -139,6 +139,48 @@ export async function boxUploadNewVersion(
   return response.data.entries[0];
 }
 
+// ───── Explicit-token uploads (vault-backed per-user path) ─────
+// These take a Box access token directly instead of pulling it from the local
+// token store, so callers can upload as a specific attorney using that user's
+// Box token read from the platform vault. Errors propagate with err.response
+// (incl. status) so the caller can detect 401 and refresh.
+
+export async function boxUploadFileWithToken(
+  fileBuffer: Buffer,
+  fileName: string,
+  parentFolderId: string,
+  accessToken: string
+): Promise<BoxFileMetadata> {
+  const form = new FormData();
+  form.append("attributes", JSON.stringify({ name: fileName, parent: { id: parentFolderId } }));
+  form.append("file", fileBuffer, { filename: fileName });
+  const response = await axios.post(`${BOX_UPLOAD_BASE}/files/content`, form, {
+    headers: { ...form.getHeaders(), Authorization: `Bearer ${accessToken}` },
+    timeout: 300000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return response.data.entries[0];
+}
+
+export async function boxUploadNewVersionWithToken(
+  fileBuffer: Buffer,
+  fileName: string,
+  fileId: string,
+  accessToken: string
+): Promise<BoxFileMetadata> {
+  const form = new FormData();
+  form.append("attributes", JSON.stringify({ name: fileName }));
+  form.append("file", fileBuffer, { filename: fileName });
+  const response = await axios.post(`${BOX_UPLOAD_BASE}/files/${fileId}/content`, form, {
+    headers: { ...form.getHeaders(), Authorization: `Bearer ${accessToken}` },
+    timeout: 300000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return response.data.entries[0];
+}
+
 export async function boxDownloadFile(
   fileId: string,
   userEmail: string
