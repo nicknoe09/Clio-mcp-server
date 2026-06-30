@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
 import { getActingClioUserId } from "../clio/actingUser";
+import { isActingUserOwner } from "../clio/owner";
 
 const CALENDAR_FIELDS =
   "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color}";
@@ -190,9 +191,13 @@ export function registerCalendarTools(server: McpServer): void {
   // create_calendar_entry
   server.tool(
     "create_calendar_entry",
-    `Create a calendar entry in Clio. Event type is OPT-IN — if you don't pass event_type or event_type_id, the entry is created with NO event type (the bare calendar entry). Pass an explicit event_type only if the caller asked for one.
+    `Create a calendar entry in Clio. By default the entry lands on YOUR OWN personal Clio calendar.
 
-Event types (use event_type_id or event_type name):
+OWNER-ONLY custom features: event types and cross-calendar assignment (calendar_owner_id / assign_to_user_id) only apply when the acting user is the configured owner (the attorney the custom tooling was built for). For every other user these inputs are IGNORED and the event is simply created on their own personal calendar.
+
+Event type is OPT-IN — if you don't pass event_type or event_type_id, the entry is created with NO event type (the bare calendar entry). Pass an explicit event_type only if the caller asked for one.
+
+Event types (owner-only; use event_type_id or event_type name):
 - "hard_scheduled" (ID ${EVENT_TYPES.HARD_SCHEDULED}) — hearings, trials, depositions, mediations, calls, conferences
 - "nrn_claude" (ID ${EVENT_TYPES.NRN_CLAUDE}) — NRN Claude Events tag
 - "trial_hearing" (ID ${EVENT_TYPES.TRIAL_HEARING}) — Trial/Hearing/Depositions/Mediations
@@ -230,6 +235,20 @@ Event types (use event_type_id or event_type name):
         if (params.description) body.data.description = params.description;
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
+
+        // The custom calendaring behavior (event types, cross-calendar
+        // assignment) is owner-only. Everyone else gets plain calendaring:
+        // the event lands on their own personal calendar, and any custom
+        // inputs they (or the agent) passed are ignored.
+        const isOwner = await isActingUserOwner();
+        const ignoredForNonOwner: string[] = [];
+        if (!isOwner) {
+          if (params.assign_to_user_id !== undefined) ignoredForNonOwner.push("assign_to_user_id");
+          if (params.calendar_owner_id !== undefined) ignoredForNonOwner.push("calendar_owner_id");
+          if (params.event_type !== undefined) ignoredForNonOwner.push("event_type");
+          if (params.event_type_id !== undefined) ignoredForNonOwner.push("event_type_id");
+        }
+
         // Resolve calendar_owner. Priority:
         //   1. assign_to_user_id (look up that user's primary calendar)
         //   2. calendar_owner_id (explicit Calendar ID)
@@ -237,8 +256,10 @@ Event types (use event_type_id or event_type name):
         //      hardcoded calendar — that silently put everyone's events on one
         //      person's calendar). Fail loudly if it can't be resolved rather
         //      than misattributing.
+        // For non-owners, options 1 and 2 are skipped entirely — the event
+        // always goes on their own personal calendar (option 3).
         let calendarOwnerId: number;
-        if (params.assign_to_user_id !== undefined) {
+        if (isOwner && params.assign_to_user_id !== undefined) {
           const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
           if (resolved === null) {
             return {
@@ -255,7 +276,7 @@ Event types (use event_type_id or event_type name):
             };
           }
           calendarOwnerId = resolved;
-        } else if (params.calendar_owner_id !== undefined) {
+        } else if (isOwner && params.calendar_owner_id !== undefined) {
           calendarOwnerId = params.calendar_owner_id;
         } else {
           const actingId = await getActingClioUserId();
@@ -279,25 +300,28 @@ Event types (use event_type_id or event_type name):
         body.data.calendar_owner = { id: calendarOwnerId };
         if (params.recurrence_rule) body.data.recurrence_rule = params.recurrence_rule;
 
-        // Event type is opt-in. Do NOT auto-detect or default; user-side
-        // policy is "only set an event type when explicitly asked."
+        // Event type is opt-in AND owner-only. Do NOT auto-detect or default;
+        // user-side policy is "only set an event type when explicitly asked."
         // The previous version auto-set NRN_CLAUDE (or HARD_SCHEDULED for
         // pattern-matching summaries) — that ran against the user's intent
         // and ended up tagging every Claude-created event with a type the
-        // user didn't choose.
+        // user didn't choose. For non-owners the custom event types don't
+        // apply at all, so this block is skipped.
         let eventTypeId: number | null = null;
-        if (params.event_type_id) {
-          eventTypeId = params.event_type_id;
-        } else if (params.event_type) {
-          const typeMap: Record<string, number> = {
-            hard_scheduled: EVENT_TYPES.HARD_SCHEDULED,
-            nrn_claude: EVENT_TYPES.NRN_CLAUDE,
-            trial_hearing: EVENT_TYPES.TRIAL_HEARING,
-            deadline: EVENT_TYPES.DEADLINE,
-            admin: EVENT_TYPES.ADMIN,
-            personal: EVENT_TYPES.OUT_PERSONAL,
-          };
-          eventTypeId = typeMap[params.event_type.toLowerCase()] || null;
+        if (isOwner) {
+          if (params.event_type_id) {
+            eventTypeId = params.event_type_id;
+          } else if (params.event_type) {
+            const typeMap: Record<string, number> = {
+              hard_scheduled: EVENT_TYPES.HARD_SCHEDULED,
+              nrn_claude: EVENT_TYPES.NRN_CLAUDE,
+              trial_hearing: EVENT_TYPES.TRIAL_HEARING,
+              deadline: EVENT_TYPES.DEADLINE,
+              admin: EVENT_TYPES.ADMIN,
+              personal: EVENT_TYPES.OUT_PERSONAL,
+            };
+            eventTypeId = typeMap[params.event_type.toLowerCase()] || null;
+          }
         }
         if (eventTypeId) {
           body.data.calendar_entry_event_type = { id: eventTypeId };
@@ -319,6 +343,12 @@ Event types (use event_type_id or event_type name):
                 recurrence_rule: result.data?.recurrence_rule,
                 event_type: result.data?.calendar_entry_event_type,
               },
+              ...(ignoredForNonOwner.length > 0
+                ? {
+                    note: "Custom event types and cross-calendar assignment are owner-only. The event was created on your own personal Clio calendar; the following inputs were ignored.",
+                    ignored: ignoredForNonOwner,
+                  }
+                : {}),
             }, null, 2),
           }],
         };
@@ -342,7 +372,7 @@ Event types (use event_type_id or event_type name):
   // update_calendar_entry
   server.tool(
     "update_calendar_entry",
-    "Update an existing calendar entry in Clio. Can modify time, summary, description, location, matter, event type, or recurrence. For recurring events, updates the entire series.",
+    "Update an existing calendar entry in Clio. Can modify time, summary, description, location, matter, or recurrence. For recurring events, updates the entire series. OWNER-ONLY custom features: setting/clearing event types and reassigning to another calendar (calendar_owner_id / assign_to_user_id) only apply when the acting user is the configured owner; for every other user these inputs are ignored.",
     {
       id: z.coerce.number().describe("Calendar entry ID to update"),
       summary: z.string().optional().describe("Updated event title/summary"),
@@ -372,8 +402,24 @@ Event types (use event_type_id or event_type name):
         if (params.location !== undefined) body.data.location = params.location;
         if (params.all_day !== undefined) body.data.all_day = params.all_day;
         if (params.matter_id !== undefined) body.data.matter = { id: params.matter_id };
+
+        // Custom event types and cross-calendar reassignment are owner-only.
+        // For non-owners these inputs are ignored — they can still update the
+        // entry's own fields (time, summary, location, etc.) on their own
+        // calendar, but can't retag with custom event types or move it to a
+        // different calendar.
+        const isOwner = await isActingUserOwner();
+        const ignoredForNonOwner: string[] = [];
+        if (!isOwner) {
+          if (params.assign_to_user_id !== undefined) ignoredForNonOwner.push("assign_to_user_id");
+          if (params.calendar_owner_id !== undefined) ignoredForNonOwner.push("calendar_owner_id");
+          if (params.event_type !== undefined) ignoredForNonOwner.push("event_type");
+          if (params.event_type_id !== undefined) ignoredForNonOwner.push("event_type_id");
+        }
+
         // Resolve calendar_owner reassignment. assign_to_user_id takes priority.
-        if (params.assign_to_user_id !== undefined) {
+        // Owner-only; skipped entirely for non-owners.
+        if (isOwner && params.assign_to_user_id !== undefined) {
           const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
           if (resolved === null) {
             return {
@@ -390,22 +436,22 @@ Event types (use event_type_id or event_type name):
             };
           }
           body.data.calendar_owner = { id: resolved };
-        } else if (params.calendar_owner_id !== undefined) {
+        } else if (isOwner && params.calendar_owner_id !== undefined) {
           body.data.calendar_owner = { id: params.calendar_owner_id };
         }
         if (params.recurrence_rule !== undefined) {
           body.data.recurrence_rule = params.recurrence_rule === "" ? null : params.recurrence_rule;
         }
 
-        // Event type. Sentinel values clear an existing event_type:
+        // Event type. Owner-only. Sentinel values clear an existing event_type:
         //   event_type_id <= 0  → null (clear)
         //   event_type in {"", "none", "null"}  → null (clear)
         // Otherwise: lookup by name or use the explicit id.
-        if (params.event_type_id !== undefined) {
+        if (isOwner && params.event_type_id !== undefined) {
           body.data.calendar_entry_event_type = params.event_type_id > 0
             ? { id: params.event_type_id }
             : null;
-        } else if (params.event_type !== undefined) {
+        } else if (isOwner && params.event_type !== undefined) {
           const lower = params.event_type.toLowerCase();
           if (lower === "" || lower === "none" || lower === "null") {
             body.data.calendar_entry_event_type = null;
@@ -439,6 +485,12 @@ Event types (use event_type_id or event_type name):
                 recurrence_rule: result.data?.recurrence_rule,
                 event_type: result.data?.calendar_entry_event_type,
               },
+              ...(ignoredForNonOwner.length > 0
+                ? {
+                    note: "Custom event types and cross-calendar reassignment are owner-only. The following inputs were ignored.",
+                    ignored: ignoredForNonOwner,
+                  }
+                : {}),
             }, null, 2),
           }],
         };
