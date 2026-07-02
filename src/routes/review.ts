@@ -5,7 +5,7 @@ import https from "https";
 import { fetchAllPages, rawGetSingle, rawPatchSingle, rawPostSingle } from "../clio/pagination";
 import { patchTimeEntrySmart, resolveActivityRouting, deleteActivity } from "../clio/lineItems";
 import { auditTimeEntries, AuditEntry } from "../tools/auditTime";
-import { detectFlags, detectCombinables, HC_COURT_IDS, Flag, CombineGroup } from "../tools/audit";
+import { detectFlags, detectCombinables, HC_COURT_IDS, Flag, CombineGroup, AUDIT_LINE_ITEM_FIELDS } from "../tools/audit";
 import { getActiveUsers, findUserById } from "../utils/userRoster";
 
 const router = Router();
@@ -289,7 +289,7 @@ async function auditDraftBillEntries(userId: number) {
 
   for (const bill of relevantBills) {
     const lineItems = await fetchAllPages<any>("/line_items", {
-      fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+      fields: AUDIT_LINE_ITEM_FIELDS,
       bill_id: bill.id,
     });
 
@@ -302,7 +302,7 @@ async function auditDraftBillEntries(userId: number) {
 
       // Line items return quantity in HOURS (not seconds like /activities)
       // Verify: li.quantity * li.price should ≈ li.total
-      let hours = li.rounded_quantity || li.quantity || 0;
+      let hours = li.quantity || 0;
       const rate = li.price || 0;
 
       // Fallback: derive hours from total/rate
@@ -312,7 +312,7 @@ async function auditDraftBillEntries(userId: number) {
 
       // Debug first 3 entries
       if (allEntries.length < 3) {
-        console.log(`[Review] Entry #${allEntries.length}: li.rounded_quantity=${li.rounded_quantity}, li.quantity=${li.quantity}, li.price=${li.price}, li.total=${li.total}, hours=${hours}`);
+        console.log(`[Review] Entry #${allEntries.length}: li.quantity=${li.quantity}, li.price=${li.price}, li.total=${li.total}, hours=${hours}`);
       }
 
       const note = li.activity?.note || li.description || "";
