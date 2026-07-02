@@ -34,10 +34,10 @@ export const ENV = {
     get MCP_SCOPE_NAME() { return getEnv("MCP_SCOPE_NAME"); },
     get ALLOWED_EMAILS() { return process.env.ALLOWED_EMAILS ?? ""; },
     get ALLOWED_EMAIL_DOMAINS() { return process.env.ALLOWED_EMAIL_DOMAINS ?? ""; },
-    // Comma-separated emails of the "owner(s)" who get the custom calendaring
-    // behavior (RomSum/NRN event types, cross-calendar assignment). Everyone
-    // else gets plain calendaring on their own personal calendar. Defaults to
-    // the original author when unset (see src/clio/owner.ts).
+    // Comma-separated emails of the "owner(s)" who can set the custom RomSum/NRN
+    // calendar event types. Everyone else has those inputs ignored. Calendar
+    // placement/reassignment is NOT gated by this. Defaults to the original
+    // author when unset (see src/clio/owner.ts).
     get OWNER_EMAILS() { return process.env.OWNER_EMAILS ?? ""; },
 
     // --- Box (unchanged — out of scope) ---

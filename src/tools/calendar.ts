@@ -193,7 +193,7 @@ export function registerCalendarTools(server: McpServer): void {
     "create_calendar_entry",
     `Create a calendar entry in Clio. By default the entry lands on YOUR OWN personal Clio calendar.
 
-OWNER-ONLY custom features: event types and cross-calendar assignment (calendar_owner_id / assign_to_user_id) only apply when the acting user is the configured owner (the attorney the custom tooling was built for). For every other user these inputs are IGNORED and the event is simply created on their own personal calendar.
+OWNER-ONLY: the custom event types below only apply when the acting user is the configured owner (the attorney the custom tooling was built for); for every other user event_type / event_type_id are IGNORED. Calendar placement (calendar_owner_id / assign_to_user_id, or the default of your own personal calendar) works for ALL users — Clio enforces write permission on the target calendar.
 
 Event type is OPT-IN — if you don't pass event_type or event_type_id, the entry is created with NO event type (the bare calendar entry). Pass an explicit event_type only if the caller asked for one.
 
@@ -236,15 +236,15 @@ Event types (owner-only; use event_type_id or event_type name):
         if (params.location) body.data.location = params.location;
         if (params.matter_id) body.data.matter = { id: params.matter_id };
 
-        // The custom calendaring behavior (event types, cross-calendar
-        // assignment) is owner-only. Everyone else gets plain calendaring:
-        // the event lands on their own personal calendar, and any custom
-        // inputs they (or the agent) passed are ignored.
+        // Only the custom NRN/RomSum EVENT TYPES are owner-only. Calendar
+        // targeting (assign_to_user_id / calendar_owner_id) is available to
+        // everyone — Clio itself enforces write permission on the target
+        // calendar, so a user can only reassign to calendars they own or can
+        // write to. Non-owners who pass an event type get it ignored (and told
+        // so); their calendar targeting is honored.
         const isOwner = await isActingUserOwner();
         const ignoredForNonOwner: string[] = [];
         if (!isOwner) {
-          if (params.assign_to_user_id !== undefined) ignoredForNonOwner.push("assign_to_user_id");
-          if (params.calendar_owner_id !== undefined) ignoredForNonOwner.push("calendar_owner_id");
           if (params.event_type !== undefined) ignoredForNonOwner.push("event_type");
           if (params.event_type_id !== undefined) ignoredForNonOwner.push("event_type_id");
         }
@@ -256,10 +256,8 @@ Event types (owner-only; use event_type_id or event_type name):
         //      hardcoded calendar — that silently put everyone's events on one
         //      person's calendar). Fail loudly if it can't be resolved rather
         //      than misattributing.
-        // For non-owners, options 1 and 2 are skipped entirely — the event
-        // always goes on their own personal calendar (option 3).
         let calendarOwnerId: number;
-        if (isOwner && params.assign_to_user_id !== undefined) {
+        if (params.assign_to_user_id !== undefined) {
           const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
           if (resolved === null) {
             return {
@@ -276,7 +274,7 @@ Event types (owner-only; use event_type_id or event_type name):
             };
           }
           calendarOwnerId = resolved;
-        } else if (isOwner && params.calendar_owner_id !== undefined) {
+        } else if (params.calendar_owner_id !== undefined) {
           calendarOwnerId = params.calendar_owner_id;
         } else {
           const actingId = await getActingClioUserId();
@@ -345,7 +343,7 @@ Event types (owner-only; use event_type_id or event_type name):
               },
               ...(ignoredForNonOwner.length > 0
                 ? {
-                    note: "Custom event types and cross-calendar assignment are owner-only. The event was created on your own personal Clio calendar; the following inputs were ignored.",
+                    note: "Custom event types are owner-only, so the following inputs were ignored. Calendar placement (calendar_owner_id / assign_to_user_id / default) was applied as normal.",
                     ignored: ignoredForNonOwner,
                   }
                 : {}),
@@ -372,7 +370,7 @@ Event types (owner-only; use event_type_id or event_type name):
   // update_calendar_entry
   server.tool(
     "update_calendar_entry",
-    "Update an existing calendar entry in Clio. Can modify time, summary, description, location, matter, or recurrence. For recurring events, updates the entire series. OWNER-ONLY custom features: setting/clearing event types and reassigning to another calendar (calendar_owner_id / assign_to_user_id) only apply when the acting user is the configured owner; for every other user these inputs are ignored.",
+    "Update an existing calendar entry in Clio. Can modify time, summary, description, location, matter, or recurrence. For recurring events, updates the entire series. Reassigning to another calendar (calendar_owner_id / assign_to_user_id) works for ALL users — Clio enforces write permission on the target calendar. OWNER-ONLY: setting/clearing custom event types (event_type / event_type_id) only applies when the acting user is the configured owner; for every other user those inputs are ignored.",
     {
       id: z.coerce.number().describe("Calendar entry ID to update"),
       summary: z.string().optional().describe("Updated event title/summary"),
@@ -403,23 +401,21 @@ Event types (owner-only; use event_type_id or event_type name):
         if (params.all_day !== undefined) body.data.all_day = params.all_day;
         if (params.matter_id !== undefined) body.data.matter = { id: params.matter_id };
 
-        // Custom event types and cross-calendar reassignment are owner-only.
-        // For non-owners these inputs are ignored — they can still update the
-        // entry's own fields (time, summary, location, etc.) on their own
-        // calendar, but can't retag with custom event types or move it to a
-        // different calendar.
+        // Only the custom NRN/RomSum EVENT TYPES are owner-only. Reassignment
+        // (assign_to_user_id / calendar_owner_id) is available to everyone —
+        // Clio enforces write permission on the target calendar, so a user can
+        // only move an entry to a calendar they own or can write to. Non-owners
+        // who pass an event type get it ignored (and told so); their
+        // reassignment is honored.
         const isOwner = await isActingUserOwner();
         const ignoredForNonOwner: string[] = [];
         if (!isOwner) {
-          if (params.assign_to_user_id !== undefined) ignoredForNonOwner.push("assign_to_user_id");
-          if (params.calendar_owner_id !== undefined) ignoredForNonOwner.push("calendar_owner_id");
           if (params.event_type !== undefined) ignoredForNonOwner.push("event_type");
           if (params.event_type_id !== undefined) ignoredForNonOwner.push("event_type_id");
         }
 
         // Resolve calendar_owner reassignment. assign_to_user_id takes priority.
-        // Owner-only; skipped entirely for non-owners.
-        if (isOwner && params.assign_to_user_id !== undefined) {
+        if (params.assign_to_user_id !== undefined) {
           const resolved = await findUserPrimaryCalendarId(params.assign_to_user_id);
           if (resolved === null) {
             return {
@@ -436,7 +432,7 @@ Event types (owner-only; use event_type_id or event_type name):
             };
           }
           body.data.calendar_owner = { id: resolved };
-        } else if (isOwner && params.calendar_owner_id !== undefined) {
+        } else if (params.calendar_owner_id !== undefined) {
           body.data.calendar_owner = { id: params.calendar_owner_id };
         }
         if (params.recurrence_rule !== undefined) {
@@ -487,7 +483,7 @@ Event types (owner-only; use event_type_id or event_type name):
               },
               ...(ignoredForNonOwner.length > 0
                 ? {
-                    note: "Custom event types and cross-calendar reassignment are owner-only. The following inputs were ignored.",
+                    note: "Custom event types are owner-only, so the following inputs were ignored. Reassignment (calendar_owner_id / assign_to_user_id) was applied as normal.",
                     ignored: ignoredForNonOwner,
                   }
                 : {}),
