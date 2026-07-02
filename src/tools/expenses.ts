@@ -244,10 +244,10 @@ export function registerExpenseTools(server: McpServer): void {
     async () => {
       try {
         const cats = await fetchAllPages<any>("/expense_categories", {
-          fields: "id,name,rate",
+          fields: "id,name,rate,entry_type",
         });
         const formatted = cats
-          .map((c: any) => ({ id: c.id, name: c.name, rate: c.rate ?? null }))
+          .map((c: any) => ({ id: c.id, name: c.name, rate: c.rate ?? null, entry_type: c.entry_type ?? null }))
           .sort((a: any, b: any) => (a.name || "").localeCompare(b.name || ""));
         return {
           content: [{
@@ -321,11 +321,16 @@ export function registerExpenseTools(server: McpServer): void {
         // was given we attempt the create anyway and surface Clio's own
         // validation error verbatim (some configurations may allow it).
         let category: ExpenseCategoryRef | null = null;
-        if (params.expense_category_id !== undefined || params.expense_category_name !== undefined) {
+        // Blank/whitespace names are treated as "not provided" — LLM clients
+        // sometimes fill optional string params with "" (and z.coerce would
+        // otherwise send it into resolution, wasting a category fetch and
+        // producing a confusing error).
+        const categoryName = params.expense_category_name?.trim();
+        if (params.expense_category_id !== undefined || categoryName) {
           const cats = await fetchExpenseCategories();
           category = resolveExpenseCategory(cats, {
             id: params.expense_category_id,
-            name: params.expense_category_name,
+            name: categoryName,
           });
         }
 
@@ -343,22 +348,46 @@ export function registerExpenseTools(server: McpServer): void {
         if (category) body.data.expense_category = { id: category.id };
 
         const result = await rawPostSingle("/activities", body);
-        const entry = result.data;
+        const created = result.data;
+        if (!created?.id) {
+          throw new Error("Expense create returned no ID — Clio may not have created the expense.");
+        }
+
+        // Read back what actually stuck. Clio returns 201/200 even when it
+        // silently drops unrecognized or invalid fields from a POST body, so
+        // report from a fresh GET with explicit fields rather than trusting
+        // the POST echo. Read-back failure is non-fatal (fall back to echo).
+        let saved = created;
+        let readbackOk = false;
+        try {
+          const readback = await rawGetSingle(`/activities/${created.id}`, {
+            fields: "id,type,date,quantity,price,total,note,expense_category{id,name},matter{id,display_number},user{id,name}",
+          });
+          if (readback.data?.id) {
+            saved = readback.data;
+            readbackOk = true;
+          }
+        } catch { /* non-fatal: report from the POST echo */ }
+
+        const categoryDropped = readbackOk && category && saved.expense_category?.id !== category.id;
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
               success: true,
-              activity_id: entry.id,
-              date: entry.date,
-              amount: entry.price,
-              quantity: entry.quantity,
-              total: entry.total ?? Math.round(params.amount * params.quantity * 100) / 100,
-              category: category ? category.name : null,
-              note: entry.note ?? params.note ?? null,
+              activity_id: saved.id,
+              date: saved.date,
+              amount: saved.price,
+              quantity: saved.quantity,
+              total: saved.total ?? Math.round(params.amount * params.quantity * 100) / 100,
+              category: saved.expense_category?.name ?? (category ? category.name : null),
+              note: saved.note ?? params.note ?? null,
               matter_id: params.matter_id,
               user_id: userId,
+              ...(categoryDropped
+                ? { warning: `Clio accepted the create but the expense_category ("${category!.name}") did not persist on the expense — set it in Clio UI or retry.` }
+                : {}),
             }, null, 2),
           }],
         };
@@ -388,7 +417,7 @@ export function registerExpenseTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "convert_time_entry_to_expense",
-    "Convert a time entry into an expense (e.g. a filing fee that was logged as time). Clio's API cannot change an activity's type, so this creates a new ExpenseEntry (same matter/date/user as the time entry, note preserved unless overridden) and then deletes the original time entry. Amount defaults to the entry's billed value (hours × rate); pass amount to override. If the time entry is on a DRAFT bill, its line is removed as part of the delete and the new expense sits unbilled — regenerate the draft in Clio UI to pull it onto the bill. Refuses if the entry is on a non-draft bill. If deleting the original fails, the just-created expense is rolled back so nothing changes.",
+    "Convert a time entry into an expense (e.g. a filing fee that was logged as time). Clio's API cannot change an activity's type, so this creates a new ExpenseEntry (same matter/date/user as the time entry, note preserved unless overridden) and then deletes the original time entry. Amount defaults to the entry's billed value (hours × rate); pass amount to override. If the time entry is on a DRAFT bill, its line is removed as part of the delete and the new expense sits unbilled — regenerate the draft in Clio UI to pull it onto the bill. Refuses if the entry is on a non-draft bill. If deleting the original fails, the tool re-reads the entry's actual state: when the entry survived, the new expense is rolled back and the error reports any partial bill change with recovery steps; when the entry turns out to be deleted despite the error, the conversion is reported complete with a warning.",
     {
       activity_id: z.coerce.number().describe("Clio activity ID of the TimeEntry to convert"),
       amount: z.coerce.number().optional().describe("Expense amount in dollars. Defaults to the time entry's billed value (hours × rate). Required if that value is 0."),
@@ -399,6 +428,17 @@ export function registerExpenseTools(server: McpServer): void {
     },
     async (params) => {
       try {
+        // Validate an explicitly-provided amount up front. z.coerce maps
+        // ''/null to 0, and without this check that 0 would fall through to
+        // the derivation-failure error below — which blames the derivation
+        // and tells a caller who DID pass amount to pass it explicitly.
+        if (params.amount !== undefined && !(params.amount > 0)) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `amount must be greater than 0 (got ${params.amount}). Omit amount to default to the entry's hours × rate.` }) }],
+            isError: true,
+          };
+        }
+
         // Step 1: Read the time entry, including bill routing, so we can
         // refuse BEFORE creating anything if the conversion can't complete.
         const actResp = await rawGetSingle(`/activities/${params.activity_id}`, {
@@ -437,6 +477,16 @@ export function registerExpenseTools(server: McpServer): void {
             isError: true,
           };
         }
+        // Same guard prepareLineSplit uses: without it, a missing user would
+        // serialize as "user":{} and Clio would either 422 or silently
+        // attribute the new expense to the OAuth token owner — breaking the
+        // "conversion preserves attribution" contract.
+        if (!act.user?.id) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Could not resolve the timekeeper (user) for activity ${params.activity_id} — cannot preserve attribution on the converted expense.` }) }],
+            isError: true,
+          };
+        }
 
         // Step 2: Amount — explicit param, else the entry's billed value.
         const derived = deriveConversionAmount(act);
@@ -456,11 +506,16 @@ export function registerExpenseTools(server: McpServer): void {
 
         // Step 3: Resolve category (same semantics as create_expense).
         let category: ExpenseCategoryRef | null = null;
-        if (params.expense_category_id !== undefined || params.expense_category_name !== undefined) {
+        // Blank/whitespace names are treated as "not provided" — LLM clients
+        // sometimes fill optional string params with "" (and z.coerce would
+        // otherwise send it into resolution, wasting a category fetch and
+        // producing a confusing error).
+        const categoryName = params.expense_category_name?.trim();
+        if (params.expense_category_id !== undefined || categoryName) {
           const cats = await fetchExpenseCategories();
           category = resolveExpenseCategory(cats, {
             id: params.expense_category_id,
-            name: params.expense_category_name,
+            name: categoryName,
           });
         }
 
@@ -476,7 +531,7 @@ export function registerExpenseTools(server: McpServer): void {
             quantity: 1,
             price: amount,
             matter: { id: act.matter.id },
-            user: { id: act.user?.id },
+            user: { id: act.user.id },
           },
         };
         if (expenseNote) body.data.note = expenseNote;
@@ -491,21 +546,93 @@ export function registerExpenseTools(server: McpServer): void {
         // Step 5: Delete the original time entry. deleteActivity auto-removes
         // the draft-bill line first when there is one, and refuses non-draft
         // bills (we already pre-checked, but the state could have changed).
-        // If the delete fails, roll back the just-created expense so the
-        // conversion is atomic from the caller's perspective.
-        let removedFromBill: { line_item_id: number; bill: any } | undefined;
+        //
+        // deleteActivity is TWO sequential writes (DELETE the bill line, then
+        // DELETE the activity), so a thrown error does not tell us how far it
+        // got — and an ambiguous failure (e.g. timeout) may even mean the
+        // delete actually committed. Blindly rolling back the new expense on
+        // any error would (a) falsely promise "nothing changed" when the
+        // draft bill already lost its line, or (b) destroy BOTH records when
+        // the delete committed despite the error. So on failure we re-read
+        // the entry's actual state and branch:
+        //   - entry gone            → conversion complete; keep the expense,
+        //                             report success with a warning
+        //   - entry survived        → roll back the expense; if its bill line
+        //                             was already removed, raise a rich error
+        //                             with recovery steps (same shape as
+        //                             prepareHourChange's step2 error)
+        let removedFromBill: { line_item_id?: number; bill: any } | undefined;
+        let deleteWarning: string | undefined;
         try {
           const delResult = await deleteActivity(params.activity_id);
           removedFromBill = delResult.removed_from_bill;
         } catch (delErr: any) {
+          let originalExists = true;
+          let stillOnBill = !!act.bill?.id;
           try {
-            await rawDeleteSingle(`/activities/${expense.id}`);
-          } catch (rbErr: any) {
-            console.error(`[convert_time_entry_to_expense] rollback delete /activities/${expense.id} failed: ${rbErr.message}. Orphan expense may exist.`);
-            delErr.message = `${delErr.message} — AND rollback of the new expense (activity ${expense.id}) ALSO failed; delete it manually in Clio.`;
+            const checkResp = await rawGetSingle(`/activities/${params.activity_id}`, {
+              fields: "id,bill{id,state,number}",
+            });
+            originalExists = !!checkResp.data?.id;
+            stillOnBill = !!checkResp.data?.bill?.id;
+          } catch (checkErr: any) {
+            if (checkErr.response?.status === 404) originalExists = false;
+            // Any other failure: state unknown — assume the entry survived.
+            // That path rolls back the expense and reports the raw error,
+            // which is the conservative default.
           }
-          throw delErr;
+
+          if (!originalExists) {
+            // The delete committed despite the error. The conversion is
+            // complete — keep the expense and report success.
+            deleteWarning = `deleteActivity reported an error ("${delErr.message}") but the time entry is confirmed deleted — the conversion completed. Verify the draft bill state in Clio if the entry was on one.`;
+            if (act.bill?.id) removedFromBill = { bill: act.bill };
+          } else {
+            // The entry survived → roll back the new expense.
+            try {
+              await rawDeleteSingle(`/activities/${expense.id}`);
+            } catch (rbErr: any) {
+              console.error(`[convert_time_entry_to_expense] rollback delete /activities/${expense.id} failed: ${rbErr.message}. Orphan expense may exist.`);
+              delErr.message = `${delErr.message} — AND rollback of the new expense (activity ${expense.id}) ALSO failed; delete it manually in Clio.`;
+            }
+            if (act.bill?.id && !stillOnBill) {
+              // Partial deleteActivity: the draft-bill line was removed but
+              // the activity itself survived (now unbilled). The bill is
+              // short one line until the user acts — say so explicitly.
+              const richErr: any = new Error(
+                `Conversion failed midway: time entry ${params.activity_id}'s line was already removed from draft bill ${act.bill.number || act.bill.id}, but the entry itself could not be deleted (it still exists, now unbilled). The new expense was rolled back. To recover: retry convert_time_entry_to_expense (the entry is now unbilled, so the retry has no bill step), or open bill ${act.bill.number || act.bill.id} in Clio UI and click "Regenerate Draft" to restore the line at its original hours. Underlying error: ${delErr.message}`,
+              );
+              richErr.response = {
+                status: delErr.response?.status || 500,
+                data: {
+                  context: "line_removed_but_activity_survived",
+                  bill_id: act.bill.id,
+                  bill_number: act.bill.number,
+                  activity_id: params.activity_id,
+                  rolled_back_expense: true,
+                  clio_error: delErr.response?.data,
+                },
+              };
+              throw richErr;
+            }
+            throw delErr;
+          }
         }
+
+        // Read back the expense to report what actually stuck (Clio returns
+        // 201/200 even when it silently drops fields from a POST body).
+        let savedExpense = expense;
+        let readbackOk = false;
+        try {
+          const rb = await rawGetSingle(`/activities/${expense.id}`, {
+            fields: "id,type,date,quantity,price,total,note,expense_category{id,name},matter{id,display_number},user{id,name}",
+          });
+          if (rb.data?.id) {
+            savedExpense = rb.data;
+            readbackOk = true;
+          }
+        } catch { /* non-fatal: report from the POST echo */ }
+        const categoryDropped = readbackOk && category && savedExpense.expense_category?.id !== category.id;
 
         const wasOnDraft = !!removedFromBill;
         return {
@@ -523,16 +650,20 @@ export function registerExpenseTools(server: McpServer): void {
                 was_on_draft_bill: wasOnDraft ? removedFromBill!.bill : null,
               },
               expense: {
-                activity_id: expense.id,
+                activity_id: savedExpense.id,
                 type: "ExpenseEntry",
-                date: expense.date,
-                amount: expense.price,
-                total: expense.total ?? amount,
-                category: category ? category.name : null,
-                note: expense.note ?? expenseNote ?? null,
+                date: savedExpense.date,
+                amount: savedExpense.price,
+                total: savedExpense.total ?? amount,
+                category: savedExpense.expense_category?.name ?? (category ? category.name : null),
+                note: savedExpense.note ?? expenseNote ?? null,
                 matter: act.matter,
                 user: act.user ?? null,
               },
+              ...(deleteWarning ? { warning: deleteWarning } : {}),
+              ...(categoryDropped
+                ? { category_warning: `Clio accepted the create but the expense_category ("${category!.name}") did not persist on the expense — set it in Clio UI or retry.` }
+                : {}),
               ui_instruction: wasOnDraft
                 ? `Time entry ${params.activity_id} was removed from draft bill ${removedFromBill!.bill.number || removedFromBill!.bill.id} and deleted; expense ${expense.id} was created unbilled. To put the expense on the bill: open Clio UI → bill ${removedFromBill!.bill.number || removedFromBill!.bill.id} → "Regenerate Draft" (or delete_draft_bill + "Generate Bill" on matter ${act.matter.display_number || act.matter.id}).`
                 : `Time entry ${params.activity_id} deleted; expense ${expense.id} created unbilled on matter ${act.matter.display_number || act.matter.id}. It will be picked up on the matter's next generated bill.`,
