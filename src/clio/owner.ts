@@ -2,12 +2,15 @@ import { getActingClioIdentity } from "./pagination";
 
 /**
  * The "owner" is the attorney the custom calendaring tooling was originally
- * built for (RomSum / NRN event types, cross-calendar assignment, NRN calendar
- * IDs). When the server was scoped to one person, that behavior applied to
- * every request. Now that the whole firm uses the server, those customizations
- * should ONLY apply to the owner — everyone else gets plain calendaring: events
- * land on their own personal Clio calendar with no custom event types and no
- * cross-calendar targeting.
+ * built for (the RomSum / NRN event types). When the server was scoped to one
+ * person, that behavior applied to every request. Now that the whole firm uses
+ * the server, the custom EVENT TYPES should ONLY apply to the owner — everyone
+ * else has event_type / event_type_id ignored.
+ *
+ * NOTE: this gate covers the custom event types ONLY. Calendar placement and
+ * reassignment (calendar_owner_id / assign_to_user_id) are available to every
+ * user — Clio itself enforces write permission on the target calendar, so a
+ * user can only move an entry to a calendar they own or can write to.
  *
  * Configurable via OWNER_EMAILS (comma-separated, case-insensitive). Defaults
  * to Nicholas Noe, who authored the custom tooling.
