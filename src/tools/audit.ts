@@ -10,6 +10,18 @@ function entryUid(e: any): number {
   return e["activity_id"] ?? e["line_item_id"];
 }
 
+// Field selector for the draft-bill line-item audit. IMPORTANT: /line_items
+// does NOT support `rounded_quantity` — that field lives on /activities, and
+// requesting it here returns 400 InvalidFields (this broke audit_draft_bills,
+// download_bill_audit, and the interactive review route). On /line_items,
+// `quantity` is already the billable amount in decimal HOURS for time lines
+// (contrast /activities, where quantity is in seconds), so downstream code
+// must use `li.quantity` directly with no /3600 conversion. Shared across all
+// three call sites to keep them from diverging. See the regression test in
+// test/auditLineItemFields.test.ts.
+export const AUDIT_LINE_ITEM_FIELDS =
+  "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}";
+
 
 // Harris County Probate Court picklist IDs
 export const HC_COURT_IDS = new Set([
@@ -613,7 +625,7 @@ export function registerAuditTools(server: McpServer): void {
 
         for (const bill of relevantBills) {
           const lineItems = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+            fields: AUDIT_LINE_ITEM_FIELDS,
             bill_id: bill.id,
           });
 
@@ -623,7 +635,10 @@ export function registerAuditTools(server: McpServer): void {
           for (const li of lineItems) {
             if (li.activity?.type !== "TimeEntry") continue;
 
-            const hours = (li.rounded_quantity || li.quantity) ? (li.rounded_quantity || li.quantity) / 3600 : 0;
+            // /line_items `quantity` is already decimal hours (NOT seconds), so
+            // no /3600 conversion — the old seconds math produced ~0 hours and
+            // silently defeated every hours-based flag.
+            const hours = li.quantity || 0;
             const rate = li.price || 0;
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
@@ -880,7 +895,7 @@ export function registerAuditTools(server: McpServer): void {
 
         for (const bill of relevantBills) {
           const lineItems = await fetchAllPages<any>("/line_items", {
-            fields: "id,total,type,date,description,quantity,rounded_quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}",
+            fields: AUDIT_LINE_ITEM_FIELDS,
             bill_id: bill.id,
           });
 
@@ -890,7 +905,10 @@ export function registerAuditTools(server: McpServer): void {
           for (const li of lineItems) {
             if (li.activity?.type !== "TimeEntry") continue;
 
-            const hours = (li.rounded_quantity || li.quantity) ? (li.rounded_quantity || li.quantity) / 3600 : 0;
+            // /line_items `quantity` is already decimal hours (NOT seconds), so
+            // no /3600 conversion — the old seconds math produced ~0 hours and
+            // silently defeated every hours-based flag.
+            const hours = li.quantity || 0;
             const rate = li.price || 0;
             const note = li.activity?.note || li.description || "";
             const isHC = matterInfo?.is_hc || false;
