@@ -22,6 +22,23 @@ function entryUid(e: any): number {
 export const AUDIT_LINE_ITEM_FIELDS =
   "id,total,type,date,description,quantity,price,bill{id,number},matter{id,display_number},user{id,name},activity{id,type,note}";
 
+// Join predicate for scoping firm-wide draft bills to an attorney's matters.
+// A Clio bill can reference multiple matters, and the relevant one is NOT
+// guaranteed to sit at matters[0] — checking only the first entry silently
+// dropped one bill from the 2026-07 audit run (draft-bill count 94 vs the
+// authoritative per-matter count of 95). Returns the id of the first
+// associated matter present in matterIds, or null when none match.
+// Exported for the regression test in test/auditBillMatterJoin.test.ts.
+export function matchBillMatter(
+  bill: { matters?: Array<{ id?: number } | null> },
+  matterIds: Set<number>,
+): number | null {
+  for (const m of bill.matters ?? []) {
+    if (m && typeof m.id === "number" && matterIds.has(m.id)) return m.id;
+  }
+  return null;
+}
+
 
 // Harris County Probate Court picklist IDs
 export const HC_COURT_IDS = new Set([
@@ -549,6 +566,16 @@ export function registerAuditTools(server: McpServer): void {
     {
       responsible_attorney_id: z.coerce.number().describe("Clio user ID of the responsible attorney"),
       practice_area: z.string().optional().describe("Optional: filter to a specific practice area (e.g. 'Guardianship', 'Probate')"),
+      matter_status: z
+        .enum(["open", "pending", "closed", "all"])
+        .optional()
+        .default("open")
+        .describe("Which matters to scope the audit to. Default 'open'. Use 'all' to also catch draft bills sitting on pending/closed matters."),
+      summary_only: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, omit the per-entry flagged_by_bill detail and return only the summary + diagnostics. Keeps the response small for large batches."),
     },
     async (params) => {
       try {
@@ -556,8 +583,8 @@ export function registerAuditTools(server: McpServer): void {
         const matterParams: Record<string, any> = {
           fields: "id,display_number,description,practice_area{name},responsible_attorney{id,name},custom_field_values{id,field_name,value}",
           responsible_attorney_id: params.responsible_attorney_id,
-          status: "open",
         };
+        if (params.matter_status !== "all") matterParams.status = params.matter_status;
         const matters = await fetchAllPages<any>("/matters", matterParams);
 
         // Build matter lookup with court classification
@@ -606,12 +633,22 @@ export function registerAuditTools(server: McpServer): void {
           state: "draft",
         });
 
-        // Filter to bills that belong to this attorney's matters
+        // Filter to bills that belong to this attorney's matters. Match on ANY
+        // associated matter (see matchBillMatter) and remember which matter
+        // matched so the per-bill matter lookup below can't diverge from the
+        // join. Bills with no matter reference at all are surfaced in the
+        // diagnostics — they can never join and would otherwise vanish silently.
         const matterIds = new Set(matterMap.keys());
-        const relevantBills = draftBills.filter((b: any) => {
-          const billMatter = b.matters?.[0];
-          return billMatter && matterIds.has(billMatter.id);
-        });
+        const relevantBills: any[] = [];
+        const billsWithNoMatter: any[] = [];
+        for (const b of draftBills) {
+          const matchedMatterId = matchBillMatter(b, matterIds);
+          if (matchedMatterId !== null) {
+            relevantBills.push({ ...b, matched_matter_id: matchedMatterId });
+          } else if (!b.matters || b.matters.length === 0) {
+            billsWithNoMatter.push(b);
+          }
+        }
 
         if (relevantBills.length === 0) {
           return {
@@ -629,7 +666,7 @@ export function registerAuditTools(server: McpServer): void {
             bill_id: bill.id,
           });
 
-          const matterId = bill.matters?.[0]?.id;
+          const matterId = bill.matched_matter_id;
           const matterInfo = matterId ? matterMap.get(matterId) : null;
 
           for (const li of lineItems) {
@@ -729,7 +766,13 @@ export function registerAuditTools(server: McpServer): void {
             hours: e.hours,
             rate: e.rate,
             amount: e.amount,
-            note: e.note,
+            // Cap pathological note lengths — the full response for a large
+            // batch approached 1 MB; per-entry notes rarely need more than
+            // this to act on a flag (the full text is in Clio / the CSV export).
+            note:
+              typeof e.note === "string" && e.note.length > 500
+                ? `${e.note.slice(0, 500)}… [truncated ${e.note.length - 500} chars]`
+                : e.note,
             flags: e.flags,
           });
         }
@@ -744,6 +787,18 @@ export function registerAuditTools(server: McpServer): void {
             hc_standard_matters: hcMatters,
             general_hygiene_matters: generalMatters,
             draft_bills: relevantBills.length,
+            // Self-auditing counts: how many draft bills exist firm-wide vs
+            // how many joined to this attorney's matters, plus the one class
+            // of bill that can never join (no matter reference at all). A
+            // future count discrepancy is diagnosable from this response
+            // instead of requiring a per-matter counter-scan.
+            draft_bills_firmwide: draftBills.length,
+            draft_bills_matched: relevantBills.length,
+            draft_bills_without_matter: billsWithNoMatter.length,
+            draft_bills_without_matter_sample: billsWithNoMatter
+              .slice(0, 10)
+              .map((b: any) => ({ bill_id: b.id, number: b.number ?? null, total: b.total ?? null })),
+            matter_status_scope: params.matter_status,
             total_entries: allEntries.length,
             total_hours: Math.round(totalHours * 100) / 100,
             total_amount: Math.round(totalAmount * 100) / 100,
@@ -754,7 +809,7 @@ export function registerAuditTools(server: McpServer): void {
             severity_counts: severityCounts,
             top_issues: Object.entries(codeCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([code, count]) => ({ code, count })),
           },
-          flagged_by_bill: Object.fromEntries(byBill),
+          flagged_by_bill: params.summary_only ? undefined : Object.fromEntries(byBill),
           _meta: {
             hc_court_ids: [...HC_COURT_IDS],
             standards_note: "HC = Harris County Probate Court fee standards (March 2025). Rate caps apply only to HC matters whose description contains 'guardianship' or 'appointment'. General = billing hygiene (block billing, vague entries, clerical, duplicates).",
@@ -826,6 +881,11 @@ export function registerAuditTools(server: McpServer): void {
     {
       responsible_attorney_id: z.coerce.number().describe("Clio user ID of the responsible attorney"),
       practice_area: z.string().optional().describe("Optional: filter to a specific practice area (e.g. 'Guardianship', 'Probate')"),
+      matter_status: z
+        .enum(["open", "pending", "closed", "all"])
+        .optional()
+        .default("open")
+        .describe("Which matters to scope the audit to. Default 'open'. Use 'all' to also catch draft bills sitting on pending/closed matters."),
     },
     async (params) => {
       try {
@@ -833,8 +893,8 @@ export function registerAuditTools(server: McpServer): void {
         const matterParams: Record<string, any> = {
           fields: "id,display_number,description,practice_area{name},responsible_attorney{id,name},custom_field_values{id,field_name,value}",
           responsible_attorney_id: params.responsible_attorney_id,
-          status: "open",
         };
+        if (params.matter_status !== "all") matterParams.status = params.matter_status;
         const matters = await fetchAllPages<any>("/matters", matterParams);
 
         const matterMap = new Map<number, {
@@ -878,11 +938,13 @@ export function registerAuditTools(server: McpServer): void {
           state: "draft",
         });
 
+        // Same any-matter join as audit_draft_bills (see matchBillMatter).
         const matterIds = new Set(matterMap.keys());
-        const relevantBills = draftBills.filter((b: any) => {
-          const billMatter = b.matters?.[0];
-          return billMatter && matterIds.has(billMatter.id);
-        });
+        const relevantBills: any[] = [];
+        for (const b of draftBills) {
+          const matchedMatterId = matchBillMatter(b, matterIds);
+          if (matchedMatterId !== null) relevantBills.push({ ...b, matched_matter_id: matchedMatterId });
+        }
 
         if (relevantBills.length === 0) {
           return {
@@ -899,7 +961,7 @@ export function registerAuditTools(server: McpServer): void {
             bill_id: bill.id,
           });
 
-          const matterId = bill.matters?.[0]?.id;
+          const matterId = bill.matched_matter_id;
           const matterInfo = matterId ? matterMap.get(matterId) : null;
 
           for (const li of lineItems) {
