@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { diagnosticTool } from "../utils/diagnostics";
 import JSZip from "jszip";
 
 const BILL_FIELDS =
@@ -145,7 +146,7 @@ export function registerBillTools(server: McpServer): void {
   // bill, and (c) a presence check showing which of the tracked fields
   // came back populated vs null/missing. Useful for confirming Clio
   // actually supports each name in BILL_FIELDS before relying on it.
-  server.tool(
+  diagnosticTool(server).tool(
     "debug_bill_fields",
     "Debug helper: fetch one bill with the full get_bills field set and report which fields Clio returned. Use this after editing BILL_FIELDS to confirm Clio accepts each field name and to see the actual shape of nested objects (client, matters).",
     {
@@ -850,7 +851,7 @@ export function registerBillTools(server: McpServer): void {
   //     the error body — without creating a matter.
   //   - The matter-schema read is a plain GET of one existing matter to reveal
   //     the real field names (custom_rate, billing fields, etc.).
-  server.tool(
+  diagnosticTool(server).tool(
     "probe_billing_write_apis",
     "Diagnostic (non-destructive). Probes whether Clio's v4 API exposes any bill-generation/creation endpoint, and discovers what POST /matters requires. Reads HTTP status codes from deliberately-invalid payloads (empty body / nonexistent matter id) so NO bill or matter is ever created: 404 = route absent, 405 = route exists but not POST-able, 422/400 = route exists and reached validation. Also GETs one existing matter to reveal the real field schema (custom_rate, billing fields) for building create_matter. Run this before building matter/bill write tools.",
     {

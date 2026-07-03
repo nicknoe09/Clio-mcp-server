@@ -9,6 +9,7 @@ import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, type UtilHours } from "../dashboard/rateTabs";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
+import { diagnosticTool } from "../utils/diagnostics";
 import { FIRM_ROSTER, COLLECTIONS_ROSTER, SCORECARD_ROSTER, INITIALS_BY_USER_ID, MONTH_NAMES_FULL, MONTH_NAMES_SHORT } from "../domain/roster";
 import { border, $, makePara, makeDocxTable, pageBreak, spacer, h2, pageProps } from "../utils/docx";
 import { round2, round1, fmt } from "../utils/num";
@@ -1242,7 +1243,7 @@ export function registerDocumentTools(server: McpServer): void {
   // dashboard tool uses. Hits candidate endpoints with the firm's token and
   // reports HTTP status + response shape, plus enumerates the classic reports.
   // ============================================================
-  server.tool(
+  diagnosticTool(server).tool(
     "probe_clio_report_apis",
     "Diagnostic (read-only). Probes candidate Clio report API endpoints with the firm's token and returns HTTP status + response shape for each, to discover whether the new 'Custom Reports' (beta) reporting engine is API-accessible and under what path (vs the classic /reports endpoint the dashboard uses). Also enumerates classic /reports by kind/name/format so a missing or mis-grouped report can be spotted. Run this when the dashboard can't find the expected Revenue Report.",
     {},
@@ -3369,7 +3370,7 @@ export function registerDocumentTools(server: McpServer): void {
   // boundaries and per-row identities can be mapped precisely. Diagnostic for
   // normalizing the initials column.
   // ============================================================
-  server.tool(
+  diagnosticTool(server).tool(
     "dump_compare_layout",
     "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K, Collected N). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and to compare month blocks (e.g. April vs May) for duplicated data.",
     {},

@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
 import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
 import { resolveActingUserId, AttributionError } from "../clio/actingUser";
+import { diagnosticTool } from "../utils/diagnostics";
 
 const TIME_ENTRY_FIELDS =
   "id,date,created_at,updated_at,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
@@ -317,7 +318,7 @@ export function registerTimeTools(server: McpServer): void {
   );
 
   // test_update_time_entry — test whether Clio allows PATCH on a time entry (including on draft bills)
-  server.tool(
+  diagnosticTool(server).tool(
     "test_update_time_entry",
     "Test tool: attempts to update a single time entry's description in Clio via PATCH. Use this to verify whether Clio allows modifications to time entries that are already on draft bills. Reads the entry first, applies the change, then reads again to confirm. Pass dry_run=true to just read the entry without modifying it.",
     {
@@ -549,7 +550,7 @@ export function registerTimeTools(server: McpServer): void {
   // fields you specify and report Clio's response verbatim. Used to discover
   // which fields are writable on /line_items (the API reference is
   // auth-walled, so empirical probing is the practical path).
-  server.tool(
+  diagnosticTool(server).tool(
     "test_update_line_item",
     "Diagnostic: PATCH a single line_item directly with the fields you specify and report Clio's response verbatim. Confirmed-writable fields: note, price, quantity, date. Read-only / computed (Clio rejects with 422): rounded_quantity, total, type, billed. Pass dry_run=true to just read the line_item.",
     {
