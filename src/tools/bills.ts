@@ -9,6 +9,16 @@ const BILL_FIELDS =
   "total,due,balance,paid,pending,paid_at,credits_issued,shared,matters," +
   "client{id,name,primary_email_address,type}";
 
+// Field selector for get_bill_line_items. /line_items supports top-level
+// user{id,name} (1-level nesting, same selector AUDIT_LINE_ITEM_FIELDS in
+// audit.ts relies on), so the timekeeper comes back on the line item itself.
+// Do NOT resolve timekeepers via per-activity GETs: on bills with >~50 lines
+// the resulting fan-out hits Clio's rate limit and the 429 backoff pushes the
+// call past the connector gateway timeout (reported 2026-07-02 on a 167-line
+// bill). Exported for the regression test in test/billLineItemFields.test.ts.
+export const BILL_LINE_ITEM_FIELDS =
+  "id,type,kind,description,note,date,quantity,price,total,group_ordering,discount{rate,type},activity{id},user{id,name}";
+
 export function registerBillTools(server: McpServer): void {
   server.tool(
     "get_bills",
@@ -288,48 +298,16 @@ export function registerBillTools(server: McpServer): void {
           };
         }
 
-        // Fetch all line items on this bill. NOTE: Clio's /line_items field
-        // selector supports only 1-level nesting (e.g. `activity{id}` works;
-        // `activity{id,user{id,name}}` returns 400 InvalidFields). We pull
-        // the activity ref here and resolve the timekeeper in a separate
-        // batch step below.
+        // Fetch all line items on this bill, timekeeper included — see the
+        // BILL_LINE_ITEM_FIELDS comment for why there is no per-activity
+        // enrichment step here.
         const queryParams: Record<string, any> = {
-          fields: "id,type,kind,description,note,date,quantity,price,total,group_ordering,discount{rate,type},activity{id}",
+          fields: BILL_LINE_ITEM_FIELDS,
           bill_id: params.bill_id,
         };
         if (!params.include_hidden) queryParams.display = true;
 
         const lineItems = await fetchAllPages<any>("/line_items", queryParams);
-
-        // Resolve timekeeper for each unique activity via parallel per-activity
-        // GETs. /activities supports 1-level nesting on `user{id,name}` so each
-        // lookup is one tiny round-trip. For a 50-line bill this finishes in
-        // sub-second; well under Clio's rate limits. Failures on individual
-        // activities surface as null timekeeper for that line, not a fatal error.
-        const activityIds = Array.from(
-          new Set(
-            (lineItems as any[])
-              .map((li) => li.activity?.id)
-              .filter((id): id is number => typeof id === "number"),
-          ),
-        );
-        const userByActivityId = new Map<number, { id: number; name: string } | null>();
-        await Promise.all(
-          activityIds.map(async (id) => {
-            try {
-              const resp = await rawGetSingle(`/activities/${id}`, {
-                fields: "id,user{id,name}",
-              });
-              const u = resp.data?.user;
-              userByActivityId.set(
-                id,
-                u && typeof u.id === "number" ? { id: u.id, name: u.name } : null,
-              );
-            } catch {
-              userByActivityId.set(id, null);
-            }
-          }),
-        );
 
         // Sort by Clio's bill ordering: group_ordering, then date, then id.
         lineItems.sort((a: any, b: any) => {
@@ -352,8 +330,8 @@ export function registerBillTools(server: McpServer): void {
           note: li.note ?? null,
           description: li.description ?? null,
           timekeeper:
-            typeof li.activity?.id === "number"
-              ? userByActivityId.get(li.activity.id) ?? null
+            li.user && typeof li.user.id === "number"
+              ? { id: li.user.id, name: li.user.name }
               : null,
           discount:
             li.discount && (li.discount.rate != null || li.discount.type)

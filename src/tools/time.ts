@@ -7,11 +7,60 @@ import { resolveActingUserId, AttributionError } from "../clio/actingUser";
 const TIME_ENTRY_FIELDS =
   "id,date,created_at,updated_at,quantity,rounded_quantity,price,total,note,type,billed,matter{id,display_number,description,client},user{id,name}";
 
+// Clio's GET /activities has no `billed` query param — its documented filter
+// is `status`. Note the enum distinguishes "draft" (entry sits on an
+// unfinalized draft bill) from "unbilled" (entry on no bill at all): a plain
+// status="unbilled" query does NOT return draft-bill entries, and Clio marks
+// draft-bill entries billed=true in the response body. That combination is
+// why billed="false" (strictly unbilled) can legitimately return 0 entries
+// for a matter whose draft bill is full — callers wanting a draft bill's
+// entries must ask for status="draft" (reported 2026-07-02).
+export const TIME_ENTRY_STATUSES = [
+  "draft",
+  "unbilled",
+  "billed",
+  "billable",
+  "non_billable",
+  "written_off",
+] as const;
+export type TimeEntryStatus = (typeof TIME_ENTRY_STATUSES)[number];
+
+/**
+ * Resolve the billed/status params into (a) the server-side Clio `status`
+ * filter and (b) the client-side `billed` flag filter. Pure — unit-tested in
+ * test/timeEntryScope.test.ts.
+ *
+ * - `status` set: passed straight through to Clio; the client-side billed
+ *   filter is SKIPPED (draft entries carry billed=true — filtering on the
+ *   flag would empty a status="draft" pull).
+ * - billed="false": strictly unbilled (server status="unbilled" + client
+ *   billed!==true) — explicitly excludes draft-bill entries.
+ * - billed="true": client-side flag filter only (a server status="billed"
+ *   filter would miss draft-bill entries, which read billed=true).
+ */
+export function resolveTimeEntryScope(
+  billed: "true" | "false" | "all",
+  status?: TimeEntryStatus,
+): { serverStatus?: string; clientBilled?: boolean } {
+  if (status) {
+    if (billed !== "all") {
+      throw new Error(
+        `Ambiguous filter: status="${status}" cannot be combined with billed="${billed}". ` +
+          `Use status alone (it is the precise Clio-side filter), or billed alone.`,
+      );
+    }
+    return { serverStatus: status };
+  }
+  if (billed === "false") return { serverStatus: "unbilled", clientBilled: false };
+  if (billed === "true") return { clientBilled: true };
+  return {};
+}
+
 export function registerTimeTools(server: McpServer): void {
   // get_time_entries
   server.tool(
     "get_time_entries",
-    "Get time entries with filters. Hours use Clio rounded_quantity (billed hours, rounded to billing increment).",
+    "Get time entries with filters. Hours use Clio rounded_quantity (billed hours, rounded to billing increment). To pull the entries sitting on a matter's DRAFT bill, use status=\"draft\" — billed=\"false\" means strictly unbilled (on no bill at all) and deliberately EXCLUDES draft-bill entries. For the lines on one specific bill, prefer get_bill_line_items.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       user_id: z.coerce.number().optional().describe("Filter by user/timekeeper ID"),
@@ -21,10 +70,26 @@ export function registerTimeTools(server: McpServer): void {
         .enum(["true", "false", "all"])
         .optional()
         .default("all")
-        .describe("Filter by billed status"),
+        .describe("Filter by billed flag. \"false\" = strictly unbilled — excludes entries on draft bills (use status=\"draft\" for those). Cannot be combined with status."),
+      status: z
+        .enum(TIME_ENTRY_STATUSES)
+        .optional()
+        .describe("Clio-native status filter, passed through server-side. \"draft\" returns entries sitting on unfinalized draft bills — the supported way to pull a draft bill's entries per matter. Cannot be combined with billed."),
     },
     async (params) => {
       try {
+        // Resolve billed/status into the server-side Clio filter + the
+        // client-side flag filter (and reject ambiguous combinations).
+        let scope: { serverStatus?: string; clientBilled?: boolean };
+        try {
+          scope = resolveTimeEntryScope(params.billed, params.status);
+        } catch (scopeErr: any) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: scopeErr.message }) }],
+            isError: true,
+          };
+        }
+
         const queryParams: Record<string, any> = {
           type: "TimeEntry",
           fields: TIME_ENTRY_FIELDS,
@@ -33,22 +98,14 @@ export function registerTimeTools(server: McpServer): void {
         if (params.user_id) queryParams.user_id = params.user_id;
         // Clio ignores date_from/date_to — use created_since for server-side filtering
         if (params.start_date) queryParams.created_since = `${params.start_date}T00:00:00+00:00`;
-        // Clio's GET /activities does NOT have a `billed` query param (verified
-        // 2026-05-05 via OpenAPI). The documented filter is `status` with enum
-        // {billed, draft, unbilled, non_billable, billable, written_off}. Map our
-        // boolean billed→status only for the cases where there's a clean 1:1
-        // mapping; otherwise rely on the client-side filter below for correctness.
-        if (params.billed === "false") queryParams.status = "unbilled";
-        // Note: billed="true" is NOT mapped to status="billed" because that misses
-        // entries on draft bills (which the response.billed field still marks true).
-        // Client-side filter handles that case.
+        if (scope.serverStatus) queryParams.status = scope.serverStatus;
 
         let entries = await fetchAllPages<any>("/activities", queryParams);
 
-        // Client-side billed filter — authoritative source of truth, since
-        // Clio's status filter has gaps (see comment above).
-        if (params.billed === "true") entries = entries.filter((e: any) => e.billed === true);
-        else if (params.billed === "false") entries = entries.filter((e: any) => e.billed !== true);
+        // Client-side billed-flag filter (see resolveTimeEntryScope for when
+        // it applies — never on a status pull).
+        if (scope.clientBilled === true) entries = entries.filter((e: any) => e.billed === true);
+        else if (scope.clientBilled === false) entries = entries.filter((e: any) => e.billed !== true);
 
         // Client-side date filtering (created_since filters by creation, not activity date)
         if (params.start_date) entries = entries.filter((e: any) => e.date >= params.start_date!);
@@ -89,6 +146,16 @@ export function registerTimeTools(server: McpServer): void {
                   count: formatted.length,
                   total_hours: totalHours,
                   total_value: totalValue,
+                  // Echo the scope that was actually applied so batch callers
+                  // can verify each response against the request they sent.
+                  applied_filters: {
+                    matter_id: params.matter_id ?? null,
+                    user_id: params.user_id ?? null,
+                    start_date: params.start_date ?? null,
+                    end_date: params.end_date ?? null,
+                    billed: params.billed,
+                    status: params.status ?? null,
+                  },
                   entries: formatted,
                 },
                 null,
