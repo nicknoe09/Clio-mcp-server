@@ -79,6 +79,7 @@ const TIMEKEEPER_ROSTER: Record<number, TimekeeperInfo> = {
   358528744: { name: "Angela Alanis",      role: "paralegal", licensedDate: null },
   358108805: { name: "Anna Lozano",        role: "paralegal", licensedDate: null },
   358550509: { name: "Kaz Gonzalez",       role: "paralegal", licensedDate: null },
+  360383465: { name: "Stacy Bakri",        role: "paralegal", licensedDate: null },
   360091325: { name: "Jonathan Barbee",    role: "clerk",     licensedDate: null },
 };
 

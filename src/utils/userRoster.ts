@@ -25,6 +25,7 @@ export const CLIO_USERS: ClioUser[] = [
   { id: 359865560, name: "Courteney Daniel",     role: "Attorney",    active: true },
   { id: 360049685, name: "Gus Vlahadamis",       role: "Attorney",    active: true },
   { id: 360091325, name: "Jonathan Barbee",      role: "Attorney",    active: true },
+  { id: 360383465, name: "Stacy Bakri",          role: "NonAttorney", active: true },
 ];
 
 export function findUserByName(name: string): ClioUser | undefined {

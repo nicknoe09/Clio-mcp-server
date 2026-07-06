@@ -441,6 +441,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
       344117381: "PAR", 344134017: "KES", 348755029: "NRN", 359380639: "NAF",
       358528744: "ACA", 358108805: "AFL", 358550509: "AKG", 359711375: "TBS",
       359576660: "MNH", 360091325: "JPB", 360049685: "KGV", 359865560: "CTD",
+      360383465: "SAB",
     };
     const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
     const boxFilename = `${initials} Goals ${params.year}.xlsx`;
@@ -480,7 +481,8 @@ const WEEKLY_GOALS_ROSTER = [
   { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
   { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
   { name: "Jonathan Barbee", user_id: 360091325, goal: 32, group: "KES" }, // associate
-  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para
+  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para — left mid-2026; keep through year-end so her Jan–Jun months stay on the monthly chart, drop for 2027
+  { name: "Stacy Bakri",     user_id: 360383465, goal: 30, group: "KES" }, // partner/para — Kenny's paralegal, replaced Anna mid-2026
   { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
 
@@ -2100,7 +2102,7 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
             { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's ongoing collections in perpetuity; paraSalary = Stacy's (confirm)
+            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's ongoing collections in perpetuity; paraSalary = Stacy's $75k (confirmed)
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
@@ -2172,7 +2174,7 @@ export function registerDocumentTools(server: McpServer): void {
             configSheet.getRow(26).values = [110, 100];
             configSheet.getRow(27).values = [121, 300];
             configSheet.getRow(28).values = [133, 500];
-            configSheet.getRow(30).values = ["Paralegals: ACA, AFL, AKG"];
+            configSheet.getRow(30).values = ["Paralegals: ACA, SAB, AKG"];
             configSheet.columns.forEach(col => { col.width = 16; });
           }
 
@@ -2987,7 +2989,7 @@ export function registerDocumentTools(server: McpServer): void {
           configRows.push(xmlRow(26, [xmlCell("A26", 110), xmlCell("B26", 100, { style: STYLE_CUR })]));
           configRows.push(xmlRow(27, [xmlCell("A27", 121), xmlCell("B27", 300, { style: STYLE_CUR })]));
           configRows.push(xmlRow(28, [xmlCell("A28", 133), xmlCell("B28", 500, { style: STYLE_CUR })]));
-          configRows.push(xmlRow(30, [xmlCell("A30", "Paralegals: ACA, AFL, AKG")]));
+          configRows.push(xmlRow(30, [xmlCell("A30", "Paralegals: ACA, SAB, AKG")]));
           // Column widths so the Bonus Config table reads cleanly.
           const bonusConfigXml = buildSheetXml(configRows, {
             cols: [
@@ -3096,7 +3098,7 @@ export function registerDocumentTools(server: McpServer): void {
           // discards the sheet's cell data ("Removed Records").
           const paraTitleCells: string[] = [xmlCell(`A${paraStart}`, "Paralegal Hours Bonus", { style: STYLE_BOLD })];
           const paraHdrCells: string[] = [xmlCell(`A${paraHdr}`, "Month", { style: STYLE_BOLD })];
-          const XML_PARALEGALS = ["ACA", "AFL", "AKG"];
+          const XML_PARALEGALS = ["ACA", "SAB", "AKG"]; // keep in sync with PARALEGALS above (AFL replaced by SAB mid-2026)
           const XML_PARA_TIERS = [{ minHours: 133, bonus: 500 }, { minHours: 121, bonus: 300 }, { minHours: 110, bonus: 100 }];
           for (let pi = 0; pi < XML_PARALEGALS.length; pi++) {
             const col = 2 + pi * 3;

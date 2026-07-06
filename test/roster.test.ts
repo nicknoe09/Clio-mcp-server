@@ -8,6 +8,11 @@ describe("roster", () => {
     expect(new Set(FIRM_ROSTER.map(r => r.initials)).size).toBe(13);
     expect(FIRM_ROSTER.some(r => r.initials === "SAB")).toBe(true);
   });
+  it("SAB has her real Clio user_id (no placeholders in the roster)", () => {
+    expect(FIRM_ROSTER.find(r => r.initials === "SAB")?.user_id).toBe(360383465);
+    // 999xxxxxxx was the pre-onboarding placeholder convention — none should remain.
+    for (const r of FIRM_ROSTER) expect(r.user_id).toBeLessThan(999000000);
+  });
   it("SCORECARD_ROSTER is FIRM minus Of-Counsel (KGV/CTD)", () => {
     expect(SCORECARD_ROSTER).toHaveLength(FIRM_ROSTER.length - 2);
     const ini = SCORECARD_ROSTER.map(r => r.initials);
