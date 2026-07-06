@@ -211,6 +211,30 @@ async function assertActingClioIdentity(): Promise<void> {
 }
 
 /**
+ * One audit line per Clio write, so attribution questions ("who created this
+ * contact, under whose Clio token?") are answerable from server logs.
+ * clio_user is the resolved token owner from who_am_i — "unverified" when the
+ * identity guard failed open — and the created resource id is included on
+ * successful POSTs so a specific Clio record can be matched to its log line.
+ */
+export function formatClioWriteLog(
+  method: string,
+  path: string,
+  signedInEmail: string | undefined,
+  clioIdentity: { id: number; email: string } | undefined,
+  outcome: string
+): string {
+  const signedIn = (signedInEmail ?? "").trim().toLowerCase() || "unknown";
+  const clioUser = clioIdentity ? `${clioIdentity.id} (${clioIdentity.email})` : "unverified";
+  return `[clio-write] ${method} ${path} signed_in=${signedIn} clio_user=${clioUser} outcome=${outcome}`;
+}
+
+function logClioWrite(method: string, path: string, outcome: string): void {
+  const ctx = getContext();
+  console.log(formatClioWriteLog(method, path, ctx?.userEmail, ctx?.clioIdentity, outcome));
+}
+
+/**
  * Make a raw HTTPS GET request that returns binary data as a Buffer.
  * Follows 303/302/301 redirects (Clio redirects file downloads to S3).
  * Strips Authorization header on redirect since S3 doesn't need it.
@@ -371,17 +395,25 @@ export async function rawPostSingle(
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 
-  return withBackoff(async () => {
-    try {
-      return await rawPost(fullUrl, body);
-    } catch (err: any) {
-      if (err.response?.status === 401) {
-        await refreshAccessToken();
+  try {
+    const result = await withBackoff(async () => {
+      try {
         return await rawPost(fullUrl, body);
+      } catch (err: any) {
+        if (err.response?.status === 401) {
+          await refreshAccessToken();
+          return await rawPost(fullUrl, body);
+        }
+        throw err;
       }
-      throw err;
-    }
-  });
+    });
+    const createdId = result?.data?.id;
+    logClioWrite("POST", url, createdId != null ? `ok id=${createdId}` : "ok");
+    return result;
+  } catch (err: any) {
+    logClioWrite("POST", url, `failed status=${err.response?.status ?? "network"}`);
+    throw err;
+  }
 }
 
 /**
@@ -442,17 +474,24 @@ export async function rawPatchSingle(
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 
-  return withBackoff(async () => {
-    try {
-      return await rawPatch(fullUrl, body);
-    } catch (err: any) {
-      if (err.response?.status === 401) {
-        await refreshAccessToken();
+  try {
+    const result = await withBackoff(async () => {
+      try {
         return await rawPatch(fullUrl, body);
+      } catch (err: any) {
+        if (err.response?.status === 401) {
+          await refreshAccessToken();
+          return await rawPatch(fullUrl, body);
+        }
+        throw err;
       }
-      throw err;
-    }
-  });
+    });
+    logClioWrite("PATCH", url, "ok");
+    return result;
+  } catch (err: any) {
+    logClioWrite("PATCH", url, `failed status=${err.response?.status ?? "network"}`);
+    throw err;
+  }
 }
 
 /**
@@ -508,17 +547,24 @@ export async function rawDeleteSingle(url: string): Promise<any> {
   const baseUrl = ENV.CLIO_API_BASE_URL.replace(/\/$/, "");
   const fullUrl = `${baseUrl}${url}`;
 
-  return withBackoff(async () => {
-    try {
-      return await rawHttpDelete(fullUrl);
-    } catch (err: any) {
-      if (err.response?.status === 401) {
-        await refreshAccessToken();
+  try {
+    const result = await withBackoff(async () => {
+      try {
         return await rawHttpDelete(fullUrl);
+      } catch (err: any) {
+        if (err.response?.status === 401) {
+          await refreshAccessToken();
+          return await rawHttpDelete(fullUrl);
+        }
+        throw err;
       }
-      throw err;
-    }
-  });
+    });
+    logClioWrite("DELETE", url, "ok");
+    return result;
+  } catch (err: any) {
+    logClioWrite("DELETE", url, `failed status=${err.response?.status ?? "network"}`);
+    throw err;
+  }
 }
 
 /**
