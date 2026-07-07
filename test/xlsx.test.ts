@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { colToNum, patchCell, readCell } from "../src/utils/xlsx";
+import { colToNum, patchCell, readCell, translateFormulaRefs, expandSharedFormulas } from "../src/utils/xlsx";
 
 describe("colToNum", () => {
   it("maps Excel column letters to 1-based numbers", () => {
@@ -45,6 +45,84 @@ describe("patchCell", () => {
   it("leaves the XML unchanged when the cell is absent", () => {
     const xml = `<row r="5"><c r="C5"><v>1</v></c></row>`;
     expect(patchCell(xml, "Z5", 9)).toBe(xml);
+  });
+
+  it("keeps follower formulas alive when patching a shared-formula MASTER", () => {
+    // E5 masters shared group si=2 covering E5:E7. Writing a value into E5 used
+    // to strip the master's <f> and orphan E6/E7 (Excel: "Removed Records:
+    // Shared formula"). Followers must come out as self-contained formulas.
+    const xml =
+      `<row r="5"><c r="E5"><f t="shared" ref="E5:E7" si="2">C5+D5</f><v>10</v></c></row>` +
+      `<row r="6"><c r="E6"><f t="shared" si="2"/><v>11</v></c></row>` +
+      `<row r="7"><c r="E7"><f t="shared" si="2"/><v>12</v></c></row>`;
+    const out = patchCell(xml, "E5", 99);
+    expect(out).not.toContain('t="shared"');
+    expect(out).toContain(`<c r="E5"><v>99</v></c>`);
+    expect(out).toContain(`<c r="E6"><f>C6+D6</f><v>11</v></c>`);
+    expect(out).toContain(`<c r="E7"><f>C7+D7</f><v>12</v></c>`);
+  });
+});
+
+describe("translateFormulaRefs", () => {
+  it("shifts relative refs and honors $ anchors", () => {
+    expect(translateFormulaRefs("C5+D5", 1, 0)).toBe("C6+D6");
+    expect(translateFormulaRefs("SUM(A1:B2)", 2, 1)).toBe("SUM(B3:C4)");
+    expect(translateFormulaRefs("$A5+A$5+$A$5", 1, 1)).toBe("$A6+B$5+$A$5");
+  });
+
+  it("leaves string literals, quoted sheet names, and function names alone", () => {
+    expect(translateFormulaRefs(`IF(A1="A1","A1",LOG10(A1))`, 1, 0)).toBe(`IF(A2="A1","A1",LOG10(A2))`);
+    expect(translateFormulaRefs(`'Rate Sheet'!B2+Util!C3`, 1, 1)).toBe(`'Rate Sheet'!C3+Util!D4`);
+  });
+
+  it("turns off-sheet shifts into #REF!", () => {
+    expect(translateFormulaRefs("A1", -1, 0)).toBe("#REF!");
+  });
+});
+
+describe("expandSharedFormulas", () => {
+  const sheet =
+    `<row r="5"><c r="E5"><f t="shared" ref="E5:E7" si="0">$B$1*C5</f><v>10</v></c></row>` +
+    `<row r="6"><c r="E6" s="3"><f t="shared" si="0"/><v>11</v></c></row>` +
+    `<row r="7"><c r="E7"><f t="shared" si="0"/><v>12</v></c></row>`;
+
+  it("materializes followers with shifted refs and unshares the master", () => {
+    const out = expandSharedFormulas(sheet);
+    expect(out).not.toContain('t="shared"');
+    expect(out).toContain(`<c r="E5"><f>$B$1*C5</f><v>10</v></c>`);
+    expect(out).toContain(`<c r="E6" s="3"><f>$B$1*C6</f><v>11</v></c>`);
+    expect(out).toContain(`<c r="E7"><f>$B$1*C7</f><v>12</v></c>`);
+  });
+
+  it("drops orphaned followers (master already stripped) but keeps their cached values", () => {
+    const orphaned =
+      `<row r="5"><c r="E5"><v>99</v></c></row>` +
+      `<row r="6"><c r="E6"><f t="shared" si="0"/><v>11</v></c></row>`;
+    const out = expandSharedFormulas(orphaned);
+    expect(out).not.toContain("<f");
+    expect(out).toContain(`<c r="E6"><v>11</v></c>`);
+  });
+
+  it("orphansOnly heals orphans without rewriting intact groups", () => {
+    const mixed = sheet + `<row r="9"><c r="F9"><f t="shared" si="8"/><v>7</v></c></row>`;
+    const out = expandSharedFormulas(mixed, { orphansOnly: true });
+    expect(out).toContain(`<f t="shared" ref="E5:E7" si="0">$B$1*C5</f>`); // intact group untouched
+    expect(out).toContain(`<f t="shared" si="0"/>`);
+    expect(out).toContain(`<c r="F9"><v>7</v></c>`); // orphan healed
+  });
+
+  it("does not fuse a self-closing cell with the next cell's formula", () => {
+    const xml = `<row r="5"><c r="D5" s="1"/><c r="E5"><f t="shared" ref="E5:E5" si="0">C5</f><v>1</v></c></row>`;
+    const out = expandSharedFormulas(xml);
+    expect(out).toContain(`<c r="D5" s="1"/>`);
+    expect(out).toContain(`<c r="E5"><f>C5</f><v>1</v></c>`);
+  });
+
+  it("keeps plain (non-shared) formulas untouched", () => {
+    const xml = `<row r="5"><c r="E5"><f>C5+D5</f><v>1</v></c><c r="F5"><f t="shared" si="0">A5</f><v>2</v></c></row>`;
+    const out = expandSharedFormulas(xml);
+    expect(out).toContain(`<c r="E5"><f>C5+D5</f><v>1</v></c>`);
+    expect(out).toContain(`<c r="F5"><f>A5</f><v>2</v></c>`);
   });
 });
 
