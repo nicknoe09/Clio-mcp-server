@@ -327,6 +327,118 @@ export function colToNum(s: string): number {
 }
 
 /**
+ * Shift every RELATIVE cell reference in an A1-style formula by (dRow, dCol),
+ * honoring $ anchors ($A5 keeps its column, A$5 keeps its row). Skips text
+ * inside "…" string literals and '…' quoted sheet names, and refuses tokens
+ * that only look like refs (function names such as LOG10, columns past XFD).
+ * A reference shifted off the sheet becomes #REF!, matching Excel.
+ */
+export function translateFormulaRefs(formula: string, dRow: number, dCol: number): string {
+  let out = "";
+  let i = 0;
+  while (i < formula.length) {
+    const ch = formula[i];
+    if (ch === '"' || ch === "'") {
+      // String literal / quoted sheet name — copy verbatim ("" and '' escape).
+      let j = i + 1;
+      while (j < formula.length) {
+        if (formula[j] === ch) {
+          if (formula[j + 1] === ch) { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      out += formula.slice(i, j);
+      i = j;
+      continue;
+    }
+    const m = /^(\$?)([A-Z]{1,3})(\$?)(\d+)/.exec(formula.slice(i));
+    if (m) {
+      const colNum = colToNum(m[2]);
+      const rowNum = parseInt(m[4], 10);
+      const prev = out[out.length - 1] ?? "";
+      const next = formula[i + m[0].length] ?? "";
+      const isRef =
+        colNum <= 16384 && rowNum >= 1 && rowNum <= 1048576 && // real sheet coords (≤XFD / ≤1048576)
+        !/[A-Za-z0-9_.$]/.test(prev) &&                        // not the tail of a name/number
+        !/[A-Za-z0-9_(]/.test(next);                           // not a function call / longer name
+      if (isRef) {
+        const newCol = m[1] ? colNum : colNum + dCol;
+        const newRow = m[3] ? rowNum : rowNum + dRow;
+        out += newCol < 1 || newCol > 16384 || newRow < 1 || newRow > 1048576
+          ? "#REF!"
+          : `${m[1]}${colLetter(newCol)}${m[3]}${newRow}`;
+        i += m[0].length;
+        continue;
+      }
+      out += m[0]; // looked ref-shaped but isn't — copy whole token so we can't re-match inside it
+      i += m[0].length;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Rewrite a worksheet's shared formulas (<f t="shared" si="N">) as ordinary
+ * per-cell formulas. A shared group stores its formula text ONLY on the master
+ * cell; follower cells carry just si="N". Our patch path strips <f> from any
+ * cell it writes a value into, and stripping a MASTER orphans every follower —
+ * Excel then repairs the file with "Removed Records: Shared formula" (the
+ * sheet3 corruption in the recovery log). Expanding first makes each cell
+ * self-contained, so dropping any one formula can never break another cell.
+ *
+ * Followers get the master's formula with relative refs shifted by their
+ * offset (what Excel does implicitly). Already-orphaned followers — an si with
+ * no master left, i.e. corruption baked in by an earlier run — lose the dead
+ * <f> and keep their cached <v> as a plain value. With `orphansOnly` set, only
+ * that healing happens and intact shared groups are left untouched (used on
+ * the download/repair path to avoid rewriting sheets we aren't patching).
+ */
+export function expandSharedFormulas(xml: string, opts?: { orphansOnly?: boolean }): string {
+  if (!xml.includes('t="shared"')) return xml;
+  const cellRe = /<c\b[^>]*?\br="([A-Z]+)(\d+)"[^>]*?(?:\/>|>([\s\S]*?)<\/c>)/g;
+
+  // Pass 1: master formula per si (the <f t="shared"> that carries text).
+  const masters = new Map<string, { col: number; row: number; formula: string }>();
+  let cm: RegExpExecArray | null;
+  while ((cm = cellRe.exec(xml)) !== null) {
+    const inner = cm[3];
+    if (inner == null || !inner.includes('t="shared"')) continue;
+    const fm = inner.match(/<f\b([^>]*)>([\s\S]*?)<\/f>/);
+    if (!fm || !/\bt="shared"/.test(fm[1]) || fm[2].trim() === "") continue;
+    const si = fm[1].match(/\bsi="([^"]*)"/)?.[1];
+    if (si != null && !masters.has(si)) {
+      masters.set(si, { col: colToNum(cm[1]), row: parseInt(cm[2], 10), formula: fm[2] });
+    }
+  }
+
+  // Pass 2: unshare masters, materialize followers, drop orphans.
+  return xml.replace(cellRe, (cell, colL: string, rowS: string, inner?: string) => {
+    if (inner == null || !inner.includes('t="shared"')) return cell;
+    const newInner = inner.replace(/<f\b([^>]*?)(?:\/>|>([\s\S]*?)<\/f>)/g, (f, attrs: string, content?: string) => {
+      if (!/\bt="shared"/.test(attrs)) return f;
+      const si = attrs.match(/\bsi="([^"]*)"/)?.[1];
+      if (content != null && content.trim() !== "") {
+        return opts?.orphansOnly ? f : `<f>${content}</f>`; // master: keep its formula, drop sharing
+      }
+      const master = si != null ? masters.get(si) : undefined;
+      if (!master) return ""; // orphaned follower: drop dead <f>, cached <v> stays as the value
+      if (opts?.orphansOnly) return f;
+      const dRow = parseInt(rowS, 10) - master.row;
+      const dCol = colToNum(colL) - master.col;
+      // Refs shift on the unescaped text ('"' not '&quot;'), then re-escape.
+      return `<f>${xmlEsc(translateFormulaRefs(xmlUnesc(master.formula), dRow, dCol))}</f>`;
+    });
+    if (newInner === inner) return cell;
+    return cell.slice(0, cell.length - inner.length - "</c>".length) + newInner + "</c>";
+  });
+}
+
+/**
  * Normalize a worksheet's <sheetData>: rows must be unique and in ascending
  * order, and cells within each row must be in ascending column order — Excel
  * rejects violations as corrupt ("we found a problem with some content") even
@@ -564,7 +676,10 @@ export async function surgicalWriteXlsx(
 
   // Process patched sheets
   for (const [name, rawXml] of Object.entries(patchedSheets)) {
-    const xml = sanitizeSheetXml(rawXml); // enforce unique + sorted rows/cells
+    // Expand shared formulas so no written sheet can carry an si="N" follower
+    // whose master a patch removed (Excel repairs that as a corrupt sheet),
+    // then enforce unique + sorted rows/cells.
+    const xml = sanitizeSheetXml(expandSharedFormulas(rawXml));
     const existingPath = sheetMap[name];
     if (existingPath) {
       // Replace existing sheet XML
@@ -688,7 +803,25 @@ export async function sanitizeXlsxBuffer(buf: Buffer): Promise<Buffer> {
       }
     }
 
-    // (B) Pad sharedStrings to cover any out-of-range refs (the original repair).
+    // (B) Heal orphaned shared formulas a prior write baked in: a follower cell
+    // still says <f t="shared" si="N"/> but the group's master <f> (the one
+    // carrying the formula text) was stripped by a value write. Excel repairs
+    // that as "Removed Records: Shared formula from /xl/worksheets/sheetN.xml".
+    // orphansOnly leaves intact shared groups alone so untouched sheets don't
+    // get rewritten; the dead <f> is dropped and the cached <v> survives.
+    for (const name of Object.keys(zip.files)) {
+      if (!/^xl\/worksheets\/sheet\d+\.xml$/.test(name)) continue;
+      const wsXml = await zip.file(name)!.async("string");
+      if (!wsXml.includes('t="shared"')) continue;
+      const healed = expandSharedFormulas(wsXml, { orphansOnly: true });
+      if (healed !== wsXml) {
+        zip.file(name, healed);
+        changed = true;
+        console.warn(`[Dashboard] sanitizeXlsxBuffer: removed orphaned shared-formula refs in ${name}`);
+      }
+    }
+
+    // (C) Pad sharedStrings to cover any out-of-range refs (the original repair).
     const ssFile = zip.file("xl/sharedStrings.xml");
     if (ssFile) {
       let ss = await ssFile.async("string");
@@ -732,6 +865,13 @@ export           const colLetter = (c: number): string => {
           // and so over-matched past a self-closing cell into the NEXT cell's
           // </c>, fusing cells and dumping the value into the wrong column.
           export function patchCell(xml: string, ref: string, val: number): string {
+            // 0) Shared formulas first: stripping <f> from a cell that MASTERS a
+            //    shared group (<f t="shared" ref="…" si="N">…</f>) orphans every
+            //    follower cell's si="N" and Excel repairs the sheet with
+            //    "Removed Records: Shared formula". Expand the whole sheet to
+            //    plain per-cell formulas once (no-op after the first call), so
+            //    the strip below can never take out another cell's formula.
+            if (xml.includes('t="shared"')) xml = expandSharedFormulas(xml);
             // 1) self-closing empty cell — turn it into a value cell (preserve
             //    style, drop any t="…" so the number isn't read as a string idx).
             const selfRe = new RegExp(`<c\\b([^>]*?)\\br="${ref}"([^>]*?)/>`);
