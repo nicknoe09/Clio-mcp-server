@@ -184,10 +184,15 @@ export function registerPerformanceTools(server: McpServer): void {
     }
   );
 
-  // get_utilization_report
+  // get_billable_target_report (formerly get_utilization_report — renamed because
+  // this is NOT the dashboard's utilization metric: it measures billable hours vs a
+  // daily TARGET (default 6.0 hrs/working day), not billable ÷ available hours
+  // (1880/12), and it counts ALL time entries in the numerator, not just billable.
+  // Comparable numbers to the dashboard's Utilization tab come from the weekly
+  // goals sheets / dashboard, not this tool.)
   server.tool(
-    "get_utilization_report",
-    "Billable hours utilization per timekeeper. Flags timekeepers below 80% utilization. Includes weekly trend if period > 4 weeks.",
+    "get_billable_target_report",
+    "Hours worked vs a daily billable TARGET per timekeeper (default 6.0 hrs/working day). NOT the dashboard's utilization rate (billable ÷ available 1880-hr basis) — percentages here run higher and include all tracked time. Flags timekeepers below 80% of target. Includes weekly trend if period > 4 weeks.",
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
@@ -246,7 +251,7 @@ export function registerPerformanceTools(server: McpServer): void {
           .map(([uid, u]) => {
             const avgPerDay =
               workingDays > 0 ? u.billable_hours / workingDays : 0;
-            const utilPct =
+            const pctOfTarget =
               targetHours > 0
                 ? (u.billable_hours / targetHours) * 100
                 : 0;
@@ -260,9 +265,9 @@ export function registerPerformanceTools(server: McpServer): void {
               working_days: workingDays,
               avg_hours_per_day: Math.round(avgPerDay * 100) / 100,
               target_hours_per_day: params.target_hours_per_day,
-              utilization_pct: Math.round(utilPct * 10) / 10,
+              pct_of_target: Math.round(pctOfTarget * 10) / 10,
               variance_from_target: Math.round(variance * 100) / 100,
-              flag: utilPct < 80 ? "BELOW_TARGET" : null,
+              flag: pctOfTarget < 80 ? "BELOW_TARGET" : null,
             };
 
             if (showTrend) {
@@ -276,12 +281,12 @@ export function registerPerformanceTools(server: McpServer): void {
 
             return result;
           })
-          .sort((a, b) => b.utilization_pct - a.utilization_pct);
+          .sort((a, b) => b.pct_of_target - a.pct_of_target);
 
-        const firmAvgUtil =
+        const firmAvgPctOfTarget =
           results.length > 0
             ? Math.round(
-                (results.reduce((s, r) => s + r.utilization_pct, 0) /
+                (results.reduce((s, r) => s + r.pct_of_target, 0) /
                   results.length) *
                   10
               ) / 10
@@ -301,7 +306,7 @@ export function registerPerformanceTools(server: McpServer): void {
                     total_target_hours: targetHours,
                   },
                   summary: {
-                    firm_avg_utilization_pct: firmAvgUtil,
+                    firm_avg_pct_of_target: firmAvgPctOfTarget,
                     highest_performer: results[0]?.name ?? "N/A",
                     lowest_performer:
                       results[results.length - 1]?.name ?? "N/A",
