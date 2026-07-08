@@ -115,13 +115,21 @@ export function maxRowNumber(xml: string): number {
 }
 
 /**
- * Compute a per-month firm-average rate for a month-blocked tab (Utilization /
+ * Compute a per-month firm rate for a month-blocked tab (Utilization /
  * Realization). For every month block, each attorney row's own rate is derived
  * from the numeric hour columns via `rateFn` (NOT read from the tab's rate-column
- * FORMULAS, whose cached values are stale until Excel recalculates), and the
- * block's firm figure is the simple MEAN of the listed billers' rates. `rateFn`
+ * FORMULAS, whose cached values are stale until Excel recalculates). `rateFn`
  * returns null for a row that should be excluded (e.g. an inactive timekeeper
- * with a zero denominator), so those rows never drag the mean down.
+ * with a zero denominator), so those rows never distort the firm figure.
+ *
+ * `mode` picks how the block's firm figure is derived:
+ *  - "mean" (default): the simple MEAN of the listed billers' own rates.
+ *  - "totals": `rateFn` applied to the SUM of the hour columns across the listed
+ *    billers — the same formula as an individual row, computed on firm totals.
+ *    A mean-of-rates overweights low-volume billers (a timekeeper with 0.5
+ *    billed hours at 100% counts the same as one with 150 hours at 80%), which
+ *    overstated the Realization firm average; totals weights each biller by
+ *    volume and reconciles with the tab's own per-month "Total" row.
  *
  * Shares the exact block-scan rules of findTabMonthBlock (col A month label, col
  * B initials, block ends on blank/"EMPLOYEE"/"TOTAL"). When a sheet holds the
@@ -133,6 +141,7 @@ export function firmAvgRateByMonth(
   sharedStrings: string[],
   numCols: string[],
   rateFn: (vals: Record<string, number>) => number | null,
+  mode: "mean" | "totals" = "mean",
 ): Array<{ monthAbbr: string; avgRate: number; billers: number }> {
   const cellText = (rowXml: string, col: string): string => {
     const re = new RegExp(`(<c\\b[^>]*\\br="${col}\\d+"[^>]*>)([\\s\\S]*?)</c>`);
@@ -167,14 +176,15 @@ export function firmAvgRateByMonth(
   ordered.sort((a, b) => a.n - b.n);
   for (const o of ordered) rows.push({ body: o.body });
 
-  // Most-recent block per month (keyed by month abbr) → {sum, count}.
-  const acc = new Map<string, { sum: number; count: number }>();
-  let cur: { abbr: string; sum: number; count: number } | null = null;
-  const flush = () => { if (cur && cur.count > 0) acc.set(cur.abbr, { sum: cur.sum, count: cur.count }); };
+  // Most-recent block per month (keyed by month abbr) → {sum, count, totals}.
+  type Acc = { sum: number; count: number; totals: Record<string, number> };
+  const acc = new Map<string, Acc>();
+  let cur: ({ abbr: string } & Acc) | null = null;
+  const flush = () => { if (cur && cur.count > 0) acc.set(cur.abbr, { sum: cur.sum, count: cur.count, totals: cur.totals }); };
   for (const { body } of rows) {
     const a3 = cellText(body, "A").trim().toUpperCase().slice(0, 3);
     const b = cellText(body, "B").trim().toUpperCase();
-    if (MONTH_ABBRS.includes(a3)) { flush(); cur = { abbr: a3, sum: 0, count: 0 }; continue; }
+    if (MONTH_ABBRS.includes(a3)) { flush(); cur = { abbr: a3, sum: 0, count: 0, totals: {} }; continue; }
     if (!cur) continue;
     if (b === "" || b === "EMPLOYEE" || b === "TOTAL") { flush(); cur = null; continue; }
     const vals: Record<string, number> = {};
@@ -183,6 +193,7 @@ export function firmAvgRateByMonth(
     if (rate == null || !Number.isFinite(rate)) continue;
     cur.sum += rate;
     cur.count += 1;
+    for (const c of numCols) cur.totals[c] = (cur.totals[c] ?? 0) + vals[c];
   }
   flush();
 
@@ -190,7 +201,11 @@ export function firmAvgRateByMonth(
     .filter((abbr) => acc.has(abbr))
     .map((abbr) => {
       const a = acc.get(abbr)!;
-      return { monthAbbr: abbr, avgRate: a.sum / a.count, billers: a.count };
+      const totalsRate = mode === "totals" ? rateFn(a.totals) : null;
+      const avgRate = mode === "totals"
+        ? (totalsRate != null && Number.isFinite(totalsRate) ? totalsRate : 0)
+        : a.sum / a.count;
+      return { monthAbbr: abbr, avgRate, billers: a.count };
     });
 }
 

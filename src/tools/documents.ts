@@ -6,7 +6,7 @@ import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard/workedHours";
-import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, type UtilHours } from "../dashboard/rateTabs";
+import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { diagnosticTool } from "../utils/diagnostics";
@@ -1592,6 +1592,9 @@ export function registerDocumentTools(server: McpServer): void {
                   const h = byIni[r.initials.toUpperCase()];
                   if (h) byUid[r.user_id] = h;
                 }
+                const ensured = ensureTabMonthBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"], ["C", "D", "E", "G"]);
+                utilXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Utilization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const res = patchUtilizationBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, byUid, initialsToUid, initialsAliases);
                 utilXml = res.xml;
                 utilPatched += res.patched;
@@ -1617,6 +1620,9 @@ export function registerDocumentTools(server: McpServer): void {
                 const ca = await getClientActivityCSV({ start_date: mStart, end_date: mEnd, reportId: m === params.month ? params.client_activity_report_id : undefined, pollSeconds: 180 });
                 if (m === params.month) clientActivityReportId = ca.report.id;
                 const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
+                realizXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Realization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const block = findTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
@@ -1649,6 +1655,9 @@ export function registerDocumentTools(server: McpServer): void {
               try {
                 const rows = await genFeeAllocationByMonth(params.year, m, { filterByPayment: false });
                 const collAgg = aggregateFeeAllocationCollectionHrs(rows, rosterRT);
+                const ensured = ensureTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
+                collectionXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Collection tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const block = findTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
                 if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
@@ -2805,6 +2814,9 @@ export function registerDocumentTools(server: McpServer): void {
                   const tb = bundle.data[r.user_id];
                   if (tb) byUid[r.user_id] = { billable: tb.billableHrs, nonbillable: tb.nonbillableHrs };
                 }
+                const ensured = ensureTabMonthBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"], ["C", "D", "E", "G"]);
+                utilXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Utilization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const res = patchUtilizationBlock(utilXml, MONTH_ABBRS[m - 1], sharedStrings, byUid, initialsToUid, initialsAliases);
                 utilXml = res.xml;
                 utilPatched += res.patched;
@@ -2840,6 +2852,9 @@ export function registerDocumentTools(server: McpServer): void {
                 });
                 if (m === params.month) clientActivityReportId = ca.report.id;
                 const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
+                realizXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Realization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const block = findTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
@@ -2863,9 +2878,13 @@ export function registerDocumentTools(server: McpServer): void {
           // ============================================================
           // Firm-average summary tables (Utilization / Realization)
           // ============================================================
-          // Append a "Firm Average" table to the BOTTOM of each rate tab — the
-          // simple MEAN of the listed billers' own monthly rate (utilization =
-          // billable/available; realization = nondiscounted/total-billed). It is
+          // Append a "Firm Average" table to the BOTTOM of each rate tab.
+          // Utilization = the simple MEAN of the listed billers' own monthly rate
+          // (billable/available), matching its goal column (mean of individual
+          // goals). Realization = the same formula as an individual row applied
+          // to the firm TOTALS (Σnondiscounted / Σtotal-billed) — a mean of
+          // per-biller rates overweighted low-volume billers and overstated the
+          // firm figure. It is
           // appended after the existing month blocks (never inserted mid-sheet,
           // so the template's per-attorney rate formulas are left untouched) and
           // refreshed in place each run via the marker below. Rates are recomputed
@@ -2931,6 +2950,9 @@ export function registerDocumentTools(server: McpServer): void {
                   collAgg = aggregateFeeAllocationCollectionHrs(monthFeeRows, ROSTER);
                 }
                 // -- Collection patch -- (cols C=collected hrs, D=uncollected hrs)
+                const ensured = ensureTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
+                collectionXml = ensured.xml;
+                if (ensured.created) console.log(`[dashboard] Collection tab: generated new ${MONTH_ABBRS[m - 1]} block`);
                 const block = findTabMonthBlock(collectionXml, MONTH_ABBRS[m - 1], sharedStrings, ["C", "D"]);
                 if (!block) continue;
                 for (const { row, ini } of block.attorneys) {
