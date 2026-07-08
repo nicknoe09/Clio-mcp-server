@@ -21,9 +21,11 @@ Environment:
 
 Usage:
   python3 scripts/closed_matters_by_year.py [--start-year YYYY] [--end-year YYYY]
+  python3 scripts/closed_matters_by_year.py --this-month
 """
 
 import argparse
+import calendar
 import csv
 import logging
 import os
@@ -197,6 +199,76 @@ def bucket_all_closed(session: requests.Session, base_url: str):
     return by_year, unknown, total
 
 
+def month_bounds(year: int, month: int):
+    """Return (first_day, last_day) of a calendar month."""
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def prev_month(year: int, month: int):
+    return (year - 1, 12) if month == 1 else (year, month - 1)
+
+
+def report_this_month(session: requests.Session, base_url: str,
+                      today: date, prior_years: int = 3) -> None:
+    """Count matters closed in the current month and compare against trend.
+
+    Trend baselines:
+      - average for the same calendar month over the prior `prior_years` years
+      - average per month over the trailing 12 full months
+    The month-to-date count is projected to month-end at the current daily
+    pace and compared to the trailing-12-month average (+/-15% = on trend).
+    """
+    month_start, month_end = month_bounds(today.year, today.month)
+    month_name = today.strftime("%B %Y")
+
+    this_month = count_for_range(session, base_url, month_start, month_end)
+
+    same_month_prior = []
+    for offset in range(1, prior_years + 1):
+        y = today.year - offset
+        start, end = month_bounds(y, today.month)
+        same_month_prior.append((y, count_for_range(session, base_url, start, end)))
+        time.sleep(PAGE_DELAY_SECONDS)
+
+    trailing_counts = []
+    y, m = prev_month(today.year, today.month)
+    for _ in range(12):
+        start, end = month_bounds(y, m)
+        trailing_counts.append(count_for_range(session, base_url, start, end))
+        y, m = prev_month(y, m)
+        time.sleep(PAGE_DELAY_SECONDS)
+
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    projected = this_month / today.day * days_in_month
+    same_month_avg = sum(n for _, n in same_month_prior) / len(same_month_prior)
+    trailing_avg = sum(trailing_counts) / len(trailing_counts)
+
+    print()
+    print(f"Matters closed in {month_name} (through {today.isoformat()}): {this_month}")
+    if today.day < days_in_month:
+        print(f"Projected month-end at current pace ({today.day}/{days_in_month} days): "
+              f"{projected:.1f}")
+    for y, n in same_month_prior:
+        print(f"  {today.strftime('%B')} {y}: {n}")
+    print(f"Same-month average, prior {len(same_month_prior)} years: {same_month_avg:.1f}")
+    print(f"Trailing 12 full months: {sum(trailing_counts)} closed "
+          f"(avg {trailing_avg:.1f}/month)")
+
+    baseline = trailing_avg
+    compare = projected if today.day < days_in_month else this_month
+    if baseline == 0:
+        verdict = "no baseline (no closures in the trailing 12 months)"
+    elif compare > baseline * 1.15:
+        verdict = f"AHEAD of trend ({compare:.1f} vs {baseline:.1f}/month baseline)"
+    elif compare < baseline * 0.85:
+        verdict = f"BEHIND trend ({compare:.1f} vs {baseline:.1f}/month baseline)"
+    else:
+        verdict = f"ON trend ({compare:.1f} vs {baseline:.1f}/month baseline)"
+    print(f"Trend verdict: {verdict}")
+    if today.day < days_in_month:
+        print("(Month in progress — verdict uses the month-end projection.)")
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     current_year = date.today().year
     parser = argparse.ArgumentParser(
@@ -206,6 +278,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="first calendar year to report (default: current year - 9)")
     parser.add_argument("--end-year", type=int, default=current_year,
                         help="last calendar year to report (default: current year)")
+    parser.add_argument("--this-month", action="store_true",
+                        help="instead of the yearly report, count matters closed in "
+                             "the current month and compare against trend (same month "
+                             "in prior years and the trailing 12-month average)")
     args = parser.parse_args(argv)
     if args.start_year > args.end_year:
         parser.error("--start-year must be <= --end-year")
@@ -231,6 +307,14 @@ def main(argv=None) -> int:
         "X-API-VERSION": "4.0.10",
         "Accept": "application/json",
     })
+
+    if args.this_month:
+        try:
+            report_this_month(session, base_url, date.today())
+        except (ClioApiError, requests.RequestException) as exc:
+            log.error("%s", exc)
+            return 1
+        return 0
 
     try:
         # Method 1: authoritative server-side per-year counts.
