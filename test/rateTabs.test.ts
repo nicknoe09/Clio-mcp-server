@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { patchUtilizationBlock, buildFirmAvgRows, type UtilHours } from "../src/dashboard/rateTabs";
+import {
+  patchUtilizationBlock, buildFirmAvgRows, ensureTabMonthBlock,
+  appendRealizationFirmAvg, FIRM_AVG_MARKER, type UtilHours,
+} from "../src/dashboard/rateTabs";
+import { findTabMonthBlock, patchCell, readCell } from "../src/utils/xlsx";
 
 // Minimal Utilization-style tab: A=month, B=initials, C=Billable, D=Nonbillable,
 // E=Total, F=Available, G=Untracked. Cells must already exist for a value write.
@@ -77,5 +81,93 @@ describe("buildFirmAvgRows", () => {
     // Without a goal, the biller count sits in col D (not E).
     expect(xml).toContain(`r="D52"`);
     expect(xml).not.toContain(`r="E52"`);
+  });
+});
+
+// Realization-style tab: A=month, B=initials, D=billed-nondiscounted,
+// E=billed-discounted, F=unbilled, G=rate formula, plus a per-month Total row.
+const realizRow = (r: number, ini: string, d: number, e: number) =>
+  `<row r="${r}">${str(`B${r}`, ini)}${num(`D${r}`, d)}${num(`E${r}`, e)}${num(`F${r}`, 0)}<c r="G${r}"><f>D${r}/(D${r}+E${r})</f><v>0</v></c></row>`;
+const realizXml = sheet([
+  `<row r="2">${str("A2", "JUN")}${str("B2", "Employee")}</row>`,
+  realizRow(3, "PAR", 50, 50),
+  realizRow(4, "KES", 1, 0),
+  `<row r="5">${str("B5", "Total")}<c r="D5"><f>SUM(D3:D4)</f><v>51</v></c><c r="E5"><f>SUM(E3:E4)</f><v>50</v></c></row>`,
+]);
+
+describe("appendRealizationFirmAvg", () => {
+  it("writes the totals-based firm rate (ΣD/Σ(D+E)), not the mean of biller rates", () => {
+    const out = appendRealizationFirmAvg(realizXml, []);
+    expect(out).toContain(FIRM_AVG_MARKER);
+    // ΣD/Σ(D+E) = 51/101 ≈ 0.5050, rounded to 4dp. The old mean was 0.75.
+    expect(out).toContain(`<v>${Math.round((51 / 101) * 10000) / 10000}</v>`);
+    expect(out).not.toContain(`<v>0.75</v>`);
+  });
+});
+
+describe("ensureTabMonthBlock", () => {
+  it("is a no-op when the month block already exists", () => {
+    const res = ensureTabMonthBlock(realizXml, "JUN", [], ["D", "E", "F"]);
+    expect(res.created).toBe(false);
+    expect(res.xml).toBe(realizXml);
+  });
+
+  it("clones the last block for a missing month: label, initials, zeroed data, shifted formulas", () => {
+    const res = ensureTabMonthBlock(realizXml, "JUL", [], ["D", "E", "F"]);
+    expect(res.created).toBe(true);
+    const block = findTabMonthBlock(res.xml, "JUL", [], ["D", "E", "F"]);
+    expect(block).not.toBeNull();
+    expect(block!.attorneys.map((a) => a.ini)).toEqual(["PAR", "KES"]);
+    const [r1, r2] = block!.attorneys.map((a) => a.row);
+    // Data cols zeroed so the clone's stale numbers can't read as real data.
+    for (const c of ["D", "E", "F"]) {
+      expect(readCell(res.xml, `${c}${r1}`, [])).toBe("0");
+      expect(readCell(res.xml, `${c}${r2}`, [])).toBe("0");
+    }
+    // Row-local rate formula follows its row; the Total row's SUM spans the new rows.
+    expect(res.xml).toContain(`<f>D${r1}/(D${r1}+E${r1})</f>`);
+    expect(res.xml).toContain(`<f>SUM(D${r1}:D${r2})</f>`);
+    // JUN block untouched.
+    expect(res.xml).toContain(`<f>D3/(D3+E3)</f>`);
+    const jun = findTabMonthBlock(res.xml, "JUN", [], ["D", "E", "F"]);
+    expect(readCell(res.xml, `D${jun!.attorneys[0].row}`, [])).toBe("50");
+  });
+
+  it("creates the block below the month rows and strips a prior firm-average summary", () => {
+    const withSummary = appendRealizationFirmAvg(realizXml, []);
+    const res = ensureTabMonthBlock(withSummary, "JUL", [], ["D", "E", "F"]);
+    expect(res.created).toBe(true);
+    // The stale summary is stripped; callers re-append it after patching.
+    expect(res.xml).not.toContain(FIRM_AVG_MARKER);
+    // An unpatched (all-zero) clone contributes no summary row yet…
+    expect(appendRealizationFirmAvg(res.xml, [])).not.toContain("July");
+    // …but once the caller patches data into it, the summary covers both months.
+    const block = findTabMonthBlock(res.xml, "JUL", [], ["D", "E", "F"]);
+    const patched = patchCell(res.xml, `D${block!.attorneys[0].row}`, 40);
+    const refreshed = appendRealizationFirmAvg(patched, []);
+    expect(refreshed).toContain("June");
+    expect(refreshed).toContain("July");
+  });
+
+  it("returns unchanged when there is no block to clone", () => {
+    const empty = sheet([`<row r="1">${str("A1", "Realization")}</row>`]);
+    const res = ensureTabMonthBlock(empty, "JUL", [], ["D", "E", "F"]);
+    expect(res.created).toBe(false);
+    expect(res.xml).toBe(empty);
+  });
+
+  it("keeps Available hours but zeroes the data cols on a cloned Utilization block", () => {
+    const res = ensureTabMonthBlock(utilXml, "FEB", [], ["C", "D"], ["C", "D", "E", "G"]);
+    expect(res.created).toBe(true);
+    const block = findTabMonthBlock(res.xml, "FEB", [], ["C", "D"]);
+    expect(block).not.toBeNull();
+    const row = block!.attorneys[0].row;
+    expect(readCell(res.xml, `C${row}`, [])).toBe("0");
+    expect(readCell(res.xml, `F${row}`, [])).toBe("156.67"); // Available carried over
+    // ...and the cloned block is immediately patchable.
+    const { patched, xml } = patchUtilizationBlock(res.xml, "FEB", [], { 1: { billable: 90, nonbillable: 10 } }, initialsToUid, aliases);
+    expect(patched).toBe(1); // PAR (only uid 1 has hours)
+    expect(xml).toContain(`<c r="C${row}"><v>90</v></c>`);
+    expect(xml).toContain(`<c r="G${row}"><v>56.7</v></c>`);
   });
 });

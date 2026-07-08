@@ -55,6 +55,25 @@ describe("firmAvgRateByMonth", () => {
     ]);
   });
 
+  it("totals mode applies the rate formula to the summed columns (matches the Total row)", () => {
+    const out = firmAvgRateByMonth(realizXml, [], ["D", "E"], realizRate, "totals");
+    expect(out).toEqual([
+      { monthAbbr: "JAN", avgRate: 125 / 150, billers: 2 }, // ΣD/Σ(D+E), not the 0.85 mean
+    ]);
+  });
+
+  it("totals mode is not skewed up by a low-volume biller at 100%", () => {
+    const skewed = sheet([
+      `<row r="2">${str("A2", "JAN")}${str("B2", "Employee")}</row>`,
+      `<row r="3">${str("B3", "PAR")}${num("D3", 50)}${num("E3", 50)}</row>`, // 50% on 100h billed
+      `<row r="4">${str("B4", "KES")}${num("D4", 1)}${num("E4", 0)}</row>`,  // 100% on 1h billed
+    ]);
+    const mean = firmAvgRateByMonth(skewed, [], ["D", "E"], realizRate);
+    const totals = firmAvgRateByMonth(skewed, [], ["D", "E"], realizRate, "totals");
+    expect(mean[0].avgRate).toBeCloseTo(0.75, 10);      // overestimates the firm
+    expect(totals[0].avgRate).toBeCloseTo(51 / 101, 10); // ≈ 0.505 — volume-weighted
+  });
+
   it("returns no rows when every biller is excluded", () => {
     const allZero = sheet([
       `<row r="2">${str("A2", "JAN")}${str("B2", "Employee")}</row>`,

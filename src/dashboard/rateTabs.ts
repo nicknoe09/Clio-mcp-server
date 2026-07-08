@@ -6,7 +6,7 @@
 // col B = initials); these patch one month's block in place.
 // ============================================================
 import {
-  findTabMonthBlock, patchCell, readCell, MONTH_ABBRS,
+  findTabMonthBlock, patchCell, readCell, MONTH_ABBRS, expandSharedFormulas,
   firmAvgRateByMonth, maxRowNumber, appendRowsBeforeSheetClose, stripRowsFromMarker,
   xmlCell, xmlRow, STYLE_BOLD, STYLE_PCT, STYLE_GEN,
 } from "../utils/xlsx";
@@ -58,6 +58,119 @@ export function patchUtilizationBlock(
 // refreshed in place each run.
 export const FIRM_AVG_MARKER = "Firm Average (auto-generated";
 const monthFull = (abbr: string) => MONTH_NAMES_FULL[MONTH_ABBRS.indexOf(abbr)] ?? abbr;
+
+/**
+ * Ensure a rate tab has a block for `monthAbbr`, creating one when the template
+ * doesn't carry it. The monthly update used to only PATCH blocks that already
+ * exist (findTabMonthBlock → skip when absent), so every run rewrote the prior
+ * months' sections but a month missing from the template never appeared at all.
+ *
+ * When the block is missing, the LAST existing month block is cloned as the
+ * layout template: its rows (month-header row through its "Total" row, when it
+ * has one) are appended after the sheet's last row, renumbered, block-local
+ * formula references shifted with them, the col-A label rewritten to the target
+ * month (matching the reference label's abbreviated/full + case style), and
+ * `zeroCols` (default `dataCols`) zeroed on the attorney rows so the clone's
+ * stale numbers can't read as real data. Any auto-generated Firm Average
+ * summary is stripped first so the new block lands above where the summary is
+ * re-appended.
+ *
+ * Returns the (possibly updated) XML and whether a block was created. `created`
+ * is false with the XML untouched when the block already exists, or when the
+ * tab has no reference block to clone.
+ */
+export function ensureTabMonthBlock(
+  xml: string,
+  monthAbbr: string,
+  sharedStrings: string[],
+  dataCols: string[],
+  zeroCols?: string[],
+): { xml: string; created: boolean } {
+  if (findTabMonthBlock(xml, monthAbbr, sharedStrings, dataCols)) return { xml, created: false };
+
+  let base = stripRowsFromMarker(xml, FIRM_AVG_MARKER, sharedStrings);
+  // Cloned cells must not carry shared-formula fragments (a follower <f
+  // t="shared" si="N"/> without its master corrupts the sheet) — expand to
+  // plain per-cell formulas first. No-op when the sheet has none.
+  if (base.includes('t="shared"')) base = expandSharedFormulas(base);
+
+  const rows: Array<{ n: number; raw: string }> = [];
+  for (const m of base.matchAll(/<row\b[^>]*\br="(\d+)"[^>]*>[\s\S]*?<\/row>/g)) {
+    rows.push({ n: parseInt(m[1], 10), raw: m[0] });
+  }
+  rows.sort((a, b) => a.n - b.n);
+
+  // Last complete month block = the clone reference. Same scan rules as
+  // findTabMonthBlock: col A month label opens a block; blank/"EMPLOYEE"/
+  // "TOTAL" in col B ends it ("Total" belongs to the block and is cloned too).
+  type Ref = { hdr: number; hdrText: string; attorneys: number[]; total: number | null };
+  let ref: Ref | null = null;
+  let cur: Ref | null = null;
+  for (const { n } of rows) {
+    const aText = readCell(base, `A${n}`, sharedStrings).trim();
+    const b = readCell(base, `B${n}`, sharedStrings).trim().toUpperCase();
+    if (MONTH_ABBRS.includes(aText.toUpperCase().slice(0, 3))) {
+      if (cur && cur.attorneys.length) ref = cur;
+      cur = { hdr: n, hdrText: aText, attorneys: [], total: null };
+      continue;
+    }
+    if (!cur) continue;
+    if (b === "" || b === "EMPLOYEE" || b === "TOTAL") {
+      if (b === "TOTAL") cur.total = n;
+      if (cur.attorneys.length) ref = cur;
+      cur = null;
+      continue;
+    }
+    cur.attorneys.push(n);
+  }
+  if (cur && cur.attorneys.length) ref = cur;
+  if (!ref) return { xml, created: false };
+
+  const end = ref.total ?? ref.attorneys[ref.attorneys.length - 1];
+  const delta = maxRowNumber(base) + 2 - ref.hdr;
+  const inRange = rows.filter((r) => r.n >= ref!.hdr && r.n <= end);
+
+  const shifted = inRange.map(({ raw }) => {
+    let out = raw.replace(/(<row\b[^>]*?\br=")(\d+)(")/, (_s, p1, rn, p3) => `${p1}${parseInt(rn, 10) + delta}${p3}`);
+    // Cell refs (r="D12") move with the row.
+    out = out.replace(/(\br=")([A-Z]{1,3})(\d+)(")/g, (_s, p1, col, rn, p4) => `${p1}${col}${parseInt(rn, 10) + delta}${p4}`);
+    // Formula refs move only when they point INSIDE the cloned block (a row-local
+    // rate like D12/(D12+E12) or the Total row's SUM over the block); anything
+    // referencing outside the block keeps its target.
+    out = out.replace(/<f\b([^>]*)>([\s\S]*?)<\/f>/g, (_s, attrs, f) => {
+      const nf = f.replace(/(\$?[A-Z]{1,3}\$?)(\d+)/g, (t: string, col: string, rn: string) => {
+        const num = parseInt(rn, 10);
+        return num >= ref!.hdr && num <= end ? `${col}${num + delta}` : t;
+      });
+      return `<f${attrs}>${nf}</f>`;
+    });
+    return out;
+  });
+  base = appendRowsBeforeSheetClose(base, shifted);
+
+  // Rewrite the header's col-A label to the target month, keeping the reference
+  // label's shape ("JUN" → "JUL", "June" → "July") and its cell style. The
+  // replacement is an inline string so no shared-string entry is needed.
+  const mi = MONTH_ABBRS.indexOf(monthAbbr);
+  let label = ref.hdrText.length > 3 ? (MONTH_NAMES_FULL[mi] ?? monthAbbr) : monthAbbr;
+  if (ref.hdrText === ref.hdrText.toUpperCase()) label = label.toUpperCase();
+  else if (label.length === 3) label = label.charAt(0) + label.slice(1).toLowerCase();
+  const newHdr = ref.hdr + delta;
+  const aRe = new RegExp(`<c\\b([^>]*?)\\br="A${newHdr}"([^>]*?)(?:/>|>[\\s\\S]*?</c>)`);
+  const am = base.match(aRe);
+  if (am) {
+    const sm = `${am[1]} ${am[2]}`.match(/\bs="(\d+)"/);
+    base = base.replace(aRe, xmlCell(`A${newHdr}`, label, sm ? { style: sm[1] } : undefined));
+  }
+
+  // Zero the data columns on the cloned attorney rows — the caller's patch pass
+  // overwrites the roster rows it has data for; everything else must read 0,
+  // not the reference month's numbers.
+  for (const n of ref.attorneys) {
+    for (const c of zeroCols ?? dataCols) base = patchCell(base, `${c}${n + delta}`, 0);
+  }
+  return { xml: base, created: true };
+}
 
 /**
  * Build the rows of a "Firm Average" summary table: a bold title row (col A
@@ -118,16 +231,20 @@ export function appendUtilizationFirmAvg(xml: string, sharedStrings: string[], f
 
 /**
  * Refresh the Realization tab's bottom "Firm Average" summary: per-month firm
- * mean realization (Billed-Nondiscounted D / Total Billed (D+E) over billers
- * with D+E>0).
+ * realization computed EXACTLY like an individual row — Billed-Nondiscounted /
+ * Total Billed — but on the summed columns (ΣD / Σ(D+E)) of billers with
+ * D+E>0. The old simple mean of each biller's own rate overweighted
+ * low-volume billers (a timekeeper with a handful of hours at ~100% pulled the
+ * mean up) and overstated the firm figure; the totals form matches the tab's
+ * per-month "Total" row.
  */
 export function appendRealizationFirmAvg(xml: string, sharedStrings: string[]): string {
   const base = stripRowsFromMarker(xml, FIRM_AVG_MARKER, sharedStrings);
   const summary = firmAvgRateByMonth(base, sharedStrings, ["D", "E"],
-    (v) => (v.D + v.E > 0 ? v.D / (v.D + v.E) : null));
+    (v) => (v.D + v.E > 0 ? v.D / (v.D + v.E) : null), "totals");
   if (!summary.length) return base;
   return appendRowsBeforeSheetClose(base, buildFirmAvgRows(
     summary, maxRowNumber(base) + 2,
-    `${FIRM_AVG_MARKER} — do not edit) — mean of listed billers' realization rate`,
-    "Firm Avg Realization Rate"));
+    `${FIRM_AVG_MARKER} — do not edit) — firm realization rate: total nondiscounted ÷ total billed of listed billers`,
+    "Firm Realization Rate"));
 }
