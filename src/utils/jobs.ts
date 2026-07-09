@@ -1,11 +1,11 @@
 // ============================================================
-// Background-job registry for long-running tools (download_dashboard_update).
+// Background-job registry for long-running tools
+// (download_dashboard_update, download_all_weekly_goals).
 // ============================================================
 
-// ---- Background-job registry for long-running dashboard updates ----
-// download_dashboard_update can take several minutes (classic mode generates a
-// revenue report per timekeeper), well past the MCP client's ~180s timeout. So
-// it runs as a detached job: the tool returns a job_id immediately and the work
+// These tools can take several minutes (a revenue report or goals workbook per
+// timekeeper), well past the MCP client's ~180s timeout. So they run as
+// detached jobs: the tool returns a job_id immediately and the work
 // continues server-side; get_dashboard_status reports progress/result. The Map
 // is a module singleton, so it persists across tool calls for the life of the
 // server process (jobs are lost only if the process restarts).
