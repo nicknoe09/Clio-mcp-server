@@ -3,6 +3,7 @@ import { SCORECARD_ROSTER, MONTH_NAMES_SHORT } from "../domain/roster";
 import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
+import { classifyYtdTimeEntries } from "../dashboard/classifiedHours";
 
 // --- Firm roster: initials → Clio user ID ---
 const ROSTER = SCORECARD_ROSTER;
@@ -300,7 +301,7 @@ export function registerScorecardTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "generate_weekly_goals",
-    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking.",
+    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin), synthetic fee-placeholder entries are excluded, and all other worked time (including contingency/flat-matter time and zero-priced client-matter entries) counts as billable — so the utilization figures reconcile to the dashboard's Utilization tab.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -309,36 +310,29 @@ export function registerScorecardTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const startDate = `${params.year}-01-01`;
         const today = new Date();
         const endDate = today.toISOString().split("T")[0];
 
-        const rawEntries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
-          user_id: params.user_id,
-          created_since: `${startDate}T00:00:00+00:00`,
+        // Same dashboard filtration as the Excel weekly sheets and 26 Compare
+        // (see dashboard/classifiedHours.ts): nonbillable = admin-matter time,
+        // fee placeholders dropped, everything else billable.
+        const entries = await classifyYtdTimeEntries({
+          year: params.year, endDate, userIds: [params.user_id],
         });
-        const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
-        const userName = entries[0]?.user?.name ?? "Unknown";
+        const userName = entries[0]?.userName ?? "Unknown";
 
         const months: Record<string, { billable: number; nonbillable: number }> = {};
         const weeks: Record<string, { billable: number; nonbillable: number }> = {};
 
         for (const e of entries) {
-          const hours = (e.rounded_quantity || e.quantity) / 3600;
+          if (e.cls === "excluded") continue; // fee placeholders aren't real worked time
           const monthKey = e.date.slice(0, 7);
           const weekKey = getWeekKey(e.date);
           if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
           if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
 
-          if ((e.price || 0) > 0) {
-            months[monthKey].billable += hours;
-            weeks[weekKey].billable += hours;
-          } else {
-            months[monthKey].nonbillable += hours;
-            weeks[weekKey].nonbillable += hours;
-          }
+          months[monthKey][e.cls] += e.hours;
+          weeks[weekKey][e.cls] += e.hours;
         }
 
         const monthNames = MONTH_NAMES_SHORT;

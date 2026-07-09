@@ -5,6 +5,7 @@ import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
+import { classifyYtdTimeEntries, type ClassifiedTimeEntry } from "../dashboard/classifiedHours";
 import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard/workedHours";
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
 import { applyTieredSplit } from "../domain/vd";
@@ -163,6 +164,10 @@ interface WeeklyGoalsParams {
   hours_per_day?: number;
   box_folder_id?: string;
   dashboard_file_id?: string;
+  /** Pre-classified YTD entries (all users OK — filtered to user_id here). The
+   *  batch tool classifies the whole roster in one pass and hands each sheet its
+   *  slice, so 12 sheets don't redo the /matters + candidate-matter lookups. */
+  entries?: ClassifiedTimeEntry[];
 }
 
 async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
@@ -179,25 +184,23 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   figures?: any;
 }> {
   const hoursPerDay = params.hours_per_day ?? 8;
-  const startDate = `${params.year}-01-01`;
   const endDate = new Date().toISOString().split("T")[0];
 
-  const rawEntries = await fetchAllPages<any>("/activities", {
-    type: "TimeEntry", fields: "id,date,quantity,rounded_quantity,price,user{id,name}", user_id: params.user_id,
-    created_since: `${startDate}T00:00:00+00:00`,
-  });
-  const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
-  const userName = entries[0]?.user?.name ?? "Unknown";
+  // Classified with the SAME filtration as the monthly dashboard (26 Compare
+  // cols I/H): nonbillable = admin-matter time, fee placeholders excluded,
+  // everything else billable — see dashboard/classifiedHours.ts. Replaces the
+  // old price>0 heuristic so the weekly sheets reconcile to the dashboard.
+  const entries = (params.entries
+    ?? await classifyYtdTimeEntries({ year: params.year, endDate, userIds: [params.user_id] })
+  ).filter((e) => e.uid === params.user_id);
+  const userName = entries[0]?.userName ?? "Unknown";
 
   // Group by month and week
   const months: Record<string, { billable: number; nonbillable: number }> = {};
   const weeks: Record<string, { billable: number; nonbillable: number }> = {};
 
   for (const e of entries) {
-    // rounded_quantity = seconds rounded to billing increment (what the client
-    // is billed for). Raw `quantity` = actual tracked seconds, which under-
-    // reports billed hours and is NOT what these goals/scorecard reports want.
-    const hours = (e.rounded_quantity ?? e.quantity) / 3600;
+    if (e.cls === "excluded") continue; // fee placeholders aren't real worked time
     const monthKey = e.date.slice(0, 7);
     const d2 = new Date(e.date + "T12:00:00");
     const dow = d2.getDay();
@@ -208,8 +211,8 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
     if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
 
-    if ((e.price || 0) > 0) { months[monthKey].billable += hours; weeks[weekKey].billable += hours; }
-    else { months[monthKey].nonbillable += hours; weeks[weekKey].nonbillable += hours; }
+    months[monthKey][e.cls] += e.hours;
+    weeks[weekKey][e.cls] += e.hours;
   }
 
   function getWorkingDays(year: number, month: number): number {
@@ -316,6 +319,8 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow(["Utilization Goal"]).font = { bold: true };
   ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
   ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
+    .font = { italic: true, color: { argb: "FF666666" } };
+  ws1.addRow(["Hours use the firm dashboard's filtration: nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin); synthetic fee-placeholder entries excluded; all other worked time counts as billable."])
     .font = { italic: true, color: { argb: "FF666666" } };
 
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
@@ -548,26 +553,23 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
   note?: string;
 }> {
   const closePct = params.close_threshold_pct ?? 90;
-  const startDate = `${params.year}-01-01`;
   const endDate = `${params.year}-12-31`;
 
-  // One fetch covers every timekeeper (the weekly sheets fetch per user).
-  const rawEntries = await fetchAllPages<any>("/activities", {
-    type: "TimeEntry",
-    fields: "id,date,quantity,rounded_quantity,price,user{id}",
-    created_since: `${startDate}T00:00:00+00:00`,
+  // Same dashboard filtration as the weekly sheets (classifiedHours.ts): the
+  // chart tracks billable vs goal only, where billable = all worked time except
+  // admin-matter hours and fee placeholders — matching 26 Compare col I, not
+  // the old price>0 heuristic.
+  const entries = await classifyYtdTimeEntries({
+    year: params.year, endDate, userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
   });
-  const entries = rawEntries.filter((e: any) => e.date >= startDate && e.date <= endDate);
 
   // billableByUser[user_id][monthIdx] = billable hours
   const billableByUser: Record<number, number[]> = {};
   for (const r of WEEKLY_GOALS_ROSTER) billableByUser[r.user_id] = Array(12).fill(0);
   for (const e of entries) {
-    const uid = e.user?.id;
-    if (!uid || !billableByUser[uid]) continue;
-    if ((e.price || 0) <= 0) continue; // chart tracks billable vs goal only
+    if (e.cls !== "billable" || !billableByUser[e.uid]) continue;
     const m = parseInt(e.date.slice(5, 7), 10) - 1;
-    billableByUser[uid][m] += (e.rounded_quantity ?? e.quantity) / 3600;
+    billableByUser[e.uid][m] += e.hours;
   }
 
   // Months that have started (the current month shades month-to-date, same
@@ -674,7 +676,7 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
     };
     ws.getCell(rowNum, 2).value = label;
   }
-  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date.";
+  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable uses the dashboard's filtration (admin-matter time and fee placeholders excluded).";
   ws.getCell(28, 1).font = { italic: true, color: { argb: "FF666666" } };
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
@@ -1100,7 +1102,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_weekly_goals",
-    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
+    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin), synthetic fee-placeholder entries are excluded, and all other worked time counts as billable — so the sheet's Utilization % reconciles to the dashboard's Utilization tab. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1136,6 +1138,7 @@ export function registerDocumentTools(server: McpServer): void {
   server.tool(
     "download_all_weekly_goals",
     "Update the weekly goals spreadsheet for all firm timekeepers, uploading to Box in parallel. " +
+    "Hours use the same filtration as the firm dashboard (nonbillable = admin-matter time, fee placeholders excluded), classified once for the whole roster. " +
     "The full batch regenerates every sheet from Clio time entries and can exceed the MCP client's ~180s timeout, " +
     "so it runs as a background job: this tool returns a job_id immediately — poll get_dashboard_status with it " +
     "for the per-person results (status, box_url, and key figures for each timekeeper). No arguments required.",
@@ -1158,6 +1161,16 @@ export function registerDocumentTools(server: McpServer): void {
       // every timekeeper's sheet outlasts the ~180s client timeout in unattended
       // jobs). Result/error are recorded on the job for get_dashboard_status polling.
       (async () => {
+      // Classify the whole roster's entries ONCE (one /matters pull + one
+      // /activities pull per member), then hand each sheet its slice — instead
+      // of 12 parallel sheets each redoing the admin-matter/placeholder lookups.
+      const allEntries = await classifyYtdTimeEntries({
+        year: targetYear,
+        endDate: new Date().toISOString().split("T")[0],
+        userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
+      });
+
+
       const results = await Promise.allSettled(
         WEEKLY_GOALS_ROSTER.map(({ name, user_id, goal, group }) =>
           downloadWeeklyGoals({
@@ -1165,6 +1178,7 @@ export function registerDocumentTools(server: McpServer): void {
             weekly_billable_goal: goal,
             year: targetYear,
             box_folder_id: folderId,
+            entries: allEntries,
           }).then((res: any) => {
             const uploaded = !!res.box_file_id;
             return {
@@ -1253,6 +1267,7 @@ export function registerDocumentTools(server: McpServer): void {
     "download_monthly_goals_summary",
     "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
     "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
+    "Billable hours use the same filtration as the firm dashboard (admin-matter time and synthetic fee placeholders excluded), so the YTD Utilization % row reconciles to the dashboard. " +
     "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run).",
     {
       year: z.coerce.number().optional().describe("Year (defaults to current year)"),
