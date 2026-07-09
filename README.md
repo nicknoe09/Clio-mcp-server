@@ -190,7 +190,7 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 | `get_wip_report` | Work-in-progress report with aging flags |
 | `get_trust_balances` | Trust/IOLTA balances with low-balance and dormancy flags |
 | `get_user_productivity` | Timekeeper hours and top matters |
-| `get_utilization_report` | Utilization % per timekeeper with weekly trends |
+| `get_billable_target_report` | Hours vs daily billable target per timekeeper with weekly trends (not the dashboard's utilization rate) |
 | `get_realization_rate` | Billed vs worked value by timekeeper and matter |
 | `get_timekeeper_realization` | Deep per-attorney: worked, billed, collected, effective rate |
 | `reconcile_statement` | Match bank transactions against Clio expenses |
