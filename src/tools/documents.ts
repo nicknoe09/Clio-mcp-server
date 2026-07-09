@@ -176,6 +176,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   reason?: string;
   note?: string;
   weekly_measurables?: any;
+  figures?: any;
 }> {
   const hoursPerDay = params.hours_per_day ?? 8;
   const startDate = `${params.year}-01-01`;
@@ -406,6 +407,40 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     cell.font = { bold: true, color: { argb: cumWeeklyOU >= 0 ? "FF008000" : "FFFF0000" } };
   }
 
+  // Key figures for the JSON payload, so callers (Claude, unattended jobs) can
+  // read the numbers without downloading and parsing the workbook.
+  let lastStartedIdx = -1;
+  for (let i = 0; i < allWeeks.length; i++) {
+    if (allWeeks[i].monDate > today) break;
+    lastStartedIdx = i;
+  }
+  let figures: any = null;
+  if (lastStartedIdx >= 0) {
+    const wk = weeks[allWeeks[lastStartedIdx].key] ?? { billable: 0, nonbillable: 0 };
+    let t4Sum = 0, t4Cnt = 0;
+    for (let j = Math.max(0, lastStartedIdx - 3); j <= lastStartedIdx; j++) {
+      t4Sum += weeks[allWeeks[j].key]?.billable ?? 0;
+      t4Cnt++;
+    }
+    figures = {
+      user: userName,
+      current_week: allWeeks[lastStartedIdx].key,
+      week_billable: round1(wk.billable),
+      week_nonbillable: round1(wk.nonbillable),
+      week_goal: params.weekly_billable_goal,
+      week_over_under: round1(wk.billable - params.weekly_billable_goal),
+      trailing_4wk_avg_billable: round1(t4Sum / t4Cnt),
+      ytd_weekly_over_under: round1(cumWeeklyOU),
+      ytd_billable: round1(cumBillable),
+      ytd_goal: round1(cumGoal),
+      ytd_over_under: round1(cumBillable - cumGoal),
+      ytd_utilization_pct: ytdUtil,
+      prior_month_collections: collectionsValue != null
+        ? { month: collectionsLabel, amount: round2(collectionsValue) }
+        : null,
+    };
+  }
+
   // Legend for the Billable-row shading (rows 14-17).
   const goalNum = params.weekly_billable_goal;
   ws2.getCell("B14").value = "Legend — Billable hours";
@@ -450,7 +485,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     // Also duplicate the sheet into Weekly Measureables (kept in sync each run).
     const weekly_measurables = await duplicateToFolder(buffer, boxFilename, WEEKLY_MEASURABLES_FOLDER_ID);
     if (result.uploaded) {
-      return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url, weekly_measurables };
+      return { filename: boxFilename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url, weekly_measurables, figures };
     }
     return {
       filename: boxFilename,
@@ -460,13 +495,14 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
       reason: result.reason,
       note: result.note,
       weekly_measurables,
+      figures,
     };
   }
 
   // No Box target — park the buffer and hand back a direct-download URL.
   console.warn(`[Doc] generate_weekly_goals — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
   const reg = registerDownload(buffer, filename, mimeForFilename(filename));
-  return { filename, size_kb, direct_download_url: reg.url, expires_at: reg.expires_at };
+  return { filename, size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, figures };
 }
 
 // ─── ROSTER (hardcoded for batch weekly goals, grouped by team) ──
@@ -1064,7 +1100,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_weekly_goals",
-    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible.",
+    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1083,10 +1119,10 @@ export function registerDocumentTools(server: McpServer): void {
         });
 
         if (result.box_file_id) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: result.filename, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename: result.filename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url, weekly_measurables: result.weekly_measurables, figures: result.figures }) }] };
         }
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename: result.filename, format: "xlsx", size_kb: result.size_kb, base64: result.base64 }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ filename: result.filename, format: "xlsx", size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note, figures: result.figures }) }],
         };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
@@ -1099,8 +1135,10 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_all_weekly_goals",
-    "Update the weekly goals spreadsheet for all firm timekeepers. " +
-    "Runs all uploads in parallel to Box. No arguments required.",
+    "Update the weekly goals spreadsheet for all firm timekeepers, uploading to Box in parallel. " +
+    "The full batch regenerates every sheet from Clio time entries and can exceed the MCP client's ~180s timeout, " +
+    "so it runs as a background job: this tool returns a job_id immediately — poll get_dashboard_status with it " +
+    "for the per-person results (status, box_url, and key figures for each timekeeper). No arguments required.",
     {
       year: z.number().optional().describe("Year (defaults to current year)"),
       box_folder_id: z.string().optional().describe(
@@ -1111,6 +1149,15 @@ export function registerDocumentTools(server: McpServer): void {
       const targetYear = year ?? new Date().getFullYear();
       const folderId = box_folder_id ?? "";
 
+      const jobId = `wkgoals_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      const job: DashJob = { id: jobId, status: "running", started_at: new Date().toISOString() };
+      dashboardJobs.set(jobId, job);
+      pruneDashboardJobs();
+
+      // Run detached so the MCP call returns immediately (regenerating + uploading
+      // every timekeeper's sheet outlasts the ~180s client timeout in unattended
+      // jobs). Result/error are recorded on the job for get_dashboard_status polling.
+      (async () => {
       const results = await Promise.allSettled(
         WEEKLY_GOALS_ROSTER.map(({ name, user_id, goal, group }) =>
           downloadWeeklyGoals({
@@ -1130,6 +1177,7 @@ export function registerDocumentTools(server: McpServer): void {
               direct_download_url: res.direct_download_url ?? null,
               expires_at: res.expires_at ?? null,
               reason: res.reason ?? null,
+              figures: res.figures ?? null,
             };
           })
             .catch((err: Error) => ({
@@ -1142,6 +1190,7 @@ export function registerDocumentTools(server: McpServer): void {
               direct_download_url: null,
               expires_at: null,
               reason: err.message,
+              figures: null,
             }))
         )
       );
@@ -1161,6 +1210,7 @@ export function registerDocumentTools(server: McpServer): void {
           box_file_id: u.box_file_id,
           direct_download_url: u.direct_download_url,
           expires_at: u.expires_at,
+          figures: u.figures,
         });
       }
 
@@ -1175,6 +1225,22 @@ export function registerDocumentTools(server: McpServer): void {
             failed: uploads.filter((u: any) => typeof u.status === "string" && u.status.startsWith("FAILED")).length,
             by_team: groups,
           }, null, 2),
+        }],
+      };
+      })()
+        .then((res: any) => { job.result = res; job.status = "done"; job.finished_at = new Date().toISOString(); })
+        .catch((err: any) => { job.status = "error"; job.error = String(err?.message ?? err); job.finished_at = new Date().toISOString(); });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            job_id: jobId,
+            status: "started",
+            year: targetYear,
+            timekeepers: WEEKLY_GOALS_ROSTER.length,
+            message: "Weekly goals batch is running in the background (regenerates and uploads every timekeeper's sheet). Poll get_dashboard_status with this job_id for per-person results.",
+          }),
         }],
       };
     }
@@ -3373,12 +3439,12 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_dashboard_status",
-    "Check a download_dashboard_update background job by job_id: returns running | done | error, timestamps, and (when finished) the full result or error. Poll this after calling download_dashboard_update, which returns immediately with a job_id.",
-    { job_id: z.string().describe("The job_id returned by download_dashboard_update") },
+    "Check a background job by job_id: returns running | done | error, timestamps, and (when finished) the full result or error. Poll this after calling download_dashboard_update or download_all_weekly_goals, which return immediately with a job_id.",
+    { job_id: z.string().describe("The job_id returned by download_dashboard_update or download_all_weekly_goals") },
     async (p) => {
       const j = dashboardJobs.get(p.job_id);
       if (!j) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No job '${p.job_id}' found — it may have expired or the server restarted. Re-run download_dashboard_update.`, known_jobs: [...dashboardJobs.keys()] }) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `No job '${p.job_id}' found — it may have expired or the server restarted. Re-run the tool that started it.`, known_jobs: [...dashboardJobs.keys()] }) }] };
       }
       let result: any;
       const inner = j.result?.content?.[0]?.text;
