@@ -312,6 +312,43 @@ function rawGetBinary(
 }
 
 /**
+ * GET an absolute URL and return binary content, following up to `redirectsLeft`
+ * redirects. NO Authorization header is sent — the download URLs Clio hands back
+ * (e.g. for asynchronously generated bill PDFs) are presigned S3-style links,
+ * and S3 rejects requests that carry both a bearer header and signed query params.
+ */
+export function rawGetBinaryFromUrl(
+  fullUrl: string,
+  redirectsLeft = 5
+): Promise<{ buffer: Buffer; contentType: string }> {
+  return new Promise((resolve, reject) => {
+    https.get(fullUrl, (res) => {
+      const status = res.statusCode ?? 0;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        res.resume(); // discard body so the socket is freed
+        const loc = res.headers.location;
+        if (!loc) return reject(new Error(`Redirect (${status}) without Location header`));
+        if (redirectsLeft <= 0) return reject(new Error("Too many redirects following download URL"));
+        resolve(rawGetBinaryFromUrl(new URL(loc, fullUrl).toString(), redirectsLeft - 1));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        if (status >= 200 && status < 300) {
+          resolve({ buffer, contentType: res.headers["content-type"] || "application/octet-stream" });
+        } else {
+          const err: any = new Error(`Download failed with status ${status}`);
+          err.response = { status, data: buffer.toString("utf8").slice(0, 500) };
+          reject(err);
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+/**
  * Fetch a single binary resource from Clio (e.g. bill PDF).
  * Handles auth refresh on 401 and rate-limit backoff.
  */
