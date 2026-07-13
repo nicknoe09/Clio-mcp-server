@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   looksLikePdf,
+  looksLikeBillResource,
   extractDownloadUrl,
   interpretBillPdfResponse,
   downloadBillPdfBuffer,
@@ -25,6 +26,20 @@ describe("looksLikePdf", () => {
   });
   it("rejects JSON", () => {
     expect(looksLikePdf(Buffer.from('{"a":1}'), "application/json")).toBe(false);
+  });
+});
+
+describe("looksLikeBillResource", () => {
+  // The live 2026-07-13 shape: GET /bills/{id}.pdf returning the bill's
+  // default fields instead of a render-job status.
+  it("recognizes the bill default-field envelope", () => {
+    expect(
+      looksLikeBillResource({ data: { id: 1323892745, etag: '"abc"', number: 22386, state: "awaiting_payment" } })
+    ).toBe(true);
+  });
+  it("does not flag a generation-job status", () => {
+    expect(looksLikeBillResource({ data: { id: 5, state: "in_progress" } })).toBe(false);
+    expect(looksLikeBillResource({ data: { state: "queued" } })).toBe(false);
   });
 });
 
@@ -160,6 +175,26 @@ describe("downloadBillPdfBuffer", () => {
     const { deps } = scriptedDeps({ "/bills/12.pdf": [json({ data: { state: "still_generating" } })] });
     await expect(downloadBillPdfBuffer(12, { deps, timeoutMs: 5, pollIntervalMs: 100 })).rejects.toThrow(
       /still generating.*still_generating/s
+    );
+  });
+
+  it("falls through to the /download alternate when .pdf keeps returning the bill resource", async () => {
+    const billEnvelope = json({ data: { id: 20, etag: '"e"', number: 22386, state: "awaiting_payment" } });
+    const { deps, calls } = scriptedDeps({
+      "/bills/20.pdf": [billEnvelope],
+      "/bills/20": [billEnvelope], // Accept-header alternate also serves JSON
+      "/bills/20/download": [pdfResult],
+    });
+    const out = await downloadBillPdfBuffer(20, { deps, pollIntervalMs: 1, timeoutMs: 1000 });
+    expect(out.buffer.equals(PDF)).toBe(true);
+    expect(calls).toContain("/bills/20/download");
+  });
+
+  it("diagnoses a bill-resource-only endpoint on timeout instead of blaming generation", async () => {
+    const billEnvelope = json({ data: { id: 21, etag: '"e"', number: 9, state: "awaiting_payment" } });
+    const { deps } = scriptedDeps({ "/bills/21.pdf": [billEnvelope] }); // alternates unscripted → fail → swallowed
+    await expect(downloadBillPdfBuffer(21, { deps, timeoutMs: 5, pollIntervalMs: 100 })).rejects.toThrow(
+      /did not start PDF generation.*probe_bill_pdf_apis.*awaiting_payment/s
     );
   });
 });

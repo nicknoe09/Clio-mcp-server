@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
-import { downloadBillPdfBuffer, downloadBillPdfBuffers } from "../clio/billPdf";
+import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { downloadBillPdfBuffer, downloadBillPdfBuffers, looksLikePdf } from "../clio/billPdf";
 import { diagnosticTool } from "../utils/diagnostics";
 import JSZip from "jszip";
 
@@ -935,6 +935,144 @@ export function registerBillTools(server: McpServer): void {
       } else {
         out.matter_schema = { error: "No matter id available to sample." };
       }
+
+      return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
+    },
+  );
+
+  // ============================================================
+  //  probe_bill_pdf_apis — DIAGNOSTIC for the bill-PDF download path
+  // ============================================================
+  // Why: live testing (2026-07-13, bill 1323892745) showed GET /bills/{id}.pdf
+  // returning the bill's default-field JSON (id/etag/number/state) on every
+  // poll for 90s — i.e. the .pdf suffix behaves like .json for OAuth API
+  // clients and never starts a render job. The Clio web app serves rendered
+  // bills from a first-party bill_printings route (session-cookie auth), so
+  // the supported API path may be a generate-then-fetch endpoint PAIR rather
+  // than repeated GETs on /bills/{id}.pdf. This probe hits every candidate
+  // route against a REAL bill and reports status/content-type/full body, so
+  // one run against live data settles which route actually serves the file.
+  //
+  // SAFETY: read-only by default. The only writes are gated behind
+  // generate_printing=true, which POSTs /bill_printings — that renders a PDF
+  // of an existing bill (what the web UI's Download button does) and creates
+  // no billing records. Route-existence POSTs use an intentionally INVALID
+  // empty body (404 = no route, 405 = no POST, 422/400 = route exists,
+  // nothing created).
+  diagnosticTool(server).tool(
+    "probe_bill_pdf_apis",
+    "Diagnostic for bill PDF download. Probes every candidate route for fetching a bill's rendered PDF via the API — GET /bills/{id}.pdf, content negotiation (Accept: application/pdf), /bills/{id}/download(.pdf), and the bill_printings generate-then-fetch pair — reporting status, content-type, and the FULL response body for each. Read-only by default; set generate_printing=true to also POST /bill_printings for this bill (renders a PDF, creates no billing records) and poll the resulting printing for a downloadable file. Use an issued (non-draft) bill_id.",
+    {
+      bill_id: z.coerce.number().describe("A real, issued bill ID to probe against (use get_bills to find one)."),
+      generate_printing: z.coerce.boolean().optional().default(false)
+        .describe("Also POST /bill_printings for this bill and poll the created printing for a PDF. Renders a PDF of the existing bill; creates no billing records."),
+    },
+    async (params) => {
+      const id = params.bill_id;
+      const out: any = {
+        note:
+          "Each probe reports status, content_type, is_pdf, and the raw body so the working route is identifiable from one run. " +
+          "Redirects (303→S3) are followed automatically, so a working redirect route shows up as is_pdf=true.",
+        get_probes: [],
+        bill_printings: {},
+      };
+
+      const probeGet = async (label: string, path: string, headers?: Record<string, string>, query: Record<string, any> = {}) => {
+        try {
+          const res = await rawGetBinarySingle(path, query, headers);
+          const isPdf = looksLikePdf(res.buffer, res.contentType);
+          return {
+            probe: label, status: 200, content_type: res.contentType, is_pdf: isPdf, bytes: res.buffer.length,
+            body: isPdf ? `(PDF bytes, ${res.buffer.length} bytes)` : res.buffer.toString("utf8").slice(0, 1500),
+            interpretation: isPdf ? "SUCCESS — this route serves the PDF." : "Route exists but returned non-PDF content — see body.",
+          };
+        } catch (e: any) {
+          const status = e?.response?.status ?? null;
+          return {
+            probe: label, status, is_pdf: false,
+            body: typeof e?.response?.data === "string" ? e.response.data.slice(0, 800) : e?.response?.data,
+            interpretation:
+              status === 404 ? "No such route."
+              : status === 406 ? "Route exists but this Accept type is not supported."
+              : status === 403 ? "Forbidden — token lacks permission for this route."
+              : `Request failed: ${e?.message}`,
+          };
+        }
+      };
+
+      out.get_probes.push(await probeGet(`GET /bills/${id}.pdf`, `/bills/${id}.pdf`));
+      out.get_probes.push(await probeGet(`GET /bills/${id} (Accept: application/pdf)`, `/bills/${id}`, { Accept: "application/pdf" }));
+      out.get_probes.push(await probeGet(`GET /bills/${id}/download`, `/bills/${id}/download`));
+      out.get_probes.push(await probeGet(`GET /bills/${id}/download.pdf`, `/bills/${id}/download.pdf`));
+      out.get_probes.push(await probeGet(`GET /bill_printings?bill_id=${id}`, `/bill_printings`, undefined, { bill_id: id }));
+
+      // Route-existence probe: POST /bill_printings with an INVALID empty body.
+      try {
+        const res = await rawPostSingle("/bill_printings", { data: {} });
+        out.bill_printings.post_route_probe = {
+          status: 200, route_exists: true,
+          WARNING: "POST /bill_printings accepted an empty body — inspect the response; a printing may have been created.",
+          response: res?.data ?? res,
+        };
+      } catch (e: any) {
+        const status = e?.response?.status ?? null;
+        out.bill_printings.post_route_probe = {
+          status, route_exists: status !== 404 && status !== null,
+          interpretation:
+            status === 404 ? "No POST /bill_printings route in API v4 — the generate-then-fetch pair is not exposed here."
+            : status === 405 ? "Route exists but POST is not allowed."
+            : status === 422 || status === 400 ? "Route EXISTS and reached validation — a valid {data:{bill:{id}}} payload may create a printing. Re-run with generate_printing=true."
+            : status === 403 ? "Route exists but forbidden for this token."
+            : "Unexpected — see clio_error.",
+          clio_error: typeof e?.response?.data === "string" ? e.response.data.slice(0, 600) : e?.response?.data,
+        };
+      }
+
+      if (params.generate_printing) {
+        // Try the payload shapes Clio uses elsewhere for associations.
+        const payloads = [{ data: { bill: { id } } }, { data: { bill_id: id } }];
+        for (const body of payloads) {
+          try {
+            const res = await rawPostSingle("/bill_printings", body);
+            const printing = res?.data ?? res;
+            out.bill_printings.create = { sent: body, status: 200, response: printing };
+            const pid = printing?.id;
+            if (pid) {
+              // Poll the printing briefly, then try to fetch its file.
+              let state = printing?.state;
+              const deadline = Date.now() + 30_000;
+              while (!["completed", "complete", "finished", "failed", "error"].includes(String(state ?? "")) && Date.now() < deadline) {
+                await new Promise((r) => setTimeout(r, 2000));
+                try {
+                  const s = await rawGetSingle(`/bill_printings/${pid}`);
+                  state = (s?.data ?? s)?.state;
+                  out.bill_printings.last_poll = s?.data ?? s;
+                } catch (pollErr: any) {
+                  out.bill_printings.poll_error = pollErr?.response?.status ?? pollErr?.message;
+                  break;
+                }
+              }
+              out.bill_printings.final_state = state ?? "unknown";
+              out.bill_printings.fetch_pdf = await probeGet(`GET /bill_printings/${pid}.pdf`, `/bill_printings/${pid}.pdf`);
+              if (!out.bill_printings.fetch_pdf.is_pdf) {
+                out.bill_printings.fetch_download = await probeGet(`GET /bill_printings/${pid}/download`, `/bill_printings/${pid}/download`);
+              }
+            }
+            break; // a payload shape worked — don't create a second printing
+          } catch (e: any) {
+            (out.bill_printings.create_attempts ??= []).push({
+              sent: body, status: e?.response?.status ?? null,
+              clio_error: typeof e?.response?.data === "string" ? e.response.data.slice(0, 600) : e?.response?.data,
+            });
+          }
+        }
+      }
+
+      // One-line verdict so the caller doesn't have to eyeball every probe.
+      const winner = out.get_probes.find((p: any) => p.is_pdf) ?? (out.bill_printings.fetch_pdf?.is_pdf ? out.bill_printings.fetch_pdf : null) ?? (out.bill_printings.fetch_download?.is_pdf ? out.bill_printings.fetch_download : null);
+      out.verdict = winner
+        ? `PDF obtained via: ${winner.probe}. Wire download_bill_pdf to this route.`
+        : "No probed route returned a PDF. If post_route_probe shows /bill_printings exists, re-run with generate_printing=true; otherwise the OAuth API may not expose rendered bill PDFs and reconstruct-from-line-items remains the fallback.";
 
       return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
     },
