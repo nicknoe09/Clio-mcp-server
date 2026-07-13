@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
+import { downloadBillPdfBuffer, downloadBillPdfBuffers } from "../clio/billPdf";
 import { diagnosticTool } from "../utils/diagnostics";
 import JSZip from "jszip";
 
@@ -404,7 +405,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bill_pdf",
-    "Download a single bill as a PDF file. Returns base64-encoded PDF for download. Requires the bill ID (use get_bills to find IDs). Draft bills may not have PDFs available.",
+    "Download a single bill as a PDF file. Clio generates bill PDFs asynchronously, so this requests generation and polls (up to ~90s) until the PDF is ready. Returns base64-encoded PDF for download. Requires the bill ID (use get_bills to find IDs). Draft bills may not have PDFs available.",
     {
       bill_id: z.coerce.number().describe("Clio bill ID"),
     },
@@ -430,30 +431,10 @@ export function registerBillTools(server: McpServer): void {
           };
         }
 
-        // Download the PDF — try .pdf suffix first, fall back to Accept header
-        let result: { buffer: Buffer; contentType: string };
-        try {
-          result = await rawGetBinarySingle(`/bills/${params.bill_id}.pdf`);
-        } catch (suffixErr: any) {
-          // If .pdf suffix doesn't work, try Accept header approach
-          if (suffixErr.response?.status === 404 || suffixErr.response?.status === 406) {
-            result = await rawGetBinarySingle(
-              `/bills/${params.bill_id}`,
-              {},
-              { "Accept": "application/pdf" }
-            );
-          } else {
-            throw suffixErr;
-          }
-        }
-
-        // Verify we actually got a PDF
-        if (!result.contentType.includes("pdf") && !result.buffer.slice(0, 5).toString().startsWith("%PDF")) {
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Clio returned content-type "${result.contentType}" instead of PDF. The API may not support PDF download for this bill.` }) }],
-            isError: true,
-          };
-        }
+        // Clio generates bill PDFs asynchronously: GET /bills/{id}.pdf kicks
+        // off generation and returns JSON until the PDF is ready, so poll and
+        // follow the download URL rather than expecting bytes on the first GET.
+        const result = await downloadBillPdfBuffer(params.bill_id);
 
         const base64 = result.buffer.toString("base64");
         const filename = `Bill-${bill.number || params.bill_id}.pdf`;
@@ -471,7 +452,7 @@ export function registerBillTools(server: McpServer): void {
         };
       } catch (err: any) {
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data ?? err.clioBody }) }],
           isError: true,
         };
       }
@@ -703,7 +684,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bills_pdf",
-    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range, then downloads each PDF and bundles them. Draft bills are skipped (no PDF available). Returns base64-encoded zip for download.",
+    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range, then downloads each PDF and bundles them. Clio generates bill PDFs asynchronously — generation is kicked off for every bill up front, then polled (up to ~3 min total) until each PDF is ready. Draft bills are skipped (no PDF available). Returns base64-encoded zip for download.",
     {
       state: z
         .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
@@ -747,40 +728,25 @@ export function registerBillTools(server: McpServer): void {
           };
         }
 
-        // Download each PDF sequentially (respects rate limits)
+        // Clio generates bill PDFs asynchronously — kick off generation for
+        // every bill up front, then poll until each is ready (total wall time
+        // tracks the slowest bill, not the sum). Per-bill failures are
+        // collected without sinking the batch.
+        const pdfResults = await downloadBillPdfBuffers(downloadable.map((b: any) => b.id));
+
         const zip = new JSZip();
         let downloaded = 0;
         let failed = 0;
         const errors: string[] = [];
 
         for (const bill of downloadable) {
-          try {
-            let result: { buffer: Buffer; contentType: string };
-            try {
-              result = await rawGetBinarySingle(`/bills/${bill.id}.pdf`);
-            } catch (suffixErr: any) {
-              if (suffixErr.response?.status === 404 || suffixErr.response?.status === 406) {
-                result = await rawGetBinarySingle(
-                  `/bills/${bill.id}`,
-                  {},
-                  { "Accept": "application/pdf" }
-                );
-              } else {
-                throw suffixErr;
-              }
-            }
-
-            const filename = `Bill-${bill.number || bill.id}.pdf`;
-            zip.file(filename, result.buffer);
+          const result = pdfResults.get(bill.id);
+          if (result?.ok) {
+            zip.file(`Bill-${bill.number || bill.id}.pdf`, result.buffer);
             downloaded++;
-
-            // Courtesy delay between downloads to avoid slamming the API
-            if (downloaded < downloadable.length) {
-              await new Promise((r) => setTimeout(r, 200));
-            }
-          } catch (dlErr: any) {
+          } else {
             failed++;
-            errors.push(`Bill ${bill.number || bill.id}: ${dlErr.message}`);
+            errors.push(`Bill ${bill.number || bill.id}: ${result ? result.error : "no result returned"}`);
           }
         }
 
