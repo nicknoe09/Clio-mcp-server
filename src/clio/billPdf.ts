@@ -79,6 +79,24 @@ export function extractDownloadUrl(body: any): string | null {
   return best ? (best as { url: string; score: number }).url : null;
 }
 
+// Bill lifecycle states. If the "pending" JSON's state is one of THESE, the
+// endpoint returned the bill resource itself (default fields: id/etag/number/
+// state), NOT a generation-job status — i.e. GET /bills/{id}.pdf behaved like
+// .json and no PDF render was started. Observed live 2026-07-13 on bill
+// 1323892745: two 90s poll runs, body never changed from the bill envelope.
+const BILL_STATES = new Set(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "deleted"]);
+
+/** True when a JSON body is (a wrapper around) the bill resource itself. */
+export function looksLikeBillResource(raw: any): boolean {
+  const d = raw?.data ?? raw;
+  return (
+    !!d &&
+    typeof d === "object" &&
+    ("etag" in d || "number" in d) &&
+    BILL_STATES.has(String(d.state ?? ""))
+  );
+}
+
 /** Pull a human-readable message out of a Clio error body. */
 function clioErrorMessage(raw: any): string {
   const err = raw?.error ?? raw?.errors;
@@ -195,6 +213,73 @@ async function resolveProbe(
   }
 }
 
+// Per-bill poll bookkeeping: every interim body, verbatim, so live behavior is
+// diagnosable from logs/errors (requested after the 2026-07-13 timeout runs
+// where only the last truncated body was visible).
+type PendingState = {
+  polls: number;
+  lastRaw: any;
+  bodies: Set<string>;
+  alternatesTried: boolean;
+  allBillResource: boolean;
+};
+
+function newPendingState(): PendingState {
+  return { polls: 0, lastRaw: null, bodies: new Set(), alternatesTried: false, allBillResource: true };
+}
+
+function recordPending(billId: number, raw: any, st: PendingState): void {
+  st.polls++;
+  st.lastRaw = raw;
+  const body = JSON.stringify(raw);
+  st.bodies.add(body);
+  if (!looksLikeBillResource(raw)) st.allBillResource = false;
+  console.log(`[bill-pdf] bill ${billId} poll #${st.polls}: no PDF yet; full Clio body: ${body.slice(0, 2000)}`);
+}
+
+function timeoutError(billId: number, st: PendingState, timeoutMs: number): Error {
+  const secs = Math.round(timeoutMs / 1000);
+  const changed = st.bodies.size > 1 ? "the body CHANGED across polls" : "the body never changed";
+  const diagnosis = st.allBillResource
+    ? `Clio kept returning the bill resource itself (id/etag/number/state; ${st.polls} poll(s), ${changed}) — ` +
+      `GET /bills/{id}.pdf did not start PDF generation for this API client, so longer polling won't help. ` +
+      `Run probe_bill_pdf_apis with this bill_id to discover the route that actually serves the file.`
+    : `PDF was still generating after ${secs}s (${st.polls} poll(s), ${changed}) — try again shortly.`;
+  const bodies = [...st.bodies].map((b) => b.slice(0, 400)).join(" || ");
+  return Object.assign(
+    new Error(`Bill ${billId} PDF download failed after ${secs}s: ${diagnosis} Distinct Clio responses seen: ${bodies}`),
+    { clioBody: st.lastRaw, timedOut: true }
+  );
+}
+
+/**
+ * One-shot attempts at alternative routes, tried after the first "pending"
+ * response. GET /bills/{id}.pdf has been observed returning plain bill JSON
+ * forever (never a render job), so also try content negotiation on the bare
+ * resource and a /download route mirroring /reports/{id}/download. Any
+ * failure here is swallowed — the caller keeps polling the .pdf route.
+ */
+async function tryAlternateRoutes(billId: number, deps: BillPdfDeps): Promise<BinaryResult | null> {
+  const candidates: Array<{ label: string; get: () => Promise<BinaryResult> }> = [
+    { label: `GET /bills/${billId} (Accept: application/pdf)`, get: () => deps.getBinary(`/bills/${billId}`, {}, { Accept: "application/pdf" }) },
+    { label: `GET /bills/${billId}/download`, get: () => deps.getBinary(`/bills/${billId}/download`) },
+  ];
+  for (const c of candidates) {
+    try {
+      const probe = interpretBillPdfResponse(await c.get());
+      if (probe.kind !== "pdf" && probe.kind !== "url") continue;
+      const resolved = await resolveProbe(billId, probe, deps);
+      if (resolved) {
+        console.log(`[bill-pdf] bill ${billId}: alternate route succeeded: ${c.label}`);
+        return resolved;
+      }
+    } catch (e: any) {
+      console.log(`[bill-pdf] bill ${billId}: alternate route failed (${c.label}): ${e?.response?.status ?? e?.message}`);
+    }
+  }
+  return null;
+}
+
 /**
  * Download one bill's PDF, driving Clio's async generation: request,
  * poll while Clio reports the PDF as still generating, then return the
@@ -205,22 +290,19 @@ export async function downloadBillPdfBuffer(billId: number, opts: BillPdfOptions
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
   const deadline = Date.now() + timeoutMs;
-  let lastRaw: any = null;
+  const st = newPendingState();
 
   while (true) {
     const probe = await probeBillPdf(billId, deps);
     const resolved = await resolveProbe(billId, probe, deps);
     if (resolved) return resolved;
-    lastRaw = (probe as { raw?: any }).raw ?? lastRaw;
-    if (Date.now() + pollIntervalMs > deadline) {
-      throw Object.assign(
-        new Error(
-          `Bill ${billId} PDF was still generating after ${Math.round(timeoutMs / 1000)}s — try again shortly. ` +
-            `Last Clio response: ${JSON.stringify(lastRaw).slice(0, 500)}`
-        ),
-        { clioBody: lastRaw, timedOut: true }
-      );
+    recordPending(billId, (probe as { raw?: any }).raw, st);
+    if (!st.alternatesTried) {
+      st.alternatesTried = true;
+      const alt = await tryAlternateRoutes(billId, deps);
+      if (alt) return alt;
     }
+    if (Date.now() + pollIntervalMs > deadline) throw timeoutError(billId, st, timeoutMs);
     await deps.sleep(pollIntervalMs);
   }
 }
@@ -245,27 +327,37 @@ export async function downloadBillPdfBuffers(
   const deadline = Date.now() + timeoutMs;
 
   const results: BulkBillPdfResult = new Map();
-  let pending: { id: number; lastRaw: any }[] = [];
+  let pending: { id: number; st: PendingState }[] = [];
 
-  const attempt = async (id: number): Promise<{ pendingRaw: any } | null> => {
+  /** Returns true when the bill reached a terminal result (success or failure). */
+  const attempt = async (id: number, st: PendingState): Promise<boolean> => {
     try {
       const probe = await probeBillPdf(id, deps);
       const resolved = await resolveProbe(id, probe, deps);
       if (resolved) {
         results.set(id, { ok: true, buffer: resolved.buffer });
-        return null;
+        return true;
       }
-      return { pendingRaw: (probe as { raw?: any }).raw };
+      recordPending(id, (probe as { raw?: any }).raw, st);
+      if (!st.alternatesTried) {
+        st.alternatesTried = true;
+        const alt = await tryAlternateRoutes(id, deps);
+        if (alt) {
+          results.set(id, { ok: true, buffer: alt.buffer });
+          return true;
+        }
+      }
+      return false;
     } catch (err: any) {
       results.set(id, { ok: false, error: err.message });
-      return null;
+      return true;
     }
   };
 
   // Phase 1: one probe per bill — triggers generation for all of them.
   for (const id of billIds) {
-    const p = await attempt(id);
-    if (p) pending.push({ id, lastRaw: p.pendingRaw });
+    const st = newPendingState();
+    if (!(await attempt(id, st))) pending.push({ id, st });
     // Courtesy delay between kick-offs to avoid slamming the API.
     if (id !== billIds[billIds.length - 1]) await deps.sleep(200);
   }
@@ -275,19 +367,13 @@ export async function downloadBillPdfBuffers(
     await deps.sleep(pollIntervalMs);
     const still: typeof pending = [];
     for (const entry of pending) {
-      const p = await attempt(entry.id);
-      if (p) still.push({ id: entry.id, lastRaw: p.pendingRaw ?? entry.lastRaw });
+      if (!(await attempt(entry.id, entry.st))) still.push(entry);
     }
     pending = still;
   }
 
   for (const entry of pending) {
-    results.set(entry.id, {
-      ok: false,
-      error:
-        `PDF was still generating after ${Math.round(timeoutMs / 1000)}s. ` +
-        `Last Clio response: ${JSON.stringify(entry.lastRaw).slice(0, 300)}`,
-    });
+    results.set(entry.id, { ok: false, error: timeoutError(entry.id, entry.st, timeoutMs).message });
   }
 
   return results;
