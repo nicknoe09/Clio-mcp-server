@@ -190,12 +190,14 @@ describe("downloadBillPdfBuffer", () => {
     expect(calls).toContain("/bills/20/download");
   });
 
-  it("diagnoses a bill-resource-only endpoint on timeout instead of blaming generation", async () => {
+  it("fails fast with guidance when Clio returns the bill envelope (no API PDF support)", async () => {
     const billEnvelope = json({ data: { id: 21, etag: '"e"', number: 9, state: "awaiting_payment" } });
-    const { deps } = scriptedDeps({ "/bills/21.pdf": [billEnvelope] }); // alternates unscripted → fail → swallowed
-    await expect(downloadBillPdfBuffer(21, { deps, timeoutMs: 5, pollIntervalMs: 100 })).rejects.toThrow(
-      /did not start PDF generation.*probe_bill_pdf_apis.*awaiting_payment/s
+    const { deps, calls } = scriptedDeps({ "/bills/21.pdf": [billEnvelope] }); // alternates unscripted → fail → swallowed
+    await expect(downloadBillPdfBuffer(21, { deps, timeoutMs: 60_000 })).rejects.toThrow(
+      /does not expose rendered bill PDFs.*get_bill_line_items.*awaiting_payment/s
     );
+    // Fail-fast: exactly one probe of the .pdf route, no 45s poll loop.
+    expect(calls.filter((c) => c === "/bills/21.pdf").length).toBe(1);
   });
 });
 
@@ -224,5 +226,19 @@ describe("downloadBillPdfBuffers", () => {
     const results = await downloadBillPdfBuffers([1, 2], { deps, pollIntervalMs: 50, timeoutMs: 10 });
     expect(results.get(1)).toMatchObject({ ok: true });
     expect(results.get(2)).toMatchObject({ ok: false, error: expect.stringContaining("still generating") });
+  });
+
+  it("fails bill-envelope bills fast in bulk without polling", async () => {
+    const billEnvelope = json({ data: { id: 2, etag: '"e"', number: 9, state: "paid" } });
+    const { deps } = scriptedDeps({
+      "/bills/1.pdf": [pdfResult],
+      "/bills/2.pdf": [billEnvelope],
+    });
+    const results = await downloadBillPdfBuffers([1, 2], { deps, pollIntervalMs: 1, timeoutMs: 60_000 });
+    expect(results.get(1)).toMatchObject({ ok: true });
+    expect(results.get(2)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("does not expose rendered bill PDFs"),
+    });
   });
 });

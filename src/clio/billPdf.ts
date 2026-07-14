@@ -1,6 +1,15 @@
 // ============================================================
 // Clio bill PDF download — async generation flow
 // ============================================================
+// STATUS (2026-07-14, probe_bill_pdf_apis on live bill 22386): Clio's OAuth
+// API does not expose rendered bill PDFs at all on this account. Every
+// candidate route was probed — .pdf suffix and Accept: application/pdf return
+// bill JSON metadata; /bills/{id}/download(.pdf) and the web UI's
+// bill_printings pair are 404. The download tools therefore FAIL FAST with
+// guidance (web UI download / get_bill_line_items reconstruction) when Clio
+// returns the bill envelope. The machinery below is kept in case Clio ever
+// ships a real job-status flow on these routes.
+// ============================================================
 // Clio generates bill PDFs asynchronously. GET /bills/{id}.pdf does NOT
 // reliably return PDF bytes on the first request: it kicks off generation
 // and responds 200 with a JSON body (a "still generating" status, or a
@@ -237,6 +246,27 @@ function recordPending(billId: number, raw: any, st: PendingState): void {
   console.log(`[bill-pdf] bill ${billId} poll #${st.polls}: no PDF yet; full Clio body: ${body.slice(0, 2000)}`);
 }
 
+// Definitive as of 2026-07-14 (probe_bill_pdf_apis on live bill 22386 /
+// 1323892745): Clio's OAuth API does not expose rendered bill PDFs. The .pdf
+// suffix and Accept: application/pdf both return the bill's JSON metadata (no
+// render job is ever started), /bills/{id}/download(.pdf) are 404, and the
+// bill_printings pair the web UI uses does not exist in API v4 (GET and POST
+// both 404). So when the first response is the bill envelope, fail fast with
+// guidance instead of polling into the connector's 60s timeout. The polling
+// machinery stays for the case where Clio ever returns a real job status.
+function billResourceError(billId: number, st: PendingState): Error {
+  return Object.assign(
+    new Error(
+      `Clio's OAuth API does not expose rendered bill PDFs — GET /bills/${billId}.pdf returned the bill's ` +
+        `JSON metadata (no PDF render job is started for API clients), and every alternative route ` +
+        `(Accept: application/pdf, /bills/{id}/download, bill_printings) is absent, verified 2026-07-14 via ` +
+        `probe_bill_pdf_apis. Get the PDF from the Clio web UI (Billing → the bill → Download PDF), or ` +
+        `reconstruct the invoice from get_bill_line_items. Clio response: ${JSON.stringify(st.lastRaw).slice(0, 300)}`
+    ),
+    { clioBody: st.lastRaw, billResource: true }
+  );
+}
+
 function timeoutError(billId: number, st: PendingState, timeoutMs: number): Error {
   const secs = Math.round(timeoutMs / 1000);
   const changed = st.bodies.size > 1 ? "the body CHANGED across polls" : "the body never changed";
@@ -287,7 +317,9 @@ async function tryAlternateRoutes(billId: number, deps: BillPdfDeps): Promise<Bi
  */
 export async function downloadBillPdfBuffer(billId: number, opts: BillPdfOptions = {}): Promise<BinaryResult> {
   const deps = opts.deps ?? defaultDeps();
-  const timeoutMs = opts.timeoutMs ?? 90_000;
+  // Default poll budget sits under the MCP connector's 60s call timeout so a
+  // diagnosis always reaches the caller instead of a bare client-side timeout.
+  const timeoutMs = opts.timeoutMs ?? 45_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
   const deadline = Date.now() + timeoutMs;
   const st = newPendingState();
@@ -302,6 +334,8 @@ export async function downloadBillPdfBuffer(billId: number, opts: BillPdfOptions
       const alt = await tryAlternateRoutes(billId, deps);
       if (alt) return alt;
     }
+    // The bill envelope means the API will never serve this PDF — fail fast.
+    if (st.allBillResource) throw billResourceError(billId, st);
     if (Date.now() + pollIntervalMs > deadline) throw timeoutError(billId, st, timeoutMs);
     await deps.sleep(pollIntervalMs);
   }
@@ -346,6 +380,11 @@ export async function downloadBillPdfBuffers(
           results.set(id, { ok: true, buffer: alt.buffer });
           return true;
         }
+      }
+      // The bill envelope means the API will never serve this PDF — terminal.
+      if (st.allBillResource) {
+        results.set(id, { ok: false, error: billResourceError(id, st).message });
+        return true;
       }
       return false;
     } catch (err: any) {

@@ -405,7 +405,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bill_pdf",
-    "Download a single bill as a PDF file. Clio generates bill PDFs asynchronously, so this requests generation and polls (up to ~90s) until the PDF is ready. Returns base64-encoded PDF for download. Requires the bill ID (use get_bills to find IDs). Draft bills may not have PDFs available.",
+    "Download a single bill as a PDF file. IMPORTANT: Clio's OAuth API does not expose rendered bill PDFs on this account (verified 2026-07-14 via probe_bill_pdf_apis — every candidate route returns bill JSON or 404), so this tool is expected to fail fast with guidance: get the PDF from the Clio web UI (Billing → the bill → Download PDF) or reconstruct the invoice from get_bill_line_items. The attempt is still made in case Clio ships the capability; if a PDF ever comes back it is returned base64-encoded.",
     {
       bill_id: z.coerce.number().describe("Clio bill ID"),
     },
@@ -684,7 +684,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bills_pdf",
-    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range, then downloads each PDF and bundles them. Clio generates bill PDFs asynchronously — generation is kicked off for every bill up front, then polled (up to ~3 min total) until each PDF is ready. Draft bills are skipped (no PDF available). Returns base64-encoded zip for download.",
+    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range. IMPORTANT: Clio's OAuth API does not expose rendered bill PDFs on this account (verified 2026-07-14 via probe_bill_pdf_apis), so expect per-bill failures directing to the Clio web UI or get_bill_line_items reconstruction. Draft bills are skipped. If Clio ever serves the PDFs, they are bundled and returned as a base64-encoded zip.",
     {
       state: z
         .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
@@ -1028,6 +1028,62 @@ export function registerBillTools(server: McpServer): void {
         };
       }
 
+      // Delivery-route candidates: if Clio's SEND-BILL flow (web UI "Send bill",
+      // which emails a secure PDF link/attachment) is API-triggerable, the PDF
+      // can be obtained by sending the bill to a firm inbox and pulling the
+      // attachment there. Route existence only — every POST uses an INVALID
+      // empty body so no email is ever sent: 404 = no route, 405 = no POST,
+      // 422/400 = route exists and validated our bad payload (nothing sent).
+      out.delivery_routes = [];
+      const deliveryCandidates = [
+        `/bills/${id}/deliveries`,
+        "/bill_deliveries",
+        `/bills/${id}/send`,
+        `/bills/${id}/share`,
+        "/outbound_shares",
+      ];
+      for (const path of deliveryCandidates) {
+        try {
+          const res = await rawPostSingle(path, { data: {} });
+          out.delivery_routes.push({
+            path, status: 200, route_exists: true,
+            WARNING: "POST accepted an empty body — inspect the response; a delivery/share MAY have been created.",
+            response: res?.data ?? res,
+          });
+        } catch (e: any) {
+          const status = e?.response?.status ?? null;
+          out.delivery_routes.push({
+            path, status, route_exists: status !== 404 && status !== null,
+            interpretation:
+              status === 404 ? "No such route."
+              : status === 405 ? "Route exists but POST is not allowed."
+              : status === 422 || status === 400 ? "Route EXISTS and reached validation — bill sending is likely API-triggerable with a valid payload (recipient etc.). Nothing was sent."
+              : status === 403 ? "Route exists but forbidden for this token."
+              : "Unexpected — see clio_error.",
+            clio_error: typeof e?.response?.data === "string" ? e.response.data.slice(0, 400) : e?.response?.data,
+          });
+        }
+      }
+
+      // Read-only: does the rendered invoice ever land in Clio Documents?
+      // (Some flows save sent invoices as matter documents, which ARE
+      // downloadable via the API's /documents S3-redirect path.)
+      try {
+        const bill = (await rawGetSingle(`/bills/${id}`, { fields: "id,number,shared,last_sent_at,matters" }))?.data;
+        out.bill_send_state = { number: bill?.number, shared: bill?.shared, last_sent_at: bill?.last_sent_at };
+        if (bill?.number != null) {
+          const docs = await fetchAllPages<any>("/documents", {
+            query: String(bill.number),
+            fields: "id,name,content_type,date,matter{id,display_number}",
+          }, 10);
+          out.documents_matching_bill_number = docs.map((d: any) => ({
+            id: d.id, name: d.name, content_type: d.content_type, date: d.date, matter: d.matter?.display_number,
+          }));
+        }
+      } catch (e: any) {
+        out.documents_matching_bill_number = { error: e?.response?.status ?? e?.message };
+      }
+
       if (params.generate_printing) {
         // Try the payload shapes Clio uses elsewhere for associations.
         const payloads = [{ data: { bill: { id } } }, { data: { bill_id: id } }];
@@ -1070,9 +1126,13 @@ export function registerBillTools(server: McpServer): void {
 
       // One-line verdict so the caller doesn't have to eyeball every probe.
       const winner = out.get_probes.find((p: any) => p.is_pdf) ?? (out.bill_printings.fetch_pdf?.is_pdf ? out.bill_printings.fetch_pdf : null) ?? (out.bill_printings.fetch_download?.is_pdf ? out.bill_printings.fetch_download : null);
+      const sendable = (out.delivery_routes as any[]).filter((r) => r.route_exists);
       out.verdict = winner
         ? `PDF obtained via: ${winner.probe}. Wire download_bill_pdf to this route.`
-        : "No probed route returned a PDF. If post_route_probe shows /bill_printings exists, re-run with generate_printing=true; otherwise the OAuth API may not expose rendered bill PDFs and reconstruct-from-line-items remains the fallback.";
+        : sendable.length > 0
+          ? `No route returns the PDF directly, but delivery route(s) exist: ${sendable.map((r: any) => r.path).join(", ")}. ` +
+            `Bill sending may be API-triggerable — send to a firm inbox and pull the attachment there.`
+          : "No probed route returned a PDF and no delivery/send route exists. The OAuth API does not expose rendered bill PDFs — use the Clio web UI download or reconstruct-from-line-items.";
 
       return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
     },
