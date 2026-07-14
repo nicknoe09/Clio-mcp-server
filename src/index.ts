@@ -10,6 +10,7 @@ dotenv.config();
 
 import { ENV } from "./utils/env";
 import { createApp } from "./app";
+import { diagnosticToolsEnabled } from "./utils/diagnostics";
 
 const BASE_URL = ENV.PUBLIC_BASE_URL.replace(/\/$/, "");
 
@@ -26,6 +27,12 @@ const httpServer = app.listen(PORT, () => {
   console.log(`  Discovery: ${BASE_URL}/.well-known/oauth-protected-resource`);
   console.log(`  Box OAuth: http://localhost:${PORT}/box/oauth/start`);
   console.log(`  Auth:      per-user Microsoft OAuth (Bearer JWT required)`);
+  // Boot-visible so a mistyped flag value is diagnosable from deploy logs
+  // instead of silently hiding the probe tools.
+  console.log(
+    `  Diag tools: ${diagnosticToolsEnabled() ? "ENABLED" : "disabled"} ` +
+    `(ENABLE_DIAGNOSTIC_TOOLS=${JSON.stringify(process.env.ENABLE_DIAGNOSTIC_TOOLS ?? "(unset)")})`
+  );
 });
 // Node's default keep-alive timeout (5s) is shorter than Railway's edge proxy
 // idle timeout, so the proxy reuses sockets the server already closed —
