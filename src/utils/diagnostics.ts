@@ -7,8 +7,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 // in the connector's tool list (reported 2026-07-03). They register only when
 // ENABLE_DIAGNOSTIC_TOOLS=true is set on the deployment.
 
+// Lenient truthy parse: dashboards (Railway etc.) hand back whatever casing
+// the operator typed, and a strict === "true" silently no-ops on "True"/"1"
+// (bitten 2026-07-14 — flag set, tools never registered, no signal anywhere).
 export function diagnosticToolsEnabled(): boolean {
-  return process.env.ENABLE_DIAGNOSTIC_TOOLS === "true";
+  const raw = (process.env.ENABLE_DIAGNOSTIC_TOOLS ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
 }
 
 const noopRegistrar = {

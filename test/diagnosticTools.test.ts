@@ -82,4 +82,27 @@ describe("diagnostic tool gating", () => {
       expect(names, `${tool} should be registered`).toContain(tool);
     }
   });
+
+  // Railway's dashboard stores whatever casing the operator typed; a strict
+  // === "true" silently no-opped on "True" (2026-07-14). Accept the common
+  // truthy spellings, keep rejecting everything else.
+  it("accepts common truthy spellings (True, TRUE, 1, padded)", async () => {
+    for (const value of ["True", "TRUE", "1", " true "]) {
+      vi.stubEnv("ENABLE_DIAGNOSTIC_TOOLS", value);
+      const names = await listToolNames();
+      expect(names, `probe tools should register for ${JSON.stringify(value)}`).toContain(
+        "probe_billing_write_apis"
+      );
+    }
+  });
+
+  it("still hides diagnostics for non-truthy values", async () => {
+    for (const value of ["false", "0", "ture", "enabled"]) {
+      vi.stubEnv("ENABLE_DIAGNOSTIC_TOOLS", value);
+      const names = await listToolNames();
+      expect(names, `probe tools should stay hidden for ${JSON.stringify(value)}`).not.toContain(
+        "probe_billing_write_apis"
+      );
+    }
+  });
 });
