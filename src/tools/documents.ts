@@ -6,7 +6,7 @@ import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { classifyYtdTimeEntries, type ClassifiedTimeEntry } from "../dashboard/classifiedHours";
-import { buildWorkedHoursSplitByMonth, deriveHoursPartition } from "../dashboard/workedHours";
+import { buildWorkedHoursSplitByMonth } from "../dashboard/workedHours";
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
@@ -187,9 +187,9 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const endDate = new Date().toISOString().split("T")[0];
 
   // Classified with the SAME filtration as the monthly dashboard (26 Compare
-  // cols I/H): nonbillable = admin-matter time, fee placeholders excluded,
-  // everything else billable — see dashboard/classifiedHours.ts. Replaces the
-  // old price>0 heuristic so the weekly sheets reconcile to the dashboard.
+  // cols I/H): billable vs nonbillable comes STRICTLY from Clio's entry-level
+  // non_billable flag (no matter-name/type or rate heuristics), with only the
+  // synthetic fee-placeholder entries excluded — see dashboard/classifiedHours.ts.
   const entries = (params.entries
     ?? await classifyYtdTimeEntries({ year: params.year, endDate, userIds: [params.user_id] })
   ).filter((e) => e.uid === params.user_id);
@@ -320,7 +320,7 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
   ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
     .font = { italic: true, color: { argb: "FF666666" } };
-  ws1.addRow(["Hours use the firm dashboard's filtration: nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin); synthetic fee-placeholder entries excluded; all other worked time counts as billable."])
+  ws1.addRow(["Hours use the firm dashboard's filtration: billable vs nonbillable follows each entry's Clio non-billable flag (rate and matter are ignored); synthetic fee-placeholder entries are excluded."])
     .font = { italic: true, color: { argb: "FF666666" } };
 
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
@@ -556,9 +556,9 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
   const endDate = `${params.year}-12-31`;
 
   // Same dashboard filtration as the weekly sheets (classifiedHours.ts): the
-  // chart tracks billable vs goal only, where billable = all worked time except
-  // admin-matter hours and fee placeholders — matching 26 Compare col I, not
-  // the old price>0 heuristic.
+  // chart tracks billable vs goal only, where billable = worked time whose
+  // Clio non_billable flag is false, minus fee placeholders — matching
+  // 26 Compare col I. No matter-name/type or rate heuristics.
   const entries = await classifyYtdTimeEntries({
     year: params.year, endDate, userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
   });
@@ -676,7 +676,7 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
     };
     ws.getCell(rowNum, 2).value = label;
   }
-  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable uses the dashboard's filtration (admin-matter time and fee placeholders excluded).";
+  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable uses the dashboard's filtration (entries flagged non-billable in Clio and fee placeholders excluded).";
   ws.getCell(28, 1).font = { italic: true, color: { argb: "FF666666" } };
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
@@ -1102,7 +1102,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_weekly_goals",
-    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin), synthetic fee-placeholder entries are excluded, and all other worked time counts as billable — so the sheet's Utilization % reconciles to the dashboard's Utilization tab. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
+    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): billable vs nonbillable follows each entry's native Clio non-billable flag (matter names/types and rates are never consulted — internal work booked at a dollar rate but flagged non-billable counts as nonbillable), with only synthetic fee-placeholder entries excluded — so the sheet's Utilization % reconciles to the dashboard's Utilization tab. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1138,7 +1138,7 @@ export function registerDocumentTools(server: McpServer): void {
   server.tool(
     "download_all_weekly_goals",
     "Update the weekly goals spreadsheet for all firm timekeepers, uploading to Box in parallel. " +
-    "Hours use the same filtration as the firm dashboard (nonbillable = admin-matter time, fee placeholders excluded), classified once for the whole roster. " +
+    "Hours use the same filtration as the firm dashboard (billable vs nonbillable from each entry's Clio non-billable flag, fee placeholders excluded), classified once for the whole roster. " +
     "The full batch regenerates every sheet from Clio time entries and can exceed the MCP client's ~180s timeout, " +
     "so it runs as a background job: this tool returns a job_id immediately — poll get_dashboard_status with it " +
     "for the per-person results (status, box_url, and key figures for each timekeeper). No arguments required.",
@@ -1267,7 +1267,7 @@ export function registerDocumentTools(server: McpServer): void {
     "download_monthly_goals_summary",
     "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
     "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
-    "Billable hours use the same filtration as the firm dashboard (admin-matter time and synthetic fee placeholders excluded), so the YTD Utilization % row reconciles to the dashboard. " +
+    "Billable hours use the same filtration as the firm dashboard (each entry's Clio non-billable flag decides billable vs nonbillable; synthetic fee placeholders excluded), so the YTD Utilization % row reconciles to the dashboard. " +
     "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run).",
     {
       year: z.coerce.number().optional().describe("Year (defaults to current year)"),
@@ -1547,7 +1547,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual') and by ORIGINATING attorney (col V 'Originating'). Fees from billers not on the roster are pooled into the 'NRB' row so Σ col N == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL billable hours WORKED that month (activity/work-date basis, billed or not — from the Revenue Report), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour entries whose rate doesn't match the timekeeper's standard hourly rate); real worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the 'Utilization' tab (billable = worked billable hours; nonbillable = admin-matter hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted admin nonbillable and collapsed it to ~0; the Total and Untracked columns are recomputed from Billable+Nonbillable so they can't drift from the patched hours) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from auto-generated Clio Client Activity reports — one per month patched) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab (target month only). ALSO patches the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report per patched month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source the target month from a specific pre-generated Realization report. All three rate tabs honor backfill_ytd: a normal run patches only the TARGET month's block, while backfill_ytd=true re-derives EVERY YTD month block (generating one Client Activity / Fee Allocation report per month) — use it for a one-time historical correction of stale months. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable category columns D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888) — an informational breakdown only; TNB col H is the TOTAL of entries flagged non-billable in Clio (the entry-level non_billable flag decides billable vs nonbillable — matter names/types and rates are never consulted — so col H can exceed D+E+F+G when internal matters outside the four categories carry flagged non-billable time); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual') and by ORIGINATING attorney (col V 'Originating'). Fees from billers not on the roster are pooled into the 'NRB' row so Σ col N == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL hours WORKED that month whose Clio non_billable flag is false (activity/work-date basis, billed or not), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour billable-flagged entries whose rate doesn't match the timekeeper's standard hourly rate); real worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the 'Utilization' tab (billable = worked billable hours; nonbillable = flagged non-billable hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted nonbillable and collapsed it to ~0; the Total and Untracked columns are recomputed from Billable+Nonbillable so they can't drift from the patched hours) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from auto-generated Clio Client Activity reports — one per month patched) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab (target month only). ALSO patches the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report per patched month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source the target month from a specific pre-generated Realization report. All three rate tabs honor backfill_ytd: a normal run patches only the TARGET month's block, while backfill_ytd=true re-derives EVERY YTD month block (generating one Client Activity / Fee Allocation report per month) — use it for a one-time historical correction of stale months. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization' and 'Realization' tabs: one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1804,13 +1804,15 @@ export function registerDocumentTools(server: McpServer): void {
         }
 
         type PerUserData = {
+          // billableHrs (col I) / nonbillableHrs (col H) are split per entry by
+          // Clio's non_billable flag — never by matter or rate.
           billableHrs: number; nonbillableHrs: number; billedHrs: number; unbilledHrs: number;
-          // workedBillableHrs = billable hours WORKED that month — now identical to the
-          // DERIVED col I (totalWorkedHrs − nonbillableHrs). Feeds the paralegal HOURS
-          // bonus, which rewards hours worked, not hours billed on invoices.
+          // workedBillableHrs = billable hours WORKED that month — identical to col I.
+          // Feeds the paralegal HOURS bonus, which rewards hours worked, not hours
+          // billed on invoices.
           workedBillableHrs: number;
-          // totalWorkedHrs = ALL hours worked that month by work date (col J anchor).
-          // Billable (col I) is derived as totalWorkedHrs − nonbillableHrs.
+          // totalWorkedHrs = ALL hours worked that month by work date (col J anchor)
+          // = billableHrs + nonbillableHrs (fee placeholders backed out).
           totalWorkedHrs: number;
           billableDollars: number; billedDollars: number; writeOffs: number; lineDiscounts: number;
           bizDev: number; potentialClients: number; cle: number; otherAdmin: number;
@@ -1876,11 +1878,12 @@ export function registerDocumentTools(server: McpServer): void {
         // entries by work date (the firm's definition; reproduces the reference where
         // the Revenue Report's billed+unbilled overcounts). Real contingency/flat
         // worked time is included; only the 1h fee placeholders below are removed.
-        _step = "building worked hours (time entries: total + flag-based billable)";
-        // total    = ALL worked time entries by work date (= manual Activities total).
-        // billable = legacy flag-based view (non_billable !== true), used only as a
-        //            reconciliation cross-check — col I is DERIVED as total − nonbillable.
-        const { total: totalWorkedByMonth, billable: workedBillableByMonth } =
+        _step = "building worked hours (time entries, split by the non_billable flag)";
+        // Partitioned per entry by Clio's non_billable flag (the same single
+        // decision the weekly goal sheets use — see classifiedHours.ts):
+        //   billable    = entries where non_billable === false (col I basis)
+        //   nonbillable = entries where non_billable === true  (col H)
+        const { billable: workedBillableByMonth, nonbillable: workedNonbillableByMonth } =
           await buildWorkedHoursSplitByMonth(params.year, params.month, ROSTER, { months: writeMonths });
 
         // Synthetic 1-hour fee-placeholder hours (on contingency/flat matters) to back
@@ -1903,27 +1906,28 @@ export function registerDocumentTools(server: McpServer): void {
             }
             // Billed $ (col K) = "Billed Time" on invoices issued this billing month.
             d.billedDollars = billedByMonth[m]?.[r.user_id] ?? 0;
-            // Nonbillable (col H) = sum of the four tracked admin categories (Rachel's
-            // definition) — computed first because Billable is derived FROM it.
+            // Cols D–G = the four tracked admin categories (Rachel's breakdown of
+            // admin-matter time). Informational only — the billable-vs-nonbillable
+            // SPLIT below comes strictly from the entry-level non_billable flag, so
+            // col H can exceed D+E+F+G when internal/other matters outside the four
+            // categories carry flagged non-billable time (e.g. rated RomSum entries).
             d.bizDev = cat?.bizDev ?? 0;
             d.potentialClients = cat?.potentialClients ?? 0;
             d.cle = cat?.cle ?? 0;
             d.otherAdmin = cat?.otherAdmin ?? 0;
-            d.nonbillableHrs = d.bizDev + d.potentialClients + d.cle + d.otherAdmin;
-            // Hours columns, anchored on the firm's definition Billable = Total − Nonbillable:
-            //   Total worked (col J) = ALL time entries WORKED this month (work-date basis,
-            //     billed or not) = the number a manual Activities search / get_user_productivity
-            //     shows. Rachel's synthetic 1-hour contingency/flat fee-placeholders
-            //     (excludedHrsByMonth) are backed out — they aren't real worked time.
-            //   Billable (col I) = Total − Nonbillable, DERIVED. This guarantees
-            //     col I + col H == col J by construction and makes col I robust to admin
-            //     time logged WITHOUT the non_billable flag (the bug that inflated col I to
-            //     the Revenue Report's issue-date value). Real worked time on contingency/
-            //     flat matters stays in Billable (those matters aren't admin categories).
+            // Hours columns, classified STRICTLY by Clio's entry-level non_billable
+            // flag — no matter-name/type or rate heuristic (rated internal work
+            // flagged non-billable used to leak into col I):
+            //   Nonbillable (col H) = hours where non_billable === true.
+            //   Billable (col I)    = hours where non_billable === false, minus
+            //     Rachel's synthetic 1-hour fee placeholders (excludedHrsByMonth —
+            //     billable-flagged in Clio but not real worked time).
+            //   Total worked (col J) = col H + col I (work-date basis, billed or not).
             const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
-            d.totalWorkedHrs = Math.max(0, (totalWorkedByMonth[m]?.[r.user_id] ?? 0) - excl);
-            d.billableHrs = deriveHoursPartition(d.totalWorkedHrs, d.nonbillableHrs).billable;
-            d.workedBillableHrs = d.billableHrs; // paralegal HOURS bonus uses the same reconciled figure
+            d.nonbillableHrs = workedNonbillableByMonth[m]?.[r.user_id] ?? 0;
+            d.billableHrs = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
+            d.totalWorkedHrs = d.billableHrs + d.nonbillableHrs;
+            d.workedBillableHrs = d.billableHrs; // paralegal HOURS bonus uses the same figure
             md[r.user_id] = d;
             mrd[r.user_id] = respByMonth[m]?.[r.user_id] ?? { respHrs: 0, respBilled: 0 };
           }
@@ -1945,31 +1949,28 @@ export function registerDocumentTools(server: McpServer): void {
         // Attorney Performance tab below.
         const targetBundle = monthsData.find((b) => b.month === params.month)!;
 
-        // ---- HOURS RECONCILIATION GUARD (cols I/H/J) ----
-        // col I is now DERIVED (Total − Nonbillable). Cross-check it against the LEGACY
-        // flag-based billable (entries where non_billable !== true). A material gap means
-        // admin/nonbillable time isn't carrying the non_billable flag in Clio — the exact
-        // condition that previously let admin hours be double-counted (once as billable,
-        // once as nonbillable) and inflated col I/J. Also flag the impossible partition
-        // (nonbillable > total, which clamps billable to 0). Warn loudly; never silently
-        // ship a drift. Mirrors the collections Σcol N == firm-fees reconciliation below.
+        // ---- HOURS RECONCILIATION LOG (cols I/H/J) ----
+        // Cols I/H are split per entry by the non_billable flag, so col I + col H ==
+        // col J holds by construction. What can still drift is Clio DATA HYGIENE:
+        // compare the tracked admin-category sum (cols D–G, matter-based breakdown)
+        // against flagged nonbillable (col H). Categories exceeding col H means
+        // admin-matter time was logged WITHOUT the non_billable flag in Clio — the
+        // sheet follows the flag (that time counts as billable), so the entries
+        // should be fixed in Clio. Col H exceeding the categories is expected:
+        // internal/other matters outside the four tracked categories (e.g. RomSum)
+        // carry flagged non-billable time.
         {
-          const m = params.month;
           let firmTotal = 0;
           for (const r of ROSTER) {
             const d = targetBundle.data[r.user_id];
             if (!d) continue;
             firmTotal += d.totalWorkedHrs;
-            const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
-            const flagBillable = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
-            const delta = flagBillable - d.billableHrs; // flag-based minus derived
-            if (d.nonbillableHrs > d.totalWorkedHrs + 0.05) {
-              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: nonbillable ${round1(d.nonbillableHrs)}h EXCEEDS total worked ${round1(d.totalWorkedHrs)}h — billable clamped to 0. Admin-matter pull and total-worked pull disagree on scope.`);
-            } else if (Math.abs(delta) > 2.0) {
-              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: flag-based billable=${round1(flagBillable)}h vs derived (total−nonbillable)=${round1(d.billableHrs)}h (Δ${round1(delta)}h). Likely admin/nonbillable time logged WITHOUT the non_billable flag — col I uses the derived figure (correct), but the gap is worth a look.`);
+            const catSum = d.bizDev + d.potentialClients + d.cle + d.otherAdmin;
+            if (catSum > d.nonbillableHrs + 0.05) {
+              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: admin-category hours ${round1(catSum)}h EXCEED flagged nonbillable ${round1(d.nonbillableHrs)}h (Δ${round1(catSum - d.nonbillableHrs)}h) — admin-matter time logged WITHOUT the non_billable flag in Clio. Col H/I follow the flag; fix the entries in Clio.`);
             }
           }
-          console.log(`[Dashboard] worked-hours firm total ${monthName}: ${round1(firmTotal)}h (col J basis = manual Activities total)`);
+          console.log(`[Dashboard] worked-hours firm total ${monthName}: ${round1(firmTotal)}h (col J basis = manual Activities total, fee placeholders backed out)`);
         }
 
         // Collections (cols N/S) are written per-month from the cumulative Fee
@@ -2106,7 +2107,9 @@ export function registerDocumentTools(server: McpServer): void {
               wsRow.getCell(5).value = round1(d.potentialClients);
               wsRow.getCell(6).value = round1(d.cle);
               wsRow.getCell(7).value = round1(d.otherAdmin);
-              wsRow.getCell(8).value = round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin);
+              // H = TOTAL flagged nonbillable (may exceed the D–G tracked categories
+              // when internal/other matters carry flagged non-billable time).
+              wsRow.getCell(8).value = round1(d.nonbillableHrs);
               wsRow.getCell(9).value = round1(d.billableHrs);
               wsRow.getCell(10).value = round1(d.billableHrs + d.nonbillableHrs);
               wsRow.getCell(11).value = round2(d.billedDollars);
@@ -2696,7 +2699,7 @@ export function registerDocumentTools(server: McpServer): void {
               const rd = md.respData[r.user_id];
               const patches: [number, number][] = [
                 [4, round1(d.bizDev)], [5, round1(d.potentialClients)], [6, round1(d.cle)], [7, round1(d.otherAdmin)],
-                [8, round1(d.bizDev + d.potentialClients + d.cle + d.otherAdmin)],
+                [8, round1(d.nonbillableHrs)], // H = flagged nonbillable, not the D–G sum
                 [9, round1(d.billableHrs)], [10, round1(d.billableHrs + d.nonbillableHrs)],
                 [11, round2(d.billedDollars)],
                 [12, round2(d.writeOffs)], [13, round2(d.lineDiscounts)],
@@ -2728,7 +2731,9 @@ export function registerDocumentTools(server: McpServer): void {
                 xmlCell(`E${row}`, d ? round1(d.potentialClients) : 0, { style: S.hrs }),
                 xmlCell(`F${row}`, d ? round1(d.cle) : 0, { style: S.hrs }),
                 xmlCell(`G${row}`, d ? round1(d.otherAdmin) : 0, { style: S.hrs }),
-                xmlCell(`H${row}`, null, { style: S.hrsFormula, formula: `SUM(D${row}:G${row})` }),
+                // H = flagged nonbillable as a VALUE, not =SUM(D:G) — flagged time on
+                // matters outside the four tracked categories must stay in col H.
+                xmlCell(`H${row}`, d ? round1(d.nonbillableHrs) : 0, { style: S.hrsFormula }),
                 xmlCell(`I${row}`, d ? round1(d.billableHrs) : 0, { style: S.hrsFormula }),
                 xmlCell(`J${row}`, null, { style: S.totalFormula, formula: `H${row}+I${row}` }),
                 xmlCell(`K${row}`, d ? round2(d.billedDollars) : 0, { style: S.currency }),
@@ -2873,10 +2878,10 @@ export function registerDocumentTools(server: McpServer): void {
 
           // -- Utilization patch -- (cols C=billable, D=nonbillable, E=Total, G=Untracked)
           // Sourced from the SAME data as 26 Compare cols I (worked billable hours)
-          // and H (admin-matter nonbillable), NOT the Client Activity report — its
-          // Price==0 nonbillable test missed rated admin-matter time and collapsed
-          // Utilization nonbillable to ~0; catByMonth (summed into nonbillableHrs) is
-          // the figure that already reconciles on 26 Compare. Total (E) and Untracked
+          // and H (flagged non-billable hours), NOT the Client Activity report — its
+          // Price==0 nonbillable test missed rated non-billable time and collapsed
+          // Utilization nonbillable to ~0; the flag-based nonbillableHrs is the
+          // figure that already reconciles on 26 Compare. Total (E) and Untracked
           // (G) are rewritten from the patched figures so they can't drift from
           // Billable/Nonbillable (the partner rows had stale pre-fix Totals like Mar
           // PAR 282 vs the correct 252.8+70.6=323.4): Total = Billable + Nonbillable;
