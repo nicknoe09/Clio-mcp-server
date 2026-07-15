@@ -301,7 +301,7 @@ export function registerScorecardTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "generate_weekly_goals",
-    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): nonbillable = admin-matter time (Biz Dev, Potential Clients, CLE, Admin), synthetic fee-placeholder entries are excluded, and all other worked time (including contingency/flat-matter time and zero-priced client-matter entries) counts as billable — so the utilization figures reconcile to the dashboard's Utilization tab.",
+    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): billable vs nonbillable follows each entry's native Clio non-billable flag (matter names/types and rates are never consulted — internal work booked at a dollar rate but flagged non-billable counts as nonbillable), with only synthetic fee-placeholder entries excluded — so the utilization figures reconcile to the dashboard's Utilization tab.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -314,8 +314,8 @@ export function registerScorecardTools(server: McpServer): void {
         const endDate = today.toISOString().split("T")[0];
 
         // Same dashboard filtration as the Excel weekly sheets and 26 Compare
-        // (see dashboard/classifiedHours.ts): nonbillable = admin-matter time,
-        // fee placeholders dropped, everything else billable.
+        // (see dashboard/classifiedHours.ts): billable vs nonbillable from each
+        // entry's non_billable flag, fee placeholders dropped.
         const entries = await classifyYtdTimeEntries({
           year: params.year, endDate, userIds: [params.user_id],
         });

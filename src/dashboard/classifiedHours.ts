@@ -3,27 +3,24 @@
 // dashboard model and the on-tempo weekly goals sheets, so both report the same
 // utilization numerator (billable ÷ 1880/12) and reconcile at month close.
 //
-// Classification per time entry, matching 26 Compare's semantics exactly:
-//   nonbillable — the entry is booked to one of the tracked admin matters
-//                 (Biz Dev/Website, Potential Clients, CLE, Other Admin), the
-//                 same matters buildNonbillableByMonth sums into col H. Price
-//                 and the entry-level non_billable flag are irrelevant — a rated
-//                 CLE entry is still nonbillable.
+// Billable vs nonbillable is decided ENTIRELY by Clio's native entry-level
+// `non_billable` flag — never by matter name/number, matter type, practice
+// area, or price/rate:
+//   nonbillable — non_billable === true. Price is irrelevant: internal work
+//                 booked at a dollar rate (e.g. a $525/hr RomSum admin entry)
+//                 but flagged non-billable in Clio is nonbillable. (The old
+//                 admin-matter/rate rules counted such entries billable.)
 //   excluded    — one of Rachel's synthetic 1-hour fee-placeholder entries
-//                 (off-standard-rate 1.0h entry on a fee-based matter, per the
-//                 two-step matter-gated rule in excludedHours.ts). Not real
+//                 (off-standard-rate 1.0h BILLABLE-flagged entry on a fee-based
+//                 matter, per the two-step rule in excludedHours.ts). Not real
 //                 worked time: dropped from BOTH billable and nonbillable.
-//   billable    — everything else, INCLUDING real worked time on contingency /
-//                 flat-fee matters and zero-priced entries on client matters
-//                 (col I is derived as total − admin nonbillable, so a client-
-//                 matter entry counts regardless of its price or flag).
-//
-// This deliberately replaces the weekly sheets' old price>0 heuristic, which
-// over-counted (placeholders, rated admin time) and under-counted (zero-priced
-// client work) relative to the dashboard.
+//                 This exclusion is the only consumer of the entry's rate and
+//                 matter fields, and it only ever moves billable-flagged
+//                 entries to "excluded" — it never flips billable/nonbillable.
+//   billable    — everything else (non_billable === false), including
+//                 zero-priced entries and contingency/flat-matter worked time.
 // ============================================================
 import { fetchAllPages, rawGetSingle } from "../clio/pagination";
-import { CATEGORY_PREFIXES } from "./nonbillable";
 import {
   standardRateByUser, isFeePlaceholderRate, matterQualifiesForStrip,
 } from "./excludedHours";
@@ -40,6 +37,8 @@ export type ClassifiedTimeEntry = {
 };
 
 // Raw shape the pure classifier consumes (one row per /activities TimeEntry).
+// `rate` and `matterId` feed ONLY the fee-placeholder exclusion — never the
+// billable-vs-nonbillable decision.
 export type RawTimeEntry = {
   id: number;
   uid: number;
@@ -51,33 +50,29 @@ export type RawTimeEntry = {
   nonBillableFlag: boolean;
 };
 
-/** IDs of the tracked admin matters (one /matters pull, matched by the same
- *  display-number prefixes buildNonbillableByMonth uses). */
-export async function getAdminMatterIds(): Promise<Set<number>> {
-  const allMatters = await fetchAllPages<any>("/matters", { fields: "id,display_number" });
-  const prefixes = CATEGORY_PREFIXES.flatMap((c) => c.prefixes);
-  const ids = new Set<number>();
-  for (const mt of allMatters) {
-    const dn = String(mt.display_number || "");
-    if (prefixes.some((p) => dn.startsWith(p))) ids.add(mt.id);
-  }
-  return ids;
+/**
+ * THE billable-vs-nonbillable decision, in one place: an entry is nonbillable
+ * exactly when Clio's entry-level non_billable flag is true. Strict === true so
+ * a missing/omitted field never silently flips an entry to nonbillable.
+ */
+export function isNonBillableEntry(nonBillableFlag: unknown): boolean {
+  return nonBillableFlag === true;
 }
 
 /**
- * Pure classification: admin matter → nonbillable; identified placeholder →
- * excluded; everything else → billable. Admin membership wins over the
- * placeholder set (an admin matter is never fee-based, so the overlap is
- * theoretical — but nonbillable is the safer bucket if it ever happens).
+ * Pure classification, strictly from the entry's own non_billable flag:
+ * flagged → nonbillable; identified placeholder → excluded; everything else →
+ * billable. The flag wins over the placeholder set (placeholders are by
+ * construction billable-flagged, so the overlap is theoretical — but a flagged
+ * entry must never leave the nonbillable sum).
  */
 export function classifyRawEntries(
   raw: RawTimeEntry[],
-  adminMatterIds: Set<number>,
   excludedEntryIds: Set<number>,
 ): ClassifiedTimeEntry[] {
   return raw.map((e) => ({
     id: e.id, uid: e.uid, userName: e.userName, date: e.date, hours: e.hours,
-    cls: e.matterId !== undefined && adminMatterIds.has(e.matterId) ? "nonbillable"
+    cls: isNonBillableEntry(e.nonBillableFlag) ? "nonbillable"
       : excludedEntryIds.has(e.id) ? "excluded"
       : "billable",
   }));
@@ -91,7 +86,7 @@ export function classifyRawEntries(
  * matter lookup fails).
  */
 export async function findPlaceholderEntryIds(raw: RawTimeEntry[]): Promise<Set<number>> {
-  const pop = raw.filter((e) => !e.nonBillableFlag && e.matterId !== undefined);
+  const pop = raw.filter((e) => !isNonBillableEntry(e.nonBillableFlag) && e.matterId !== undefined);
   const rateEntries = pop.map((e) => ({
     uid: e.uid, month: parseInt(e.date.slice(5, 7), 10) || 0, hours: e.hours, rate: e.rate,
   }));
@@ -116,10 +111,9 @@ export async function findPlaceholderEntryIds(raw: RawTimeEntry[]): Promise<Set<
 
 /**
  * Pull + classify a year's time entries for the given users (work dates
- * `year`-01-01 .. `endDate` inclusive). One /activities pull per user, one
- * /matters pull for admin-matter membership, and one matter lookup per
- * placeholder-candidate matter — the same query budget as the dashboard's
- * monthly builders.
+ * `year`-01-01 .. `endDate` inclusive). One /activities pull per user plus one
+ * matter lookup per placeholder-candidate matter — the same query budget as
+ * the dashboard's monthly builders.
  */
 export async function classifyYtdTimeEntries(opts: {
   year: number;
@@ -127,7 +121,6 @@ export async function classifyYtdTimeEntries(opts: {
   userIds: number[];
 }): Promise<ClassifiedTimeEntry[]> {
   const startDate = `${opts.year}-01-01`;
-  const adminIds = await getAdminMatterIds();
 
   const raw: RawTimeEntry[] = [];
   for (const userId of opts.userIds) {
@@ -159,5 +152,5 @@ export async function classifyYtdTimeEntries(opts: {
   }
 
   const excludedIds = await findPlaceholderEntryIds(raw);
-  return classifyRawEntries(raw, adminIds, excludedIds);
+  return classifyRawEntries(raw, excludedIds);
 }
