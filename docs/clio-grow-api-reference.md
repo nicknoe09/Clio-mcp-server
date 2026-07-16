@@ -31,9 +31,13 @@ login) has two layers:
 - **Clio Identity** (`account.clio.com`, OIDC) is the sign-in layer shared by
   all Clio products. Identity tokens are for SSO only — Clio's own docs note
   Identity access tokens are not used for API calls.
-- **API authorization** is a per-app OAuth grant. Grow API access is enabled
-  on the application in Clio's developer portal (`developers.api.clio.com`);
-  the resulting bearer tokens are what `api.clio.com/grow` accepts.
+- **API authorization** is a per-app OAuth grant. The app is *registered* in
+  Clio's developer portal (`developers.api.clio.com`), but authorization runs
+  through the **same OAuth endpoints as Manage** — `https://app.clio.com/oauth/authorize`
+  and `.../oauth/token` (the `eu.`/`ca.`/`au.` host for other regions) — i.e.
+  Clio unified login. The portal domain is NOT an OAuth server. These default
+  off `CLIO_BASE_URL`; override with `GROW_OAUTH_AUTHORIZE_URL` /
+  `GROW_OAUTH_TOKEN_URL` only if the app page says otherwise.
 
 This server integrates via a dedicated Clio Platform app (`GROW_CLIENT_ID` /
 `GROW_CLIENT_SECRET`, created in the developer portal with redirect URL
