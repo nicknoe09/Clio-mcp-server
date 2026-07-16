@@ -385,7 +385,7 @@ function rawPost(fullUrl: string, body: any): Promise<any> {
     const options = {
       hostname: parsed.hostname,
       port: 443,
-      path: parsed.pathname,
+      path: `${parsed.pathname}${parsed.search}`,
       method: "POST",
       headers: {
         "Authorization": `Bearer ${getAccessToken()}`,
@@ -464,7 +464,7 @@ function rawPatch(fullUrl: string, body: any): Promise<any> {
     const options = {
       hostname: parsed.hostname,
       port: 443,
-      path: parsed.pathname,
+      path: `${parsed.pathname}${parsed.search}`,
       method: "PATCH",
       headers: {
         "Authorization": `Bearer ${getAccessToken()}`,
