@@ -531,7 +531,9 @@ const WEEKLY_GOALS_ROSTER = [
   { name: "Angela Alanis",   user_id: 358528744, goal: 30, group: "PAR" }, // partner/para
   { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
   { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
-  { name: "Jonathan Barbee", user_id: 360091325, goal: 32, group: "KES" }, // associate
+  // Jonathan Barbee (JPB, 360091325) — terminated July 2026; removed from the
+  // weekly goal sheets and monthly summary per firm decision. His historical
+  // sheet stays in Box; dashboard/collections history stays via FIRM_ROSTER.
   { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para — left mid-2026; keep through year-end so her Jan–Jun months stay on the monthly chart, drop for 2027
   { name: "Stacy Bakri",     user_id: 360383465, goal: 30, group: "KES" }, // partner/para — Kenny's paralegal, replaced Anna mid-2026
   { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
@@ -2204,8 +2206,8 @@ export function registerDocumentTools(server: McpServer): void {
           _step = "creating Bonus Config";
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
-            { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's ongoing collections in perpetuity; paraSalary = Stacy's $75k (confirmed)
+            { ini: "PAR", salary: 332340, associate: "NAF", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 }, // associate = NAF (Nick Fernelius); PAR never had JPB
+            { ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // associate = JPB (terminated Jul 2026; his ongoing collections still credit KES, like AFL in the paralegal field). paralegal = Stacy (current) + Anna's ongoing collections; paraSalary = Stacy's $75k
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
