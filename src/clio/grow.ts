@@ -55,7 +55,8 @@ function growRequest(
   method: "GET" | "POST" | "DELETE",
   fullUrl: string,
   token: string,
-  body?: any
+  body?: any,
+  redirectsLeft = 3
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(fullUrl);
@@ -71,23 +72,60 @@ function growRequest(
     const req = https.request(
       { hostname: parsed.hostname, port: 443, path, method, headers },
       (res) => {
+        const status = res.statusCode ?? 0;
+
+        // Redirects: some Grow endpoints canonicalize their path (e.g. a
+        // trailing-slash 301/302). Follow SAME-HOST redirects transparently,
+        // reusing the bearer. A CROSS-HOST redirect (e.g. to the auth host for
+        // a step-up/insufficient-scope challenge) is NOT followed — forwarding
+        // the bearer off-host would leak it — and is surfaced with its Location
+        // so the cause (usually a missing scope) is diagnosable.
+        if ([301, 302, 303, 307, 308].includes(status)) {
+          res.resume(); // drain the socket
+          const loc = res.headers.location;
+          if (!loc) {
+            const err: any = new Error(`Redirect (${status}) with no Location header`);
+            err.response = { status, data: {}, headers: res.headers };
+            return reject(err);
+          }
+          if (redirectsLeft <= 0) {
+            const err: any = new Error(`Too many redirects following ${fullUrl}`);
+            err.response = { status, data: {}, headers: res.headers };
+            return reject(err);
+          }
+          const target = new URL(loc, fullUrl);
+          if (target.hostname === parsed.hostname) {
+            // 303 (and legacy 302 on non-GET) → GET without a body; 307/308 keep method+body.
+            const nextMethod = status === 303 ? "GET" : method;
+            const nextBody = nextMethod === "GET" ? undefined : body;
+            return resolve(growRequest(nextMethod, target.toString(), token, nextBody, redirectsLeft - 1));
+          }
+          const err: any = new Error(
+            `Grow API redirected off-host (${status}) to ${target.origin}${target.pathname} — ` +
+              `not followed (would leak the token). This usually means the endpoint requires a scope the ` +
+              `token lacks; add the matching grow_* scope to the app and GROW_OAUTH_SCOPE, then reconnect.`
+          );
+          err.response = { status, data: {}, headers: res.headers, redirectLocation: loc };
+          return reject(err);
+        }
+
         let responseBody = "";
         res.on("data", (chunk) => (responseBody += chunk));
         res.on("end", () => {
           try {
             const json = responseBody ? JSON.parse(responseBody) : {};
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            if (status >= 200 && status < 300) {
               resolve(json);
             } else {
-              const err: any = new Error(`Request failed with status code ${res.statusCode}`);
-              err.response = { status: res.statusCode, data: json, headers: res.headers };
+              const err: any = new Error(`Request failed with status code ${status}`);
+              err.response = { status, data: json, headers: res.headers };
               reject(err);
             }
           } catch {
             const err: any = new Error(
-              `Request failed with status ${res.statusCode}: ${responseBody.slice(0, 200)}`
+              `Request failed with status ${status}: ${responseBody.slice(0, 200)}`
             );
-            err.response = { status: res.statusCode, data: responseBody.slice(0, 500), headers: res.headers };
+            err.response = { status, data: responseBody.slice(0, 500), headers: res.headers };
             reject(err);
           }
         });

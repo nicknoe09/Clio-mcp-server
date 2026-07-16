@@ -56,10 +56,13 @@ function ok(payload: unknown) {
 
 function growError(err: any) {
   const status = err.response?.status;
+  const redirectLocation = err.response?.redirectLocation ?? err.response?.headers?.location;
   const authHint =
     status === 401 || status === 403
       ? "If every Grow tool returns 401/403, run grow_who_am_i for a diagnosis — most likely the Grow Platform app hasn't been connected for your user yet (visit /grow/oauth/start on this server). See docs/clio-grow-api-reference.md."
-      : undefined;
+      : redirectLocation && /\/oauth\/authorize|auth\.api\.clio\.com/.test(String(redirectLocation))
+        ? "This endpoint redirected to the auth host — the token is missing the scope it requires. Add the matching grow_* scope (e.g. a sources/settings scope) to the app's permissions and to GROW_OAUTH_SCOPE, then reconnect at /grow/oauth/start."
+        : undefined;
   return {
     content: [
       {
@@ -69,6 +72,7 @@ function growError(err: any) {
           message: err.message,
           status,
           grow_error: err.response?.data,
+          ...(redirectLocation ? { redirect_location: redirectLocation } : {}),
           ...(authHint ? { hint: authHint } : {}),
         }),
       },
