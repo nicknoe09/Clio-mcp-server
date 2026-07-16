@@ -2206,8 +2206,8 @@ export function registerDocumentTools(server: McpServer): void {
           _step = "creating Bonus Config";
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
           const BONUS_ATTORNEYS = [
-            { ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
-            { ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's ongoing collections in perpetuity; paraSalary = Stacy's $75k (confirmed)
+            { ini: "PAR", salary: 332340, associate: "NAF", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 }, // associate = NAF (Nick Fernelius); PAR never had JPB
+            { ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // associate = JPB (terminated Jul 2026; his ongoing collections still credit KES, like AFL in the paralegal field). paralegal = Stacy (current) + Anna's ongoing collections; paraSalary = Stacy's $75k
             { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
