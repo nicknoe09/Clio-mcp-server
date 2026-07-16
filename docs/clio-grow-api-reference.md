@@ -35,12 +35,16 @@ login) has two layers:
   on the application in Clio's developer portal (`developers.api.clio.com`);
   the resulting bearer tokens are what `api.clio.com/grow` accepts.
 
-This server assumes the firm's existing per-user OAuth tokens (minted by the
-shared Clio app, `CLIO_CLIENT_ID`) are honored by the Grow host, and reuses
-the same token store and 401-refresh path. The `grow_who_am_i` tool verifies
-this empirically in one call: success confirms unified access; a 401/403 while
-Manage `who_am_i` works means Grow API access must be enabled on the app in
-the developer portal.
+This server integrates via a dedicated Clio Platform app (`GROW_CLIENT_ID` /
+`GROW_CLIENT_SECRET`, created in the developer portal with redirect URL
+`<PUBLIC_BASE_URL>/grow/oauth/callback`). Each attorney authorizes once at
+`/grow/oauth/start`; the callback identifies them by calling Grow
+`who_am_i` with the fresh token and matching the email to a provisioned
+platform user, then stores the encrypted pair in the vault under provider
+`clio_grow` (see `src/clio/growAuth.ts`). Grow calls prefer those tokens and
+refresh them against `GROW_OAUTH_TOKEN_URL`; if none are stored, calls fall
+back to the Manage token. `grow_who_am_i` reports which source was used
+(`token_source`) and diagnoses failures.
 
 Support: `api@clio.com` (API issues), `api.partnerships@clio.com` (partnerships).
 

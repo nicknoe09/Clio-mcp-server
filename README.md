@@ -203,9 +203,13 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 
 Full coverage of the Clio Grow API v2 (see `docs/clio-grow-api-reference.md`).
 Grow is a separate host (`GROW_API_BASE_URL`, default `https://api.clio.com/grow`)
-reached with the **same per-user Clio tokens** as Manage; run `grow_who_am_i`
-first — a 401/403 there while Manage works means the shared Clio OAuth app
-still needs Grow API access enabled in Clio's developer portal.
+authorized by a **separate Clio Platform app** (`GROW_CLIENT_ID`/`GROW_CLIENT_SECRET`,
+created at developers.api.clio.com with redirect URL
+`<PUBLIC_BASE_URL>/grow/oauth/callback`). Each attorney connects once at
+`<PUBLIC_BASE_URL>/grow/oauth/start`; their token pair is stored in the vault
+under provider `clio_grow` and auto-refreshed. Without a stored Grow token the
+tools fall back to the Manage token. Run `grow_who_am_i` first — it reports
+which token was used (`token_source`) and diagnoses 401/403s.
 
 | Tool | Description |
 |------|-------------|

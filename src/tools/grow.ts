@@ -6,6 +6,7 @@ import {
   growFetchAllPages,
   growPostSingle,
   growDeleteSingle,
+  resolveGrowBearer,
 } from "../clio/grow";
 
 // MCP tools for the Clio Grow API v2 (intake/CRM), covering every endpoint in
@@ -57,7 +58,7 @@ function growError(err: any) {
   const status = err.response?.status;
   const authHint =
     status === 401 || status === 403
-      ? "If Manage tools work but every Grow tool returns 401/403, the shared Clio OAuth app does not yet have Grow API access — enable it for the app in Clio's developer portal (developers.api.clio.com). See docs/clio-grow-api-reference.md."
+      ? "If every Grow tool returns 401/403, run grow_who_am_i for a diagnosis — most likely the Grow Platform app hasn't been connected for your user yet (visit /grow/oauth/start on this server). See docs/clio-grow-api-reference.md."
       : undefined;
   return {
     content: [
@@ -117,14 +118,17 @@ export function registerGrowTools(server: McpServer): void {
   // OAuth app; this tool proves out the token against Grow in one call.
   server.tool(
     "grow_who_am_i",
-    "Verify Clio Grow API access and return the current Grow user + firm (GET /users/who_am_i on the Grow API). Use this FIRST if any other grow_* tool errors: a 401/403 here while Manage who_am_i works means the Clio OAuth app needs Grow API access enabled in the developer portal.",
+    "Verify Clio Grow API access and return the current Grow user + firm (GET /users/who_am_i on the Grow API). Reports token_source: 'grow_oauth' (you connected the Grow Platform app at /grow/oauth/start) or 'manage_fallback' (no Grow tokens stored; trying the Manage token). Use this FIRST if any other grow_* tool errors — a 401/403 with manage_fallback means you need to connect at /grow/oauth/start.",
     {},
     async () => {
+      let tokenSource: string | undefined;
       try {
+        tokenSource = (await resolveGrowBearer()).source;
         const me = await growGetSingle("/users/who_am_i");
         return ok({
           grow_api_base_url: ENV.GROW_API_BASE_URL,
           grow_access: "confirmed",
+          token_source: tokenSource,
           user: me?.data ?? me,
         });
       } catch (err: any) {
@@ -137,11 +141,14 @@ export function registerGrowTools(server: McpServer): void {
                 error: true,
                 grow_api_base_url: ENV.GROW_API_BASE_URL,
                 grow_access: "FAILED",
+                token_source: tokenSource,
                 status,
                 grow_error: err.response?.data,
                 diagnosis:
                   status === 401 || status === 403
-                    ? "Your Clio token was rejected by the Grow API. Manage and Grow use unified login, but the OAuth app must have Grow API access enabled (developers.api.clio.com). If the firm's Grow account is in another region, set GROW_API_BASE_URL (eu./ca./au. prefix)."
+                    ? tokenSource === "grow_oauth"
+                      ? "Your stored Grow tokens were rejected. Reconnect the Grow app at /grow/oauth/start; if it persists, check the Platform app's Grow permissions in developers.api.clio.com."
+                      : "The Manage token was rejected by the Grow API (expected when the Grow Platform app hasn't been connected). Visit /grow/oauth/start on this server to authorize the Grow app, then retry. If the firm's Grow account is in another region, also set GROW_API_BASE_URL (eu./ca./au. prefix)."
                     : status === 404
                       ? "Endpoint not found — GROW_API_BASE_URL may be wrong for this account's region."
                       : `Unexpected failure: ${err.message}`,

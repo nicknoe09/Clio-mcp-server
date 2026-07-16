@@ -277,6 +277,91 @@ export async function updateBoxTokens(
   });
 }
 
+// =====================================================================
+// Clio Grow integration (per-user) — provider row 'clio_grow', mirroring the
+// Clio/Box functions above with a 'clio_grow'-scoped AAD. Unlike 'clio'/'box'
+// (rows created by the platform /setup page), the Grow connect flow lives on
+// THIS server (/grow/oauth/start), so the write is an upsert: update the row
+// when it exists, insert it on first connect.
+// =====================================================================
+
+export interface GrowTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: Date | null;
+}
+
+/**
+ * Read + decrypt this user's Clio Grow tokens. Returns null when the user has
+ * no `clio_grow` integration row (Grow not connected yet).
+ */
+export async function getGrowTokens(userId: string): Promise<GrowTokens | null> {
+  const row = await withTenant(userId, async (client) => {
+    const res = await client.query(
+      `SELECT access_token_ct, access_token_nonce, access_token_dek_ct,
+              refresh_token_ct, refresh_token_nonce, refresh_token_dek_ct, expires_at
+         FROM user_integrations
+        WHERE provider = 'clio_grow'
+        LIMIT 1`
+    );
+    return res.rows[0] ?? null;
+  });
+
+  if (!row) return null;
+
+  const accessField: EncryptedField = {
+    ct: toBuffer(row.access_token_ct),
+    nonce: toBuffer(row.access_token_nonce),
+    dekCt: toBuffer(row.access_token_dek_ct),
+  };
+  const refreshField: EncryptedField = {
+    ct: toBuffer(row.refresh_token_ct),
+    nonce: toBuffer(row.refresh_token_nonce),
+    dekCt: toBuffer(row.refresh_token_dek_ct),
+  };
+
+  const accessToken = decryptToken(accessField, tokenAad(userId, "access_token", "clio_grow"));
+  const refreshToken = decryptToken(refreshField, tokenAad(userId, "refresh_token", "clio_grow"));
+  const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
+  return { accessToken, refreshToken, expiresAt };
+}
+
+/**
+ * Encrypt + persist this user's Clio Grow tokens (insert on first connect,
+ * update thereafter). Same tenant-scoped transaction style RLS requires.
+ */
+export async function upsertGrowTokens(
+  userId: string,
+  accessToken: string,
+  refreshToken: string,
+  expiresAt: Date | null
+): Promise<void> {
+  const access = encryptToken(accessToken, tokenAad(userId, "access_token", "clio_grow"));
+  const refresh = encryptToken(refreshToken, tokenAad(userId, "refresh_token", "clio_grow"));
+
+  await withTenant(userId, async (client) => {
+    const updated = await client.query(
+      `UPDATE user_integrations
+          SET access_token_ct = $1, access_token_nonce = $2, access_token_dek_ct = $3,
+              refresh_token_ct = $4, refresh_token_nonce = $5, refresh_token_dek_ct = $6,
+              expires_at = $7, updated_at = now()
+        WHERE provider = 'clio_grow'`,
+      [access.ct, access.nonce, access.dekCt, refresh.ct, refresh.nonce, refresh.dekCt, expiresAt]
+    );
+    if (updated.rowCount === 0) {
+      await client.query(
+        `INSERT INTO user_integrations
+            (user_id, provider,
+             access_token_ct, access_token_nonce, access_token_dek_ct,
+             refresh_token_ct, refresh_token_nonce, refresh_token_dek_ct,
+             expires_at)
+         VALUES ($1, 'clio_grow', $2, $3, $4, $5, $6, $7, $8)`,
+        [userId, access.ct, access.nonce, access.dekCt, refresh.ct, refresh.nonce, refresh.dekCt, expiresAt]
+      );
+    }
+  });
+}
+
 export interface UploadKeyOwner {
   userId: string;
   email: string;

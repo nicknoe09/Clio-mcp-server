@@ -13,10 +13,26 @@ export const ENV = {
     PORT: parseInt(getEnv("PORT", "3000"), 10),
     get CLIO_BASE_URL() { return getEnv("CLIO_BASE_URL", "https://app.clio.com"); },
     get CLIO_API_BASE_URL() { return getEnv("CLIO_API_BASE_URL", "https://app.clio.com/api/v4"); },
-    // Clio Grow API v2 (see docs/clio-grow-api-reference.md). Same per-user
-    // bearer tokens as Manage (unified login); region-specific hosts exist
-    // (eu./ca./au. prefixes) if the firm's Grow account is not US.
+    // Clio Grow API v2 (see docs/clio-grow-api-reference.md). Region-specific
+    // hosts exist (eu./ca./au. prefixes) if the firm's Grow account is not US.
     get GROW_API_BASE_URL() { return getEnv("GROW_API_BASE_URL", "https://api.clio.com/grow"); },
+    // Clio Platform app credentials for the Grow API (created in the developer
+    // portal at developers.api.clio.com — a SEPARATE app from the legacy Manage
+    // one behind CLIO_CLIENT_ID). When set, /grow/oauth/start runs the connect
+    // flow and Grow calls use the per-user tokens it stores; when unset, Grow
+    // calls fall back to the Manage token.
+    get GROW_CLIENT_ID() { return process.env.GROW_CLIENT_ID ?? ""; },
+    get GROW_CLIENT_SECRET() { return process.env.GROW_CLIENT_SECRET ?? ""; },
+    // OAuth endpoints for the Platform app. The app's page in the developer
+    // portal shows the authoritative URLs — override these if they differ.
+    get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", "https://developers.api.clio.com/oauth/authorize"); },
+    get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://developers.api.clio.com/oauth/token"); },
+    // Optional space-separated scopes; most Platform apps declare permissions
+    // in-portal, so this stays empty unless the portal says otherwise.
+    get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? ""; },
+    get GROW_REDIRECT_URI() {
+        return getEnv("GROW_REDIRECT_URI", `${ENV.PUBLIC_BASE_URL.replace(/\/$/, "")}/grow/oauth/callback`);
+    },
     // CLIO_CLIENT_ID / SECRET are still required — they refresh each attorney's
     // per-user Clio token (must be the SAME Clio OAuth app the platform uses).
     get CLIO_CLIENT_ID() { return getEnv("CLIO_CLIENT_ID"); },
