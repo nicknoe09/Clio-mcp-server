@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 process.env.GROW_CLIENT_ID = "test-grow-client";
 process.env.GROW_CLIENT_SECRET = "test-grow-secret";
 process.env.GROW_REDIRECT_URI = "https://example.test/grow/oauth/callback";
+delete process.env.GROW_OAUTH_SCOPE; // exercise the default
 
 import {
   issueOAuthState,
@@ -32,7 +33,7 @@ describe("getGrowAuthorizationUrl", () => {
     expect(url.searchParams.get("client_id")).toBe("test-grow-client");
     expect(url.searchParams.get("redirect_uri")).toBe("https://example.test/grow/oauth/callback");
     expect(url.searchParams.get("state")).toBe("abc123");
-    // No scope param unless GROW_OAUTH_SCOPE is set.
-    expect(url.searchParams.get("scope")).toBeNull();
+    // account.clio.com (Hydra) requires a scope; default is "openid".
+    expect(url.searchParams.get("scope")).toBe("openid");
   });
 });
