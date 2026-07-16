@@ -486,7 +486,17 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const initials = INITIALS_MAP[params.user_id] ?? userName.split(" ").map((p: string) => p[0]?.toUpperCase() ?? "").join("");
     const boxFilename = `${initials} Goals ${params.year}.xlsx`;
     const folderId = params.box_folder_id || WEEKLY_GOALS_FOLDER_ID;
-    const result = await uploadToBox({ buffer, filename: boxFilename, folderId });
+    // Version the existing sheet when there is one; CREATE it when there
+    // isn't. uploadToBox alone deliberately never creates files, which left a
+    // NEW timekeeper (no prior "<INI> Goals <year>.xlsx" in the folder, e.g.
+    // SAB mid-2026) permanently unable to get a sheet into Box — every run
+    // uploaded the file, deleted it as an orphan, and fell back to a 1-hour
+    // download link. Same lookup-then-version-or-create flow as
+    // duplicateToFolder uses for the Weekly Measureables copy.
+    const existingId = await findBoxFileId(folderId, boxFilename);
+    const result = existingId
+      ? await uploadToBox({ buffer, filename: boxFilename, folderId, overwriteFileId: existingId })
+      : await createBoxFile({ buffer, filename: boxFilename, folderId });
     // Also duplicate the sheet into Weekly Measureables (kept in sync each run).
     const weekly_measurables = await duplicateToFolder(buffer, boxFilename, WEEKLY_MEASURABLES_FOLDER_ID);
     if (result.uploaded) {
