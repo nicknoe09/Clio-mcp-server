@@ -35,10 +35,13 @@ export const ENV = {
     // lives in GROW_API_BASE_URL. Override if the app page says otherwise.
     get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", "https://account.clio.com/oauth2/auth"); },
     get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://account.clio.com/oauth2/token"); },
-    // Optional space-separated scopes. account.clio.com (Hydra) may require a
-    // scope (e.g. "openid" and/or Grow-specific scopes shown on the app page);
-    // set this if the authorize step returns an invalid_scope / missing-scope error.
-    get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? ""; },
+    // Space-separated OAuth scopes. account.clio.com (Hydra) requires a scope on
+    // the authorize request — omitting it returns a 400 "could not complete the
+    // request as formatted". Default to "openid" (the baseline Clio Identity
+    // scope, per Clio's SSO docs). If the Grow API then rejects the token
+    // (401/403), the app needs its Grow-specific scope(s) too — set this to
+    // "openid <grow-scope…>" using whatever the app's page in the portal lists.
+    get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? "openid"; },
     get GROW_REDIRECT_URI() {
         return getEnv("GROW_REDIRECT_URI", `${ENV.PUBLIC_BASE_URL.replace(/\/$/, "")}/grow/oauth/callback`);
     },
