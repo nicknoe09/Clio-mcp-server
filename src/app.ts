@@ -7,6 +7,12 @@ import { verifyMicrosoftToken, isEmailAllowed, AuthError } from "./auth/microsof
 import { buildUserContext, NotProvisionedError } from "./auth/vault";
 import { registerOAuthProxyRoutes } from "./auth/oauthProxy";
 import { getBoxAuthorizationUrl, exchangeBoxCodeForTokens } from "./box/auth";
+import {
+  getGrowAuthorizationUrl,
+  exchangeGrowCodeForTokens,
+  issueOAuthState,
+  consumeOAuthState,
+} from "./clio/growAuth";
 import { registerMatterTools } from "./tools/matters";
 import { registerMatterFinancialsTools } from "./tools/matterFinancials";
 import { registerTimeTools } from "./tools/time";
@@ -251,6 +257,41 @@ export function createApp(): express.Express {
 
   // --- Binary upload → Box (auth via X-Upload-Secret; see routes/upload.ts) ---
   app.use(uploadRouter);
+
+  // --- Clio Grow OAuth (Clio Platform app; per-attorney tokens → vault) ---
+  app.get("/grow/oauth/start", (_req, res) => {
+    try {
+      const url = getGrowAuthorizationUrl(issueOAuthState());
+      res.redirect(url);
+    } catch (err: any) {
+      res.status(500).send(`Grow OAuth misconfigured: ${err.message}`);
+    }
+  });
+
+  app.get("/grow/oauth/callback", async (req, res) => {
+    const { code, state, error, error_description } = req.query as Record<string, string | undefined>;
+    if (error) {
+      res.status(400).send(`<h1>Clio Grow authorization failed</h1><p>${error}: ${error_description ?? ""}</p>`);
+      return;
+    }
+    if (!consumeOAuthState(state)) {
+      res.status(400).send("Invalid or expired state parameter — restart at /grow/oauth/start.");
+      return;
+    }
+    if (!code) {
+      res.status(400).send("Missing authorization code");
+      return;
+    }
+    try {
+      const { email } = await exchangeGrowCodeForTokens(code);
+      res.send(
+        `<h1>Clio Grow Connected</h1><p>Grow tokens saved for ${email}. You can close this window.</p>`
+      );
+    } catch (err: any) {
+      console.error("[grow-oauth] callback failed:", err?.response?.data ?? err.message);
+      res.status(500).send(`Grow OAuth error: ${err.message}`);
+    }
+  });
 
   // --- Box OAuth (unchanged — out of scope) ---
   app.get("/box/oauth/start", (_req, res) => {

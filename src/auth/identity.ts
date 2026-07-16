@@ -29,6 +29,12 @@ export interface UserContext {
   // cached per request. Used by the central write guard to verify the Clio
   // token actually belongs to the signed-in attorney. See clio/pagination.ts.
   clioIdentity?: { id: number; email: string; name: string };
+  // Per-user Clio Grow (Platform app) tokens, lazily loaded from the vault on
+  // first Grow call in the request (growTokensLoaded guards the one-time read).
+  // Absent → Grow calls fall back to the Manage accessToken. See clio/grow.ts.
+  growAccessToken?: string;
+  growRefreshToken?: string;
+  growTokensLoaded?: boolean;
 }
 
 export const als = new AsyncLocalStorage<UserContext>();
@@ -47,5 +53,15 @@ export function updateContextTokens(accessToken: string, refreshToken: string): 
     store.accessToken = accessToken;
     store.refreshToken = refreshToken;
     store.clioError = undefined;
+  }
+}
+
+/** Same as updateContextTokens, for the per-user Clio Grow token pair. */
+export function updateContextGrowTokens(accessToken: string, refreshToken: string): void {
+  const store = als.getStore();
+  if (store) {
+    store.growAccessToken = accessToken;
+    store.growRefreshToken = refreshToken;
+    store.growTokensLoaded = true;
   }
 }
