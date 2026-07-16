@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages } from "../clio/pagination";
+import { fetchAllPages, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
 
 // Note fields we read back. Clio Note has subject + detail (the body), a date,
 // and a polymorphic parent (matter or contact). We expand the matter so callers
@@ -151,6 +151,87 @@ export function registerNoteTools(server: McpServer): void {
               }),
             },
           ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // update_note — edit an existing note's subject/body/date (PATCH /notes/{id}).
+  server.tool(
+    "update_note",
+    "Update an existing Clio note (PATCH /notes/{id}). Find the note_id via search_notes. Only the fields you pass are changed; the note's parent matter/contact and type are not moved.",
+    {
+      note_id: z.coerce.number().describe("Clio note ID to update"),
+      subject: z.string().optional().describe("New note subject"),
+      detail: z.string().optional().describe("New note body/detail text"),
+      date: z.string().optional().describe("New note date (YYYY-MM-DD)"),
+    },
+    async ({ note_id, subject, detail, date }) => {
+      try {
+        const body: any = { data: {} };
+        if (subject !== undefined) body.data.subject = subject;
+        if (detail !== undefined) body.data.detail = detail;
+        if (date !== undefined) body.data.date = date;
+        if (Object.keys(body.data).length === 0) {
+          throw new Error("Nothing to update — pass at least one of subject, detail, or date.");
+        }
+
+        const result = await rawPatchSingle(`/notes/${note_id}`, body);
+        const n = result.data ?? {};
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              updated: true,
+              note: { id: n.id, date: n.date, subject: n.subject, detail: n.detail },
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // delete_note — remove a note (DELETE /notes/{id}).
+  server.tool(
+    "delete_note",
+    "Delete a Clio note (DELETE /notes/{id}). This permanently removes the note. Find the note_id via search_notes.",
+    {
+      note_id: z.coerce.number().describe("Clio note ID to delete"),
+    },
+    async ({ note_id }) => {
+      try {
+        await rawDeleteSingle(`/notes/${note_id}`);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ deleted: true, id: note_id }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              message: err.message,
+              status: err.response?.status,
+              clio_error: err.response?.data,
+            }),
+          }],
           isError: true,
         };
       }
