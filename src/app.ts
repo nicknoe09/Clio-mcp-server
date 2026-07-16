@@ -31,6 +31,7 @@ import { registerVersionTools } from "./tools/version";
 import { registerWhoAmITools } from "./tools/whoami";
 import { registerNoteTools } from "./tools/notes";
 import { registerGrowTools } from "./tools/grow";
+import { registerClioDocumentTools } from "./tools/clioDocuments";
 import reviewRouter from "./routes/review";
 import uploadRouter from "./routes/upload";
 import { getDownload } from "./utils/downloadStore";
@@ -71,6 +72,7 @@ export function createMcpServer(): McpServer {
     registerWhoAmITools(server);
     registerNoteTools(server);
     registerGrowTools(server);
+    registerClioDocumentTools(server);
 
     if (!loggedRegistration) {
       loggedRegistration = true;
