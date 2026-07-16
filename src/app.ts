@@ -41,6 +41,7 @@ import { registerClioDocumentTools } from "./tools/clioDocuments";
 import { registerReminderTools } from "./tools/reminders";
 import { registerTimerTools } from "./tools/timers";
 import { registerLookupTools } from "./tools/lookups";
+import { registerCommunicationTools } from "./tools/communications";
 import reviewRouter from "./routes/review";
 import uploadRouter from "./routes/upload";
 import { getDownload } from "./utils/downloadStore";
@@ -85,6 +86,7 @@ export function createMcpServer(): McpServer {
     registerReminderTools(server);
     registerTimerTools(server);
     registerLookupTools(server);
+    registerCommunicationTools(server);
 
     if (!loggedRegistration) {
       loggedRegistration = true;
