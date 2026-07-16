@@ -280,7 +280,8 @@ export function createApp(): express.Express {
       res.status(400).send(`<h1>Clio Grow authorization failed</h1><p>${error}: ${error_description ?? ""}</p>`);
       return;
     }
-    if (!consumeOAuthState(state)) {
+    const pending = consumeOAuthState(state);
+    if (!pending) {
       res.status(400).send("Invalid or expired state parameter — restart at /grow/oauth/start.");
       return;
     }
@@ -289,7 +290,7 @@ export function createApp(): express.Express {
       return;
     }
     try {
-      const { email } = await exchangeGrowCodeForTokens(code);
+      const { email } = await exchangeGrowCodeForTokens(code, pending.codeVerifier);
       res.send(
         `<h1>Clio Grow Connected</h1><p>Grow tokens saved for ${email}. You can close this window.</p>`
       );

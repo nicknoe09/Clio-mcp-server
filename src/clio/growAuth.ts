@@ -1,5 +1,5 @@
 import axios from "axios";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import https from "https";
 import { ENV } from "../utils/env";
 import { als, updateContextGrowTokens } from "../auth/identity";
@@ -19,27 +19,49 @@ import { getUserByEmail, upsertGrowTokens } from "../auth/vault";
  * token, and match its email to a provisioned platform user.
  */
 
-// --- CSRF state (single-instance in-memory; entries expire after 10 min) ---
+// --- CSRF state + PKCE (single-instance in-memory; entries expire after 10 min) ---
+//
+// Each pending authorization stores its expiry and, when PKCE is enabled, the
+// code_verifier generated at /grow/oauth/start. The verifier is retrieved at
+// /grow/oauth/callback (keyed by the returned state) and sent on the token
+// exchange so account.clio.com (Hydra) can verify the challenge.
 
-const pendingStates = new Map<string, number>();
+interface PendingAuth {
+  exp: number;
+  codeVerifier?: string;
+}
+
+const pendingStates = new Map<string, PendingAuth>();
 const STATE_TTL_MS = 10 * 60 * 1000;
+
+/** base64url of the SHA-256 of the verifier — the S256 code_challenge. */
+function s256Challenge(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
 
 export function issueOAuthState(): string {
   // Prune expired entries opportunistically so the map can't grow unbounded.
   const now = Date.now();
-  for (const [s, exp] of pendingStates) {
-    if (exp < now) pendingStates.delete(s);
+  for (const [s, entry] of pendingStates) {
+    if (entry.exp < now) pendingStates.delete(s);
   }
   const state = randomBytes(16).toString("hex");
-  pendingStates.set(state, now + STATE_TTL_MS);
+  // RFC 7636: 43–128 chars from the unreserved set. 32 random bytes → 43 base64url chars.
+  const codeVerifier = ENV.GROW_OAUTH_PKCE ? randomBytes(32).toString("base64url") : undefined;
+  pendingStates.set(state, { exp: now + STATE_TTL_MS, codeVerifier });
   return state;
 }
 
-export function consumeOAuthState(state: string | undefined): boolean {
-  if (!state) return false;
-  const exp = pendingStates.get(state);
+/**
+ * Validate + consume a returned state. Returns the pending entry (with the PKCE
+ * code_verifier, if any) on success, or null if the state is unknown/expired.
+ */
+export function consumeOAuthState(state: string | undefined): PendingAuth | null {
+  if (!state) return null;
+  const entry = pendingStates.get(state);
   pendingStates.delete(state);
-  return exp !== undefined && exp >= Date.now();
+  if (!entry || entry.exp < Date.now()) return null;
+  return entry;
 }
 
 // --- Authorization URL ---
@@ -48,6 +70,10 @@ export function getGrowAuthorizationUrl(state: string): string {
   if (!ENV.GROW_CLIENT_ID) {
     throw new Error("GROW_CLIENT_ID is not set — add the Clio Platform app credentials first.");
   }
+  const entry = pendingStates.get(state);
+  if (!entry) {
+    throw new Error("Unknown OAuth state — call issueOAuthState() before building the authorize URL.");
+  }
   const params = new URLSearchParams({
     response_type: "code",
     client_id: ENV.GROW_CLIENT_ID,
@@ -55,6 +81,10 @@ export function getGrowAuthorizationUrl(state: string): string {
     state,
   });
   if (ENV.GROW_OAUTH_SCOPE) params.set("scope", ENV.GROW_OAUTH_SCOPE);
+  if (entry.codeVerifier) {
+    params.set("code_challenge", s256Challenge(entry.codeVerifier));
+    params.set("code_challenge_method", "S256");
+  }
   return `${ENV.GROW_OAUTH_AUTHORIZE_URL}?${params.toString()}`;
 }
 
@@ -110,16 +140,21 @@ function expiryFrom(expiresIn: number | undefined): Date | null {
  * Exchange the authorization code, identify the attorney via Grow who_am_i,
  * and persist the token pair to the vault under provider 'clio_grow'.
  */
-export async function exchangeGrowCodeForTokens(code: string): Promise<{ email: string }> {
-  const tokens = await postTokenGrant(
-    new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      client_id: ENV.GROW_CLIENT_ID,
-      client_secret: ENV.GROW_CLIENT_SECRET,
-      redirect_uri: ENV.GROW_REDIRECT_URI,
-    })
-  );
+export async function exchangeGrowCodeForTokens(
+  code: string,
+  codeVerifier?: string
+): Promise<{ email: string }> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    client_id: ENV.GROW_CLIENT_ID,
+    client_secret: ENV.GROW_CLIENT_SECRET,
+    redirect_uri: ENV.GROW_REDIRECT_URI,
+  });
+  // PKCE: echo the verifier so Hydra can check it against the challenge sent at
+  // authorize time. Required whenever a code_challenge was included there.
+  if (codeVerifier) body.set("code_verifier", codeVerifier);
+  const tokens = await postTokenGrant(body);
 
   const me = await growWhoAmIWithToken(tokens.access_token);
   const email = String(me?.data?.email ?? "").trim().toLowerCase();

@@ -42,6 +42,14 @@ export const ENV = {
     // (401/403), the app needs its Grow-specific scope(s) too — set this to
     // "openid <grow-scope…>" using whatever the app's page in the portal lists.
     get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? "openid"; },
+    // PKCE (S256). Clio's Platform app has a "Use PKCE" option and recommends it
+    // even for confidential clients; account.clio.com (Hydra) accepts PKCE from
+    // confidential clients regardless. On by default; set GROW_OAUTH_PKCE=false
+    // only if PKCE ever causes an issue with a non-PKCE authorization server.
+    get GROW_OAUTH_PKCE() {
+        const v = (process.env.GROW_OAUTH_PKCE ?? "true").trim().toLowerCase();
+        return !(v === "false" || v === "0" || v === "no" || v === "off");
+    },
     get GROW_REDIRECT_URI() {
         return getEnv("GROW_REDIRECT_URI", `${ENV.PUBLIC_BASE_URL.replace(/\/$/, "")}/grow/oauth/callback`);
     },
