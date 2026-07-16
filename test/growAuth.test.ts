@@ -4,6 +4,7 @@ process.env.GROW_CLIENT_ID = "test-grow-client";
 process.env.GROW_CLIENT_SECRET = "test-grow-secret";
 process.env.GROW_REDIRECT_URI = "https://example.test/grow/oauth/callback";
 delete process.env.GROW_OAUTH_SCOPE; // exercise the default
+delete process.env.GROW_OAUTH_PKCE; // PKCE on by default
 
 import {
   issueOAuthState,
@@ -12,28 +13,46 @@ import {
 } from "../src/clio/growAuth";
 
 describe("Grow OAuth state", () => {
-  it("issues single-use states", () => {
+  it("issues single-use states carrying a PKCE verifier", () => {
     const state = issueOAuthState();
     expect(state).toMatch(/^[0-9a-f]{32}$/);
-    expect(consumeOAuthState(state)).toBe(true);
-    // Single-use: a second consume of the same state fails.
-    expect(consumeOAuthState(state)).toBe(false);
+    const entry = consumeOAuthState(state);
+    expect(entry).not.toBeNull();
+    expect(entry?.codeVerifier).toEqual(expect.any(String));
+    // Single-use: a second consume of the same state returns null.
+    expect(consumeOAuthState(state)).toBeNull();
   });
 
   it("rejects unknown or missing states", () => {
-    expect(consumeOAuthState("not-a-real-state")).toBe(false);
-    expect(consumeOAuthState(undefined)).toBe(false);
+    expect(consumeOAuthState("not-a-real-state")).toBeNull();
+    expect(consumeOAuthState(undefined)).toBeNull();
   });
 });
 
 describe("getGrowAuthorizationUrl", () => {
-  it("builds the authorize URL with code flow params and state", () => {
-    const url = new URL(getGrowAuthorizationUrl("abc123"));
+  it("builds the authorize URL with code flow params, state, scope, and PKCE", () => {
+    const state = issueOAuthState();
+    const url = new URL(getGrowAuthorizationUrl(state));
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("client_id")).toBe("test-grow-client");
     expect(url.searchParams.get("redirect_uri")).toBe("https://example.test/grow/oauth/callback");
-    expect(url.searchParams.get("state")).toBe("abc123");
+    expect(url.searchParams.get("state")).toBe(state);
     // account.clio.com (Hydra) requires a scope; default is "openid".
     expect(url.searchParams.get("scope")).toBe("openid");
+    // PKCE S256 challenge is present and well-formed (base64url, no padding).
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    const challenge = url.searchParams.get("code_challenge");
+    expect(challenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
+  it("throws for a state that was never issued", () => {
+    expect(() => getGrowAuthorizationUrl("never-issued")).toThrow(/Unknown OAuth state/);
+  });
+
+  it("omits PKCE params when the verifier flow is consumed (state gone)", () => {
+    // A consumed state can't build an authorize URL — verifier is single-use.
+    const state = issueOAuthState();
+    consumeOAuthState(state);
+    expect(() => getGrowAuthorizationUrl(state)).toThrow(/Unknown OAuth state/);
   });
 });
