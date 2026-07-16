@@ -25,24 +25,34 @@ Developer portal: `https://developers.api.clio.com` (also region-prefixed:
 
 ## Authentication
 
-The spec declares no `securitySchemes` block. The working model (Clio unified
-login) has two layers:
+The spec declares no `securitySchemes` block. Per Clio API Support, a Grow
+(Clio Platform / "API Hub") app uses its own OAuth 2.0 authorization-code
+flow — distinct from both Clio Identity/SSO and the legacy Manage API:
 
-- **Clio Identity** (`account.clio.com`, OIDC) is the sign-in layer shared by
-  all Clio products. Identity tokens are for SSO only — Clio's own docs note
-  Identity access tokens are not used for API calls.
-- **API authorization** is a per-app OAuth grant. The app is *registered* in
-  Clio's developer portal (`developers.api.clio.com`), but authorization runs
-  through **Clio Identity at `account.clio.com`** — an Ory Hydra OAuth2 server:
-  `https://account.clio.com/oauth2/auth` (authorize) and
-  `https://account.clio.com/oauth2/token` (token). This is neither the portal
-  domain nor the legacy Manage OAuth server (`app.clio.com/oauth/*`) — a Grow
-  `client_id` is unknown to `app.clio.com` (it returns "client_id is
-  incorrect"). Confirmed empirically: logging into `grow.clio.com` redirects to
-  `account.clio.com/login?login_challenge=…`. The account host is global (not
-  region-prefixed); the data region lives in `GROW_API_BASE_URL`. Defaults are
-  overridable via `GROW_OAUTH_AUTHORIZE_URL` / `GROW_OAUTH_TOKEN_URL`, and
-  `GROW_OAUTH_SCOPE` if Hydra requires an explicit scope.
+- **Authorization server: the API Hub, `auth.api.clio.com`.**
+  `https://auth.api.clio.com/oauth/authorize` (authorize) and
+  `https://auth.api.clio.com/oauth/token` (token). This is a THIRD host —
+  **not** Clio Identity (`account.clio.com`, SSO/OIDC only) and **not** the
+  legacy Manage OAuth (`app.clio.com`). A Grow App Key is registered in none of
+  the others: `app.clio.com` rejects it with "client_id is incorrect / select
+  region" and `account.clio.com` with `invalid_client` "OAuth 2.0 Client does
+  not exist". US host shown; other regions may use a prefixed host.
+- **`client_id` is the app's App Key** (distinct from the App ID shown in the
+  portal's app list). App Secret is the client secret.
+- **Scopes are Grow-specific** — e.g. `grow_contact_read`, `grow_matter_read`,
+  `grow_lead_inbox_read`, `grow_user_read` (and `_write` counterparts). Do NOT
+  send `openid`/`offline_access`; a `refresh_token` is returned automatically.
+  The requested scopes must be a subset of the app's selected App Permissions.
+- **Private apps** authorize only for members of the owning firm, and the
+  authorizing user's Clio Grow account must be linked to their Clio Manage
+  account under the *same email*, or Clio returns "Private application access
+  denied".
+- **Redirect URI** must be a strict 1:1 match with what's registered on the app
+  (protocol, domain, path, no trailing-slash drift) or the Hub returns 400.
+
+All of the above are env-configurable: `GROW_OAUTH_AUTHORIZE_URL`,
+`GROW_OAUTH_TOKEN_URL`, `GROW_OAUTH_SCOPE`, `GROW_OAUTH_PKCE`,
+`GROW_REDIRECT_URI`.
 
 This server integrates via a dedicated Clio Platform app (`GROW_CLIENT_ID` /
 `GROW_CLIENT_SECRET`, created in the developer portal with redirect URL
