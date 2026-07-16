@@ -23,29 +23,31 @@ export const ENV = {
     // calls fall back to the Manage token.
     get GROW_CLIENT_ID() { return process.env.GROW_CLIENT_ID ?? ""; },
     get GROW_CLIENT_SECRET() { return process.env.GROW_CLIENT_SECRET ?? ""; },
-    // OAuth endpoints for the Platform (Grow) app. Grow apps are registered in
-    // the developer portal (developers.api.clio.com) but authorize through Clio
-    // IDENTITY at account.clio.com — an Ory Hydra OAuth2 server, NOT the legacy
-    // Manage OAuth on app.clio.com and NOT the portal domain. (Confirmed: logging
-    // into grow.clio.com redirects to account.clio.com/login?login_challenge=…,
-    // and Clio's SSO docs document account.clio.com/oauth2/{auth,token}.) A Grow
-    // client_id is unknown to app.clio.com's registry, which is why that host
-    // returned "client_id is incorrect". Hydra's standard paths are /oauth2/auth
-    // and /oauth2/token. Account host is global (not region-prefixed); the region
-    // lives in GROW_API_BASE_URL. Override if the app page says otherwise.
-    get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", "https://account.clio.com/oauth2/auth"); },
-    get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://account.clio.com/oauth2/token"); },
-    // Space-separated OAuth scopes. account.clio.com (Hydra) requires a scope on
-    // the authorize request — omitting it returns a 400 "could not complete the
-    // request as formatted". Default to "openid" (the baseline Clio Identity
-    // scope, per Clio's SSO docs). If the Grow API then rejects the token
-    // (401/403), the app needs its Grow-specific scope(s) too — set this to
-    // "openid <grow-scope…>" using whatever the app's page in the portal lists.
-    get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? "openid"; },
-    // PKCE (S256). Clio's Platform app has a "Use PKCE" option and recommends it
-    // even for confidential clients; account.clio.com (Hydra) accepts PKCE from
-    // confidential clients regardless. On by default; set GROW_OAUTH_PKCE=false
-    // only if PKCE ever causes an issue with a non-PKCE authorization server.
+    // OAuth endpoints for the Platform (Grow) app. Clio Grow apps are created in
+    // the API Hub developer portal (developers.api.clio.com) and authorize through
+    // the API Hub auth server at auth.api.clio.com — confirmed by Clio API Support.
+    // This is a THIRD host, distinct from Clio Identity/SSO (account.clio.com) and
+    // the legacy Manage OAuth (app.clio.com); a Grow App Key exists in none of the
+    // others' registries. US host shown; other regions may use a prefixed host —
+    // override if so. Both endpoints stay env-overridable.
+    get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", "https://auth.api.clio.com/oauth/authorize"); },
+    get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://auth.api.clio.com/oauth/token"); },
+    // Space-separated OAuth scopes. Per Clio API Support, Grow uses Grow-SPECIFIC
+    // scopes (grow_contact_read, grow_matter_read, grow_lead_inbox_read,
+    // grow_user_read, and their _write counterparts) — NOT openid/offline_access
+    // (a refresh_token is returned automatically on the authorization_code grant).
+    // The requested scopes must be a subset of the App Permissions selected on the
+    // app in the portal; set GROW_OAUTH_SCOPE to match those exactly (add _write
+    // scopes to enable the create/delete tools). Default covers the four confirmed
+    // read scopes so the read tools + grow_who_am_i work out of the box.
+    get GROW_OAUTH_SCOPE() {
+        return process.env.GROW_OAUTH_SCOPE ??
+            "grow_contact_read grow_matter_read grow_lead_inbox_read grow_user_read";
+    },
+    // PKCE (S256). Clio's Platform app has an optional "Use PKCE" toggle. Set
+    // GROW_OAUTH_PKCE to match that toggle: on by default (sending a code_challenge
+    // is RFC-recommended and normally accepted even by non-enforcing servers); set
+    // GROW_OAUTH_PKCE=false if the app does NOT have PKCE enabled and it errors.
     get GROW_OAUTH_PKCE() {
         const v = (process.env.GROW_OAUTH_PKCE ?? "true").trim().toLowerCase();
         return !(v === "false" || v === "0" || v === "no" || v === "off");

@@ -37,8 +37,11 @@ describe("getGrowAuthorizationUrl", () => {
     expect(url.searchParams.get("client_id")).toBe("test-grow-client");
     expect(url.searchParams.get("redirect_uri")).toBe("https://example.test/grow/oauth/callback");
     expect(url.searchParams.get("state")).toBe(state);
-    // account.clio.com (Hydra) requires a scope; default is "openid".
-    expect(url.searchParams.get("scope")).toBe("openid");
+    // Grow uses Grow-specific scopes (not openid); default covers the four
+    // confirmed read scopes.
+    expect(url.searchParams.get("scope")).toBe(
+      "grow_contact_read grow_matter_read grow_lead_inbox_read grow_user_read"
+    );
     // PKCE S256 challenge is present and well-formed (base64url, no padding).
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     const challenge = url.searchParams.get("code_challenge");
