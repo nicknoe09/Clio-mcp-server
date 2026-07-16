@@ -193,7 +193,7 @@ export async function getActingClioIdentity(): Promise<{ id: number; email: stri
  * email) lets the write proceed — the guard only ever blocks on a CONFIRMED
  * email mismatch. Disable entirely with DISABLE_CLIO_IDENTITY_GUARD=true.
  */
-async function assertActingClioIdentity(): Promise<void> {
+export async function assertActingClioIdentity(): Promise<void> {
   if (process.env.DISABLE_CLIO_IDENTITY_GUARD === "true") return;
   const ctx = getContext();
   if (!ctx || !ctx.userEmail) return; // no signed-in identity to compare against

@@ -13,6 +13,10 @@ export const ENV = {
     PORT: parseInt(getEnv("PORT", "3000"), 10),
     get CLIO_BASE_URL() { return getEnv("CLIO_BASE_URL", "https://app.clio.com"); },
     get CLIO_API_BASE_URL() { return getEnv("CLIO_API_BASE_URL", "https://app.clio.com/api/v4"); },
+    // Clio Grow API v2 (see docs/clio-grow-api-reference.md). Same per-user
+    // bearer tokens as Manage (unified login); region-specific hosts exist
+    // (eu./ca./au. prefixes) if the firm's Grow account is not US.
+    get GROW_API_BASE_URL() { return getEnv("GROW_API_BASE_URL", "https://api.clio.com/grow"); },
     // CLIO_CLIENT_ID / SECRET are still required — they refresh each attorney's
     // per-user Clio token (must be the SAME Clio OAuth app the platform uses).
     get CLIO_CLIENT_ID() { return getEnv("CLIO_CLIENT_ID"); },

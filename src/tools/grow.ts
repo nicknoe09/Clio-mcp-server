@@ -1,0 +1,449 @@
+import { z } from "zod/v4";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ENV } from "../utils/env";
+import {
+  growGetSingle,
+  growFetchAllPages,
+  growPostSingle,
+  growDeleteSingle,
+} from "../clio/grow";
+
+// MCP tools for the Clio Grow API v2 (intake/CRM), covering every endpoint in
+// docs/clio-grow.openapi.yaml. Grow is a separate product surface from Manage:
+// its contacts/matters are intake-pipeline records that carry a `clio_id`
+// pointing at the synced Clio Manage record, which is the join key back to the
+// Manage tools in the rest of this server.
+
+// Shared list-filter inputs (Grow supports these on every list endpoint).
+const sinceFilters = {
+  created_since: z
+    .string()
+    .optional()
+    .describe("Only results created on/after this ISO-8601 timestamp, e.g. 2026-01-01T00:00:00Z"),
+  updated_since: z
+    .string()
+    .optional()
+    .describe("Only results updated on/after this ISO-8601 timestamp"),
+  ids: z
+    .array(z.number())
+    .optional()
+    .describe("Filter to specific Grow resource IDs (max 50)"),
+  max_results: z
+    .number()
+    .optional()
+    .describe("Cap the number of returned rows (default: all pages)"),
+};
+
+// `ids` is applied client-side (filterByIds) - Grow expects repeated ids[]
+// params, which the shared buildQueryString can't express.
+export function growListParams(args: {
+  created_since?: string;
+  updated_since?: string;
+  ids?: number[];
+}): Record<string, any> {
+  const params: Record<string, any> = {};
+  if (args.created_since) params.created_since = args.created_since;
+  if (args.updated_since) params.updated_since = args.updated_since;
+  return params;
+}
+
+function ok(payload: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+function growError(err: any) {
+  const status = err.response?.status;
+  const authHint =
+    status === 401 || status === 403
+      ? "If Manage tools work but every Grow tool returns 401/403, the shared Clio OAuth app does not yet have Grow API access — enable it for the app in Clio's developer portal (developers.api.clio.com). See docs/clio-grow-api-reference.md."
+      : undefined;
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify({
+          error: true,
+          message: err.message,
+          status,
+          grow_error: err.response?.data,
+          ...(authHint ? { hint: authHint } : {}),
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+/** Client-side ids[] filter (Grow repeats the param; simpler to filter here). */
+function filterByIds<T extends { id?: number }>(rows: T[], ids?: number[]): T[] {
+  if (!ids?.length) return rows;
+  const wanted = new Set(ids);
+  return rows.filter((r) => r.id != null && wanted.has(r.id));
+}
+
+/** Aggregate Grow matters + leads into an intake-funnel summary (pure, unit-tested). */
+export function summarizeGrowPipeline(
+  matters: any[],
+  leads: { untriaged: number; ignored: number } | null
+) {
+  const byCategory: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const byType: Record<string, number> = {};
+  let hired = 0;
+  for (const m of matters) {
+    const cat = m.status_category ?? "unknown";
+    byCategory[cat] = (byCategory[cat] ?? 0) + 1;
+    const status = m.status ?? "unknown";
+    byStatus[status] = (byStatus[status] ?? 0) + 1;
+    const type = m.type ?? "unknown";
+    byType[type] = (byType[type] ?? 0) + 1;
+    if (m.hired_date) hired += 1;
+  }
+  return {
+    matters_total: matters.length,
+    by_status_category: byCategory,
+    by_status: byStatus,
+    by_matter_type: byType,
+    with_hired_date: hired,
+    inbox_leads: leads,
+  };
+}
+
+export function registerGrowTools(server: McpServer): void {
+  // grow_who_am_i — doubles as the auth probe for the Grow API. Manage and
+  // Grow share Clio's unified login, but Grow access must be enabled on the
+  // OAuth app; this tool proves out the token against Grow in one call.
+  server.tool(
+    "grow_who_am_i",
+    "Verify Clio Grow API access and return the current Grow user + firm (GET /users/who_am_i on the Grow API). Use this FIRST if any other grow_* tool errors: a 401/403 here while Manage who_am_i works means the Clio OAuth app needs Grow API access enabled in the developer portal.",
+    {},
+    async () => {
+      try {
+        const me = await growGetSingle("/users/who_am_i");
+        return ok({
+          grow_api_base_url: ENV.GROW_API_BASE_URL,
+          grow_access: "confirmed",
+          user: me?.data ?? me,
+        });
+      } catch (err: any) {
+        const status = err.response?.status;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: true,
+                grow_api_base_url: ENV.GROW_API_BASE_URL,
+                grow_access: "FAILED",
+                status,
+                grow_error: err.response?.data,
+                diagnosis:
+                  status === 401 || status === 403
+                    ? "Your Clio token was rejected by the Grow API. Manage and Grow use unified login, but the OAuth app must have Grow API access enabled (developers.api.clio.com). If the firm's Grow account is in another region, set GROW_API_BASE_URL (eu./ca./au. prefix)."
+                    : status === 404
+                      ? "Endpoint not found — GROW_API_BASE_URL may be wrong for this account's region."
+                      : `Unexpected failure: ${err.message}`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_contacts",
+    "List/search Clio Grow (intake CRM) contacts, or fetch one by contact_id. Returns name, emails, phone_numbers, type (Person/Company), intake status (e.g. Unassigned/Intake/Hired/Did Not Hire), associated Grow matter ids, addresses, and clio_id (the synced Clio Manage contact ID — use it to join to Manage tools like get_contacts).",
+    {
+      contact_id: z.number().optional().describe("Fetch a single Grow contact by ID (ignores other filters)"),
+      query: z.string().optional().describe("Search across contact names, emails, and phone numbers"),
+      ...sinceFilters,
+    },
+    async ({ contact_id, query, created_since, updated_since, ids, max_results }) => {
+      try {
+        if (contact_id) {
+          const res = await growGetSingle(`/contacts/${contact_id}`);
+          return ok({ contact: res?.data ?? res });
+        }
+        const params = growListParams({ created_since, updated_since });
+        if (query) params.query = query;
+        const rows = filterByIds(
+          await growFetchAllPages<any>("/contacts", params, max_results),
+          ids
+        );
+        return ok({ count: rows.length, contacts: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_matters",
+    "List Clio Grow (intake CRM) matters, or fetch one by matter_id. Grow matters are pipeline records: status_category (intake/hired/declined), status, matter type, hired_date, location, client summary, assignee user ids, inbox_lead_id, is_locked, and clio_id (the synced Clio Manage matter ID — join key to Manage tools like get_matter / get_matter_financial_summary). Filter by inbox_lead_id to find the matter created from a lead, or submitted_only for matters submitted by this app.",
+    {
+      matter_id: z.number().optional().describe("Fetch a single Grow matter by ID (ignores other filters)"),
+      inbox_lead_id: z.number().optional().describe("Only matters created from this inbox lead"),
+      submitted_only: z.boolean().optional().describe("Only matters submitted by the current application"),
+      ...sinceFilters,
+    },
+    async ({ matter_id, inbox_lead_id, submitted_only, created_since, updated_since, ids, max_results }) => {
+      try {
+        if (matter_id) {
+          const res = await growGetSingle(`/matters/${matter_id}`);
+          return ok({ matter: res?.data ?? res });
+        }
+        const params = growListParams({ created_since, updated_since });
+        if (inbox_lead_id) params.inbox_lead_id = inbox_lead_id;
+        if (submitted_only !== undefined) params.submitted_only = submitted_only;
+        const rows = filterByIds(
+          await growFetchAllPages<any>("/matters", params, max_results),
+          ids
+        );
+        return ok({ count: rows.length, matters: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_notes",
+    "List notes on a Clio Grow contact or matter (the Grow-side notes, separate from Clio Manage notes). Returns id, subject, body, timestamps.",
+    {
+      parent_type: z.enum(["contact", "matter"]).describe("Whether parent_id is a Grow contact or Grow matter"),
+      parent_id: z.number().describe("The Grow contact ID or matter ID"),
+      ...sinceFilters,
+    },
+    async ({ parent_type, parent_id, created_since, updated_since, ids, max_results }) => {
+      try {
+        const path = parent_type === "contact" ? `/contacts/${parent_id}/notes` : `/matters/${parent_id}/notes`;
+        const params = growListParams({ created_since, updated_since });
+        const rows = filterByIds(await growFetchAllPages<any>(path, params, max_results), ids);
+        return ok({ parent_type, parent_id, count: rows.length, notes: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "create_grow_note",
+    "Create a note on a Clio Grow contact or matter (e.g. an intake follow-up note). subject max 255 chars, body max 65535.",
+    {
+      parent_type: z.enum(["contact", "matter"]).describe("Whether parent_id is a Grow contact or Grow matter"),
+      parent_id: z.number().describe("The Grow contact ID or matter ID"),
+      subject: z.string().max(255).describe("Subject line of the note"),
+      body: z.string().max(65535).describe("Body content of the note"),
+    },
+    async ({ parent_type, parent_id, subject, body }) => {
+      try {
+        const path = parent_type === "contact" ? `/contacts/${parent_id}/notes` : `/matters/${parent_id}/notes`;
+        const res = await growPostSingle(path, { data: { subject, body } });
+        return ok({ created: true, parent_type, parent_id, note: res?.data ?? res });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_inbox_leads",
+    "List Clio Grow inbox leads (new/unprocessed intake leads), or fetch one by lead_id. state is required by the API: 'untriaged' (default — awaiting triage) or 'ignored'. Returns name, email, phone_number, state, timestamps. Note: leads already converted to matters no longer appear here — use get_grow_matters with inbox_lead_id instead.",
+    {
+      lead_id: z.number().optional().describe("Fetch a single inbox lead by ID (ignores other filters)"),
+      state: z.enum(["untriaged", "ignored"]).optional().describe("Lead state to list (default 'untriaged')"),
+      query: z.string().optional().describe("Search string for filtering leads"),
+      ...sinceFilters,
+    },
+    async ({ lead_id, state, query, created_since, updated_since, ids, max_results }) => {
+      try {
+        if (lead_id) {
+          const res = await growGetSingle(`/inbox_leads/${lead_id}`);
+          return ok({ inbox_lead: res?.data ?? res });
+        }
+        const params = growListParams({ created_since, updated_since });
+        params.state = state ?? "untriaged";
+        if (query) params.query = query;
+        const rows = filterByIds(
+          await growFetchAllPages<any>("/inbox_leads", params, max_results),
+          ids
+        );
+        return ok({ state: params.state, count: rows.length, inbox_leads: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "create_grow_inbox_lead",
+    "Submit a new lead into the Clio Grow lead inbox (the API successor to the legacy grow.clio.com/inbox_leads form endpoint). Required: first_name, last_name, from_message, referring_url, from_source. Optionally attach email, phone_number, and a marketing_source_id (a Grow Source id from get_grow_sources).",
+    {
+      first_name: z.string().describe("First name of the lead"),
+      last_name: z.string().describe("Last name of the lead"),
+      from_message: z.string().describe("Message content from the lead"),
+      referring_url: z.string().describe("URL the lead came from"),
+      from_source: z.string().describe("Source of the lead, e.g. 'website_chat'"),
+      email: z.string().optional().describe("Email address of the lead"),
+      phone_number: z.string().optional().describe("Phone number of the lead"),
+      marketing_source_id: z
+        .number()
+        .optional()
+        .describe("ID of the Grow Source (marketing source) to associate — see get_grow_sources"),
+    },
+    async ({ first_name, last_name, from_message, referring_url, from_source, email, phone_number, marketing_source_id }) => {
+      try {
+        const data: Record<string, any> = { first_name, last_name, from_message, referring_url, from_source };
+        if (email) data.email = email;
+        if (phone_number) data.phone_number = phone_number;
+        if (marketing_source_id) data.marketing_source = { id: marketing_source_id };
+        const res = await growPostSingle("/inbox_leads", { data });
+        return ok({ created: true, inbox_lead: res?.data ?? res });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_sources",
+    "List the firm's Clio Grow lead sources (marketing sources) — id, name, category (standard | clio_email_marketing), is_editable.",
+    { ...sinceFilters },
+    async ({ created_since, updated_since, ids, max_results }) => {
+      try {
+        const params = growListParams({ created_since, updated_since });
+        const rows = filterByIds(await growFetchAllPages<any>("/sources", params, max_results), ids);
+        return ok({ count: rows.length, sources: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "create_grow_source",
+    "Create a new Clio Grow lead source (marketing source). Name must be unique per account (case-insensitive).",
+    { name: z.string().max(255).describe("Name of the lead source") },
+    async ({ name }) => {
+      try {
+        const res = await growPostSingle("/sources", { data: { name } });
+        return ok({ created: true, source: res?.data ?? res });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_users",
+    "List users in the firm's Clio Grow account — id, name, email, and the account (firm) they belong to. Grow user IDs are what get_grow_matters returns in matter_assignee_ids.",
+    { ...sinceFilters },
+    async ({ created_since, updated_since, ids, max_results }) => {
+      try {
+        const params = growListParams({ created_since, updated_since });
+        const rows = filterByIds(await growFetchAllPages<any>("/users", params, max_results), ids);
+        return ok({ count: rows.length, users: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_custom_actions",
+    "List this app's Clio Grow custom actions (links injected into Grow UI dropdowns; currently only on the matter page).",
+    { ...sinceFilters },
+    async ({ created_since, updated_since, ids, max_results }) => {
+      try {
+        const params = growListParams({ created_since, updated_since });
+        const rows = filterByIds(await growFetchAllPages<any>("/custom_actions", params, max_results), ids);
+        return ok({ count: rows.length, custom_actions: rows });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "create_grow_custom_action",
+    "Create a Clio Grow custom action: a labeled link (6-32 chars) shown in the Grow matter page dropdown that opens target_url (must be https). Clio appends a single-use custom_action_nonce (60s expiry) to the URL for validating the click server-side.",
+    {
+      label: z.string().min(6).max(32).describe("Label shown in the Grow UI (6-32 chars)"),
+      target_url: z.string().describe("HTTPS URL opened when the action is clicked"),
+      ui_reference: z
+        .enum(["matters/show"])
+        .optional()
+        .describe("Where the action appears; only 'matters/show' is supported (default)"),
+    },
+    async ({ label, target_url, ui_reference }) => {
+      try {
+        const res = await growPostSingle("/custom_actions", {
+          data: { label, target_url, ui_reference: ui_reference ?? "matters/show" },
+        });
+        return ok({ created: true, custom_action: res?.data ?? res });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "delete_grow_custom_action",
+    "Delete a Clio Grow custom action by ID (removes the link from the Grow UI).",
+    { custom_action_id: z.number().describe("The custom action ID to delete") },
+    async ({ custom_action_id }) => {
+      try {
+        await growDeleteSingle(`/custom_actions/${custom_action_id}`);
+        return ok({ deleted: true, custom_action_id });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+
+  server.tool(
+    "get_grow_pipeline_report",
+    "Intake pipeline snapshot from Clio Grow: matter counts by status_category (intake/hired/declined), by status, by matter type, count with a hired_date, plus untriaged/ignored inbox lead counts. Scope with created_since/updated_since (e.g. this quarter's intake). Join hired matters back to Manage revenue via each matter's clio_id.",
+    {
+      created_since: sinceFilters.created_since,
+      updated_since: sinceFilters.updated_since,
+      include_leads: z
+        .boolean()
+        .optional()
+        .describe("Also count untriaged/ignored inbox leads (default true)"),
+      include_matters: z
+        .boolean()
+        .optional()
+        .describe("Include the underlying matter rows in the response (default false — summary only)"),
+    },
+    async ({ created_since, updated_since, include_leads, include_matters }) => {
+      try {
+        const params = growListParams({ created_since, updated_since });
+        const matters = await growFetchAllPages<any>("/matters", params);
+
+        let leads: { untriaged: number; ignored: number } | null = null;
+        if (include_leads !== false) {
+          const leadParams = growListParams({ created_since, updated_since });
+          const [untriaged, ignored] = await Promise.all([
+            growFetchAllPages<any>("/inbox_leads", { ...leadParams, state: "untriaged" }),
+            growFetchAllPages<any>("/inbox_leads", { ...leadParams, state: "ignored" }),
+          ]);
+          leads = { untriaged: untriaged.length, ignored: ignored.length };
+        }
+
+        const summary = summarizeGrowPipeline(matters, leads);
+        return ok({
+          window: { created_since: created_since ?? null, updated_since: updated_since ?? null },
+          ...summary,
+          ...(include_matters ? { matters } : {}),
+        });
+      } catch (err: any) {
+        return growError(err);
+      }
+    }
+  );
+}
