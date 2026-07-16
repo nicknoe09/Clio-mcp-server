@@ -199,6 +199,27 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 | `find_matters_by_custom_field` | Find matters by a CustomField value via ONE bulk paginated query (avoids per-matter brute force) |
 | `set_matter_custom_field_value` | Write/update/clear a single Matter CustomField value (handles picklist label lookup, checkbox booleans, contact ids, etc.) |
 
+### Clio Grow (intake CRM) tools
+
+Full coverage of the Clio Grow API v2 (see `docs/clio-grow-api-reference.md`).
+Grow is a separate host (`GROW_API_BASE_URL`, default `https://api.clio.com/grow`)
+reached with the **same per-user Clio tokens** as Manage; run `grow_who_am_i`
+first — a 401/403 there while Manage works means the shared Clio OAuth app
+still needs Grow API access enabled in Clio's developer portal.
+
+| Tool | Description |
+|------|-------------|
+| `grow_who_am_i` | Verify Grow API access; returns the current Grow user + firm (the auth probe) |
+| `get_grow_contacts` | List/search Grow contacts or fetch one; includes intake `status` and `clio_id` (synced Manage contact ID) |
+| `get_grow_matters` | List Grow pipeline matters or fetch one; `status_category` (intake/hired/declined), `hired_date`, `clio_id` join key, `inbox_lead_id`/`submitted_only` filters |
+| `get_grow_notes` / `create_grow_note` | Read/write notes on a Grow contact or matter |
+| `get_grow_inbox_leads` | List untriaged/ignored inbox leads or fetch one |
+| `create_grow_inbox_lead` | Submit a lead into the Grow lead inbox (API successor to the legacy form endpoint) |
+| `get_grow_sources` / `create_grow_source` | List/create the firm's lead (marketing) sources |
+| `get_grow_users` | List Grow account users (IDs match `matter_assignee_ids`) |
+| `get_grow_custom_actions` / `create_grow_custom_action` / `delete_grow_custom_action` | Manage links injected into the Grow matter-page dropdown |
+| `get_grow_pipeline_report` | Intake funnel snapshot: matter counts by status category/status/type, hired count, lead counts |
+
 ## Troubleshooting
 
 | Problem | Solution |

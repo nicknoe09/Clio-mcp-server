@@ -25,14 +25,22 @@ Developer portal: `https://developers.api.clio.com` (also region-prefixed:
 
 ## Authentication
 
-The spec declares no `securitySchemes` block, but the Custom Actions
-documentation references OAuth tokens, and access is provisioned through the
-Clio developer portal (Clio Platform apps). Practically: OAuth bearer tokens
-issued to a developer-portal application — the same model as Manage v4, but note
-this server's existing tokens are minted against `CLIO_BASE_URL` (`app.clio.com`)
-with Manage scopes; whether an existing Manage token is honored by
-`api.clio.com/grow` or a separate grant/scope is required must be verified
-empirically before building tools on it.
+The spec declares no `securitySchemes` block. The working model (Clio unified
+login) has two layers:
+
+- **Clio Identity** (`account.clio.com`, OIDC) is the sign-in layer shared by
+  all Clio products. Identity tokens are for SSO only — Clio's own docs note
+  Identity access tokens are not used for API calls.
+- **API authorization** is a per-app OAuth grant. Grow API access is enabled
+  on the application in Clio's developer portal (`developers.api.clio.com`);
+  the resulting bearer tokens are what `api.clio.com/grow` accepts.
+
+This server assumes the firm's existing per-user OAuth tokens (minted by the
+shared Clio app, `CLIO_CLIENT_ID`) are honored by the Grow host, and reuses
+the same token store and 401-refresh path. The `grow_who_am_i` tool verifies
+this empirically in one call: success confirms unified access; a 401/403 while
+Manage `who_am_i` works means Grow API access must be enabled on the app in
+the developer portal.
 
 Support: `api@clio.com` (API issues), `api.partnerships@clio.com` (partnerships).
 
@@ -92,10 +100,16 @@ Support: `api@clio.com` (API issues), `api.partnerships@clio.com` (partnerships)
   Custom-action clicks include a single-use `custom_action_nonce` (60s expiry)
   that must be echoed as a query parameter on the follow-up API call, else 403.
 
-## Relevance to this MCP server
+## Implementation in this MCP server
 
-This server currently only speaks Clio Manage API v4. The Grow v2 API opens up
-intake/CRM data that Manage does not expose:
+Implemented: `src/clio/grow.ts` (HTTP client — same per-user bearer tokens,
+401 refresh, and 429 backoff as the Manage layer; cursor pagination over
+`meta.paging.next`) and `src/tools/grow.ts` (MCP tools covering every endpoint,
+plus `get_grow_pipeline_report` and the `grow_who_am_i` auth probe). Base URL
+is `GROW_API_BASE_URL` (default `https://api.clio.com/grow`; set the `eu.` /
+`ca.` / `au.` host if the firm's Grow account is in another region).
+
+The Grow v2 API opens up intake/CRM data that Manage does not expose:
 
 1. **Pipeline visibility** — lead → intake → hired/declined funnel
    (`inbox_leads`, `matters.status_category`, `hired_date`), enabling intake
@@ -109,11 +123,9 @@ intake/CRM data that Manage does not expose:
 4. **Notes writeback** — intake follow-up notes can be written to Grow contacts
    and matters.
 
-Open questions to resolve before implementing Grow tools:
+Remaining unknowns (verify with `grow_who_am_i` after deploy):
 
-- Whether the firm's existing Clio OAuth app (`CLIO_CLIENT_ID`) can be granted
-  Grow API access, and whether per-attorney tokens in the vault work against
-  `api.clio.com/grow` or a separate authorization flow/scope is needed.
-- Rate limits (429 is documented, limits are not) — reuse `src/clio/rateLimit.ts`
-  handling.
-- Whether the firm's Grow subscription/region matches `CLIO_BASE_URL` (US).
+- Whether the firm's Clio OAuth app already has Grow API access enabled, or
+  needs it granted in the developer portal first.
+- Actual rate limits (429 is documented, limits are not) — handled by the
+  shared exponential backoff either way.

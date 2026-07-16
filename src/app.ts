@@ -30,6 +30,7 @@ import { registerMorningReportTools } from "./tools/morningReport";
 import { registerVersionTools } from "./tools/version";
 import { registerWhoAmITools } from "./tools/whoami";
 import { registerNoteTools } from "./tools/notes";
+import { registerGrowTools } from "./tools/grow";
 import reviewRouter from "./routes/review";
 import uploadRouter from "./routes/upload";
 import { getDownload } from "./utils/downloadStore";
@@ -69,6 +70,7 @@ export function createMcpServer(): McpServer {
     registerVersionTools(server);
     registerWhoAmITools(server);
     registerNoteTools(server);
+    registerGrowTools(server);
 
     if (!loggedRegistration) {
       loggedRegistration = true;
