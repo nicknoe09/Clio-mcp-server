@@ -18,6 +18,10 @@ export const FIRM_ROSTER: RosterMember[] = [
   { initials: "AKG", name: "Kaz Gonzalez", user_id: 358550509 },
   { initials: "TBS", name: "Tzipora Simmons", user_id: 359711375 },
   { initials: "MNH", name: "May Huynh", user_id: 359576660 },
+  // Jonathan Barbee — terminated July 2026. KEEP through 2026 year-end (like
+  // AFL) so his Jan–Jul dashboard rows stay updatable and collections on his
+  // old invoices keep attributing to his 26 Compare row; drop for 2027. He is
+  // already off the weekly goal sheets (see WEEKLY_GOALS_ROSTER).
   { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
   { initials: "KGV", name: "Gus Vlahadamis", user_id: 360049685 },
   { initials: "CTD", name: "Courteney Daniel", user_id: 359865560 },
