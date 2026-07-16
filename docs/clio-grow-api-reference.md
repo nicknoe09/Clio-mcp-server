@@ -33,11 +33,16 @@ login) has two layers:
   Identity access tokens are not used for API calls.
 - **API authorization** is a per-app OAuth grant. The app is *registered* in
   Clio's developer portal (`developers.api.clio.com`), but authorization runs
-  through the **same OAuth endpoints as Manage** — `https://app.clio.com/oauth/authorize`
-  and `.../oauth/token` (the `eu.`/`ca.`/`au.` host for other regions) — i.e.
-  Clio unified login. The portal domain is NOT an OAuth server. These default
-  off `CLIO_BASE_URL`; override with `GROW_OAUTH_AUTHORIZE_URL` /
-  `GROW_OAUTH_TOKEN_URL` only if the app page says otherwise.
+  through **Clio Identity at `account.clio.com`** — an Ory Hydra OAuth2 server:
+  `https://account.clio.com/oauth2/auth` (authorize) and
+  `https://account.clio.com/oauth2/token` (token). This is neither the portal
+  domain nor the legacy Manage OAuth server (`app.clio.com/oauth/*`) — a Grow
+  `client_id` is unknown to `app.clio.com` (it returns "client_id is
+  incorrect"). Confirmed empirically: logging into `grow.clio.com` redirects to
+  `account.clio.com/login?login_challenge=…`. The account host is global (not
+  region-prefixed); the data region lives in `GROW_API_BASE_URL`. Defaults are
+  overridable via `GROW_OAUTH_AUTHORIZE_URL` / `GROW_OAUTH_TOKEN_URL`, and
+  `GROW_OAUTH_SCOPE` if Hydra requires an explicit scope.
 
 This server integrates via a dedicated Clio Platform app (`GROW_CLIENT_ID` /
 `GROW_CLIENT_SECRET`, created in the developer portal with redirect URL

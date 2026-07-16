@@ -23,16 +23,21 @@ export const ENV = {
     // calls fall back to the Manage token.
     get GROW_CLIENT_ID() { return process.env.GROW_CLIENT_ID ?? ""; },
     get GROW_CLIENT_SECRET() { return process.env.GROW_CLIENT_SECRET ?? ""; },
-    // OAuth endpoints for the Platform app. Clio's Platform API (which the Grow
-    // API is part of) authorizes through the SAME endpoints as Manage — Clio
-    // unified login — so these default off CLIO_BASE_URL (app.clio.com, or the
-    // eu./ca./au. host in that var). developers.api.clio.com is only where the
-    // app is registered; it is NOT an OAuth server. Override if the portal says
-    // otherwise.
-    get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", `${ENV.CLIO_BASE_URL.replace(/\/$/, "")}/oauth/authorize`); },
-    get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", `${ENV.CLIO_BASE_URL.replace(/\/$/, "")}/oauth/token`); },
-    // Optional space-separated scopes; most Platform apps declare permissions
-    // in-portal, so this stays empty unless the portal says otherwise.
+    // OAuth endpoints for the Platform (Grow) app. Grow apps are registered in
+    // the developer portal (developers.api.clio.com) but authorize through Clio
+    // IDENTITY at account.clio.com — an Ory Hydra OAuth2 server, NOT the legacy
+    // Manage OAuth on app.clio.com and NOT the portal domain. (Confirmed: logging
+    // into grow.clio.com redirects to account.clio.com/login?login_challenge=…,
+    // and Clio's SSO docs document account.clio.com/oauth2/{auth,token}.) A Grow
+    // client_id is unknown to app.clio.com's registry, which is why that host
+    // returned "client_id is incorrect". Hydra's standard paths are /oauth2/auth
+    // and /oauth2/token. Account host is global (not region-prefixed); the region
+    // lives in GROW_API_BASE_URL. Override if the app page says otherwise.
+    get GROW_OAUTH_AUTHORIZE_URL() { return getEnv("GROW_OAUTH_AUTHORIZE_URL", "https://account.clio.com/oauth2/auth"); },
+    get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://account.clio.com/oauth2/token"); },
+    // Optional space-separated scopes. account.clio.com (Hydra) may require a
+    // scope (e.g. "openid" and/or Grow-specific scopes shown on the app page);
+    // set this if the authorize step returns an invalid_scope / missing-scope error.
     get GROW_OAUTH_SCOPE() { return process.env.GROW_OAUTH_SCOPE ?? ""; },
     get GROW_REDIRECT_URI() {
         return getEnv("GROW_REDIRECT_URI", `${ENV.PUBLIC_BASE_URL.replace(/\/$/, "")}/grow/oauth/callback`);
