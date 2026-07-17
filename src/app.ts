@@ -58,7 +58,7 @@ export function createMcpServer(): McpServer {
   try {
     const server = new McpServer({
       name: "clio-mcp",
-      version: "1.0.0",
+      version: "1.2.0",
     });
 
     registerMatterTools(server);
@@ -235,7 +235,7 @@ export function createApp(): express.Express {
     res.json({
       status: "ok",
       server: "clio-mcp",
-      version: "1.1.0",
+      version: "1.2.0",
       build: "all-tools",
       transport: "streamable-http-stateless",
       git_sha: DEPLOY_SHA,
