@@ -55,12 +55,25 @@ function fail(err: any) {
   };
 }
 
-export function formatCommunication(c: any) {
+// Emails can carry very large bodies (whole threads), so the LIST view
+// returns a truncated preview to stay within response limits; the single
+// get_communication returns the full body (preview=false).
+const BODY_PREVIEW_CHARS = 500;
+
+export function formatCommunication(c: any, preview = false) {
+  const rawBody: string | undefined = c.body ?? undefined;
+  let body = rawBody;
+  let bodyTruncated = false;
+  if (preview && typeof rawBody === "string" && rawBody.length > BODY_PREVIEW_CHARS) {
+    body = rawBody.slice(0, BODY_PREVIEW_CHARS);
+    bodyTruncated = true;
+  }
   return {
     id: c.id,
     type: TYPE_TO_FRIENDLY[c.type] ?? c.type,
     subject: c.subject,
-    body: c.body,
+    body,
+    ...(bodyTruncated ? { body_truncated: true } : {}),
     date: c.date,
     received_at: c.received_at,
     matter: c.matter,
@@ -98,7 +111,7 @@ export function registerCommunicationTools(server: McpServer): void {
         if (params.received_before) queryParams.received_before = params.received_before;
 
         const comms = await fetchAllPages<any>("/communications", queryParams, params.limit);
-        return ok({ count: comms.length, communications: comms.map(formatCommunication) });
+        return ok({ count: comms.length, communications: comms.map((c: any) => formatCommunication(c, true)) });
       } catch (err: any) {
         return fail(err);
       }

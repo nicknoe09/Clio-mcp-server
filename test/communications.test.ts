@@ -34,4 +34,24 @@ describe("formatCommunication", () => {
   it("tolerates an empty object", () => {
     expect(formatCommunication({}).id).toBeUndefined();
   });
+
+  it("returns the full body by default (single-record view)", () => {
+    const long = "x".repeat(2000);
+    const c = formatCommunication({ body: long });
+    expect(c.body).toBe(long);
+    expect(c).not.toHaveProperty("body_truncated");
+  });
+
+  it("truncates the body and flags it in preview (list) mode", () => {
+    const long = "x".repeat(2000);
+    const c = formatCommunication({ body: long }, true);
+    expect(c.body).toHaveLength(500);
+    expect(c.body_truncated).toBe(true);
+  });
+
+  it("does not flag a short body as truncated in preview mode", () => {
+    const c = formatCommunication({ body: "short" }, true);
+    expect(c.body).toBe("short");
+    expect(c).not.toHaveProperty("body_truncated");
+  });
 });
