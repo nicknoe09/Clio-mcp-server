@@ -2212,7 +2212,8 @@ export function registerDocumentTools(server: McpServer): void {
             { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
             { ini: "TBS", salary: 167500, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            { ini: "JPB", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+            // JPB (Jonathan Barbee) — terminated Jul 2026; no own bonus row. His
+            // ongoing collections now credit KES (see KES associate="JPB" above).
           ];
           const FIRM_OVERHEAD = 500000;
           const NUM_ATTORNEYS = 5;
