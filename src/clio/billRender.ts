@@ -19,7 +19,7 @@
 // asset-inlining logic are unit-testable without a real browser or HTTPS.
 // ============================================================
 import axios from "axios";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import type { Browser } from "puppeteer-core";
 import { rawGetBinarySingle } from "./pagination";
 
@@ -118,9 +118,6 @@ const CHROMIUM_NAMES = [
   "chrome",
 ];
 const CHROMIUM_WELL_KNOWN = [
-  // Stable symlink baked in by the Railway/Nixpacks build (see nixpacks.toml);
-  // covers the case where PUPPETEER_EXECUTABLE_PATH is not set in the env.
-  "/app/.chromium/chromium",
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
   "/usr/bin/google-chrome-stable",
@@ -132,17 +129,60 @@ const CHROMIUM_WELL_KNOWN = [
   "/nix/var/nix/profiles/default/bin/chromium",
 ];
 
+// The Nix store, where the Nixpacks `chromium` package's binary actually lives
+// (e.g. /nix/store/<hash>-chromium-<ver>/bin/chromium). The store dir is baked
+// into the runtime image, but the hashed sub-path is not stable and its bin dir
+// is not reliably on the runtime $PATH — so we scan it directly.
+const NIX_STORE = "/nix/store";
+
+/**
+ * Scan /nix/store for a Chromium binary. This is the reliable fallback on
+ * Railway/Nixpacks: the store is present in the runtime image even when the
+ * Nix profile bin dir is missing from $PATH. Prefers a full `chromium` build
+ * over `chromium-headless-shell`. Injectable readdir/exists for testing.
+ */
+export function scanNixStore(
+  opts: { exists?: (p: string) => boolean; readdir?: (p: string) => string[] } = {},
+): string | null {
+  const exists = opts.exists ?? existsSync;
+  const readdir = opts.readdir ?? ((p: string) => readdirSync(p));
+
+  let entries: string[];
+  try {
+    entries = readdir(NIX_STORE);
+  } catch {
+    return null; // No Nix store on this host — nothing to scan.
+  }
+
+  // Rank full chromium ahead of the headless-shell variant.
+  const ranked = entries
+    .filter((e) => /chromium/i.test(e))
+    .sort((a, b) => (/headless/i.test(a) ? 1 : 0) - (/headless/i.test(b) ? 1 : 0));
+
+  for (const entry of ranked) {
+    const p = `${NIX_STORE}/${entry}/bin/chromium`;
+    if (exists(p)) return p;
+  }
+  return null;
+}
+
 /**
  * Locate a Chromium/Chrome binary for puppeteer-core (which needs a real file
  * path — it does NOT resolve a bare name via PATH). Resolution order:
  *   1. PUPPETEER_EXECUTABLE_PATH / CHROMIUM_PATH / CHROME_PATH, if the file exists;
  *   2. a binary named like Chromium found on $PATH (covers the nixpacks
  *      `chromium` package, whose Nix-store path is not stable across builds);
- *   3. a well-known absolute location.
- * Injectable env/exists for testing. Returns null when nothing is found.
+ *   3. a well-known absolute location;
+ *   4. a scan of /nix/store (the Nixpacks chromium binary lives here even when
+ *      its bin dir is not on the runtime $PATH — the failure mode seen in prod).
+ * Injectable env/exists/readdir for testing. Returns null when nothing is found.
  */
 export function findChromium(
-  opts: { env?: NodeJS.ProcessEnv; exists?: (p: string) => boolean } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    exists?: (p: string) => boolean;
+    readdir?: (p: string) => string[];
+  } = {},
 ): string | null {
   const env = opts.env ?? process.env;
   const exists = opts.exists ?? existsSync;
@@ -163,18 +203,34 @@ export function findChromium(
     if (exists(p)) return p;
   }
 
-  return null;
+  return scanNixStore({ exists, readdir: opts.readdir });
 }
 
-/** Chromium executable path for puppeteer-core, or a clear error. */
+/** Chromium executable path for puppeteer-core, or a clear (diagnostic) error. */
 export function resolveChromiumPath(): string {
   const p = findChromium();
   if (!p) {
+    // Self-diagnosing: report what the runtime actually exposed so a lingering
+    // failure is debuggable from the tool output alone.
+    let nixHits = "n/a";
+    try {
+      nixHits =
+        readdirSync(NIX_STORE)
+          .filter((e) => /chromium/i.test(e))
+          .slice(0, 5)
+          .join(", ") || "(none)";
+    } catch {
+      nixHits = "(no /nix/store)";
+    }
+    const pathDirs = (process.env.PATH || "").split(":").filter(Boolean).length;
     throw new Error(
-      "No Chromium found for PDF rendering. The server scans $PATH and common " +
-        "locations; on Railway the nixpacks.toml `chromium` package normally " +
-        "puts it on $PATH automatically. To override, set PUPPETEER_EXECUTABLE_PATH " +
-        "(or CHROMIUM_PATH) to an existing Chromium/Chrome binary.",
+      "No Chromium found for PDF rendering. The server scans $PATH, common " +
+        "locations, and /nix/store; on Railway the nixpacks.toml `chromium` " +
+        "package should be present in the image. To override, set " +
+        "PUPPETEER_EXECUTABLE_PATH (or CHROMIUM_PATH) to an existing Chromium " +
+        `binary. [diagnostics: PATH dirs=${pathDirs}, ` +
+        `PUPPETEER_EXECUTABLE_PATH=${process.env.PUPPETEER_EXECUTABLE_PATH ?? "unset"}, ` +
+        `/nix/store chromium entries=${nixHits}]`,
     );
   }
   return p;
