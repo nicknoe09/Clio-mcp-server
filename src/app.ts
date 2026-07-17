@@ -44,6 +44,7 @@ import { registerLookupTools } from "./tools/lookups";
 import { registerCommunicationTools } from "./tools/communications";
 import { registerClioPaymentsTools } from "./tools/clioPayments";
 import { registerBillingExtrasTools } from "./tools/billingExtras";
+import { registerBillsGapTools } from "./tools/billsGap";
 import reviewRouter from "./routes/review";
 import uploadRouter from "./routes/upload";
 import { getDownload } from "./utils/downloadStore";
@@ -91,6 +92,7 @@ export function createMcpServer(): McpServer {
     registerCommunicationTools(server);
     registerClioPaymentsTools(server);
     registerBillingExtrasTools(server);
+    registerBillsGapTools(server);
 
     if (!loggedRegistration) {
       loggedRegistration = true;
