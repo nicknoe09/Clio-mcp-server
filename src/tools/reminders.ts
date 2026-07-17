@@ -20,9 +20,12 @@ import { getActingClioUserId } from "../clio/actingUser";
 // an id can be reused.
 // =====================================================================
 
+// NotificationMethod has no `name` — its identifying fields are type and
+// email_address (verified against the Clio v4 schema; requesting {name}
+// returns a 400 InvalidFields).
 const REMINDER_FIELDS =
   "id,duration,next_delivery_at,state,created_at,updated_at," +
-  "notification_method{id,name},subject{id,type}";
+  "notification_method{id,type,email_address},subject{id,type}";
 
 function ok(payload: any) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
