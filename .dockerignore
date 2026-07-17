@@ -1,0 +1,17 @@
+# Keep the build context clean and deterministic — deps come from `npm ci`
+# inside the image, not from the local tree.
+node_modules
+dist
+.git
+.env
+*.env
+npm-debug.log
+
+# Local/debug artifacts
+*.pdf
+*.png
+*.xlsx
+*.patch
+deploy_*.bat
+scratchpad
+.claude/settings.local.json
