@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { inlineBillAssets, renderBillPdf, stripPaymentStub, findChromium, scanNixStore, type AssetResult } from "../src/clio/billRender";
+import { inlineBillAssets, renderBillPdf, stripPaymentStub, PRINT_CSS, findChromium, scanNixStore, type AssetResult } from "../src/clio/billRender";
 
 const LOGO_URL =
   "https://s3.amazonaws.com/documents.goclio.com/logos/100660/Firm%20Logo.jpg?X-Amz-Signature=abc&amp;X-Amz-Expires=300";
@@ -146,6 +146,30 @@ describe("stripPaymentStub", () => {
     const { html: out, removed } = stripPaymentStub(html);
     expect(out).toBe(html);
     expect(removed).toHaveLength(0);
+  });
+});
+
+describe("PRINT_CSS (full-page invoice overrides)", () => {
+  it("moves the document margin to @page and sizes the sheet to Letter", () => {
+    expect(PRINT_CSS).toMatch(/@page\s*\{[^}]*size:\s*Letter/i);
+    expect(PRINT_CSS).toMatch(/@page\s*\{[^}]*margin:\s*0\.5in/i);
+  });
+
+  it("strips the .invoice-paper card framing and fixed width so it fills the page", () => {
+    // The card border + fixed max-width + card background must be overridden.
+    expect(PRINT_CSS).toMatch(/\.invoice-paper\s*\{[\s\S]*?border:\s*none\s*!important/);
+    expect(PRINT_CSS).toMatch(/\.invoice-paper\s*\{[\s\S]*?max-width:\s*none\s*!important/);
+    expect(PRINT_CSS).toMatch(/\.invoice-paper\s*\{[\s\S]*?width:\s*100%\s*!important/);
+    expect(PRINT_CSS).toMatch(/\.invoice-paper\s*\{[\s\S]*?box-shadow:\s*none\s*!important/);
+  });
+
+  it("zeroes the oversized web-only internal margin (no doubled margins)", () => {
+    expect(PRINT_CSS).toMatch(/\.invoice-paper\s+\.web-only\.margins\s*\{[^}]*margin:\s*0\s*!important/);
+  });
+
+  it("resets the page background to white and keeps colors exact for print", () => {
+    expect(PRINT_CSS).toMatch(/html,\s*body\s*\{[\s\S]*?background:\s*#fff\s*!important/);
+    expect(PRINT_CSS).toMatch(/print-color-adjust:\s*exact\s*!important/);
   });
 });
 

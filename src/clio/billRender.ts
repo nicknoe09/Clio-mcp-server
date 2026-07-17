@@ -363,10 +363,70 @@ export function resolveChromiumPath(): string {
   return p;
 }
 
+// ------------------------------------------------------------
+// Print CSS — make the invoice render as a full-page document
+// ------------------------------------------------------------
+// Clio's preview markup frames the invoice as a fixed-width, bordered white
+// card centered on the sheet (`.invoice-paper { border; min/max-width; margin:
+// 0 auto }`) and adds a ~1in internal margin (`.web-only.margins`). Printed as
+// a PDF that reads as "a screenshot of a bill pasted onto a page": a narrow
+// card floating in big margins. This stylesheet, injected AFTER load and AFTER
+// stub-stripping, removes the card framing and the fixed width so the invoice
+// fills the printable area, and moves the document margin to @page (so it is a
+// real page margin, not padding baked into the body). Wrapped in @media print
+// and paired with emulateMediaType('print') so the layout we compose is exactly
+// what page.pdf() renders. Exported for the unit test.
+export const PRINT_CSS = `
+@page { size: Letter; margin: 0.5in; }
+
+@media print {
+  /* No page background, no body-level margin — @page owns the margin. */
+  html, body {
+    background: #fff !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* The invoice wrapper: fill the printable width, drop the card framing so
+     it stops looking like a boxed card floating on the sheet. */
+  .invoice-paper {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: #fff !important;
+  }
+
+  /* The oversized web-only internal margin doubled the @page margin and
+     squeezed the content into a narrow column — zero it; the document margin
+     now lives in @page. */
+  .invoice-paper .web-only.margins {
+    margin: 0 !important;
+  }
+
+  /* Keep brand/logo/table-shading colors in the PDF instead of dropping to
+     grayscale. */
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+`;
+
 /**
  * Default PDF renderer: Chromium via puppeteer-core. Network is fully blocked
  * (request interception aborts everything) so the render is hermetic — the
  * logo is already a data: URI, and webfonts fall back to system fonts.
+ *
+ * Print media is emulated and PRINT_CSS is injected after the HTML loads, so
+ * the invoice renders as a full-page document (fills the width, real @page
+ * margins) rather than Clio's fixed-width bordered card. preferCSSPageSize lets
+ * the injected @page rule govern the paper size + margins, so there is no
+ * hardcoded page.pdf() margin object to conflict with it.
  */
 export async function renderHtmlToPdfDefault(html: string): Promise<Buffer> {
   // Lazy import so the module (and its unit tests) don't require the native
@@ -392,10 +452,16 @@ export async function renderHtmlToPdfDefault(html: string): Promise<Buffer> {
       else req.abort();
     });
     await page.setContent(html, { waitUntil: "load", timeout: 30_000 });
+    // Render what print CSS intends, then inject our full-page overrides.
+    // addStyleTag({ content }) creates an inline <style> (no network request,
+    // so the request interceptor above does not block it).
+    await page.emulateMediaType("print");
+    await page.addStyleTag({ content: PRINT_CSS });
     const pdf = await page.pdf({
       format: "Letter",
       printBackground: true,
-      margin: { top: "0.5in", bottom: "0.5in", left: "0.5in", right: "0.5in" },
+      // Let the injected @page rule own the paper size + margins.
+      preferCSSPageSize: true,
     });
     return Buffer.from(pdf);
   } finally {
