@@ -202,7 +202,12 @@ export async function getClientActivityCSV(opts: {
     if (attempt < attempts) await sleep(3000 * attempt);
   }
   // Fallback: latest existing completed Client Activity CSV report.
-  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,created_at", order: "id(desc)" });
+  // NOTE: /reports rejects order=id(...) with HTTP 422 (see getRevenueReportCSV),
+  // so list with the proven-safe name ordering and sort newest-first in memory —
+  // otherwise this fallback would itself 422 exactly when generation just failed,
+  // masking the real error.
+  const reports = (await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,created_at", order: "name(asc)" }))
+    .sort((a: any, b: any) => b.id - a.id);
   const candidates = reports.filter((r: any) =>
     r.state === "completed" && r.format === "csv" &&
     (String(r.kind || "").toLowerCase().includes("client_activity") ||
@@ -235,7 +240,11 @@ export async function getRealizationReportCSV(opts: {
     return { rows: parseCSV(csv), report: { id: opts.reportId, kind: "matter_realization", via: "list" } };
   }
   // Try several plausible kind strings — Clio's report kinds vary slightly.
-  const kindCandidates = ["matter_realization", "realization", "matter_realization_rate"];
+  // "realization" is FIRST because it is the kind Clio actually accepts (verified
+  // live 2026-07: POST /reports {kind:"realization"} completes in seconds with the
+  // Billed Time Collected / Outstanding / Billed Hours columns this module needs);
+  // the others are kept only as defensive fallbacks and normally 422.
+  const kindCandidates = ["realization", "matter_realization", "matter_realization_rate"];
   let lastErr: any;
   for (const kind of kindCandidates) {
     const body: any = { data: { kind, format: "csv", start_date: opts.start_date, end_date: opts.end_date } };
@@ -264,7 +273,10 @@ export async function getRealizationReportCSV(opts: {
     lastErr = new Error(`Report ${reportId} kind=${kind} did not complete (state=${state})`);
   }
   // Fallback: pick the most recent completed realization CSV by name match.
-  const reports = await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,created_at", order: "id(desc)" });
+  // /reports rejects order=id(...) (HTTP 422), so order by name and sort by id
+  // in memory — see the identical note in getClientActivityCSV.
+  const reports = (await fetchAllPages<any>("/reports", { fields: "id,name,state,kind,format,created_at", order: "name(asc)" }))
+    .sort((a: any, b: any) => b.id - a.id);
   const candidates = reports.filter((r: any) =>
     r.state === "completed" && r.format === "csv" &&
     (String(r.kind || "").toLowerCase().includes("realization") ||
@@ -310,9 +322,18 @@ export function aggregateRealizationCollections(rows: Record<string, string>[], 
 // pulled for collections). It carries per-User "Billed Hours", "Billed Time"
 // ($), "Billed Time Collected" ($), "Billed Time Outstanding" ($) — enough to
 // allocate billed hours to collected vs uncollected by the dollar split. This
-// is the DEFAULT Collection source: the dedicated Realization report can't be
-// generated via the API (POST 422s), whereas the Fee Allocation report we
-// already download reliably. Keyed by user_id via the roster matcher.
+// is the DEFAULT Collection source.
+//
+// HISTORICAL NOTE: this used to be the default because "the dedicated
+// Realization report can't be generated via the API (POST 422s)". That is NO
+// LONGER TRUE — as of 2026-07, POST /reports {kind:"realization"} generates and
+// completes reliably (getRealizationReportCSV drives it), and its per-User
+// Billed Time Collected/Outstanding/Billed Hours are the authoritative basis
+// (aggregateRealizationCollections). Fee-allocation stays the default for now
+// only because the two sources use different date bases (fee-allocation =
+// invoice issue date; realization = time-entry date), so switching the default
+// must be validated against prior data first — see the compare_collection_methods
+// diagnostic. Keyed by user_id via the roster matcher.
 export function aggregateFeeAllocationCollectionHrs(
   rows: Record<string, string>[],
   roster: { initials: string; name: string; user_id: number }[],

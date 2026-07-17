@@ -1405,6 +1405,84 @@ export function registerDocumentTools(server: McpServer): void {
   );
 
   // ============================================================
+  // DIAGNOSTIC: compare_collection_methods  (read-only — writes nothing to the dashboard)
+  // Confirms whether switching the Collection tab's default source from the Fee
+  // Allocation report (current default, invoice-issue-date basis) to the dedicated
+  // Realization report (now API-generatable — POST /reports {kind:"realization"}
+  // completes reliably) would change the per-timekeeper Collected/Uncollected
+  // HOURS. Generates BOTH reports for the month and runs the SAME aggregators the
+  // Collection tab uses, returning a side-by-side with deltas and firm totals.
+  // ============================================================
+  diagnosticTool(server).tool(
+    "compare_collection_methods",
+    "Diagnostic (read-only; writes nothing to the dashboard). For a given month, generates BOTH the Realization report (kind=realization) and the issue-date Fee Allocation report, runs the exact aggregators the Collection tab uses (aggregateRealizationCollections vs aggregateFeeAllocationCollectionHrs), and returns a per-timekeeper side-by-side of Collected/Uncollected HOURS with deltas and firm totals. Use to confirm — against prior data — whether adopting the Realization report as the Collection tab's default source is authentic before switching it.",
+    {
+      year: z.coerce.number().describe("Year, e.g. 2026"),
+      month: z.coerce.number().describe("Month number 1-12"),
+    },
+    async (p) => {
+      try {
+        const roster = FIRM_ROSTER;
+        const nameToUid = new Map<string, number>(roster.map((r) => [r.name.toLowerCase(), r.user_id]));
+        const monthStart = `${p.year}-${String(p.month).padStart(2, "0")}-01`;
+        const endDay = new Date(p.year, p.month, 0).getDate();
+        const monthEnd = `${p.year}-${String(p.month).padStart(2, "0")}-${String(endDay).padStart(2, "0")}`;
+
+        // Method A — Realization report (proposed authoritative source).
+        let realizAgg: Record<number, RealizCollectionsAgg> = {};
+        let realizMeta: any = null;
+        let realizErr: string | undefined;
+        try {
+          const rr = await getRealizationReportCSV({ start_date: monthStart, end_date: monthEnd });
+          realizAgg = aggregateRealizationCollections(rr.rows, nameToUid);
+          realizMeta = { report_id: rr.report.id, kind: rr.report.kind, via: rr.report.via, rows: rr.rows.length };
+        } catch (e: any) { realizErr = e?.message ?? String(e); }
+
+        // Method B — Fee Allocation report, issue-date basis (current default).
+        let feeAgg: Record<number, RealizCollectionsAgg> = {};
+        let feeErr: string | undefined;
+        try {
+          const rows = await genFeeAllocationByMonth(p.year, p.month, { filterByPayment: false });
+          feeAgg = aggregateFeeAllocationCollectionHrs(rows, roster);
+        } catch (e: any) { feeErr = e?.message ?? String(e); }
+
+        const round = (n: number) => Math.round((n ?? 0) * 100) / 100;
+        const perTimekeeper = roster.map((r) => {
+          const a = realizAgg[r.user_id] ?? { collectedHrs: 0, uncollectedHrs: 0 };
+          const b = feeAgg[r.user_id] ?? { collectedHrs: 0, uncollectedHrs: 0 };
+          return {
+            initials: r.initials,
+            name: r.name,
+            realization: { collectedHrs: round(a.collectedHrs), uncollectedHrs: round(a.uncollectedHrs) },
+            fee_allocation: { collectedHrs: round(b.collectedHrs), uncollectedHrs: round(b.uncollectedHrs) },
+            delta: {
+              collectedHrs: round(a.collectedHrs - b.collectedHrs),
+              uncollectedHrs: round(a.uncollectedHrs - b.uncollectedHrs),
+            },
+          };
+        });
+        const sumHrs = (sel: (x: RealizCollectionsAgg) => number, agg: Record<number, RealizCollectionsAgg>) =>
+          round(Object.values(agg).reduce((s, v) => s + sel(v), 0));
+        const totals = {
+          realization: { collectedHrs: sumHrs((v) => v.collectedHrs, realizAgg), uncollectedHrs: sumHrs((v) => v.uncollectedHrs, realizAgg) },
+          fee_allocation: { collectedHrs: sumHrs((v) => v.collectedHrs, feeAgg), uncollectedHrs: sumHrs((v) => v.uncollectedHrs, feeAgg) },
+        };
+        return { content: [{ type: "text", text: JSON.stringify({
+          period: { start: monthStart, end: monthEnd },
+          note: "Realization = time-entry-date basis (proposed default); Fee Allocation = invoice-issue-date basis (current Collection-tab default). Non-zero deltas are expected where the two date bases disagree — use this to judge materiality against prior data before switching the default.",
+          realization_report: realizMeta,
+          realization_error: realizErr,
+          fee_allocation_error: feeErr,
+          totals,
+          per_timekeeper: perTimekeeper,
+        }, null, 2) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: e?.response?.status ?? String(e), detail: e?.response?.data }, null, 2) }], isError: true };
+      }
+    }
+  );
+
+  // ============================================================
   // Report Preset tooling (classic API): list presets + their options,
   // create a preset, and generate-on-demand from a preset. Beta custom
   // reports are backed by classic ReportPresets (a report_schedule points at
