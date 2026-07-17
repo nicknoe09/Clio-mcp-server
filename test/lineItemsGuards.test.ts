@@ -3,6 +3,7 @@ import {
   assertNewHoursSane,
   reconcileHardCombineHours,
   reconcileHardCombineDollars,
+  expectedDiscountedTotal,
   MAX_ENTRY_HOURS_PER_DAY,
 } from "../src/clio/lineItems";
 
@@ -64,5 +65,25 @@ describe("reconcileHardCombineDollars (rate-aware value conservation)", () => {
     expect(r.delta_dollars).toBeCloseTo(-22, 2);
     expect(r.rates_uniform).toBe(false);
     expect(r.matches).toBe(false);
+  });
+});
+
+// Read-back verification for discount_line_item: the expected post-discount
+// total is computed against the UNDISCOUNTED base (a new discount replaces any
+// prior one), so verification stays correct even on an already-discounted line.
+describe("expectedDiscountedTotal (discount read-back reference)", () => {
+  it("computes a percentage discount off the base", () => {
+    expect(expectedDiscountedTotal(117, { pct: 25 })).toBeCloseTo(87.75, 2);
+  });
+  it("computes a money discount off the base", () => {
+    expect(expectedDiscountedTotal(117, { amount: 17 })).toBeCloseTo(100, 2);
+  });
+  it("pct=0 restores the full base (discount removal)", () => {
+    expect(expectedDiscountedTotal(117, { pct: 0 })).toBeCloseTo(117, 2);
+  });
+  it("references the base, not a current already-discounted total", () => {
+    // Line currently shows $87.75 (25% off $117); applying 10% should yield
+    // $105.30 off the $117 base, not $78.98 off the discounted figure.
+    expect(expectedDiscountedTotal(117, { pct: 10 })).toBeCloseTo(105.3, 2);
   });
 });
