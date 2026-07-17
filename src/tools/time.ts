@@ -1036,8 +1036,9 @@ export function registerTimeTools(server: McpServer): void {
     {
       line_item_id: z.coerce.number().optional().describe("Line item ID (preferred if known)"),
       activity_id: z.coerce.number().optional().describe("Activity ID; resolved to its line_item on a draft bill"),
-      new_hours: z.coerce.number().describe("New decimal hours for the activity. Must be > 0. Both increases and decreases are supported."),
+      new_hours: z.coerce.number().describe("New decimal hours for the activity. Must be > 0. Both increases and decreases are supported. Values above 24h/entry are rejected as a fat-finger guard unless force=true."),
       new_note: z.string().optional().describe("Optional new note. If provided, replaces the activity's existing note. If omitted, the note is left unchanged."),
+      force: z.coerce.boolean().optional().describe("Override the 24h/entry sanity ceiling. Only set this when a single entry legitimately exceeds 24 hours (essentially never)."),
     },
     async (params) => {
       try {
@@ -1046,6 +1047,7 @@ export function registerTimeTools(server: McpServer): void {
           activity_id: params.activity_id,
           new_hours: params.new_hours,
           new_note: params.new_note,
+          force: params.force,
         });
         return {
           content: [{
@@ -1082,9 +1084,10 @@ export function registerTimeTools(server: McpServer): void {
     {
       primary_line_item_id: z.coerce.number().describe("Line item ID of the primary line. Its hours will be set to new_primary_hours; its note may optionally be replaced."),
       secondary_line_item_ids_csv: z.string().describe("Comma-separated line_item IDs to combine into the primary, e.g. '8309925665,8261110372'. All must be on the same DRAFT bill as the primary. Cannot include the primary's own ID. Cannot contain duplicates."),
-      new_primary_hours: z.coerce.number().describe("New decimal hours for the primary line. Typically equals the sum of original primary hours + the secondaries' hours that are being rolled in."),
+      new_primary_hours: z.coerce.number().describe("New decimal hours for the primary line. Must equal original primary hours + the secondaries' hours being rolled in; a mismatch is rejected unless force=true (guards a mistyped total). Also subject to the 24h/entry ceiling."),
       new_note: z.string().optional().describe("Optional new merged narrative for the primary line."),
       secondary_treatment: z.enum(["delete", "discount_100pct"]).optional().describe("How to handle the secondaries. 'delete' (default) removes the activities entirely. 'discount_100pct' keeps them visible at $0 (firm-rule-friendly when audit trail matters)."),
+      force: z.coerce.boolean().optional().describe("Override the hours-conservation check and the 24h/entry ceiling. Set only when you deliberately intend the combined total to differ from primary+secondaries."),
     },
     async (params) => {
       try {
@@ -1129,6 +1132,7 @@ export function registerTimeTools(server: McpServer): void {
           new_primary_hours: params.new_primary_hours,
           new_note: params.new_note,
           secondary_treatment: params.secondary_treatment,
+          force: params.force,
         });
         return {
           content: [{
