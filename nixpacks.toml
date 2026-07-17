@@ -1,0 +1,12 @@
+# Railway/Nixpacks build config.
+#
+# The MCP server renders bill invoices to PDF with a headless browser
+# (render_bill_pdf / download_bills_pdf via puppeteer-core). puppeteer-core
+# ships NO browser of its own, so Chromium must be provided by the image.
+#
+# `chromium` here is the Nix package; nixpacks puts its binary on PATH. The
+# server AUTO-DETECTS it (findChromium() scans $PATH + common locations), so no
+# env var is needed. To override, set PUPPETEER_EXECUTABLE_PATH to a specific
+# binary path in the Railway dashboard.
+[phases.setup]
+nixPkgs = ["nodejs", "chromium"]

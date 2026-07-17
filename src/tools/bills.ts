@@ -1,7 +1,9 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawGetSingle, rawGetBinarySingle, rawPostSingle, rawPatchSingle, rawDeleteSingle } from "../clio/pagination";
-import { downloadBillPdfBuffer, downloadBillPdfBuffers, looksLikePdf } from "../clio/billPdf";
+import { looksLikePdf } from "../clio/billPdf";
+import { renderBillPdf } from "../clio/billRender";
+import { registerDownload } from "../utils/downloadStore";
 import { diagnosticTool } from "../utils/diagnostics";
 import JSZip from "jszip";
 
@@ -401,17 +403,22 @@ export function registerBillTools(server: McpServer): void {
   );
 
   // ============================================================
-  //  download_bill_pdf — Download a single bill as PDF
+  //  render_bill_pdf — Render a bill to PDF from its preview HTML
   // ============================================================
+  // Clio's OAuth API does not serve rendered bill PDFs (see billPdf.ts), so
+  // this renders the invoice ourselves: GET /bills/{id}/preview → inline the
+  // firm logo (strip the payment QR) → headless-Chromium render → a short-lived
+  // download URL the caller can hand to an email/attachment tool. Replaces the
+  // old download_bill_pdf, which could only fail-fast against Clio's API gap.
   server.tool(
-    "download_bill_pdf",
-    "Download a single bill as a PDF file. IMPORTANT: Clio's OAuth API does not expose rendered bill PDFs on this account (verified 2026-07-14 via probe_bill_pdf_apis — every candidate route returns bill JSON or 404), so this tool is expected to fail fast with guidance: get the PDF from the Clio web UI (Billing → the bill → Download PDF) or reconstruct the invoice from get_bill_line_items. The attempt is still made in case Clio ships the capability; if a PDF ever comes back it is returned base64-encoded.",
+    "render_bill_pdf",
+    "Render a single bill/invoice to a PDF and return a short-lived download URL (the same download-store mechanism as get_bill_preview). Clio's OAuth API does NOT serve bill PDFs, so this builds one from the rendered preview HTML (GET /bills/{id}/preview) with a headless browser: the firm logo is fetched and embedded so the PDF is self-contained, and the Clio Payments QR placeholder is intentionally omitted. Use the returned direct_download_url to attach the invoice to an email or save it. Works for any non-draft bill (drafts have no issued invoice to render). Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
     {
       bill_id: z.coerce.number().describe("Clio bill ID"),
     },
     async (params) => {
       try {
-        // Fetch bill metadata for filename and state check
+        // Fetch bill metadata for filename and state check.
         const billData = await rawGetSingle(`/bills/${params.bill_id}`, {
           fields: "id,number,state,issued_at",
         });
@@ -426,28 +433,29 @@ export function registerBillTools(server: McpServer): void {
 
         if (bill.state === "draft") {
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Bill ${bill.number || params.bill_id} is a draft — PDFs are only available for issued bills. Issue the bill in Clio first.` }) }],
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Bill ${bill.number || params.bill_id} is a draft — issue the bill in Clio first, then render its invoice.` }) }],
             isError: true,
           };
         }
 
-        // Clio generates bill PDFs asynchronously: GET /bills/{id}.pdf kicks
-        // off generation and returns JSON until the PDF is ready, so poll and
-        // follow the download URL rather than expecting bytes on the first GET.
-        const result = await downloadBillPdfBuffer(params.bill_id);
-
-        const base64 = result.buffer.toString("base64");
+        const { buffer, inlined, skipped } = await renderBillPdf(params.bill_id);
         const filename = `Bill-${bill.number || params.bill_id}.pdf`;
+        const reg = registerDownload(buffer, filename, "application/pdf");
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
+              bill_id: params.bill_id,
+              bill_number: bill.number ?? null,
               filename,
               format: "pdf",
-              size_kb: Math.round(result.buffer.length / 1024),
-              base64,
-            }),
+              size_kb: Math.round(buffer.length / 1024),
+              direct_download_url: reg.url,
+              expires_at: reg.expires_at,
+              assets: { logo_inlined: inlined.length, skipped },
+              usage_hint: "Fetch direct_download_url to attach this invoice PDF to an email or save it.",
+            }, null, 2),
           }],
         };
       } catch (err: any) {
@@ -684,7 +692,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bills_pdf",
-    "Download multiple bill PDFs as a zip file. Filters bills by state, matter, client, or date range. IMPORTANT: Clio's OAuth API does not expose rendered bill PDFs on this account (verified 2026-07-14 via probe_bill_pdf_apis), so expect per-bill failures directing to the Clio web UI or get_bill_line_items reconstruction. Draft bills are skipped. If Clio ever serves the PDFs, they are bundled and returned as a base64-encoded zip.",
+    "Render multiple bills to PDFs and return a short-lived download URL for a zip of them. Filters bills by state, matter, client, or date range. Each invoice is rendered from its preview HTML (same engine as render_bill_pdf: logo embedded, payment QR omitted). Draft bills are skipped (no issued invoice to render). Per-bill render failures are collected without sinking the batch. Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
     {
       state: z
         .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
@@ -728,37 +736,33 @@ export function registerBillTools(server: McpServer): void {
           };
         }
 
-        // Clio generates bill PDFs asynchronously — kick off generation for
-        // every bill up front, then poll until each is ready (total wall time
-        // tracks the slowest bill, not the sum). Per-bill failures are
-        // collected without sinking the batch.
-        const pdfResults = await downloadBillPdfBuffers(downloadable.map((b: any) => b.id));
-
+        // Render each issued bill's invoice to PDF from its preview HTML.
+        // Rendered sequentially so we never run more than one headless browser
+        // at a time; per-bill failures are collected without sinking the batch.
         const zip = new JSZip();
         let downloaded = 0;
         let failed = 0;
         const errors: string[] = [];
 
         for (const bill of downloadable) {
-          const result = pdfResults.get(bill.id);
-          if (result?.ok) {
-            zip.file(`Bill-${bill.number || bill.id}.pdf`, result.buffer);
+          try {
+            const { buffer } = await renderBillPdf(bill.id);
+            zip.file(`Bill-${bill.number || bill.id}.pdf`, buffer);
             downloaded++;
-          } else {
+          } catch (e: any) {
             failed++;
-            errors.push(`Bill ${bill.number || bill.id}: ${result ? result.error : "no result returned"}`);
+            errors.push(`Bill ${bill.number || bill.id}: ${e?.message ?? "render failed"}`);
           }
         }
 
         if (downloaded === 0) {
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Failed to download all ${downloadable.length} bill PDFs. Errors: ${errors.join("; ")}` }) }],
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: `Failed to render all ${downloadable.length} bill PDFs. Errors: ${errors.join("; ")}` }) }],
             isError: true,
           };
         }
 
         const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
-        const base64 = zipBuffer.toString("base64");
 
         const filterDesc = [
           params.state !== "all" ? params.state : null,
@@ -767,6 +771,7 @@ export function registerBillTools(server: McpServer): void {
         ].filter(Boolean).join("_") || "filtered";
 
         const filename = `Bills-${filterDesc}.zip`;
+        const reg = registerDownload(zipBuffer, filename, "application/zip");
 
         return {
           content: [{
@@ -775,7 +780,8 @@ export function registerBillTools(server: McpServer): void {
               filename,
               format: "zip",
               size_kb: Math.round(zipBuffer.length / 1024),
-              base64,
+              direct_download_url: reg.url,
+              expires_at: reg.expires_at,
               summary: {
                 total_matched: bills.length,
                 downloaded,
@@ -783,7 +789,7 @@ export function registerBillTools(server: McpServer): void {
                 failed,
                 errors: errors.length > 0 ? errors : undefined,
               },
-            }),
+            }, null, 2),
           }],
         };
       } catch (err: any) {
