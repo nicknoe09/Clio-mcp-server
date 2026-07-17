@@ -39,10 +39,18 @@ flow — distinct from both Clio Identity/SSO and the legacy Manage API:
   not exist". US host shown; other regions may use a prefixed host.
 - **`client_id` is the app's App Key** (distinct from the App ID shown in the
   portal's app list). App Secret is the client secret.
-- **Scopes are Grow-specific** — e.g. `grow_contact_read`, `grow_matter_read`,
-  `grow_lead_inbox_read`, `grow_user_read` (and `_write` counterparts). Do NOT
-  send `openid`/`offline_access`; a `refresh_token` is returned automatically.
-  The requested scopes must be a subset of the app's selected App Permissions.
+- **Scopes are Grow-specific** — the full set this server's tools exercise (and
+  the `GROW_OAUTH_SCOPE` default) is: `grow_lead_inbox_read`,
+  `grow_lead_inbox_write`, `grow_custom_action_read`, `grow_custom_action_write`,
+  `grow_matter_read`, `grow_matter_note_read`, `grow_matter_note_write`,
+  `grow_contact_read`, `grow_contact_note_read`, `grow_contact_note_write`,
+  `grow_user_read`. Note that notes are gated by their own
+  `grow_{matter,contact}_note_*` scopes (not the parent read scope) and custom
+  actions by `grow_custom_action_*` — requesting only the parent read scopes
+  leaves the note/write/custom-action tools failing with an auth-host redirect.
+  Do NOT send `openid`/`offline_access`; a `refresh_token` is returned
+  automatically. The requested scopes must be a subset of the app's selected App
+  Permissions.
 - **Private apps** authorize only for members of the owning firm, and the
   authorizing user's Clio Grow account must be linked to their Clio Manage
   account under the *same email*, or Clio returns "Private application access
