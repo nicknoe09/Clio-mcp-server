@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { inlineBillAssets, renderBillPdf, findChromium, type AssetResult } from "../src/clio/billRender";
+import { inlineBillAssets, renderBillPdf, findChromium, scanNixStore, type AssetResult } from "../src/clio/billRender";
 
 const LOGO_URL =
   "https://s3.amazonaws.com/documents.goclio.com/logos/100660/Firm%20Logo.jpg?X-Amz-Signature=abc&amp;X-Amz-Expires=300";
@@ -100,18 +100,44 @@ describe("findChromium", () => {
     expect(found).toBe("/usr/bin/google-chrome-stable");
   });
 
-  it("finds the Nixpacks-baked symlink when it is neither in the env var nor on PATH", () => {
-    // Deployment case: PUPPETEER_EXECUTABLE_PATH unset and the Nix chromium not
-    // on the runtime $PATH, but the build pinned a symlink at /app/.chromium.
+  it("falls back to scanning /nix/store when nothing else matches (the prod failure mode)", () => {
+    // PUPPETEER_EXECUTABLE_PATH unset, Nix chromium bin dir not on $PATH nor at
+    // any well-known location — but the binary is in /nix/store.
     const found = findChromium({
       env: { PATH: "/empty" },
-      exists: (p) => p === "/app/.chromium/chromium",
+      exists: (p) => p === "/nix/store/abc123-chromium-131.0/bin/chromium",
+      readdir: (p) => (p === "/nix/store" ? ["abc123-chromium-131.0", "def-nodejs-20"] : []),
     });
-    expect(found).toBe("/app/.chromium/chromium");
+    expect(found).toBe("/nix/store/abc123-chromium-131.0/bin/chromium");
   });
 
   it("returns null when no browser is found anywhere", () => {
-    expect(findChromium({ env: { PATH: "/nowhere" }, exists: () => false })).toBeNull();
+    expect(
+      findChromium({ env: { PATH: "/nowhere" }, exists: () => false, readdir: () => [] }),
+    ).toBeNull();
+  });
+});
+
+describe("scanNixStore", () => {
+  it("prefers a full chromium over the headless-shell variant", () => {
+    const found = scanNixStore({
+      readdir: () => ["h-chromium-headless-shell-131/", "abc-chromium-131.0", "x-nodejs-20"],
+      // Both variants have a bin/chromium; the full build must win.
+      exists: (p) =>
+        p === "/nix/store/abc-chromium-131.0/bin/chromium" ||
+        p === "/nix/store/h-chromium-headless-shell-131//bin/chromium",
+    });
+    expect(found).toBe("/nix/store/abc-chromium-131.0/bin/chromium");
+  });
+
+  it("returns null when /nix/store is absent", () => {
+    const found = scanNixStore({
+      readdir: () => {
+        throw new Error("ENOENT");
+      },
+      exists: () => true,
+    });
+    expect(found).toBeNull();
   });
 });
 
