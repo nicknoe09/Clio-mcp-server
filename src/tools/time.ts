@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages, rawPostSingle, rawPatchSingle, rawGetSingle } from "../clio/pagination";
-import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine } from "../clio/lineItems";
+import { patchTimeEntrySmart, resolveActivityRouting, removeFromDraftBill, deleteActivity, discountLineItem, prepareLineSplit, mergeLineItems, prepareHourChange, prepareHardCombine, assertNewHoursSane } from "../clio/lineItems";
 import { resolveActingUserId, AttributionError } from "../clio/actingUser";
 import { diagnosticTool } from "../utils/diagnostics";
 
@@ -1162,15 +1162,17 @@ export function registerTimeTools(server: McpServer): void {
   // create_time_entry
   server.tool(
     "create_time_entry",
-    "Create a new time entry in Clio. Requires a date, matter, and duration; the timekeeper defaults to YOU (the acting attorney) — omit user_id to log your own time. To log time for a DIFFERENT timekeeper you must pass their user_id AND set on_behalf_of=true (a guard against accidentally booking time under the wrong person). Optionally set the hourly rate and description. The entry is non-billable if rate is 0 or omitted, billable otherwise.",
+    "Create a new time entry in Clio. Requires a date, matter, and duration; the timekeeper defaults to YOU (the acting attorney) — omit user_id to log your own time. To log time for a DIFFERENT timekeeper you must pass their user_id AND set on_behalf_of=true (a guard against accidentally booking time under the wrong person). BILLABLE vs NON-BILLABLE: omitting rate does NOT make the entry non-billable — Clio applies the matter's default rate for the timekeeper and the entry is BILLABLE. To record genuinely non-billable time, set non_billable=true (which marks the entry non-billable regardless of rate). Set an explicit rate to override the default. Hours above 24/day are rejected as a fat-finger guard unless force=true.",
     {
       date: z.string().describe("Date for the time entry (YYYY-MM-DD)"),
       user_id: z.coerce.number().optional().describe("Clio user ID of the timekeeper. Omit to log your own time (default). To log for someone else, pass their id AND set on_behalf_of=true."),
       on_behalf_of: z.boolean().optional().default(false).describe("Set true to deliberately log time for a timekeeper OTHER than yourself (requires user_id). Leave false/omitted for your own time."),
       matter_id: z.coerce.number().describe("Clio matter ID to log time against"),
-      hours: z.coerce.number().describe("Duration in decimal hours (e.g. 1.5 for 1h30m)"),
+      hours: z.coerce.number().describe("Duration in decimal hours (e.g. 1.5 for 1h30m). Values above 24 are rejected unless force=true."),
       note: z.string().optional().describe("Description/narrative for the time entry"),
-      rate: z.coerce.number().optional().describe("Hourly rate in dollars. Omit or 0 for non-billable."),
+      rate: z.coerce.number().optional().describe("Hourly rate in dollars. If omitted, Clio uses the matter's default rate for the timekeeper (the entry is BILLABLE). To make the entry non-billable, use non_billable=true rather than relying on rate."),
+      non_billable: z.boolean().optional().describe("Set true to mark the entry non-billable (no charge). When omitted/false the entry is billable at the given or default rate."),
+      force: z.coerce.boolean().optional().describe("Override the 24h/day sanity ceiling on hours (essentially never needed)."),
       activity_description_id: z.coerce.number().optional().describe("Clio activity description ID (pre-defined activity type). Optional."),
     },
     async (params) => {
@@ -1179,6 +1181,18 @@ export function registerTimeTools(server: McpServer): void {
         if (quantity <= 0) {
           return {
             content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: "Hours must be greater than 0." }) }],
+            isError: true,
+          };
+        }
+        // Fat-finger guard: this POSTs /activities directly (unlike the edit
+        // tools, which route through patchTimeEntrySmart's guard), so enforce the
+        // 24h/day ceiling here — a "60" typed for "0.6" would create a 60h entry
+        // that bills at 60x rate once added to a bill.
+        try {
+          assertNewHoursSane(params.hours, { force: params.force });
+        } catch (guardErr: any) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: guardErr.message }) }],
             isError: true,
           };
         }
@@ -1208,6 +1222,13 @@ export function registerTimeTools(server: McpServer): void {
 
         if (params.note) body.data.note = params.note;
         if (params.rate !== undefined && params.rate > 0) body.data.price = params.rate;
+        // Explicit non-billable flag — the only reliable way to make the entry
+        // non-billable (omitting rate applies the matter default and stays
+        // billable). When set, also pin price to 0 so no default rate applies.
+        if (params.non_billable === true) {
+          body.data.non_billable = true;
+          body.data.price = 0;
+        }
         if (params.activity_description_id) body.data.activity_description = { id: params.activity_description_id };
 
         const result = await rawPostSingle("/activities", body);
