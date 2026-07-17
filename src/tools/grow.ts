@@ -81,6 +81,49 @@ function growError(err: any) {
   };
 }
 
+/**
+ * Best-effort readout of the scopes a Grow access token actually carries.
+ * Grow authorizes through the API Hub (ORY Hydra), whose access tokens are
+ * typically JWTs listing granted scopes as `scp` (array) or `scope`
+ * (space-delimited string). Opaque tokens can't be introspected locally, so
+ * this returns null in that case (caller distinguishes "can't tell" from "[]").
+ */
+export function readTokenScopes(token: string | undefined): string[] | null {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null; // not a JWT → opaque token, can't decode
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    if (Array.isArray(payload.scp)) return payload.scp.map(String);
+    if (typeof payload.scope === "string") return payload.scope.split(/\s+/).filter(Boolean);
+    return [];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Diagnostics comparing the scopes the app *requests* (GROW_OAUTH_SCOPE) with
+ * the scopes the current token actually *carries*. `missing_scope` is the set a
+ * re-consent at /grow/oauth/start would add — the direct explanation for a 403
+ * on a note/custom-action endpoint. `token_scope` is null for opaque tokens.
+ */
+export function growScopeReport(token: string | undefined) {
+  const requested = (ENV.GROW_OAUTH_SCOPE ?? "").split(/\s+/).filter(Boolean);
+  const granted = readTokenScopes(token);
+  return {
+    requested_scope: requested,
+    token_scope: granted,
+    missing_scope: granted === null ? null : requested.filter((s) => !granted.includes(s)),
+    ...(granted === null
+      ? {
+          scope_note:
+            "The stored access token is opaque (not a JWT), so its granted scopes can't be read here. If a grow_* endpoint returns 403 after deploying new scopes, reconnect at /grow/oauth/start — existing tokens keep the scopes they were consented for.",
+        }
+      : {}),
+  };
+}
+
 /** Client-side ids[] filter (Grow repeats the param; simpler to filter here). */
 function filterByIds<T extends { id?: number }>(rows: T[], ids?: number[]): T[] {
   if (!ids?.length) return rows;
@@ -122,17 +165,21 @@ export function registerGrowTools(server: McpServer): void {
   // OAuth app; this tool proves out the token against Grow in one call.
   server.tool(
     "grow_who_am_i",
-    "Verify Clio Grow API access and return the current Grow user + firm (GET /users/who_am_i on the Grow API). Reports token_source: 'grow_oauth' (you connected the Grow Platform app at /grow/oauth/start) or 'manage_fallback' (no Grow tokens stored; trying the Manage token). Use this FIRST if any other grow_* tool errors — a 401/403 with manage_fallback means you need to connect at /grow/oauth/start.",
+    "Verify Clio Grow API access and return the current Grow user + firm (GET /users/who_am_i on the Grow API). Reports token_source: 'grow_oauth' (you connected the Grow Platform app at /grow/oauth/start) or 'manage_fallback' (no Grow tokens stored; trying the Manage token), plus a scopes block (requested_scope vs the token's actual token_scope, and missing_scope). Use this FIRST if any other grow_* tool errors — a 401/403 with manage_fallback means you need to connect at /grow/oauth/start; a non-empty missing_scope means the stored token predates a scope change and you must reconnect to re-consent.",
     {},
     async () => {
       let tokenSource: string | undefined;
+      let scopes: ReturnType<typeof growScopeReport> | undefined;
       try {
-        tokenSource = (await resolveGrowBearer()).source;
+        const bearer = await resolveGrowBearer();
+        tokenSource = bearer.source;
+        scopes = growScopeReport(bearer.token);
         const me = await growGetSingle("/users/who_am_i");
         return ok({
           grow_api_base_url: ENV.GROW_API_BASE_URL,
           grow_access: "confirmed",
           token_source: tokenSource,
+          scopes,
           user: me?.data ?? me,
         });
       } catch (err: any) {
@@ -146,6 +193,7 @@ export function registerGrowTools(server: McpServer): void {
                 grow_api_base_url: ENV.GROW_API_BASE_URL,
                 grow_access: "FAILED",
                 token_source: tokenSource,
+                scopes,
                 status,
                 grow_error: err.response?.data,
                 diagnosis:
