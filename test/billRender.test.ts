@@ -100,6 +100,16 @@ describe("findChromium", () => {
     expect(found).toBe("/usr/bin/google-chrome-stable");
   });
 
+  it("finds the Nixpacks-baked symlink when it is neither in the env var nor on PATH", () => {
+    // Deployment case: PUPPETEER_EXECUTABLE_PATH unset and the Nix chromium not
+    // on the runtime $PATH, but the build pinned a symlink at /app/.chromium.
+    const found = findChromium({
+      env: { PATH: "/empty" },
+      exists: (p) => p === "/app/.chromium/chromium",
+    });
+    expect(found).toBe("/app/.chromium/chromium");
+  });
+
   it("returns null when no browser is found anywhere", () => {
     expect(findChromium({ env: { PATH: "/nowhere" }, exists: () => false })).toBeNull();
   });
