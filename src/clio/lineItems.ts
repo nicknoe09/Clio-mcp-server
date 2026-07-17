@@ -113,6 +113,49 @@ function buildLineItemBody(patch: SmartPatch): Record<string, any> {
 // regresses the unit handling.
 const MAX_TOTAL_INFLATION = 5;
 
+// Per-entry sanity ceiling for hour edits. A single time entry is a day's
+// work on one task — it cannot exceed 24 hours. The hour-change path PATCHes
+// /activities directly, bypassing patchTimeEntrySmart's overcharge guard, so
+// this is the only thing standing between a missing-decimal fat-finger
+// (0.6h typed as "60", i.e. a 100x overcharge on a draft bill about to be
+// issued) and the client's invoice. Chosen so it can NEVER reject a legitimate
+// edit: nothing real exceeds 24h on one entry, and same-day hard-combines
+// roll up to well under 24h too. Override with force for the rare exception.
+export const MAX_ENTRY_HOURS_PER_DAY = 24;
+
+// Sanity-check a requested new hours value for a single time entry. Throws
+// (with an actionable message) when it exceeds the daily ceiling unless the
+// caller explicitly forces it. Pure + exported so it is unit-testable and so
+// every hour-writing path shares one rule.
+export function assertNewHoursSane(
+  newHours: number,
+  ctx: { originalHours?: number; force?: boolean } = {},
+): void {
+  if (ctx.force) return;
+  if (newHours > MAX_ENTRY_HOURS_PER_DAY) {
+    throw new Error(
+      `Refusing to set ${newHours}h on a single time entry — that exceeds the ${MAX_ENTRY_HOURS_PER_DAY}h/day sanity ceiling` +
+        (ctx.originalHours != null ? ` (the line is currently ${ctx.originalHours}h)` : "") +
+        `. This is almost always a missing-decimal fat-finger (e.g. 6.0 entered as 60), which would multiply the line's charge on the bill. Pass force=true if the value is genuinely correct.`,
+    );
+  }
+}
+
+// Reconcile a hard-combine's requested primary hours against what the roll-up
+// arithmetic implies (original primary hours + the sum of the secondaries'
+// hours). Pure + exported for unit testing. A mismatch means either an
+// intentional total change (allowed via force) or a fat-finger (blocked).
+export function reconcileHardCombineHours(
+  originalPrimaryHours: number,
+  secondaryHours: number[],
+  requestedHours: number,
+): { expected: number; requested: number; delta_hours: number; matches: boolean } {
+  const expected =
+    Math.round((originalPrimaryHours + secondaryHours.reduce((a, b) => a + b, 0)) * 1000) / 1000;
+  const delta = Math.round((requestedHours - expected) * 1000) / 1000;
+  return { expected, requested: requestedHours, delta_hours: delta, matches: Math.abs(delta) <= 0.005 };
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -954,12 +997,17 @@ export async function prepareHourChange(args: {
   activity_id?: number;
   new_hours: number;
   new_note?: string;
+  force?: boolean;
 }): Promise<PrepareHourChangeResult> {
   if (typeof args.new_hours !== "number" || !(args.new_hours > 0)) {
     throw new Error(
       `prepareHourChange: new_hours must be a positive number (got ${args.new_hours}).`,
     );
   }
+  // Catastrophic-overcharge guard. This path PATCHes /activities directly,
+  // bypassing patchTimeEntrySmart's inflation guard, so enforce the per-entry
+  // daily ceiling here before anything is mutated.
+  assertNewHoursSane(args.new_hours, { force: args.force });
   if (args.line_item_id === undefined && args.activity_id === undefined) {
     throw new Error("prepareHourChange: provide line_item_id or activity_id.");
   }
@@ -1076,6 +1124,7 @@ export interface PrepareHardCombineResult {
     secondaries_succeeded: number;
     secondaries_failed: number;
   };
+  hours_reconciliation: { expected: number; requested: number; delta_hours: number; matches: boolean };
   ui_instruction: string;
 }
 
@@ -1097,6 +1146,7 @@ export async function prepareHardCombine(args: {
   new_primary_hours: number;
   new_note?: string;
   secondary_treatment?: "delete" | "discount_100pct";
+  force?: boolean;
 }): Promise<PrepareHardCombineResult> {
   const treatment = args.secondary_treatment ?? "delete";
 
@@ -1153,7 +1203,7 @@ export async function prepareHardCombine(args: {
   const billId = primary.bill.id;
 
   // Read each secondary, verify same bill, draft state.
-  const secondaryReads: Array<{ id: number; activity_id?: number; total: number }> = [];
+  const secondaryReads: Array<{ id: number; activity_id?: number; total: number; hours: number }> = [];
   for (const sid of dedupedSecondaries) {
     const resp = await rawGetSingle(`/line_items/${sid}`, { fields: LINE_ITEM_FIELDS });
     const li = resp.data;
@@ -1191,7 +1241,28 @@ export async function prepareHardCombine(args: {
       id: sid,
       activity_id: li.activity?.id,
       total: typeof li.total === "number" ? li.total : 0,
+      hours: typeof li.quantity === "number" ? li.quantity : 0,
     });
+  }
+
+  // Hours-conservation reconciliation: a hard-combine's new primary hours
+  // should equal the original primary hours plus the secondaries' hours being
+  // rolled in. A mismatch is either an intentional total change (force) or a
+  // fat-finger — block it by default so a mistyped total can't silently
+  // over/under-bill. (The 24h/entry ceiling in prepareHourChange applies too.)
+  const originalPrimaryHours = typeof primary.quantity === "number" ? primary.quantity : 0;
+  const hoursReconciliation = reconcileHardCombineHours(
+    originalPrimaryHours,
+    secondaryReads.map((s) => s.hours),
+    args.new_primary_hours,
+  );
+  if (!hoursReconciliation.matches && !args.force) {
+    const err: any = new Error(
+      `Refusing to hard-combine: new_primary_hours=${args.new_primary_hours}h, but original primary (${originalPrimaryHours}h) + secondaries (${secondaryReads.map((s) => s.hours).join("+") || 0}h) = ${hoursReconciliation.expected}h. ` +
+        `If you also intend to change the total billed hours, pass force=true; otherwise set new_primary_hours to ${hoursReconciliation.expected}.`,
+    );
+    err.response = { status: 409, data: { context: "hard_combine_hours_mismatch", ...hoursReconciliation } };
+    throw err;
   }
 
   // --- Step 1: prepareHourChange on primary ---
@@ -1199,6 +1270,7 @@ export async function prepareHardCombine(args: {
     line_item_id: args.primary_line_item_id,
     new_hours: args.new_primary_hours,
     new_note: args.new_note,
+    force: args.force,
   });
 
   // --- Step 2: handle secondaries (per-item isolation) ---
@@ -1283,6 +1355,7 @@ export async function prepareHardCombine(args: {
       secondaries_succeeded: succeeded,
       secondaries_failed: failed,
     },
+    hours_reconciliation: hoursReconciliation,
     ui_instruction: `Hard-combine prep complete on bill ${primaryResult.bill.number}. Primary activity ${primaryResult.activity_id} unbilled and re-edited to ${args.new_primary_hours}h${args.new_note !== undefined ? " with new note" : ""}. ${succeeded} ${treatment === "delete" ? "secondary activit" + (succeeded === 1 ? "y was" : "ies were") + " deleted" : "secondary line" + (succeeded === 1 ? " was" : "s were") + " discounted to 100%"}${failed > 0 ? ` (${failed} failed — see secondaries[] for details)` : ""}. To finalize: option A — open Clio UI → bill ${primaryResult.bill.number} → click "Regenerate Draft" (varies by Clio plan). Option B (if regenerate isn't available on your plan) — run delete_draft_bill(bill_id=${primaryResult.bill.id}) then in Clio UI on matter ${primaryResult.matter.display_number || primaryResult.matter.id} click "Generate Bill". Primary returns to bill at new hours, secondaries are ${treatment === "delete" ? "gone" : "still on the bill at $0"}.`,
   };
 }
