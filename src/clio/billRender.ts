@@ -6,12 +6,19 @@
 // self-contained HTML (inline CSS + DOCTYPE). This module turns that HTML into
 // a faithful PDF with a headless browser:
 //   1. Fetch the preview HTML (authorized Clio call).
-//   2. Inline external <img> assets so the render needs no network:
+//   2. Strip the Clio Payments stub that the preview appends after the invoice
+//      .footer — a "Page Break" divider (div.qr-code-preview-page-break), a
+//      REPEATED firm-address/invoice-number header (the second div.top-fold),
+//      and the "Pay your invoice online" block with its QR placeholder + link
+//      (div.qr-code-page). None of it belongs on the client-facing PDF (product
+//      decision: the payment QR is deliberately kept out of the rendered
+//      invoice), and left in it produces a spurious trailing page. The real
+//      invoice header (the FIRST div.top-fold) and the .footer are preserved.
+//   3. Inline external <img> assets so the render needs no network:
 //        - the firm logo (a presigned S3 URL) is fetched and base64-embedded;
-//        - the Clio Payments QR placeholder is STRIPPED, not embedded, so the
-//          client-facing PDF carries no broken-image box (by product decision:
-//          the payment QR is deliberately kept out of the rendered invoice).
-//   3. Render to PDF with Chromium via puppeteer-core, with request
+//        - any stray Clio Payments QR <img> that survives the stub strip is
+//          removed, not embedded, so the PDF carries no broken-image box.
+//   4. Render to PDF with Chromium via puppeteer-core, with request
 //      interception aborting ALL network so the render is hermetic and fast
 //      (webfonts fall back to system fonts; nothing hangs on a dead asset).
 //
@@ -106,6 +113,126 @@ export async function inlineBillAssets(
   }
 
   return { html: out, inlined, skipped };
+}
+
+// ------------------------------------------------------------
+// Payment-stub removal (DOM surgery on the preview HTML string)
+// ------------------------------------------------------------
+// The preview appends a "Clio Payments" stub AFTER the invoice .footer:
+//   <div class='qr-code-preview-page-break'> … Page Break … </div>
+//   <div class='top-fold'> … repeated firm-address/invoice-number header … </div>
+//   <div class="qr-code-page"> … "Pay your invoice online" + QR + click-here … </div>
+// We remove that whole stub. The FIRST .top-fold (the real invoice header) and
+// the .footer ("Please make all amounts payable to…" / "Please pay within
+// 15 days") must be preserved. Sanitization happens before the page loads, so
+// the surgery is done on the HTML string with a small balanced-tag matcher
+// (avoids a DOM-parser dependency and keeps this unit-testable and pure).
+
+/** Escape a string for safe embedding in a RegExp source. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True if a class attribute value carries `cls` as a whole (space-delimited) token. */
+function classListHas(classAttr: string, cls: string): boolean {
+  return classAttr.trim().split(/\s+/).includes(cls);
+}
+
+/**
+ * Given the index of an opening `<tag …>` in `html`, return the index just past
+ * its balanced `</tag>`, or -1 if unbalanced. Nested same-tag children are
+ * counted so the whole element (with its descendants) is spanned. Assumes tag
+ * attributes contain no unescaped `>` (true of Clio's preview markup).
+ */
+function elementEnd(html: string, openIdx: number): number {
+  const nameMatch = /^<([a-zA-Z][\w-]*)/.exec(html.slice(openIdx));
+  if (!nameMatch) return -1;
+  const tag = escapeRegExp(nameMatch[1]);
+  const tokenRe = new RegExp(`<${tag}\\b[^>]*>|</${tag}\\s*>`, "gi");
+  tokenRe.lastIndex = openIdx;
+  let depth = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(html))) {
+    if (m[0].startsWith("</")) {
+      depth--;
+      if (depth === 0) return m.index + m[0].length;
+    } else if (!m[0].endsWith("/>")) {
+      depth++;
+    }
+  }
+  return -1;
+}
+
+/** [start, end) spans of every element whose opening tag carries class `cls`. */
+function findElementsByClass(html: string, cls: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const openRe = /<[a-zA-Z][\w-]*\b[^>]*\bclass\s*=\s*(['"])([^'"]*)\1[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(html))) {
+    if (!classListHas(m[2], cls)) continue;
+    const end = elementEnd(html, m.index);
+    if (end > m.index) spans.push([m.index, end]);
+  }
+  return spans;
+}
+
+/** True if `outer` strictly contains `inner` (used to drop nested removals). */
+function strictlyContains(outer: [number, number], inner: [number, number]): boolean {
+  return (
+    outer[0] <= inner[0] &&
+    inner[1] <= outer[1] &&
+    (outer[0] < inner[0] || inner[1] < outer[1])
+  );
+}
+
+export type StubResult = { html: string; removed: string[] };
+
+/**
+ * Remove the Clio Payments stub appended after the invoice .footer:
+ *   - div.qr-code-page             ("Pay your invoice online" + QR + link)
+ *   - div.qr-code-preview-page-break ("Page Break" divider)
+ *   - the SECOND div.top-fold      (repeated header; the first is the real one)
+ *   - any div.einvoice-qr-code-container (defensive; absent in current markup)
+ * Removal is by container class where possible; the repeated header is the one
+ * case that must fall back to index [1] (guarded against there being only one
+ * .top-fold). Returns the cleaned HTML and a human-readable list of what went.
+ */
+export function stripPaymentStub(html: string): StubResult {
+  const removed: string[] = [];
+  // [start, end, label] for each element we intend to remove.
+  const targets: Array<[number, number, string]> = [];
+
+  // Prefer removal by container class.
+  for (const cls of ["qr-code-page", "qr-code-preview-page-break", "einvoice-qr-code-container"]) {
+    for (const [s, e] of findElementsByClass(html, cls)) targets.push([s, e, cls]);
+  }
+
+  // Repeated header: the second .top-fold. The FIRST is the real invoice header
+  // and must survive, so only fall back to [1] indexing here — and only when a
+  // second one actually exists.
+  const topFolds = findElementsByClass(html, "top-fold");
+  if (topFolds.length > 1) {
+    targets.push([topFolds[1][0], topFolds[1][1], "repeated header (top-fold[1])"]);
+  }
+
+  if (targets.length === 0) return { html, removed };
+
+  // Drop any target nested inside another (avoid double-removing / index skew).
+  const outer = targets.filter(
+    (t) => !targets.some((o) => o !== t && strictlyContains([o[0], o[1]], [t[0], t[1]])),
+  );
+
+  // Splice from the end backward so earlier offsets stay valid.
+  outer.sort((a, b) => b[0] - a[0]);
+  let out = html;
+  const labels: string[] = [];
+  for (const [start, end, label] of outer) {
+    out = out.slice(0, start) + out.slice(end);
+    labels.unshift(label); // rebuild document order
+  }
+
+  removed.push(`stripped payment-stub: ${labels.join(" + ")}`);
+  return { html: out, removed };
 }
 
 // Common Chromium/Chrome binary names, most-specific first, used for PATH and
@@ -300,8 +427,9 @@ export type RenderBillPdfResult = {
 };
 
 /**
- * Render one bill to a PDF buffer: fetch preview HTML → inline the logo /
- * strip the QR → render with the headless browser.
+ * Render one bill to a PDF buffer: fetch preview HTML → strip the Clio Payments
+ * stub → inline the logo → render with the headless browser. Shared by both
+ * render_bill_pdf and download_bills_pdf so the sanitization is identical.
  */
 export async function renderBillPdf(
   billId: number,
@@ -309,7 +437,10 @@ export async function renderBillPdf(
 ): Promise<RenderBillPdfResult> {
   const d = { ...defaultDeps(), ...deps };
   const html = await d.fetchPreviewHtml(billId);
-  const { html: inlinedHtml, inlined, skipped } = await inlineBillAssets(html, d.fetchAsset);
+  // Remove the payment stub (page-break divider + repeated header + QR block)
+  // before inlining images, so the QR placeholder is gone with its container.
+  const { html: strippedHtml, removed } = stripPaymentStub(html);
+  const { html: inlinedHtml, inlined, skipped } = await inlineBillAssets(strippedHtml, d.fetchAsset);
   const buffer = await d.renderPdf(inlinedHtml);
-  return { buffer, inlined, skipped };
+  return { buffer, inlined, skipped: [...removed, ...skipped] };
 }

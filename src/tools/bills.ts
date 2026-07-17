@@ -406,13 +406,14 @@ export function registerBillTools(server: McpServer): void {
   //  render_bill_pdf — Render a bill to PDF from its preview HTML
   // ============================================================
   // Clio's OAuth API does not serve rendered bill PDFs (see billPdf.ts), so
-  // this renders the invoice ourselves: GET /bills/{id}/preview → inline the
-  // firm logo (strip the payment QR) → headless-Chromium render → a short-lived
+  // this renders the invoice ourselves: GET /bills/{id}/preview → strip the
+  // Clio Payments stub (page-break divider + repeated header + "Pay online"/QR
+  // block) → inline the firm logo → headless-Chromium render → a short-lived
   // download URL the caller can hand to an email/attachment tool. Replaces the
   // old download_bill_pdf, which could only fail-fast against Clio's API gap.
   server.tool(
     "render_bill_pdf",
-    "Render a single bill/invoice to a PDF and return a short-lived download URL (the same download-store mechanism as get_bill_preview). Clio's OAuth API does NOT serve bill PDFs, so this builds one from the rendered preview HTML (GET /bills/{id}/preview) with a headless browser: the firm logo is fetched and embedded so the PDF is self-contained, and the Clio Payments QR placeholder is intentionally omitted. Use the returned direct_download_url to attach the invoice to an email or save it. Works for any non-draft bill (drafts have no issued invoice to render). Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
+    "Render a single bill/invoice to a PDF and return a short-lived download URL (the same download-store mechanism as get_bill_preview). Clio's OAuth API does NOT serve bill PDFs, so this builds one from the rendered preview HTML (GET /bills/{id}/preview) with a headless browser: the firm logo is fetched and embedded so the PDF is self-contained, and the Clio Payments stub the preview appends after the invoice (a 'Page Break' divider, a repeated firm-address/invoice-number header, and the 'Pay your invoice online' block with its QR placeholder) is stripped so the PDF ends cleanly on the invoice with no spurious trailing page. Use the returned direct_download_url to attach the invoice to an email or save it. Works for any non-draft bill (drafts have no issued invoice to render). Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
     {
       bill_id: z.coerce.number().describe("Clio bill ID"),
     },
@@ -692,7 +693,7 @@ export function registerBillTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_bills_pdf",
-    "Render multiple bills to PDFs and return a short-lived download URL for a zip of them. Filters bills by state, matter, client, or date range. Each invoice is rendered from its preview HTML (same engine as render_bill_pdf: logo embedded, payment QR omitted). Draft bills are skipped (no issued invoice to render). Per-bill render failures are collected without sinking the batch. Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
+    "Render multiple bills to PDFs and return a short-lived download URL for a zip of them. Filters bills by state, matter, client, or date range. Each invoice is rendered from its preview HTML (same engine as render_bill_pdf: logo embedded, Clio Payments stub — page-break divider, repeated header, and 'Pay online'/QR block — stripped). Draft bills are skipped (no issued invoice to render). Per-bill render failures are collected without sinking the batch. Requires Chromium on the server (PUPPETEER_EXECUTABLE_PATH).",
     {
       state: z
         .enum(["draft", "awaiting_approval", "awaiting_payment", "paid", "void", "all"])
