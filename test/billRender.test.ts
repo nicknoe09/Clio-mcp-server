@@ -1,9 +1,37 @@
 import { describe, it, expect } from "vitest";
-import { inlineBillAssets, renderBillPdf, findChromium, scanNixStore, type AssetResult } from "../src/clio/billRender";
+import { inlineBillAssets, renderBillPdf, stripPaymentStub, findChromium, scanNixStore, type AssetResult } from "../src/clio/billRender";
 
 const LOGO_URL =
   "https://s3.amazonaws.com/documents.goclio.com/logos/100660/Firm%20Logo.jpg?X-Amz-Signature=abc&amp;X-Amz-Expires=300";
 const QR_TAG = `<img src="/images/clio_payments/qr-code-preview.svg" class="qr-code-preview"/>`;
+
+// A faithful shrink of the real Clio preview tail: the invoice header
+// (FIRST .top-fold), the .footer, then the payment stub Clio appends — the
+// page-break divider, a REPEATED .top-fold header, and the qr-code-page block.
+const STUB_HTML = `<!DOCTYPE html><html><div class='invoice-paper'>
+  <div class='top-fold'>
+    <div class='header'><div class='firm'><div class='firm-address'>4610 Sweetwater Blvd</div></div></div>
+  </div>
+  <div class='body'><table><tbody><tr><td>work</td></tr></tbody></table></div>
+  <div class='footer'>
+    <div class='invoice-payable'>Please make all amounts payable to: Romano &amp; Sumner, PLLC</div>
+    <div class='invoice-payment-profile'>Please pay within 15 days.</div>
+  </div>
+  <div class='qr-code-preview-page-break'>- - - Page Break - - -</div>
+  <div class='top-fold'>
+    <div class='header'><div class='firm'><div class='firm-address'>4610 Sweetwater Blvd</div></div></div>
+    <div class='invoice-information'><label>Invoice #</label>11617</div>
+  </div>
+  <div class="qr-code-page">
+    <div class="qr-code-preview"><span class="qr-code-preview-text">QR here</span>${QR_TAG}</div>
+    <div class="text-container">
+      <div class="pay-your-invoice-header">Pay your invoice online</div>
+      <div class="click-link">Or, <a href='#0' class='link'>click here</a></div>
+    </div>
+  </div>
+  </div>
+<div class='paper-footer'>Page 1 of 1</div>
+</html>`;
 
 function fakeAsset(bytes = "PNGDATA", contentType = "image/jpeg"): AssetResult {
   return { buffer: Buffer.from(bytes), contentType };
@@ -64,6 +92,60 @@ describe("inlineBillAssets", () => {
     expect(res.html).toContain("s3.amazonaws.com"); // untouched
     expect(res.inlined).toHaveLength(0);
     expect(res.skipped.some((s) => s.includes("fetch-failed"))).toBe(true);
+  });
+});
+
+describe("stripPaymentStub", () => {
+  it("removes the whole payment stub but keeps the real header and footer", () => {
+    const { html, removed } = stripPaymentStub(STUB_HTML);
+
+    // The stub is gone: no page-break, no qr-code-page, no "Pay online" text.
+    expect(html).not.toContain("qr-code-preview-page-break");
+    expect(html).not.toContain("Page Break");
+    expect(html).not.toContain('class="qr-code-page"');
+    expect(html).not.toContain("Pay your invoice online");
+    expect(html).not.toContain("qr-code-preview.svg");
+
+    // The real invoice header (first .top-fold) survives — exactly one remains,
+    // and the repeated invoice-number header is gone with the stub.
+    expect((html.match(/class='top-fold'/g) || []).length).toBe(1);
+    expect(html).not.toContain("Invoice #");
+
+    // The footer (payable-to / pay-within-15-days) must stay on the invoice.
+    expect(html).toContain("Please make all amounts payable to");
+    expect(html).toContain("Please pay within 15 days");
+
+    // The document still ends on the paper-footer, with the stub excised.
+    expect(html).toContain("Page 1 of 1");
+
+    // skipped/removed accurately names each part that went, in document order.
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toContain("stripped payment-stub");
+    expect(removed[0]).toContain("qr-code-preview-page-break");
+    expect(removed[0]).toContain("repeated header");
+    expect(removed[0]).toContain("qr-code-page");
+  });
+
+  it("does not touch a single .top-fold when there is no repeated header", () => {
+    const html = `<div class='top-fold'>real header</div><div class='footer'>pay within 15 days</div>`;
+    const { html: out, removed } = stripPaymentStub(html);
+    expect(out).toBe(html); // nothing to strip
+    expect(removed).toHaveLength(0);
+  });
+
+  it("defensively removes an einvoice-qr-code-container if present", () => {
+    const html = `<div class='footer'>foot</div><div class='einvoice-qr-code-container'><img src='x'/></div>`;
+    const { html: out, removed } = stripPaymentStub(html);
+    expect(out).not.toContain("einvoice-qr-code-container");
+    expect(out).toContain("foot");
+    expect(removed[0]).toContain("einvoice-qr-code-container");
+  });
+
+  it("is a no-op on HTML with no payment stub", () => {
+    const html = `<div class='top-fold'>header</div><div class='body'>work</div><div class='footer'>foot</div>`;
+    const { html: out, removed } = stripPaymentStub(html);
+    expect(out).toBe(html);
+    expect(removed).toHaveLength(0);
   });
 });
 
@@ -142,8 +224,12 @@ describe("scanNixStore", () => {
 });
 
 describe("renderBillPdf orchestration", () => {
-  it("fetches preview → inlines assets → renders, passing inlined HTML to the renderer", async () => {
-    const previewHtml = `<html><img src="${LOGO_URL}"/>${QR_TAG}</html>`;
+  it("fetches preview → strips the stub → inlines assets → renders", async () => {
+    // Preview HTML that carries the firm logo AND the full payment stub.
+    const previewHtml = STUB_HTML.replace(
+      "<div class='body'>",
+      `<div class='body'><img src="${LOGO_URL}"/>`,
+    );
     let renderedHtml = "";
     const result = await renderBillPdf(123, {
       fetchPreviewHtml: async (id) => {
@@ -157,13 +243,19 @@ describe("renderBillPdf orchestration", () => {
       },
     });
 
-    // The HTML handed to the renderer has the logo embedded and the QR removed.
+    // The HTML handed to the renderer has the logo embedded and the whole
+    // payment stub removed (page-break, repeated header, qr-code-page).
     expect(renderedHtml).toContain("data:image/jpeg;base64,");
-    expect(renderedHtml).not.toContain("qr-code-preview");
     expect(renderedHtml).not.toContain("s3.amazonaws.com");
+    expect(renderedHtml).not.toContain("qr-code-page");
+    expect(renderedHtml).not.toContain("Page Break");
+    expect(renderedHtml).not.toContain("Pay your invoice online");
+    // Real header + footer survive.
+    expect((renderedHtml.match(/class='top-fold'/g) || []).length).toBe(1);
+    expect(renderedHtml).toContain("Please pay within 15 days");
 
     expect(result.buffer.toString("utf8")).toContain("%PDF");
     expect(result.inlined).toHaveLength(1);
-    expect(result.skipped.some((s) => s.includes("payment-qr"))).toBe(true);
+    expect(result.skipped.some((s) => s.includes("payment-stub"))).toBe(true);
   });
 });
