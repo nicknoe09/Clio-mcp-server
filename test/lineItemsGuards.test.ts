@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   assertNewHoursSane,
   reconcileHardCombineHours,
+  reconcileHardCombineDollars,
   MAX_ENTRY_HOURS_PER_DAY,
 } from "../src/clio/lineItems";
 
@@ -42,5 +43,26 @@ describe("reconcileHardCombineHours (hours conservation)", () => {
 
   it("tolerates sub-cent rounding noise", () => {
     expect(reconcileHardCombineHours(0.1, [0.2], 0.3).matches).toBe(true);
+  });
+});
+
+describe("reconcileHardCombineDollars (rate-aware value conservation)", () => {
+  it("conserves dollars when all rates match", () => {
+    // 0.4h@195 primary + 0.4h@195 secondary -> 0.8h@195
+    const r = reconcileHardCombineDollars({ hours: 0.4, rate: 195 }, [{ hours: 0.4, rate: 195 }], 0.8);
+    expect(r.expected_dollars).toBeCloseTo(156, 2);
+    expect(r.resulting_dollars).toBeCloseTo(156, 2);
+    expect(r.rates_uniform).toBe(true);
+    expect(r.matches).toBe(true);
+  });
+
+  it("flags the live-confirmed differing-rate loss ($178 -> $156)", () => {
+    // 0.4h@195 primary + 0.4h@250 secondary, rolled to 0.8h at the primary's $195
+    const r = reconcileHardCombineDollars({ hours: 0.4, rate: 195 }, [{ hours: 0.4, rate: 250 }], 0.8);
+    expect(r.expected_dollars).toBeCloseTo(178, 2); // 78 + 100
+    expect(r.resulting_dollars).toBeCloseTo(156, 2); // 0.8 * 195
+    expect(r.delta_dollars).toBeCloseTo(-22, 2);
+    expect(r.rates_uniform).toBe(false);
+    expect(r.matches).toBe(false);
   });
 });

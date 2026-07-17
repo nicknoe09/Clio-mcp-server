@@ -156,6 +156,42 @@ export function reconcileHardCombineHours(
   return { expected, requested: requestedHours, delta_hours: delta, matches: Math.abs(delta) <= 0.005 };
 }
 
+// Dollar-conservation reconciliation for a hard-combine. Rolling a secondary's
+// hours into the primary rebills those hours at the PRIMARY's rate — so when
+// the secondaries carry a different rate, the billed total silently changes
+// even though hours are conserved (verified live 2026-07: a 0.4h@$250 line
+// combined into a 0.4h@$195 primary dropped the bill $22 with no warning).
+// expected = primary$ + Σ secondary$ (what the lines were worth apart);
+// resulting = new primary hours × primary rate (what the combined line bills).
+// Pure + exported for unit testing.
+export function reconcileHardCombineDollars(
+  originalPrimary: { hours: number; rate: number },
+  secondaries: Array<{ hours: number; rate: number }>,
+  newPrimaryHours: number,
+): {
+  expected_dollars: number;
+  resulting_dollars: number;
+  delta_dollars: number;
+  rates_uniform: boolean;
+  matches: boolean;
+} {
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const expected = round2(
+    originalPrimary.hours * originalPrimary.rate +
+      secondaries.reduce((s, x) => s + x.hours * x.rate, 0),
+  );
+  const resulting = round2(newPrimaryHours * originalPrimary.rate);
+  const delta = round2(resulting - expected);
+  const ratesUniform = secondaries.every((s) => Math.abs(s.rate - originalPrimary.rate) < 0.005);
+  return {
+    expected_dollars: expected,
+    resulting_dollars: resulting,
+    delta_dollars: delta,
+    rates_uniform: ratesUniform,
+    matches: Math.abs(delta) <= 0.005,
+  };
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -1125,6 +1161,13 @@ export interface PrepareHardCombineResult {
     secondaries_failed: number;
   };
   hours_reconciliation: { expected: number; requested: number; delta_hours: number; matches: boolean };
+  dollars_reconciliation: {
+    expected_dollars: number;
+    resulting_dollars: number;
+    delta_dollars: number;
+    rates_uniform: boolean;
+    matches: boolean;
+  };
   ui_instruction: string;
 }
 
@@ -1203,7 +1246,7 @@ export async function prepareHardCombine(args: {
   const billId = primary.bill.id;
 
   // Read each secondary, verify same bill, draft state.
-  const secondaryReads: Array<{ id: number; activity_id?: number; total: number; hours: number }> = [];
+  const secondaryReads: Array<{ id: number; activity_id?: number; total: number; hours: number; rate: number }> = [];
   for (const sid of dedupedSecondaries) {
     const resp = await rawGetSingle(`/line_items/${sid}`, { fields: LINE_ITEM_FIELDS });
     const li = resp.data;
@@ -1242,6 +1285,7 @@ export async function prepareHardCombine(args: {
       activity_id: li.activity?.id,
       total: typeof li.total === "number" ? li.total : 0,
       hours: typeof li.quantity === "number" ? li.quantity : 0,
+      rate: typeof li.price === "number" ? li.price : 0,
     });
   }
 
@@ -1251,6 +1295,7 @@ export async function prepareHardCombine(args: {
   // fat-finger — block it by default so a mistyped total can't silently
   // over/under-bill. (The 24h/entry ceiling in prepareHourChange applies too.)
   const originalPrimaryHours = typeof primary.quantity === "number" ? primary.quantity : 0;
+  const primaryRate = typeof primary.price === "number" ? primary.price : 0;
   const hoursReconciliation = reconcileHardCombineHours(
     originalPrimaryHours,
     secondaryReads.map((s) => s.hours),
@@ -1262,6 +1307,28 @@ export async function prepareHardCombine(args: {
         `If you also intend to change the total billed hours, pass force=true; otherwise set new_primary_hours to ${hoursReconciliation.expected}.`,
     );
     err.response = { status: 409, data: { context: "hard_combine_hours_mismatch", ...hoursReconciliation } };
+    throw err;
+  }
+
+  // Dollar-conservation reconciliation: rolling the secondaries' hours into the
+  // primary rebills them at the PRIMARY's rate. When the secondaries carry a
+  // different rate, the billed total silently changes even though hours are
+  // conserved. Refuse by default so a rate-mixed combine can't quietly
+  // over/under-bill the client; the reviewer confirms with force.
+  const dollarsReconciliation = reconcileHardCombineDollars(
+    { hours: originalPrimaryHours, rate: primaryRate },
+    secondaryReads.map((s) => ({ hours: s.hours, rate: s.rate })),
+    args.new_primary_hours,
+  );
+  if (!dollarsReconciliation.matches && !args.force) {
+    const err: any = new Error(
+      `Refusing to hard-combine: this would change the billed total from $${dollarsReconciliation.expected_dollars} to $${dollarsReconciliation.resulting_dollars} (Δ$${dollarsReconciliation.delta_dollars})` +
+        (!dollarsReconciliation.rates_uniform
+          ? ` because a secondary line's rate differs from the primary's $${primaryRate}/hr — its hours get rebilled at the primary's rate.`
+          : `.`) +
+        ` If the change is intended (e.g. a write-down while combining), pass force=true.`,
+    );
+    err.response = { status: 409, data: { context: "hard_combine_dollars_mismatch", ...dollarsReconciliation } };
     throw err;
   }
 
@@ -1356,6 +1423,7 @@ export async function prepareHardCombine(args: {
       secondaries_failed: failed,
     },
     hours_reconciliation: hoursReconciliation,
+    dollars_reconciliation: dollarsReconciliation,
     ui_instruction: `Hard-combine prep complete on bill ${primaryResult.bill.number}. Primary activity ${primaryResult.activity_id} unbilled and re-edited to ${args.new_primary_hours}h${args.new_note !== undefined ? " with new note" : ""}. ${succeeded} ${treatment === "delete" ? "secondary activit" + (succeeded === 1 ? "y was" : "ies were") + " deleted" : "secondary line" + (succeeded === 1 ? " was" : "s were") + " discounted to 100%"}${failed > 0 ? ` (${failed} failed — see secondaries[] for details)` : ""}. To finalize: option A — open Clio UI → bill ${primaryResult.bill.number} → click "Regenerate Draft" (varies by Clio plan). Option B (if regenerate isn't available on your plan) — run delete_draft_bill(bill_id=${primaryResult.bill.id}) then in Clio UI on matter ${primaryResult.matter.display_number || primaryResult.matter.id} click "Generate Bill". Primary returns to bill at new hours, secondaries are ${treatment === "delete" ? "gone" : "still on the bill at $0"}.`,
   };
 }
