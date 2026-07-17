@@ -19,6 +19,7 @@
 // asset-inlining logic are unit-testable without a real browser or HTTPS.
 // ============================================================
 import axios from "axios";
+import { existsSync } from "node:fs";
 import type { Browser } from "puppeteer-core";
 import { rawGetBinarySingle } from "./pagination";
 
@@ -107,18 +108,66 @@ export async function inlineBillAssets(
   return { html: out, inlined, skipped };
 }
 
-/** Chromium executable path for puppeteer-core, from the environment. */
+// Common Chromium/Chrome binary names, most-specific first, used for PATH and
+// well-known-location scanning when no explicit env var is set.
+const CHROMIUM_NAMES = [
+  "chromium",
+  "chromium-browser",
+  "google-chrome-stable",
+  "google-chrome",
+  "chrome",
+];
+const CHROMIUM_WELL_KNOWN = [
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/google-chrome",
+  "/snap/bin/chromium",
+];
+
+/**
+ * Locate a Chromium/Chrome binary for puppeteer-core (which needs a real file
+ * path — it does NOT resolve a bare name via PATH). Resolution order:
+ *   1. PUPPETEER_EXECUTABLE_PATH / CHROMIUM_PATH / CHROME_PATH, if the file exists;
+ *   2. a binary named like Chromium found on $PATH (covers the nixpacks
+ *      `chromium` package, whose Nix-store path is not stable across builds);
+ *   3. a well-known absolute location.
+ * Injectable env/exists for testing. Returns null when nothing is found.
+ */
+export function findChromium(
+  opts: { env?: NodeJS.ProcessEnv; exists?: (p: string) => boolean } = {},
+): string | null {
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? existsSync;
+
+  const explicit =
+    env.PUPPETEER_EXECUTABLE_PATH || env.CHROMIUM_PATH || env.CHROME_PATH;
+  if (explicit && exists(explicit)) return explicit;
+
+  const dirs = (env.PATH || "").split(":").filter(Boolean);
+  for (const dir of dirs) {
+    for (const name of CHROMIUM_NAMES) {
+      const full = `${dir.replace(/\/$/, "")}/${name}`;
+      if (exists(full)) return full;
+    }
+  }
+
+  for (const p of CHROMIUM_WELL_KNOWN) {
+    if (exists(p)) return p;
+  }
+
+  return null;
+}
+
+/** Chromium executable path for puppeteer-core, or a clear error. */
 export function resolveChromiumPath(): string {
-  const p =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    process.env.CHROMIUM_PATH ||
-    process.env.CHROME_PATH ||
-    "";
+  const p = findChromium();
   if (!p) {
     throw new Error(
-      "No Chromium available for PDF rendering. Set PUPPETEER_EXECUTABLE_PATH " +
-        "(or CHROMIUM_PATH) to a Chromium/Chrome binary. On Railway, install " +
-        "chromium via nixpacks.toml and point the env var at it.",
+      "No Chromium found for PDF rendering. The server scans $PATH and common " +
+        "locations; on Railway the nixpacks.toml `chromium` package normally " +
+        "puts it on $PATH automatically. To override, set PUPPETEER_EXECUTABLE_PATH " +
+        "(or CHROMIUM_PATH) to an existing Chromium/Chrome binary.",
     );
   }
   return p;

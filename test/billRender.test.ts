@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { inlineBillAssets, renderBillPdf, type AssetResult } from "../src/clio/billRender";
+import { inlineBillAssets, renderBillPdf, findChromium, type AssetResult } from "../src/clio/billRender";
 
 const LOGO_URL =
   "https://s3.amazonaws.com/documents.goclio.com/logos/100660/Firm%20Logo.jpg?X-Amz-Signature=abc&amp;X-Amz-Expires=300";
@@ -64,6 +64,44 @@ describe("inlineBillAssets", () => {
     expect(res.html).toContain("s3.amazonaws.com"); // untouched
     expect(res.inlined).toHaveLength(0);
     expect(res.skipped.some((s) => s.includes("fetch-failed"))).toBe(true);
+  });
+});
+
+describe("findChromium", () => {
+  it("prefers an explicit env var when the file exists", () => {
+    const found = findChromium({
+      env: { PUPPETEER_EXECUTABLE_PATH: "/custom/chrome", PATH: "/usr/bin" },
+      exists: (p) => p === "/custom/chrome" || p === "/usr/bin/chromium",
+    });
+    expect(found).toBe("/custom/chrome");
+  });
+
+  it("falls through to a PATH scan when the explicit path does not exist", () => {
+    const found = findChromium({
+      env: { PUPPETEER_EXECUTABLE_PATH: "/stale/missing", PATH: "/nix/x/bin:/usr/bin" },
+      exists: (p) => p === "/usr/bin/chromium",
+    });
+    expect(found).toBe("/usr/bin/chromium");
+  });
+
+  it("scans $PATH for a Chromium-like binary (nixpacks store path)", () => {
+    const found = findChromium({
+      env: { PATH: "/nix/store/abc-chromium/bin:/usr/bin" },
+      exists: (p) => p === "/nix/store/abc-chromium/bin/chromium",
+    });
+    expect(found).toBe("/nix/store/abc-chromium/bin/chromium");
+  });
+
+  it("falls back to a well-known location when nothing is on PATH", () => {
+    const found = findChromium({
+      env: { PATH: "/empty" },
+      exists: (p) => p === "/usr/bin/google-chrome-stable",
+    });
+    expect(found).toBe("/usr/bin/google-chrome-stable");
+  });
+
+  it("returns null when no browser is found anywhere", () => {
+    expect(findChromium({ env: { PATH: "/nowhere" }, exists: () => false })).toBeNull();
   });
 });
 
