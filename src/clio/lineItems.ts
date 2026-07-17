@@ -59,6 +59,8 @@ export interface SmartPatch {
   // so internal time-entry records stay in sync with bill-line edits.
   // Ignored on the /activities path (no-op there).
   update_original_record?: boolean;
+  // Override the per-entry 24h/day hours ceiling (see assertNewHoursSane).
+  force?: boolean;
 }
 
 export interface SmartPatchResult {
@@ -192,6 +194,19 @@ export function reconcileHardCombineDollars(
   };
 }
 
+// The line total a discount SHOULD produce, computed against the UNDISCOUNTED
+// base (price × quantity) — a new discount replaces any prior one, so the base,
+// not the current (possibly already-discounted) total, is the reference. Pure +
+// exported so the read-back verification in discountLineItem is unit-testable.
+export function expectedDiscountedTotal(
+  base: number,
+  discount: { pct: number } | { amount: number },
+): number {
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  if ("pct" in discount) return round2(base * (1 - discount.pct / 100));
+  return round2(base - discount.amount);
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -206,6 +221,13 @@ export async function patchTimeEntrySmart(
   ) {
     throw new Error("patchTimeEntrySmart: provide at least one of note, price, hours, date");
   }
+
+  // Absolute hours ceiling, enforced before any write. The inflation-ratio
+  // guard on the /line_items path below is SKIPPED when the line's current
+  // total is 0 (a zero-hour or zero-rate line), so a fat-fingered hours value
+  // could slip through there; checking up front closes that hole on both the
+  // /activities and /line_items paths.
+  if (patch.hours !== undefined) assertNewHoursSane(patch.hours, { force: patch.force });
 
   const routing = await resolveActivityRouting(activityId);
 
@@ -554,6 +576,27 @@ export async function discountLineItem(args: {
     throw err;
   }
   const afterResp = await rawGetSingle(`/line_items/${lineItemId}`, { fields: LINE_ITEM_FIELDS + ",discount{rate,type}" });
+
+  // Read-back verification: confirm Clio actually applied the discount. Some
+  // /line_items writes return 200 but silently no-op (the quantity field does
+  // exactly this for ActivityLineItem). Compare the resulting total to what the
+  // requested discount implies against the undiscounted base (price × quantity).
+  const base = Number(beforeLineItem?.price ?? 0) * Number(beforeLineItem?.quantity ?? 0);
+  const expectedTotal =
+    args.discount_pct !== undefined
+      ? expectedDiscountedTotal(base, { pct: args.discount_pct })
+      : expectedDiscountedTotal(base, { amount: args.discount_amount as number });
+  const actualTotal = Number(afterResp.data?.total ?? NaN);
+  if (base > 0 && !Number.isNaN(actualTotal) && Math.abs(actualTotal - expectedTotal) > 0.02) {
+    const err: any = new Error(
+      `Refused: the discount on line_item ${lineItemId} did not take effect — after the write the line total is $${actualTotal}, but the requested discount implies $${expectedTotal} (undiscounted base $${Math.round(base * 100) / 100}). Clio appears to have silently ignored it; re-check the line before issuing the bill.`,
+    );
+    err.response = {
+      status: 422,
+      data: { context: "discount_not_applied", expected_total: expectedTotal, actual_total: actualTotal, base: Math.round(base * 100) / 100 },
+    };
+    throw err;
+  }
 
   return {
     line_item_id: lineItemId!,
@@ -1125,6 +1168,26 @@ export async function prepareHourChange(args: {
       },
     };
     throw richErr;
+  }
+
+  // Read-back verification: confirm /activities actually took the new quantity.
+  // The line was already removed from the bill in Step 1, so a silent no-op here
+  // would otherwise return success while leaving the entry unbilled at the WRONG
+  // hours. A read failure alone shouldn't mask a likely-successful write, so only
+  // a confirmed mismatch throws.
+  try {
+    const verify = await rawGetSingle(`/activities/${activityId}`, { fields: "id,quantity" });
+    const gotHours = Math.round(((verify.data?.quantity ?? 0) / 3600) * 1000) / 1000;
+    if (Math.abs(gotHours - args.new_hours) > 0.005) {
+      const err: any = new Error(
+        `Step 2 verification failed: /activities/${activityId} shows ${gotHours}h after the edit, not the requested ${args.new_hours}h — Clio may have silently ignored the change. The line was removed from bill ${bill.number} in Step 1; click "Regenerate Draft" to restore it at ${gotHours}h, or retry prepare_hour_change.`,
+      );
+      err.response = { status: 409, data: { context: "hour_change_not_applied", requested: args.new_hours, actual: gotHours } };
+      throw err;
+    }
+  } catch (e: any) {
+    if (e?.response?.data?.context === "hour_change_not_applied") throw e;
+    console.warn(`[prepareHourChange] post-write verify read failed for activity ${activityId}: ${e?.message ?? e}`);
   }
 
   return {
