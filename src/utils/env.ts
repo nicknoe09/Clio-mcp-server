@@ -34,15 +34,25 @@ export const ENV = {
     get GROW_OAUTH_TOKEN_URL() { return getEnv("GROW_OAUTH_TOKEN_URL", "https://auth.api.clio.com/oauth/token"); },
     // Space-separated OAuth scopes. Per Clio API Support, Grow uses Grow-SPECIFIC
     // scopes (grow_contact_read, grow_matter_read, grow_lead_inbox_read,
-    // grow_user_read, and their _write counterparts) — NOT openid/offline_access
-    // (a refresh_token is returned automatically on the authorization_code grant).
-    // The requested scopes must be a subset of the App Permissions selected on the
-    // app in the portal; set GROW_OAUTH_SCOPE to match those exactly (add _write
-    // scopes to enable the create/delete tools). Default covers the four confirmed
-    // read scopes so the read tools + grow_who_am_i work out of the box.
+    // grow_user_read, note/custom-action scopes, and their _write counterparts) —
+    // NOT openid/offline_access (a refresh_token is returned automatically on the
+    // authorization_code grant). The requested scopes must be a subset of the App
+    // Permissions selected on the app in the portal; set GROW_OAUTH_SCOPE to match
+    // those exactly. The default now covers every scope the Grow tools exercise so
+    // the read AND write tools work out of the box:
+    //   - grow_lead_inbox_read/_write  → get/create_grow_inbox_lead
+    //   - grow_custom_action_read/_write → get/create/delete_grow_custom_action
+    //   - grow_matter_read             → get_grow_matters
+    //   - grow_matter_note_read/_write → get/create_grow_note (matter)
+    //   - grow_contact_read            → get_grow_contacts
+    //   - grow_contact_note_read/_write → get/create_grow_note (contact)
+    //   - grow_user_read               → get_grow_users
+    // (Note: notes are gated by note-specific scopes, not the parent read scope,
+    // and custom actions by their own scope — the previous 4-read-scope default
+    // left the write/note/custom-action tools failing with an auth-host redirect.)
     get GROW_OAUTH_SCOPE() {
         return process.env.GROW_OAUTH_SCOPE ??
-            "grow_contact_read grow_matter_read grow_lead_inbox_read grow_user_read";
+            "grow_lead_inbox_read grow_lead_inbox_write grow_custom_action_read grow_custom_action_write grow_matter_read grow_matter_note_read grow_matter_note_write grow_contact_read grow_contact_note_read grow_contact_note_write grow_user_read";
     },
     // PKCE (S256). Clio's Platform app has an optional "Use PKCE" toggle. Set
     // GROW_OAUTH_PKCE to match that toggle: on by default (sending a code_challenge
