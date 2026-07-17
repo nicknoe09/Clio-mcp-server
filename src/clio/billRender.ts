@@ -118,11 +118,18 @@ const CHROMIUM_NAMES = [
   "chrome",
 ];
 const CHROMIUM_WELL_KNOWN = [
+  // Stable symlink baked in by the Railway/Nixpacks build (see nixpacks.toml);
+  // covers the case where PUPPETEER_EXECUTABLE_PATH is not set in the env.
+  "/app/.chromium/chromium",
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
   "/usr/bin/google-chrome-stable",
   "/usr/bin/google-chrome",
   "/snap/bin/chromium",
+  // Nix profile locations (the Nixpacks `chromium` package), for when the
+  // Nix profile bin dir is not on the runtime $PATH.
+  "/root/.nix-profile/bin/chromium",
+  "/nix/var/nix/profiles/default/bin/chromium",
 ];
 
 /**

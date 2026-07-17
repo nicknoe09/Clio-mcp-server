@@ -4,9 +4,29 @@
 # (render_bill_pdf / download_bills_pdf via puppeteer-core). puppeteer-core
 # ships NO browser of its own, so Chromium must be provided by the image.
 #
-# `chromium` here is the Nix package; nixpacks puts its binary on PATH. The
-# server AUTO-DETECTS it (findChromium() scans $PATH + common locations), so no
-# env var is needed. To override, set PUPPETEER_EXECUTABLE_PATH to a specific
-# binary path in the Railway dashboard.
+# `chromium` here is the Nix package. Nixpacks puts its binary on PATH during
+# the BUILD phases, but the Nix-store path is not stable across builds and is
+# not reliably on PATH in the RUNTIME image — so relying on auto-detection
+# scanning $PATH at runtime fails ("No Chromium found for PDF rendering").
+#
+# To make the browser location deterministic we resolve the Nix chromium binary
+# at build time and pin a stable symlink at /app/.chromium/chromium (baked into
+# the runtime image under the app dir), then point PUPPETEER_EXECUTABLE_PATH at
+# that fixed path. findChromium() honors that env var directly. If the symlink
+# is ever missing, detection still falls back to the PATH/well-known scan.
 [phases.setup]
 nixPkgs = ["nodejs", "chromium"]
+
+# Runs after the Nix packages are installed (chromium is on PATH here) and bakes
+# a stable symlink to the resolved store binary into the app dir.
+[phases.chromium]
+dependsOn = ["setup"]
+cmds = [
+  "mkdir -p /app/.chromium",
+  "ln -sf \"$(readlink -f \"$(command -v chromium)\")\" /app/.chromium/chromium",
+]
+
+# Available at build and runtime. Points puppeteer-core straight at the pinned
+# binary so no PATH scan is needed in production.
+[variables]
+PUPPETEER_EXECUTABLE_PATH = "/app/.chromium/chromium"
