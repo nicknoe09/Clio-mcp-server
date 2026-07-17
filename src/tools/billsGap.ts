@@ -198,20 +198,39 @@ export function registerBillsGapTools(server: McpServer): void {
   );
 
   // get_bill_themes — invoice templates/branding.
+  // Theme config blobs are huge (a full theme dump ran ~230 KB live), so the
+  // list view returns names only; fetch one theme's config via include_config
+  // + theme_id when it's needed (e.g. to feed update_bill_theme).
   server.tool(
     "get_bill_themes",
-    "List the firm's bill themes (GET /bill_themes) — the invoice templates/branding presets, including which is the default. Returns id, name, default flag, and config.",
-    { limit: z.coerce.number().optional().default(50).describe("Max themes to return") },
+    "List the firm's bill themes (GET /bill_themes) — the invoice templates/branding presets, including which is the default. Returns id, name, and default flag; theme config blobs are large, so pass include_config=true with theme_id to fetch a single theme's full config (for update_bill_theme).",
+    {
+      limit: z.coerce.number().optional().default(50).describe("Max themes to return"),
+      theme_id: z.coerce.number().optional().describe("Only this theme (required to include config)"),
+      include_config: z.boolean().optional().default(false)
+        .describe("Include the full config object — only honored when theme_id is given (configs are very large)"),
+    },
     async (params) => {
       try {
-        const themes = await fetchAllPages<any>(
-          "/bill_themes",
-          { fields: "id,name,default,config,account_id,created_at,updated_at" },
-          params.limit
-        );
+        if (params.include_config && params.theme_id === undefined) {
+          return fail(new Error("include_config requires theme_id — theme configs are too large to return for every theme at once."));
+        }
+        const withConfig = params.include_config && params.theme_id !== undefined;
+        const queryParams: Record<string, any> = {
+          fields: withConfig
+            ? "id,name,default,config,created_at,updated_at"
+            : "id,name,default,created_at,updated_at",
+        };
+        if (params.theme_id !== undefined) queryParams["ids[]"] = params.theme_id;
+        const themes = await fetchAllPages<any>("/bill_themes", queryParams, params.limit);
         return ok({
           count: themes.length,
-          bill_themes: themes.map((t: any) => ({ id: t.id, name: t.name, default: t.default, config: t.config })),
+          bill_themes: themes.map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            default: t.default,
+            ...(withConfig ? { config: t.config } : {}),
+          })),
         });
       } catch (err: any) {
         return fail(err);
