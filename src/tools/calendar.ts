@@ -36,6 +36,30 @@ async function findUserPrimaryCalendarId(userId: number): Promise<number | null>
   return (named ?? userCalendars[0]).id;
 }
 
+// Pure, unit-testable: given a list of Calendar resources and a User ID,
+// return the IDs of every calendar CREATED BY that user. Clio's Calendar and
+// User are distinct resources — a CalendarEntry's `calendar_owner` is a
+// Calendar ID, never a User ID — so filtering entries "by user" means first
+// resolving which calendars that user owns, then filtering on those calendar
+// IDs. A user commonly owns more than one calendar, so this returns ALL of
+// them (not just the primary).
+export function selectUserCalendarIds(calendars: any[], userId: number): number[] {
+  return calendars
+    .filter((c: any) => c.creator?.id === userId)
+    .map((c: any) => c.id)
+    .filter((id: any) => id !== undefined && id !== null);
+}
+
+// Resolve a User ID to the Calendar IDs that user owns (fetches /calendars,
+// then applies selectUserCalendarIds). Returns [] when the firm OAuth user
+// can't see any calendar owned by that user.
+async function findUserCalendarIds(userId: number): Promise<number[]> {
+  const calendars = await fetchAllPages<any>("/calendars", {
+    fields: "id,name,creator{id,name}",
+  });
+  return selectUserCalendarIds(calendars, userId);
+}
+
 // RomSum event type IDs (from /calendar_entry_event_types)
 const EVENT_TYPES = {
   HARD_SCHEDULED: 738410,     // NRN Hard Scheduled Event — hearings, trials, depositions, mediations, calls
@@ -123,22 +147,60 @@ export function registerCalendarTools(server: McpServer): void {
     {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
-      user_id: z.coerce.number().optional().describe("Filter by calendar owner user ID"),
+      user_id: z.coerce.number().optional().describe("Filter to entries owned by a Clio **User** (pass the User ID). The tool resolves that user to the Calendar(s) they own and filters on those. Clio's calendar_entries list filter is `calendar_id` (a Calendar resource), NOT a User ID — passing the raw user_id as a calendar filter matches nothing and Clio silently returns every firm entry, so this resolution step is required."),
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       query: z.string().optional().describe("Search term to filter by summary/description"),
     },
     async (params) => {
       try {
-        const queryParams: Record<string, any> = {
+        const baseParams: Record<string, any> = {
           fields: CALENDAR_FIELDS,
           from: `${params.start_date}T00:00:00+00:00`,
           to: `${params.end_date}T23:59:59+00:00`,
         };
-        if (params.user_id) queryParams.calendar_owner_id = params.user_id;
-        if (params.matter_id) queryParams.matter_id = params.matter_id;
-        if (params.query) queryParams.query = params.query;
+        if (params.matter_id) baseParams.matter_id = params.matter_id;
+        if (params.query) baseParams.query = params.query;
 
-        const entries = await fetchAllPages<any>("/calendar_entries", queryParams);
+        // user_id → calendar_id(s). Clio's calendar_entries index filters by
+        // `calendar_id` (a Calendar resource ID). The old code passed the raw
+        // user_id as `calendar_owner_id`, which is NOT a valid list filter, so
+        // Clio ignored it and returned EVERY firm entry in the date range —
+        // the "broken" filter. Resolve the user's owned calendars and query
+        // each (a user can own several calendars, and the list filter takes a
+        // single calendar_id), merging results and de-duplicating by entry id.
+        let entries: any[];
+        if (params.user_id) {
+          const calendarIds = await findUserCalendarIds(params.user_id);
+          if (calendarIds.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  count: 0,
+                  period: { start: params.start_date, end: params.end_date },
+                  entries: [],
+                  note: `No calendar owned by user ${params.user_id} is visible to the firm OAuth user, so no entries match. Use list_calendars(creator_user_id=${params.user_id}) to inspect what's available.`,
+                }, null, 2),
+              }],
+            };
+          }
+          const seen = new Set<number>();
+          entries = [];
+          for (const calendarId of calendarIds) {
+            const page = await fetchAllPages<any>("/calendar_entries", {
+              ...baseParams,
+              calendar_id: calendarId,
+            });
+            for (const e of page) {
+              if (!seen.has(e.id)) {
+                seen.add(e.id);
+                entries.push(e);
+              }
+            }
+          }
+        } else {
+          entries = await fetchAllPages<any>("/calendar_entries", baseParams);
+        }
 
         const formatted = entries.map((e: any) => ({
           id: e.id,
