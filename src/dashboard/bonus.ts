@@ -11,6 +11,37 @@ export type BonusAttorney = {
   ini: string; salary: number; associate: string; paralegal: string;
   paraSalary: number; legalAsst: number; payroll: number;
 };
+
+// ── The firm's bonus attribution model (single source of truth) ──
+//
+// Attribution follows the COST BASE: an attorney gets bonus credit for the
+// collections of exactly the people whose cost sits in their base target.
+//   - A PARTNER's base target = own salary + paralegal salary + payroll on
+//     both + overhead share → the partner credits own col-N collections plus
+//     their PARALEGAL(s)' collections. NOT their associate's — the associate's
+//     salary is not in the partner's base target.
+//   - An ASSOCIATE's base target = own salary + payroll on it + overhead
+//     share → the associate credits ONLY their own collections.
+// Consequences (firm-confirmed 2026-08):
+//   - The `associate` field is empty for everyone: no associate's collections
+//     roll up to a partner (previously NAF→PAR / JPB-tail→KES).
+//   - JPB (terminated Jul 2026) has no row and credits nobody; his 26 Compare
+//     col-N row remains for firm-total reconciliation only.
+//   - AFL (Anna Lozano, departed) stays in KES's PARALEGAL list so her
+//     ongoing collections keep crediting KES until they stop.
+//   - MNH is an associate, so the old "split MNH's collections among
+//     PAR/KES/NRN" rule is gone (MNH_SPLIT_AMONG is empty).
+export const FIRM_BONUS_ATTORNEYS: BonusAttorney[] = [
+  { ini: "PAR", salary: 332340, associate: "", paralegal: "ACA",     paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
+  { ini: "KES", salary: 332340, associate: "", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's tail
+  { ini: "NRN", salary: 255000, associate: "", paralegal: "AKG",     paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+  { ini: "NAF", salary: 130000, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  { ini: "MNH", salary: 110000, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  { ini: "TBS", salary: 167500, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+];
+
+// No shared-associate split: partners credit own + paralegal collections only.
+export const MNH_SPLIT_AMONG: string[] = [];
 export type BonusBracket = { width: number; rate: number };
 export type BonusRow = {
   month: string; collections: number; ytd: number; bracket: string;
@@ -35,12 +66,12 @@ function sumByInitials(mc: Record<string, number>, field: string | undefined): n
  *
  * WHY: download_dashboard_update reads the "Bonus Config" sheet and then
  * REWRITES it from what it read, so a stale sheet silently self-perpetuates —
- * that is exactly how the firm's associate-credit fixes (PR #200/#201: PAR's
- * associate is NAF, KES gets JPB's post-termination tail, KES's paralegal
- * credit is "SAB,AFL" so Anna's ongoing collections keep crediting KES until
- * they stop, and JPB has no standalone bonus row) never took effect: the sheet
- * still carried the pre-decision mappings and overrode the corrected defaults
- * on every run.
+ * that is exactly how earlier attribution fixes never took effect: the sheet
+ * still carried pre-decision mappings (PAR crediting JPB, KES crediting TBS,
+ * AFL's tail dropped) and overrode the corrected defaults on every run. The
+ * current model lives in FIRM_BONUS_ATTORNEYS: partners credit own +
+ * paralegal collections only (no associate credit), associates credit their
+ * own only.
  *
  * RULES:
  * - The ROSTER (which attorneys have bonus rows) and the ATTRIBUTION fields

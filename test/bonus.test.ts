@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeBonusData, reconcileBonusConfig, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
+import { computeBonusData, reconcileBonusConfig, FIRM_BONUS_ATTORNEYS, MNH_SPLIT_AMONG, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
 
 const BRACKETS: BonusBracket[] = [
   { width: 0, rate: 0 },           // base target at 0%
@@ -113,5 +113,43 @@ describe("reconcileBonusConfig", () => {
     ];
     const { notes } = reconcileBonusConfig(sheet, defaults);
     expect(notes.filter((n) => n.startsWith("KES:"))).toEqual([]); // equivalent lists → no override note
+  });
+});
+
+describe("FIRM_BONUS_ATTORNEYS (firm comp model pin — 2026-08)", () => {
+  it("partners credit own + paralegal(s) only; associates own only; no JPB row; no MNH split", () => {
+    const byIni = Object.fromEntries(FIRM_BONUS_ATTORNEYS.map((a) => [a.ini, a]));
+    expect(FIRM_BONUS_ATTORNEYS.map((a) => a.ini)).toEqual(["PAR", "KES", "NRN", "NAF", "MNH", "TBS"]);
+    for (const a of FIRM_BONUS_ATTORNEYS) expect(a.associate).toBe(""); // no associate credit rolls up
+    expect(byIni.PAR.paralegal).toBe("ACA");
+    expect(byIni.KES.paralegal).toBe("SAB,AFL"); // Anna's tail keeps crediting KES until it stops
+    expect(byIni.NRN.paralegal).toBe("AKG");
+    expect(byIni.NAF.paralegal).toBe("");
+    expect(byIni.MNH.paralegal).toBe("");
+    expect(byIni.TBS.paralegal).toBe("");
+    expect(MNH_SPLIT_AMONG).toEqual([]); // MNH is an associate — her collections are hers alone
+  });
+
+  it("partner credit = own + para col N only (no associate, no MNH share); associates own only", () => {
+    const data = computeBonusData(
+      { January: { PAR: 1000, NAF: 500, ACA: 200, SAB: 40, AFL: 60, KES: 700, MNH: 300, JPB: 50, TBS: 90 } },
+      FIRM_BONUS_ATTORNEYS,
+      { firmOverhead: 500000, numAttorneys: 5, brackets: BRACKETS, mnhSplitAmong: MNH_SPLIT_AMONG },
+    );
+    expect(data.PAR.rows[0].collections).toBe(1200); // own 1000 + ACA 200; NAF/MNH/JPB excluded
+    expect(data.KES.rows[0].collections).toBe(800);  // own 700 + SAB 40 + AFL 60; JPB tail excluded
+    expect(data.NAF.rows[0].collections).toBe(500);  // own only
+    expect(data.MNH.rows[0].collections).toBe(300);  // own only — not split among partners
+    expect(data.TBS.rows[0].collections).toBe(90);   // own only — never credited to KES
+  });
+
+  it("base targets follow the cost base: partner = salary + para salary + 17% payroll on both + overhead/5; associate = salary + 17% + overhead/5", () => {
+    const data = computeBonusData({}, FIRM_BONUS_ATTORNEYS, { firmOverhead: 500000, numAttorneys: 5, brackets: BRACKETS, mnhSplitAmong: MNH_SPLIT_AMONG });
+    expect(data.PAR.baseTarget).toBe(582437.8); // 332340+80000+0.17*412340+100000
+    expect(data.KES.baseTarget).toBe(576587.8); // 332340+75000+0.17*407340+100000
+    expect(data.NRN.baseTarget).toBe(486100);   // 255000+75000+0.17*330000+100000
+    expect(data.NAF.baseTarget).toBe(252100);   // 130000+0.17*130000+100000
+    expect(data.MNH.baseTarget).toBe(228700);
+    expect(data.TBS.baseTarget).toBe(295975);
   });
 });
