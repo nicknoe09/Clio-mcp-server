@@ -11,12 +11,14 @@ export type MonthlyCollections = {
   indivByMonth: Record<number, Record<number, number>>;
   // month (1-12) -> ORIGINATING-attorney user_id -> collected fees $ (→ col V "Originating")
   origByMonth: Record<number, Record<number, number>>;
-  // month (1-12) -> responsible-attorney user_id -> collected fees $ (legacy col S rollup)
+  // month (1-12) -> responsible-attorney user_id -> collected fees $ (→ col S "Collected Actual")
   respByMonth: Record<number, Record<number, number>>;
   // month -> collected fees $ from billers NOT on the roster (→ the "NRB" line, col N)
   nonRosterIndivByMonth: Record<number, number>;
   // month -> collected fees $ originated by attorneys NOT on the roster (→ the "NRB" line, col V)
   nonRosterOrigByMonth: Record<number, number>;
+  // month -> collected fees $ whose responsible attorney is NOT on the roster (→ the "NRB" line, col S)
+  nonRosterRespByMonth: Record<number, number>;
   // month -> firm-wide collected fees $ (reconciliation target: Σ col N == Σ col V == this)
   firmByMonth: Record<number, number>;
   // firm-wide YTD total collected fees (reconciliation signal)
@@ -28,20 +30,22 @@ const collNum = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,()]
 export type MonthFeeAgg = {
   indiv: Record<number, number>;        // working timekeeper (col N) → fees
   orig: Record<number, number>;         // originating attorney (col V) → fees
-  resp: Record<number, number>;         // responsible attorney (legacy col S) → fees
+  resp: Record<number, number>;         // responsible attorney (col S) → fees
   nonRosterIndiv: number;               // fees by non-roster working timekeepers (→ NRB col N)
   nonRosterOrig: number;                // fees originated by non-roster attorneys (→ NRB col V)
-  firm: number;                         // firm-wide fees collected (Σ indiv+NRB == Σ orig+NRB == this)
+  nonRosterResp: number;                // fees under non-roster responsible attorneys (→ NRB col S)
+  firm: number;                         // firm-wide fees collected (Σ indiv+NRB == Σ orig+NRB == Σ resp+NRB == this)
 };
 
 /**
  * Pure aggregation of ONE month's Fee Allocation rows into the FEES-ONLY collections
  * splits used by 26 Compare. Uses "Billed Time Collected" (excludes collected
- * expenses / interest / tax). Non-roster timekeepers and non-roster originating
- * attorneys are pooled so Σ col N (+NRB) == Σ col V (+NRB) == firm fees.
+ * expenses / interest / tax). Non-roster timekeepers, non-roster originating
+ * attorneys, and non-roster responsible attorneys are pooled so
+ * Σ col N (+NRB) == Σ col V (+NRB) == Σ col S (+NRB) == firm fees.
  */
 export function aggregateMonthFees(rows: Record<string, string>[], roster: RosterMember[]): MonthFeeAgg {
-  const agg: MonthFeeAgg = { indiv: {}, orig: {}, resp: {}, nonRosterIndiv: 0, nonRosterOrig: 0, firm: 0 };
+  const agg: MonthFeeAgg = { indiv: {}, orig: {}, resp: {}, nonRosterIndiv: 0, nonRosterOrig: 0, nonRosterResp: 0, firm: 0 };
   for (const r of rows) {
     const collected = collNum(r["Billed Time Collected"]);
     if (!collected) continue;
@@ -54,6 +58,7 @@ export function aggregateMonthFees(rows: Record<string, string>[], roster: Roste
     else agg.nonRosterOrig += collected;
     const rid = matchRosterResponsible(r["Responsible Attorney"] || "", roster);
     if (rid != null) agg.resp[rid] = (agg.resp[rid] ?? 0) + collected;
+    else agg.nonRosterResp += collected;
   }
   return agg;
 }
@@ -67,9 +72,10 @@ export function aggregateMonthFees(rows: Record<string, string>[], roster: Roste
  *   - working timekeeper  → col N "Collected Actual"
  *   - Originating Attorney → col V "Originating"
  *   - Responsible Attorney → legacy col S rollup
- * Collected fees whose timekeeper / originating attorney is NOT on the roster are
- * summed into nonRoster*ByMonth (the "NRB" line), so Σ col N == Σ col V == firm
- * fees by construction. Each report's period is guarded inside
+ * Collected fees whose timekeeper / originating attorney / responsible attorney is
+ * NOT on the roster are summed into nonRoster*ByMonth (the "NRB" line), so
+ * Σ col N == Σ col V == Σ col S == firm fees by construction. Each report's
+ * period is guarded inside
  * genFeeAllocationByMonth (assertReportPeriod), so a wrong-period report aborts.
  */
 export async function buildMonthlyCollections(
@@ -84,6 +90,7 @@ export async function buildMonthlyCollections(
   const respByMonth: Record<number, Record<number, number>> = {};
   const nonRosterIndivByMonth: Record<number, number> = {};
   const nonRosterOrigByMonth: Record<number, number> = {};
+  const nonRosterRespByMonth: Record<number, number> = {};
   const firmByMonth: Record<number, number> = {};
   let firmYtd = 0;
   for (const m of months) {
@@ -96,8 +103,9 @@ export async function buildMonthlyCollections(
     if (Object.keys(agg.resp).length) respByMonth[m] = agg.resp;
     nonRosterIndivByMonth[m] = agg.nonRosterIndiv;
     nonRosterOrigByMonth[m] = agg.nonRosterOrig;
+    nonRosterRespByMonth[m] = agg.nonRosterResp;
     firmByMonth[m] = agg.firm;
     firmYtd += agg.firm;
   }
-  return { indivByMonth, origByMonth, respByMonth, nonRosterIndivByMonth, nonRosterOrigByMonth, firmByMonth, firmYtd };
+  return { indivByMonth, origByMonth, respByMonth, nonRosterIndivByMonth, nonRosterOrigByMonth, nonRosterRespByMonth, firmByMonth, firmYtd };
 }

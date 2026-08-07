@@ -11,6 +11,37 @@ export type BonusAttorney = {
   ini: string; salary: number; associate: string; paralegal: string;
   paraSalary: number; legalAsst: number; payroll: number;
 };
+
+// ── The firm's bonus attribution model (single source of truth) ──
+//
+// Attribution follows the COST BASE: an attorney gets bonus credit for the
+// collections of exactly the people whose cost sits in their base target.
+//   - A PARTNER's base target = own salary + paralegal salary + payroll on
+//     both + overhead share → the partner credits own col-N collections plus
+//     their PARALEGAL(s)' collections. NOT their associate's — the associate's
+//     salary is not in the partner's base target.
+//   - An ASSOCIATE's base target = own salary + payroll on it + overhead
+//     share → the associate credits ONLY their own collections.
+// Consequences (firm-confirmed 2026-08):
+//   - The `associate` field is empty for everyone: no associate's collections
+//     roll up to a partner (previously NAF→PAR / JPB-tail→KES).
+//   - JPB (terminated Jul 2026) has no row and credits nobody; his 26 Compare
+//     col-N row remains for firm-total reconciliation only.
+//   - AFL (Anna Lozano, departed) stays in KES's PARALEGAL list so her
+//     ongoing collections keep crediting KES until they stop.
+//   - MNH is an associate, so the old "split MNH's collections among
+//     PAR/KES/NRN" rule is gone (MNH_SPLIT_AMONG is empty).
+export const FIRM_BONUS_ATTORNEYS: BonusAttorney[] = [
+  { ini: "PAR", salary: 332340, associate: "", paralegal: "ACA",     paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
+  { ini: "KES", salary: 332340, associate: "", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // Stacy (current) + Anna's tail
+  { ini: "NRN", salary: 255000, associate: "", paralegal: "AKG",     paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+  { ini: "NAF", salary: 130000, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  { ini: "MNH", salary: 110000, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  { ini: "TBS", salary: 167500, associate: "", paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+];
+
+// No shared-associate split: partners credit own + paralegal collections only.
+export const MNH_SPLIT_AMONG: string[] = [];
 export type BonusBracket = { width: number; rate: number };
 export type BonusRow = {
   month: string; collections: number; ytd: number; bracket: string;
@@ -27,6 +58,60 @@ function sumByInitials(mc: Record<string, number>, field: string | undefined): n
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean)
     .reduce((sum, ini) => sum + (mc[ini] || 0), 0);
+}
+
+/**
+ * Reconcile the Bonus Config read from the workbook sheet against the code
+ * defaults (the firm's comp decisions).
+ *
+ * WHY: download_dashboard_update reads the "Bonus Config" sheet and then
+ * REWRITES it from what it read, so a stale sheet silently self-perpetuates —
+ * that is exactly how earlier attribution fixes never took effect: the sheet
+ * still carried pre-decision mappings (PAR crediting JPB, KES crediting TBS,
+ * AFL's tail dropped) and overrode the corrected defaults on every run. The
+ * current model lives in FIRM_BONUS_ATTORNEYS: partners credit own +
+ * paralegal collections only (no associate credit), associates credit their
+ * own only.
+ *
+ * RULES:
+ * - The ROSTER (which attorneys have bonus rows) and the ATTRIBUTION fields
+ *   (associate / paralegal credit lists) come from the code defaults.
+ * - The COMP numbers (salary, paraSalary, legalAsst, payroll) stay
+ *   sheet-editable: a positive sheet value wins over the default; blank/zero
+ *   falls back to the default (so a half-filled row can't zero out a salary).
+ * - Sheet rows for attorneys not in the defaults are dropped (e.g. JPB's
+ *   stale standalone row); every divergence is reported in `notes`.
+ */
+export function reconcileBonusConfig(
+  sheetRows: BonusAttorney[],
+  defaults: BonusAttorney[],
+): { attorneys: BonusAttorney[]; notes: string[] } {
+  const notes: string[] = [];
+  const byIni = new Map(sheetRows.map((r) => [r.ini.toUpperCase(), r]));
+  const attorneys = defaults.map((def) => {
+    const s = byIni.get(def.ini.toUpperCase());
+    if (!s) {
+      notes.push(`${def.ini}: no sheet row — using code defaults`);
+      return { ...def };
+    }
+    const norm = (f: string) => f.split(/[,+/]/).map((x) => x.trim().toUpperCase()).filter(Boolean).join(",");
+    if (norm(s.associate) !== norm(def.associate)) {
+      notes.push(`${def.ini}: sheet associate "${s.associate || "(none)"}" overridden by firm config "${def.associate || "(none)"}"`);
+    }
+    if (norm(s.paralegal) !== norm(def.paralegal)) {
+      notes.push(`${def.ini}: sheet paralegal "${s.paralegal || "(none)"}" overridden by firm config "${def.paralegal || "(none)"}"`);
+    }
+    return {
+      ...def,
+      salary: s.salary > 0 ? s.salary : def.salary,
+      paraSalary: s.paraSalary > 0 ? s.paraSalary : def.paraSalary,
+      legalAsst: s.legalAsst > 0 ? s.legalAsst : def.legalAsst,
+      payroll: s.payroll > 0 ? s.payroll : def.payroll,
+    };
+  });
+  const dropped = sheetRows.filter((r) => !defaults.some((d) => d.ini.toUpperCase() === r.ini.toUpperCase()));
+  for (const r of dropped) notes.push(`${r.ini}: stale sheet row dropped (not in the firm bonus roster)`);
+  return { attorneys, notes };
 }
 
 /**

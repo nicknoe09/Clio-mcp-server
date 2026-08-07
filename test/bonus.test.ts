@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeBonusData, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
+import { computeBonusData, reconcileBonusConfig, FIRM_BONUS_ATTORNEYS, MNH_SPLIT_AMONG, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
 
 const BRACKETS: BonusBracket[] = [
   { width: 0, rate: 0 },           // base target at 0%
@@ -51,5 +51,105 @@ describe("computeBonusData", () => {
       { firmOverhead: 0, numAttorneys: 1, brackets: BRACKETS, mnhSplitAmong: ["PAR", "KES", "NRN"] },
     );
     expect(data.PAR.rows[0].collections).toBe(10000); // 30000 / 3
+  });
+});
+
+describe("reconcileBonusConfig", () => {
+  const defaults: BonusAttorney[] = [
+    { ini: "PAR", salary: 332340, associate: "NAF", paralegal: "ACA",     paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
+    { ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+    { ini: "TBS", salary: 167500, associate: "",    paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  ];
+  const sheetRow = (o: Partial<BonusAttorney> & { ini: string }): BonusAttorney => ({
+    salary: 0, associate: "", paralegal: "", paraSalary: 0, legalAsst: 0, payroll: 0.17, ...o,
+  });
+
+  it("attribution (associate/paralegal) comes from the code defaults, not a stale sheet", () => {
+    // The exact stale state found live (2026-08): PAR credited JPB, KES credited
+    // TBS (double-count — TBS has his own row) and lost AFL's tail.
+    const sheet = [
+      sheetRow({ ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000 }),
+      sheetRow({ ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB", paraSalary: 75000 }),
+      sheetRow({ ini: "TBS", salary: 167500 }),
+    ];
+    const { attorneys, notes } = reconcileBonusConfig(sheet, defaults);
+    const par = attorneys.find((a) => a.ini === "PAR")!;
+    const kes = attorneys.find((a) => a.ini === "KES")!;
+    expect(par.associate).toBe("NAF");
+    expect(kes.associate).toBe("JPB");
+    expect(kes.paralegal).toBe("SAB,AFL"); // AFL's tail keeps crediting KES until it stops
+    expect(notes.length).toBeGreaterThanOrEqual(3); // PAR assoc, KES assoc, KES para all overridden
+  });
+
+  it("comp numbers stay sheet-editable; blank/zero falls back to defaults", () => {
+    const sheet = [
+      sheetRow({ ini: "PAR", salary: 350000, associate: "NAF", paralegal: "ACA", paraSalary: 82000, payroll: 0.2 }),
+      sheetRow({ ini: "KES", salary: 0, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 0 }), // blanks
+    ];
+    const { attorneys } = reconcileBonusConfig(sheet, defaults);
+    const par = attorneys.find((a) => a.ini === "PAR")!;
+    const kes = attorneys.find((a) => a.ini === "KES")!;
+    expect(par.salary).toBe(350000);   // sheet edit honored
+    expect(par.paraSalary).toBe(82000);
+    expect(par.payroll).toBe(0.2);
+    expect(kes.salary).toBe(332340);   // blank → default
+    expect(kes.paraSalary).toBe(75000);
+  });
+
+  it("drops stale sheet rows not in the roster (JPB standalone) and keeps roster order", () => {
+    const sheet = [
+      sheetRow({ ini: "JPB", salary: 110000 }), // terminated — no own bonus row
+      sheetRow({ ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000 }),
+    ];
+    const { attorneys, notes } = reconcileBonusConfig(sheet, defaults);
+    expect(attorneys.map((a) => a.ini)).toEqual(["PAR", "KES", "TBS"]);
+    expect(notes.some((n) => n.startsWith("JPB:"))).toBe(true);
+    expect(notes.some((n) => n.startsWith("PAR: no sheet row"))).toBe(true);
+  });
+
+  it("initials-list comparison ignores spacing/separator/case differences", () => {
+    const sheet = [
+      sheetRow({ ini: "KES", salary: 332340, associate: "jpb", paralegal: "sab, afl", paraSalary: 75000 }),
+    ];
+    const { notes } = reconcileBonusConfig(sheet, defaults);
+    expect(notes.filter((n) => n.startsWith("KES:"))).toEqual([]); // equivalent lists → no override note
+  });
+});
+
+describe("FIRM_BONUS_ATTORNEYS (firm comp model pin — 2026-08)", () => {
+  it("partners credit own + paralegal(s) only; associates own only; no JPB row; no MNH split", () => {
+    const byIni = Object.fromEntries(FIRM_BONUS_ATTORNEYS.map((a) => [a.ini, a]));
+    expect(FIRM_BONUS_ATTORNEYS.map((a) => a.ini)).toEqual(["PAR", "KES", "NRN", "NAF", "MNH", "TBS"]);
+    for (const a of FIRM_BONUS_ATTORNEYS) expect(a.associate).toBe(""); // no associate credit rolls up
+    expect(byIni.PAR.paralegal).toBe("ACA");
+    expect(byIni.KES.paralegal).toBe("SAB,AFL"); // Anna's tail keeps crediting KES until it stops
+    expect(byIni.NRN.paralegal).toBe("AKG");
+    expect(byIni.NAF.paralegal).toBe("");
+    expect(byIni.MNH.paralegal).toBe("");
+    expect(byIni.TBS.paralegal).toBe("");
+    expect(MNH_SPLIT_AMONG).toEqual([]); // MNH is an associate — her collections are hers alone
+  });
+
+  it("partner credit = own + para col N only (no associate, no MNH share); associates own only", () => {
+    const data = computeBonusData(
+      { January: { PAR: 1000, NAF: 500, ACA: 200, SAB: 40, AFL: 60, KES: 700, MNH: 300, JPB: 50, TBS: 90 } },
+      FIRM_BONUS_ATTORNEYS,
+      { firmOverhead: 500000, numAttorneys: 5, brackets: BRACKETS, mnhSplitAmong: MNH_SPLIT_AMONG },
+    );
+    expect(data.PAR.rows[0].collections).toBe(1200); // own 1000 + ACA 200; NAF/MNH/JPB excluded
+    expect(data.KES.rows[0].collections).toBe(800);  // own 700 + SAB 40 + AFL 60; JPB tail excluded
+    expect(data.NAF.rows[0].collections).toBe(500);  // own only
+    expect(data.MNH.rows[0].collections).toBe(300);  // own only — not split among partners
+    expect(data.TBS.rows[0].collections).toBe(90);   // own only — never credited to KES
+  });
+
+  it("base targets follow the cost base: partner = salary + para salary + 17% payroll on both + overhead/5; associate = salary + 17% + overhead/5", () => {
+    const data = computeBonusData({}, FIRM_BONUS_ATTORNEYS, { firmOverhead: 500000, numAttorneys: 5, brackets: BRACKETS, mnhSplitAmong: MNH_SPLIT_AMONG });
+    expect(data.PAR.baseTarget).toBe(582437.8); // 332340+80000+0.17*412340+100000
+    expect(data.KES.baseTarget).toBe(576587.8); // 332340+75000+0.17*407340+100000
+    expect(data.NRN.baseTarget).toBe(486100);   // 255000+75000+0.17*330000+100000
+    expect(data.NAF.baseTarget).toBe(252100);   // 130000+0.17*130000+100000
+    expect(data.MNH.baseTarget).toBe(228700);
+    expect(data.TBS.baseTarget).toBe(295975);
   });
 });

@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { buildRevenueByMonth } from "../dashboard/revenue";
-import { computeBonusData } from "../dashboard/bonus";
+import { computeBonusData, reconcileBonusConfig, FIRM_BONUS_ATTORNEYS, MNH_SPLIT_AMONG } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
@@ -2207,7 +2207,7 @@ export function registerDocumentTools(server: McpServer): void {
               wsRow.getCell(13).value = round2(d.lineDiscounts); // M = Line Discounts
               wsRow.getCell(17).value = round1(rd.respHrs);
               wsRow.getCell(18).value = round2(rd.respBilled);
-              // Collections (cols N=14, S=19) are written in the per-month
+              // Collections (cols N=14, S=19, V=22) are written in the per-month
               // Fee-Allocation backfill block below — not here.
               wsRow.commit();
               tkUpdated++;
@@ -2218,8 +2218,9 @@ export function registerDocumentTools(server: McpServer): void {
           // ---- PER-MONTH COLLECTIONS (payment-filtered Fee Allocation, all YTD months) ----
           // Payment-received basis: one PAYMENT-FILTERED Fee Allocation report per
           // month (filter_by_payment=true) = money actually received that month,
-          // allocated by working timekeeper (User → col N=14 individual) and by
-          // Responsible Attorney (col S=19). This captures payments on prior-year
+          // allocated by working timekeeper (User → col N=14 individual), by
+          // Responsible Attorney (col S=19), and by Originating Attorney
+          // (col V=22). This captures payments on prior-year
           // invoices and reconciles to Clio's Revenue Report; assertReportPeriod (in
           // genFeeAllocationByMonth) guards each month so a wrong-period report aborts.
           // Replaces the old cumulative issue-date split, which bucketed by invoice
@@ -2229,14 +2230,17 @@ export function registerDocumentTools(server: McpServer): void {
           _step = "generating payment-filtered Fee Allocation reports (per YTD month)";
           const {
             indivByMonth: indivCollByMonth, origByMonth: origCollByMonth,
+            respByMonth: respCollByMonth,
             nonRosterIndivByMonth: nrbIndivByMonth, nonRosterOrigByMonth: nrbOrigByMonth,
+            nonRosterRespByMonth: nrbRespByMonth,
             firmByMonth: collFirmFeesByMonth, firmYtd: collFirmYtd,
           } = await buildMonthlyCollections(params.year, params.month, COLL_ROSTER, { months: collMonths });
           console.log(`[Dashboard] FEES-ONLY collections built: firm YTD fees received=$${collFirmYtd.toFixed(2)} (Billed Time Collected; excludes expenses/interest/tax)`);
           // Collections write to: col N=14 "Collected Actual" (working timekeeper),
-          // col V=22 "Originating" (originating attorney). Non-roster billers go to the
-          // "NRB" row so Σ col N == Σ col V == firm fees. Col S (the old, misplaced
-          // collected write) is no longer written.
+          // col S=19 "Collected Actual" under Responsible Attorney (responsible-attorney
+          // rollup), col V=22 "Originating" (originating attorney). Non-roster billers /
+          // responsible / originating attorneys go to the "NRB" row so
+          // Σ col N == Σ col S == Σ col V == firm fees.
           let collCellsWritten = 0;
           for (let m = 1; m <= params.month; m++) {
             // No static-snapshot skip: collections are refreshed for every YTD month on
@@ -2249,32 +2253,36 @@ export function registerDocumentTools(server: McpServer): void {
               if (!rowNum) continue;
               const wsRow = compareSheet.getRow(rowNum);
               wsRow.getCell(14).value = round2(indivCollByMonth[m]?.[r.user_id] ?? 0); // N "Collected Actual"
+              wsRow.getCell(19).value = round2(respCollByMonth[m]?.[r.user_id] ?? 0);  // S "Collected Actual" (Responsible)
               wsRow.getCell(22).value = round2(origCollByMonth[m]?.[r.user_id] ?? 0);  // V "Originating"
               wsRow.commit();
               collCellsWritten++;
             }
             // NRB ("Non-Roster Billers") line — aggregate collected fees from billers
-            // not on the roster (col N) and origination by non-roster attorneys (col V).
+            // not on the roster (col N), matters whose responsible attorney is not on
+            // the roster (col S), and origination by non-roster attorneys (col V).
             const nrbRow = block.map["NRB"];
             if (nrbRow) {
               const wsRow = compareSheet.getRow(nrbRow);
               wsRow.getCell(14).value = round2(nrbIndivByMonth[m] ?? 0);
+              wsRow.getCell(19).value = round2(nrbRespByMonth[m] ?? 0);
               wsRow.getCell(22).value = round2(nrbOrigByMonth[m] ?? 0);
               wsRow.commit();
               collCellsWritten++;
-            } else if ((nrbIndivByMonth[m] ?? 0) > 0.005 || (nrbOrigByMonth[m] ?? 0) > 0.005) {
-              console.warn(`[Dashboard] ${monthNames[m - 1]}: non-roster collected fees (indiv=$${round2(nrbIndivByMonth[m] ?? 0)}, orig=$${round2(nrbOrigByMonth[m] ?? 0)}) have nowhere to go — add an 'NRB' row to this month block so col N and col V reconcile.`);
+            } else if ((nrbIndivByMonth[m] ?? 0) > 0.005 || (nrbOrigByMonth[m] ?? 0) > 0.005 || (nrbRespByMonth[m] ?? 0) > 0.005) {
+              console.warn(`[Dashboard] ${monthNames[m - 1]}: non-roster collected fees (indiv=$${round2(nrbIndivByMonth[m] ?? 0)}, resp=$${round2(nrbRespByMonth[m] ?? 0)}, orig=$${round2(nrbOrigByMonth[m] ?? 0)}) have nowhere to go — add an 'NRB' row to this month block so cols N, S, and V reconcile.`);
             }
-            // Reconciliation: Σ col N (roster + NRB) and Σ col V (roster + NRB) must
+            // Reconciliation: Σ col N, Σ col S, and Σ col V (each roster + NRB) must
             // each equal the firm fees collected that month.
             const sumN = COLL_ROSTER.reduce((s, r) => s + (indivCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbIndivByMonth[m] ?? 0);
+            const sumS = COLL_ROSTER.reduce((s, r) => s + (respCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbRespByMonth[m] ?? 0);
             const sumV = COLL_ROSTER.reduce((s, r) => s + (origCollByMonth[m]?.[r.user_id] ?? 0), 0) + (nrbOrigByMonth[m] ?? 0);
             const firm = collFirmFeesByMonth[m] ?? 0;
-            if (Math.abs(sumN - firm) > 0.05 || Math.abs(sumV - firm) > 0.05) {
-              console.warn(`[Dashboard] ${monthNames[m - 1]} collections reconciliation off: Σcol N=$${round2(sumN)} Σcol V=$${round2(sumV)} firm fees=$${round2(firm)}`);
+            if (Math.abs(sumN - firm) > 0.05 || Math.abs(sumS - firm) > 0.05 || Math.abs(sumV - firm) > 0.05) {
+              console.warn(`[Dashboard] ${monthNames[m - 1]} collections reconciliation off: Σcol N=$${round2(sumN)} Σcol S=$${round2(sumS)} Σcol V=$${round2(sumV)} firm fees=$${round2(firm)}`);
             }
           }
-          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=1..${params.month} (always-refreshed, fees-only; col N indiv + col V originating)`);
+          console.log(`[Dashboard] per-month collections written: cells=${collCellsWritten} months=1..${params.month} (always-refreshed, fees-only; col N indiv + col S responsible + col V originating)`);
 
           _step = "tracking bonus sheets for deletion";
           // ---- TRACK OLD BONUS SHEETS FOR DELETION ----
@@ -2283,16 +2291,11 @@ export function registerDocumentTools(server: McpServer): void {
 
           _step = "creating Bonus Config";
           // ---- CREATE / UPDATE BONUS CONFIG SHEET ----
-          const BONUS_ATTORNEYS = [
-            { ini: "PAR", salary: 332340, associate: "NAF", paralegal: "ACA", paraSalary: 80000, legalAsst: 0, payroll: 0.17 }, // associate = NAF (Nick Fernelius); PAR never had JPB
-            { ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 }, // associate = JPB (terminated Jul 2026; his ongoing collections still credit KES, like AFL in the paralegal field). paralegal = Stacy (current) + Anna's ongoing collections; paraSalary = Stacy's $75k
-            { ini: "NRN", salary: 255000, associate: "KGV", paralegal: "AKG", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
-            { ini: "NAF", salary: 130000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            { ini: "MNH", salary: 110000, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            { ini: "TBS", salary: 167500, associate: "",    paralegal: "",    paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
-            // JPB (Jonathan Barbee) — terminated Jul 2026; no own bonus row. His
-            // ongoing collections now credit KES (see KES associate="JPB" above).
-          ];
+          // Attribution model (FIRM_BONUS_ATTORNEYS, src/dashboard/bonus.ts):
+          // partners credit own + paralegal collections (their base target carries
+          // the para's salary); associates credit their own only. No associate
+          // credit rolls up to a partner, and no MNH split.
+          const BONUS_ATTORNEYS = FIRM_BONUS_ATTORNEYS;
           const FIRM_OVERHEAD = 500000;
           const NUM_ATTORNEYS = 5;
           const BRACKETS = [
@@ -2301,7 +2304,6 @@ export function registerDocumentTools(server: McpServer): void {
             { width: 50000, rate: 0.10 },
             { width: Infinity, rate: 0.15 },
           ];
-          const MNH_SPLIT_AMONG = ["PAR", "KES", "NRN"];
 
           // Read config from existing "Bonus Config" sheet if present, else create with defaults
           let configSheet = wb.getWorksheet("Bonus Config");
@@ -2310,7 +2312,16 @@ export function registerDocumentTools(server: McpServer): void {
           let numAttorneys = NUM_ATTORNEYS;
 
           if (configSheet) {
-            // Read existing config
+            // Read the existing sheet's rows, then RECONCILE against BONUS_ATTORNEYS
+            // (reconcileBonusConfig): the roster and the associate/paralegal credit
+            // lists come from the code (firm comp model — partners credit own +
+            // paralegal collections only, with "SAB,AFL" keeping Anna's tail on
+            // KES; associates credit their own only; no standalone JPB row), while
+            // salary/paraSalary/legalAsst/payroll stay sheet-editable. Previously
+            // the sheet was used verbatim and then rewritten from itself, so a
+            // stale sheet overrode every code fix forever (PAR credited JPB; KES
+            // credited TBS — double-counting an attorney with his own bonus row —
+            // and lost AFL's tail).
             const readAttorneys: typeof BONUS_ATTORNEYS = [];
             for (let r = 5; r <= 11; r++) {
               const row = configSheet.getRow(r);
@@ -2326,7 +2337,9 @@ export function registerDocumentTools(server: McpServer): void {
                 payroll: Number(row.getCell(7).value) || 0.17,
               });
             }
-            if (readAttorneys.length > 0) configAttorneys = readAttorneys;
+            const reconciled = reconcileBonusConfig(readAttorneys, BONUS_ATTORNEYS);
+            configAttorneys = reconciled.attorneys;
+            for (const note of reconciled.notes) console.warn(`[Dashboard] Bonus Config reconcile: ${note}`);
             firmOverhead = Number(configSheet.getRow(13).getCell(2).value) || FIRM_OVERHEAD;
             numAttorneys = Number(configSheet.getRow(14).getCell(2).value) || NUM_ATTORNEYS;
           } else {
@@ -2350,7 +2363,7 @@ export function registerDocumentTools(server: McpServer): void {
             configSheet.getRow(18).values = [2, 50000, 0.05];
             configSheet.getRow(19).values = [3, 50000, 0.10];
             configSheet.getRow(20).values = [4, "Unlimited", 0.15];
-            configSheet.getRow(22).values = ["MNH collections split equally among: PAR, KES, NRN"];
+            configSheet.getRow(22).values = ["Partners credit own + paralegal collections; associates their own only"];
             configSheet.getRow(24).values = ["Paralegal Hours Bonus"];
             configSheet.getRow(24).font = { bold: true };
             configSheet.getRow(25).values = ["Min Hours", "Bonus"];
@@ -2773,7 +2786,7 @@ export function registerDocumentTools(server: McpServer): void {
           // Patch existing month data cells (cells that already exist in the XML).
           // STATIC SNAPSHOT: only the target month is written unless backfill_ytd is
           // set (then every YTD month is rewritten). Mirrors the ExcelJS hours loop's
-          // column rules. Collections (cols N=14, V=22) are patched separately below.
+          // column rules. Collections (cols N=14, S=19, V=22) are patched separately below.
           // The target month's rows may not exist yet when blockCreated — in
           // that case patchCell is a no-op and the blockCreated section below
           // writes those rows.
@@ -2833,6 +2846,7 @@ export function registerDocumentTools(server: McpServer): void {
                 xmlCell(`N${row}`, d ? round2(d.indivCollected) : 0, { style: S.collected }),
                 xmlCell(`Q${row}`, rd ? round1(rd.respHrs) : 0, { style: S.respHrs }),
                 xmlCell(`R${row}`, rd ? round2(rd.respBilled) : 0, { style: S.respBilled }),
+                xmlCell(`S${row}`, d ? round2(d.respCollected) : 0, { style: S.respColl }),
                 xmlCell(`V${row}`, d ? round2(d.origCollected) : 0, { style: S.respColl }),
               ];
               newRowsXml.push(xmlRow(row, cells));
@@ -2843,7 +2857,7 @@ export function registerDocumentTools(server: McpServer): void {
               const sr = monthBlock.sumRow;
               const first = monthBlock.firstRow;
               const last = monthBlock.lastRow;
-              const sumCells = [4,5,6,7,8,9,10,11,12,13,14,17,18,22].map(col =>
+              const sumCells = [4,5,6,7,8,9,10,11,12,13,14,17,18,19,22].map(col =>
                 xmlCell(`${colLetter(col)}${sr}`, null, { formula: `SUM(${colLetter(col)}${first}:${colLetter(col)}${last})` })
               );
               sumCells.unshift(xmlCell(`B${sr}`, monthName, { style: S.monthStr }));
@@ -2854,16 +2868,18 @@ export function registerDocumentTools(server: McpServer): void {
             compareXml = compareXml.replace("</sheetData>", newRowsXml.join("") + "</sheetData>");
           }
 
-          // ---- PERSIST PER-MONTH COLLECTIONS to compareXml (cols N=14, S=19) ----
+          // ---- PERSIST PER-MONTH COLLECTIONS to compareXml (cols N=14, S=19, V=22) ----
           // compareXml (the original sheet XML + patches) is what actually gets
           // saved — the ExcelJS edits above only feed the in-memory bonus-tracker
-          // derivation and color-coding. The Fee Allocation CSV is cumulative
-          // (Jan 1 → report date), so we group it by Issue Date month and patch
-          // each month its own slice. FEES-ONLY (Billed Time Collected): col N=14
-          // "Collected Actual" (working timekeeper) and col V=22 "Originating"
-          // (originating attorney); the "NRB" row absorbs non-roster billers so
-          // Σ col N == Σ col V == firm fees. ALWAYS refreshed for every YTD month (not a
-          // static snapshot) so payment-date drift never double-credits across a boundary.
+          // derivation and color-coding. One payment-filtered Fee Allocation report
+          // per month = money actually received that month. FEES-ONLY (Billed Time
+          // Collected): col N=14 "Collected Actual" (working timekeeper), col S=19
+          // "Collected Actual" under Responsible Attorney (responsible-attorney
+          // rollup), and col V=22 "Originating" (originating attorney); the "NRB"
+          // row absorbs non-roster billers / responsible / originating so
+          // Σ col N == Σ col S == Σ col V == firm fees. ALWAYS refreshed for every
+          // YTD month (not a static snapshot) so payment-date drift never
+          // double-credits across a boundary.
           // Runs after blockCreated so a fresh target block's cells exist.
           let collCellsPatched = 0;
           const collFirmByMonth: Record<number, number> = {};
@@ -2877,8 +2893,10 @@ export function registerDocumentTools(server: McpServer): void {
               const row = blk.map[r.initials.toUpperCase()];
               if (!row) continue;
               const iv = round2(indivCollByMonth[m]?.[r.user_id] ?? 0);
+              const rv = round2(respCollByMonth[m]?.[r.user_id] ?? 0);
               const ov = round2(origCollByMonth[m]?.[r.user_id] ?? 0);
               compareXml = patchCell(compareXml, `N${row}`, iv); // Collected Actual
+              compareXml = patchCell(compareXml, `S${row}`, rv); // Collected Actual (Responsible)
               compareXml = patchCell(compareXml, `V${row}`, ov); // Originating
               collFirmByMonth[m] = round2((collFirmByMonth[m] ?? 0) + iv);
               collCellsPatched++;
@@ -2886,8 +2904,10 @@ export function registerDocumentTools(server: McpServer): void {
             const nrbRow = blk.map["NRB"];
             if (nrbRow) {
               const iv = round2(nrbIndivByMonth[m] ?? 0);
+              const rv = round2(nrbRespByMonth[m] ?? 0);
               const ov = round2(nrbOrigByMonth[m] ?? 0);
               compareXml = patchCell(compareXml, `N${nrbRow}`, iv);
+              compareXml = patchCell(compareXml, `S${nrbRow}`, rv);
               compareXml = patchCell(compareXml, `V${nrbRow}`, ov);
               collFirmByMonth[m] = round2((collFirmByMonth[m] ?? 0) + iv);
               collCellsPatched++;
@@ -3182,7 +3202,7 @@ export function registerDocumentTools(server: McpServer): void {
           configRows.push(xmlRow(18, [xmlCell("A18", 2), xmlCell("B18", 50000, { style: STYLE_CUR }),     xmlCell("C18", 0.05, { style: STYLE_PCT })]));
           configRows.push(xmlRow(19, [xmlCell("A19", 3), xmlCell("B19", 50000, { style: STYLE_CUR }),     xmlCell("C19", 0.10, { style: STYLE_PCT })]));
           configRows.push(xmlRow(20, [xmlCell("A20", 4), xmlCell("B20", "Unlimited"),                     xmlCell("C20", 0.15, { style: STYLE_PCT })]));
-          configRows.push(xmlRow(22, [xmlCell("A22", "MNH collections split equally among: PAR, KES, NRN")]));
+          configRows.push(xmlRow(22, [xmlCell("A22", "Partners credit own + paralegal collections; associates their own only")]));
           configRows.push(xmlRow(24, [xmlCell("A24", "Paralegal Hours Bonus", { style: STYLE_BOLD })]));
           configRows.push(xmlRow(25, [xmlCell("A25", "Min Hours", { style: STYLE_BOLD }), xmlCell("B25", "Bonus", { style: STYLE_BOLD })]));
           configRows.push(xmlRow(26, [xmlCell("A26", 110), xmlCell("B26", 100, { style: STYLE_CUR })]));
