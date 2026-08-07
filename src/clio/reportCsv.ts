@@ -92,7 +92,7 @@ export async function assertReportPeriod(reportId: number | string, wantStart: s
 // belong to the prior month are captured and re-bucketed by adjusted issue date).
 //
 // Each row is a timekeeper's allocation on an invoice: "User" (working timekeeper →
-// col N), "Responsible Attorney", "Originating Attorney" (→ col V), "Billed Time",
+// col N), "Responsible Attorney" (→ col S), "Originating Attorney" (→ col V), "Billed Time",
 // "Billed Time Collected", "Issue Date". Mirrors getClientActivityCSV's
 // POST+poll+retry and verifies the period via assertReportPeriod so a wrong-period
 // report aborts instead of writing bad data.

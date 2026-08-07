@@ -19,7 +19,7 @@ export type MonthlyCollections = {
   nonRosterOrigByMonth: Record<number, number>;
   // month -> collected fees $ whose responsible attorney is NOT on the roster (→ the "NRB" line, col S)
   nonRosterRespByMonth: Record<number, number>;
-  // month -> firm-wide collected fees $ (reconciliation target: Σ col N == Σ col V == this)
+  // month -> firm-wide collected fees $ (reconciliation target: Σ col N == Σ col S == Σ col V == this)
   firmByMonth: Record<number, number>;
   // firm-wide YTD total collected fees (reconciliation signal)
   firmYtd: number;
@@ -71,7 +71,7 @@ export function aggregateMonthFees(rows: Record<string, string>[], roster: Roste
  * of the dashboard running slightly higher than Rachel's). Allocated by:
  *   - working timekeeper  → col N "Collected Actual"
  *   - Originating Attorney → col V "Originating"
- *   - Responsible Attorney → legacy col S rollup
+ *   - Responsible Attorney → col S "Collected Actual"
  * Collected fees whose timekeeper / originating attorney / responsible attorney is
  * NOT on the roster are summed into nonRoster*ByMonth (the "NRB" line), so
  * Σ col N == Σ col V == Σ col S == firm fees by construction. Each report's
