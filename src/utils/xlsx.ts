@@ -911,7 +911,47 @@ export           const colLetter = (c: number): string => {
               else inner += `<v>${val}</v>`;
               return xml.replace(fullRe, `${open}${inner}${m[3]}`);
             }
-            return xml;
+            // 3) Cell ABSENT from its row — INSERT it in column order.
+            //    Excel omits never-styled empty cells from the XML entirely, so a
+            //    patch tool that can only rewrite existing cells silently DROPS
+            //    data written to such cells (found live 2026-08: KES's Jan–Mar
+            //    col-V cells and JPB/SAB/NRB rows' data cells didn't exist, so
+            //    their collections were computed and then lost — the old
+            //    `return xml` no-op below case 2). Style is borrowed from the
+            //    nearest row's cell in the SAME column so number formats stay
+            //    column-consistent; cells must stay in ascending column order or
+            //    Excel repairs the sheet.
+            const colL = ref.match(/^[A-Z]+/)?.[0] ?? "";
+            const rowN = parseInt(ref.slice(colL.length), 10);
+            if (!colL || !Number.isFinite(rowN)) return xml;
+            const rowRe = new RegExp(`(<row\\b[^>]*\\br="${rowN}"[^>]*?)(/>|>([\\s\\S]*?)</row>)`);
+            const rm = xml.match(rowRe);
+            if (!rm) return xml; // whole row absent — block-creation paths own new rows
+            let sAttr = "";
+            for (let d = 1; d <= 40 && !sAttr; d++) {
+              for (const rr of [rowN - d, rowN + d]) {
+                if (rr < 1) continue;
+                const nm = xml.match(new RegExp(`<c\\b[^>]*\\br="${colL}${rr}"[^>]*?\\bs="(\\d+)"`));
+                if (nm) { sAttr = ` s="${nm[1]}"`; break; }
+              }
+            }
+            const newCell = `<c r="${ref}"${sAttr}><v>${val}</v></c>`;
+            if (rm[2] === "/>") {
+              // self-closing empty row → give it a body holding just this cell
+              return xml.replace(rowRe, () => `${rm[1]}>${newCell}</row>`);
+            }
+            const target = colToNum(colL);
+            let cells = rm[3];
+            const cellIter = /<c\b[^>]*?\br="([A-Z]+)\d+"[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g;
+            let insertAt = cells.length;
+            let cm: RegExpExecArray | null;
+            while ((cm = cellIter.exec(cells))) {
+              if (colToNum(cm[1]) > target) { insertAt = cm.index; break; }
+            }
+            cells = cells.slice(0, insertAt) + newCell + cells.slice(insertAt);
+            // Replacer FUNCTION so "$"-sequences in existing cell content can't be
+            // interpreted as replacement patterns.
+            return xml.replace(rowRe, () => `${rm[1]}>${cells}</row>`);
           }
 
           // Read a cell's value as a string from worksheet XML (resolves shared

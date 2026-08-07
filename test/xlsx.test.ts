@@ -42,9 +42,42 @@ describe("patchCell", () => {
     expect(out).toContain("<v>323.4</v>");
   });
 
-  it("leaves the XML unchanged when the cell is absent", () => {
+  it("INSERTS an absent cell at the end of its row (found live: KES's V cells didn't exist, so his originating collections were silently dropped)", () => {
+    // Row ends at T (col 20); patching V (col 22) must create the cell, not no-op.
+    const xml = `<row r="6"><c r="N6" s="173"><v>1</v></c><c r="T6" s="172"><v>2</v></c></row>`;
+    const out = patchCell(xml, "V6", 105220.58);
+    expect(out).toBe(`<row r="6"><c r="N6" s="173"><v>1</v></c><c r="T6" s="172"><v>2</v></c><c r="V6"><v>105220.58</v></c></row>`);
+  });
+
+  it("inserts an absent cell in COLUMN ORDER between existing cells", () => {
+    const xml = `<row r="6"><c r="N6"><v>1</v></c><c r="V6"><v>3</v></c></row>`;
+    const out = patchCell(xml, "S6", 2);
+    expect(out).toBe(`<row r="6"><c r="N6"><v>1</v></c><c r="S6"><v>2</v></c><c r="V6"><v>3</v></c></row>`);
+  });
+
+  it("borrows the style of the nearest same-column cell when inserting", () => {
+    const xml =
+      `<row r="5"><c r="S5" s="176"><v>9</v></c></row>` +
+      `<row r="6"><c r="N6" s="173"><v>1</v></c></row>`;
+    const out = patchCell(xml, "S6", 42);
+    expect(out).toContain(`<c r="S6" s="176"><v>42</v></c>`);
+  });
+
+  it("gives a self-closing empty row a body holding the inserted cell", () => {
+    const xml = `<row r="7" spans="1:23"/>`;
+    expect(patchCell(xml, "S7", 5)).toBe(`<row r="7" spans="1:23"><c r="S7"><v>5</v></c></row>`);
+  });
+
+  it("leaves the XML unchanged when the whole ROW is absent (block creation owns new rows)", () => {
     const xml = `<row r="5"><c r="C5"><v>1</v></c></row>`;
-    expect(patchCell(xml, "Z5", 9)).toBe(xml);
+    expect(patchCell(xml, "Z9", 9)).toBe(xml);
+  });
+
+  it("does not misread row r=\"6\" when patching into row 60", () => {
+    const xml = `<row r="6"><c r="S6"><v>1</v></c></row><row r="60"><c r="N60"><v>7</v></c></row>`;
+    const out = patchCell(xml, "S60", 8);
+    expect(out).toContain(`<c r="S6"><v>1</v></c>`);       // row 6 untouched
+    expect(out).toContain(`<c r="N60"><v>7</v></c><c r="S60"`); // inserted into row 60
   });
 
   it("keeps follower formulas alive when patching a shared-formula MASTER", () => {
