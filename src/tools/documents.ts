@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { buildRevenueByMonth } from "../dashboard/revenue";
-import { computeBonusData } from "../dashboard/bonus";
+import { computeBonusData, reconcileBonusConfig } from "../dashboard/bonus";
 import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
@@ -2318,7 +2318,15 @@ export function registerDocumentTools(server: McpServer): void {
           let numAttorneys = NUM_ATTORNEYS;
 
           if (configSheet) {
-            // Read existing config
+            // Read the existing sheet's rows, then RECONCILE against BONUS_ATTORNEYS
+            // (reconcileBonusConfig): the roster and the associate/paralegal credit
+            // lists come from the code (firm comp decisions — PAR←NAF, KES←JPB's
+            // tail + "SAB,AFL" so Anna's ongoing collections keep crediting KES, no
+            // standalone JPB row), while salary/paraSalary/legalAsst/payroll stay
+            // sheet-editable. Previously the sheet was used verbatim and then
+            // rewritten from itself, so a stale sheet overrode every code fix
+            // forever (PAR credited JPB; KES credited TBS — double-counting an
+            // attorney with his own bonus row — and lost AFL's tail).
             const readAttorneys: typeof BONUS_ATTORNEYS = [];
             for (let r = 5; r <= 11; r++) {
               const row = configSheet.getRow(r);
@@ -2334,7 +2342,9 @@ export function registerDocumentTools(server: McpServer): void {
                 payroll: Number(row.getCell(7).value) || 0.17,
               });
             }
-            if (readAttorneys.length > 0) configAttorneys = readAttorneys;
+            const reconciled = reconcileBonusConfig(readAttorneys, BONUS_ATTORNEYS);
+            configAttorneys = reconciled.attorneys;
+            for (const note of reconciled.notes) console.warn(`[Dashboard] Bonus Config reconcile: ${note}`);
             firmOverhead = Number(configSheet.getRow(13).getCell(2).value) || FIRM_OVERHEAD;
             numAttorneys = Number(configSheet.getRow(14).getCell(2).value) || NUM_ATTORNEYS;
           } else {

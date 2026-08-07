@@ -30,6 +30,60 @@ function sumByInitials(mc: Record<string, number>, field: string | undefined): n
 }
 
 /**
+ * Reconcile the Bonus Config read from the workbook sheet against the code
+ * defaults (the firm's comp decisions).
+ *
+ * WHY: download_dashboard_update reads the "Bonus Config" sheet and then
+ * REWRITES it from what it read, so a stale sheet silently self-perpetuates —
+ * that is exactly how the firm's associate-credit fixes (PR #200/#201: PAR's
+ * associate is NAF, KES gets JPB's post-termination tail, KES's paralegal
+ * credit is "SAB,AFL" so Anna's ongoing collections keep crediting KES until
+ * they stop, and JPB has no standalone bonus row) never took effect: the sheet
+ * still carried the pre-decision mappings and overrode the corrected defaults
+ * on every run.
+ *
+ * RULES:
+ * - The ROSTER (which attorneys have bonus rows) and the ATTRIBUTION fields
+ *   (associate / paralegal credit lists) come from the code defaults.
+ * - The COMP numbers (salary, paraSalary, legalAsst, payroll) stay
+ *   sheet-editable: a positive sheet value wins over the default; blank/zero
+ *   falls back to the default (so a half-filled row can't zero out a salary).
+ * - Sheet rows for attorneys not in the defaults are dropped (e.g. JPB's
+ *   stale standalone row); every divergence is reported in `notes`.
+ */
+export function reconcileBonusConfig(
+  sheetRows: BonusAttorney[],
+  defaults: BonusAttorney[],
+): { attorneys: BonusAttorney[]; notes: string[] } {
+  const notes: string[] = [];
+  const byIni = new Map(sheetRows.map((r) => [r.ini.toUpperCase(), r]));
+  const attorneys = defaults.map((def) => {
+    const s = byIni.get(def.ini.toUpperCase());
+    if (!s) {
+      notes.push(`${def.ini}: no sheet row — using code defaults`);
+      return { ...def };
+    }
+    const norm = (f: string) => f.split(/[,+/]/).map((x) => x.trim().toUpperCase()).filter(Boolean).join(",");
+    if (norm(s.associate) !== norm(def.associate)) {
+      notes.push(`${def.ini}: sheet associate "${s.associate || "(none)"}" overridden by firm config "${def.associate || "(none)"}"`);
+    }
+    if (norm(s.paralegal) !== norm(def.paralegal)) {
+      notes.push(`${def.ini}: sheet paralegal "${s.paralegal || "(none)"}" overridden by firm config "${def.paralegal || "(none)"}"`);
+    }
+    return {
+      ...def,
+      salary: s.salary > 0 ? s.salary : def.salary,
+      paraSalary: s.paraSalary > 0 ? s.paraSalary : def.paraSalary,
+      legalAsst: s.legalAsst > 0 ? s.legalAsst : def.legalAsst,
+      payroll: s.payroll > 0 ? s.payroll : def.payroll,
+    };
+  });
+  const dropped = sheetRows.filter((r) => !defaults.some((d) => d.ini.toUpperCase() === r.ini.toUpperCase()));
+  for (const r of dropped) notes.push(`${r.ini}: stale sheet row dropped (not in the firm bonus roster)`);
+  return { attorneys, notes };
+}
+
+/**
  * Compute per-attorney bonus rows from monthly collections.
  * @param monthCollections monthName -> initials -> collected $ (individual, col N)
  * @param configAttorneys  bonus config (salary/associate/paralegal/etc.)

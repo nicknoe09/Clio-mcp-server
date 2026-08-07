@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeBonusData, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
+import { computeBonusData, reconcileBonusConfig, type BonusBracket, type BonusAttorney } from "../src/dashboard/bonus";
 
 const BRACKETS: BonusBracket[] = [
   { width: 0, rate: 0 },           // base target at 0%
@@ -51,5 +51,67 @@ describe("computeBonusData", () => {
       { firmOverhead: 0, numAttorneys: 1, brackets: BRACKETS, mnhSplitAmong: ["PAR", "KES", "NRN"] },
     );
     expect(data.PAR.rows[0].collections).toBe(10000); // 30000 / 3
+  });
+});
+
+describe("reconcileBonusConfig", () => {
+  const defaults: BonusAttorney[] = [
+    { ini: "PAR", salary: 332340, associate: "NAF", paralegal: "ACA",     paraSalary: 80000, legalAsst: 0, payroll: 0.17 },
+    { ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000, legalAsst: 0, payroll: 0.17 },
+    { ini: "TBS", salary: 167500, associate: "",    paralegal: "",        paraSalary: 0,     legalAsst: 0, payroll: 0.17 },
+  ];
+  const sheetRow = (o: Partial<BonusAttorney> & { ini: string }): BonusAttorney => ({
+    salary: 0, associate: "", paralegal: "", paraSalary: 0, legalAsst: 0, payroll: 0.17, ...o,
+  });
+
+  it("attribution (associate/paralegal) comes from the code defaults, not a stale sheet", () => {
+    // The exact stale state found live (2026-08): PAR credited JPB, KES credited
+    // TBS (double-count — TBS has his own row) and lost AFL's tail.
+    const sheet = [
+      sheetRow({ ini: "PAR", salary: 332340, associate: "JPB", paralegal: "ACA", paraSalary: 80000 }),
+      sheetRow({ ini: "KES", salary: 332340, associate: "TBS", paralegal: "SAB", paraSalary: 75000 }),
+      sheetRow({ ini: "TBS", salary: 167500 }),
+    ];
+    const { attorneys, notes } = reconcileBonusConfig(sheet, defaults);
+    const par = attorneys.find((a) => a.ini === "PAR")!;
+    const kes = attorneys.find((a) => a.ini === "KES")!;
+    expect(par.associate).toBe("NAF");
+    expect(kes.associate).toBe("JPB");
+    expect(kes.paralegal).toBe("SAB,AFL"); // AFL's tail keeps crediting KES until it stops
+    expect(notes.length).toBeGreaterThanOrEqual(3); // PAR assoc, KES assoc, KES para all overridden
+  });
+
+  it("comp numbers stay sheet-editable; blank/zero falls back to defaults", () => {
+    const sheet = [
+      sheetRow({ ini: "PAR", salary: 350000, associate: "NAF", paralegal: "ACA", paraSalary: 82000, payroll: 0.2 }),
+      sheetRow({ ini: "KES", salary: 0, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 0 }), // blanks
+    ];
+    const { attorneys } = reconcileBonusConfig(sheet, defaults);
+    const par = attorneys.find((a) => a.ini === "PAR")!;
+    const kes = attorneys.find((a) => a.ini === "KES")!;
+    expect(par.salary).toBe(350000);   // sheet edit honored
+    expect(par.paraSalary).toBe(82000);
+    expect(par.payroll).toBe(0.2);
+    expect(kes.salary).toBe(332340);   // blank → default
+    expect(kes.paraSalary).toBe(75000);
+  });
+
+  it("drops stale sheet rows not in the roster (JPB standalone) and keeps roster order", () => {
+    const sheet = [
+      sheetRow({ ini: "JPB", salary: 110000 }), // terminated — no own bonus row
+      sheetRow({ ini: "KES", salary: 332340, associate: "JPB", paralegal: "SAB,AFL", paraSalary: 75000 }),
+    ];
+    const { attorneys, notes } = reconcileBonusConfig(sheet, defaults);
+    expect(attorneys.map((a) => a.ini)).toEqual(["PAR", "KES", "TBS"]);
+    expect(notes.some((n) => n.startsWith("JPB:"))).toBe(true);
+    expect(notes.some((n) => n.startsWith("PAR: no sheet row"))).toBe(true);
+  });
+
+  it("initials-list comparison ignores spacing/separator/case differences", () => {
+    const sheet = [
+      sheetRow({ ini: "KES", salary: 332340, associate: "jpb", paralegal: "sab, afl", paraSalary: 75000 }),
+    ];
+    const { notes } = reconcileBonusConfig(sheet, defaults);
+    expect(notes.filter((n) => n.startsWith("KES:"))).toEqual([]); // equivalent lists → no override note
   });
 });
