@@ -26,32 +26,47 @@ describe("aggregateMonthFees", () => {
     expect(agg.firm).toBe(735);
   });
 
-  it("credits col N by working timekeeper and col V by originating attorney", () => {
+  it("credits col N by working timekeeper, col S by responsible attorney, col V by originating attorney", () => {
     const rows = [
-      // Worked by Kenny, originated by Paul
-      row({ User: "Kenny Sumner", "Originating Attorney": "Paul Romano", "Billed Time Collected": "1000" }),
+      // Worked by Kenny, responsible Nicholas, originated by Paul
+      row({ User: "Kenny Sumner", "Responsible Attorney": "Nicholas Noe", "Originating Attorney": "Paul Romano", "Billed Time Collected": "1000" }),
     ];
     const agg = aggregateMonthFees(rows, ROSTER);
     expect(agg.indiv[2]).toBe(1000); // KES (worker) → col N
+    expect(agg.resp[3]).toBe(1000);  // NRN (responsible) → col S
     expect(agg.orig[1]).toBe(1000);  // PAR (originator) → col V
   });
 
-  it("pools non-roster billers so Σ col N (+NRB) == Σ col V (+NRB) == firm fees", () => {
+  it("pools non-roster billers so Σ col N (+NRB) == Σ col S (+NRB) == Σ col V (+NRB) == firm fees", () => {
     const rows = [
-      row({ User: "Paul Romano", "Originating Attorney": "Paul Romano", "Billed Time Collected": "500" }),
-      // Non-roster worker, roster originator → drops from col N without NRB, but kept via nonRosterIndiv
-      row({ User: "Elissa Silguero", "Originating Attorney": "Kenny Sumner", "Billed Time Collected": "300" }),
-      // Roster worker, non-roster originator → kept via nonRosterOrig
-      row({ User: "Nicholas Noe", "Originating Attorney": "Former Partner", "Billed Time Collected": "200" }),
+      row({ User: "Paul Romano", "Responsible Attorney": "Paul Romano", "Originating Attorney": "Paul Romano", "Billed Time Collected": "500" }),
+      // Non-roster worker, roster responsible/originator → drops from col N without NRB, but kept via nonRosterIndiv
+      row({ User: "Elissa Silguero", "Responsible Attorney": "Kenny Sumner", "Originating Attorney": "Kenny Sumner", "Billed Time Collected": "300" }),
+      // Roster worker, non-roster responsible + originator → kept via nonRosterResp/nonRosterOrig
+      row({ User: "Nicholas Noe", "Responsible Attorney": "Former Partner", "Originating Attorney": "Former Partner", "Billed Time Collected": "200" }),
     ];
     const agg = aggregateMonthFees(rows, ROSTER);
     const sumN = Object.values(agg.indiv).reduce((s, v) => s + v, 0) + agg.nonRosterIndiv;
+    const sumS = Object.values(agg.resp).reduce((s, v) => s + v, 0) + agg.nonRosterResp;
     const sumV = Object.values(agg.orig).reduce((s, v) => s + v, 0) + agg.nonRosterOrig;
     expect(agg.firm).toBe(1000);
     expect(sumN).toBe(1000);
+    expect(sumS).toBe(1000);
     expect(sumV).toBe(1000);
     expect(agg.nonRosterIndiv).toBe(300); // Elissa
+    expect(agg.nonRosterResp).toBe(200);  // Former Partner
     expect(agg.nonRosterOrig).toBe(200);  // Former Partner
+  });
+
+  it("a blank Responsible Attorney falls into the NRB pool (col S still reconciles)", () => {
+    const rows = [
+      row({ User: "Paul Romano", "Responsible Attorney": "", "Billed Time Collected": "750" }),
+    ];
+    const agg = aggregateMonthFees(rows, ROSTER);
+    expect(agg.resp).toEqual({});
+    expect(agg.nonRosterResp).toBe(750);
+    const sumS = Object.values(agg.resp).reduce((s, v) => s + v, 0) + agg.nonRosterResp;
+    expect(sumS).toBe(agg.firm);
   });
 
   it("skips rows with zero collected fees", () => {
