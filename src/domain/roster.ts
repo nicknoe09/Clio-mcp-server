@@ -33,8 +33,9 @@ export const FIRM_ROSTER: RosterMember[] = [
 
 // Collections-only roster (27) — every timekeeper that has a row in the 26 Compare
 // month blocks, including former/staff billers who still collect on old invoices.
-// Used ONLY for collections attribution (col N "Collected Actual" / col V
-// "Originating") so each biller's row is filled individually; hours/billed/bonus stay
+// Used ONLY for collections attribution (col N "Collected Actual" / col S
+// responsible-attorney "Collected Actual" / col V "Originating") so each
+// biller's row is filled individually; hours/billed/bonus stay
 // on FIRM_ROSTER. Initials match the sheet's col C; names match Clio's "User" /
 // attorney fields. (Billers with collections but no sheet row — e.g. Merari Zambrano —
 // are intentionally absent and fall into the "NRB" safety-net row.)
