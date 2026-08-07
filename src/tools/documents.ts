@@ -53,6 +53,7 @@ import {
   StyleIndices,
   surgicalWriteXlsx,
   sanitizeXlsxBuffer,
+  sanitizeSheetXml,
   colLetter,
   patchCell,
   readCell,
@@ -2776,7 +2777,12 @@ export function registerDocumentTools(server: McpServer): void {
           const origZip = await JSZip.loadAsync(fileBuffer);
           const compareSheetMap = await getZipSheetMap(origZip);
           const comparePath = compareSheetMap["26 Compare"];
-          let compareXml = await origZip.file(comparePath)!.async("string");
+          // Normalize the stored XML BEFORE patching (not only at save):
+          // unique+sorted rows/cells and any historical malformation (e.g. the
+          // pre-2026-07 patchCell cell-fusing damage) scrubbed, so the regex
+          // patchers below always operate on well-formed rows. Idempotent —
+          // the save path runs the same sanitize on the way out.
+          let compareXml = sanitizeSheetXml(await origZip.file(comparePath)!.async("string"));
           // Resolve the workbook's shared-string table once — the Util/Realiz/
           // Collection tabs store col A month labels and col B initials as shared
           // strings, so findTabMonthBlock needs this to read them as text.
@@ -3595,11 +3601,28 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   diagnosticTool(server).tool(
     "dump_compare_layout",
-    "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K, Collected N). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and to compare month blocks (e.g. April vs May) for duplicated data.",
-    {},
-    async () => {
+    "Read-only diagnostic: dumps the '26 Compare' sheet row layout from the Box dashboard — for each used row: row number, col B (month/section label), col C (initials), and key data cells (BizDev D, Billable Hrs I, Billed $ K, Collected N). Use to see exactly which rows are blocks vs SUM vs '2026 Totals', and to compare month blocks (e.g. April vs May) for duplicated data. Pass raw_rows (comma-separated sheet row numbers) to ALSO return those rows' VERBATIM worksheet XML — for diagnosing malformed/fused cells that value-level reads can't show.",
+    {
+      raw_rows: z.string().optional().describe("Comma-separated sheet row numbers (e.g. '6,38,70') whose raw <row> XML should be returned verbatim, straight from the stored sheet XML (no ExcelJS normalization)."),
+    },
+    async (p) => {
       const DASHBOARD_FILE_ID = "2199324794140";
       const buf = await sanitizeXlsxBuffer(await downloadFromBox(DASHBOARD_FILE_ID));
+      // Raw XML extraction FIRST (from the untouched zip), so ExcelJS's parse
+      // can't normalize away the malformation we're trying to observe.
+      let rawRowsOut: Record<string, string> | undefined;
+      if (p.raw_rows?.trim()) {
+        rawRowsOut = {};
+        const zip = await JSZip.loadAsync(buf);
+        const sheetMap = await getZipSheetMap(zip);
+        const xml = await zip.file(sheetMap["26 Compare"])!.async("string");
+        for (const part of p.raw_rows.split(",")) {
+          const rn = parseInt(part.trim(), 10);
+          if (!Number.isFinite(rn)) continue;
+          const m = xml.match(new RegExp(`<row\\b[^>]*\\br="${rn}"[^>]*?(?:/>|>[\\s\\S]*?</row>)`));
+          rawRowsOut[String(rn)] = m ? m[0].slice(0, 4000) : "(row element not found)";
+        }
+      }
       const wb = new ExcelJS.Workbook();
       await wb.xlsx.load(buf as any);
       const sheet = wb.getWorksheet("26 Compare");
@@ -3625,6 +3648,11 @@ export function registerDocumentTools(server: McpServer): void {
         const N = cellStr(row, 14).trim();
         if (B || C || D || I || K || N) rows.push({ row: n, B, C, bizDev_D: D, billableHrs_I: I, billed_K: K, collected_N: N });
       });
+      // When raw rows were requested, return ONLY those (the full layout dump
+      // alongside 4KB XML blobs would blow the response size).
+      if (rawRowsOut) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ sheet: "26 Compare", raw_rows: rawRowsOut }, null, 2) }] };
+      }
       return { content: [{ type: "text" as const, text: JSON.stringify({ sheet: "26 Compare", row_count: rows.length, rows }, null, 2) }] };
     }
   );
