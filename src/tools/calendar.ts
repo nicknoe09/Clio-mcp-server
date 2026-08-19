@@ -190,7 +190,7 @@ export function registerCalendarTools(server: McpServer): void {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
       user_id: z.coerce.number().optional().describe("Filter to entries owned by a Clio **User** (pass the User ID). The tool resolves that user to the Calendar(s) they own and filters on those. Clio's calendar_entries list filter is `calendar_id` (a Calendar resource), NOT a User ID — passing the raw user_id as a calendar filter matches nothing and Clio silently returns every firm entry, so this resolution step is required."),
-      include_attending: z.boolean().optional().default(false).describe("If true, ALSO return entries on OTHER people's calendars where this user is an attendee (events someone else calendared and added them to) — not just events on calendars they own. Clio has NO attendee query filter, so this is done by sweeping the date range once and matching `attendees[]` client-side; it reads more data than the owned-only path, so keep the date range tight. Each returned entry carries `match`: \"owner\", \"attendee\", or \"both\". Requires user_id."),
+      include_attending: z.boolean().optional().default(true).describe("ON BY DEFAULT. Returns entries on calendars the user owns AND entries on OTHER people's calendars where the user is an attendee (events someone else calendared and added them to) — because both are genuinely \"their events\". Each returned entry carries `match`: \"owner\", \"attendee\", or \"both\". Clio has NO attendee query filter, so the attendee half is found by sweeping the date range and matching `attendees[]` client-side; keep the date range tight on large firms. Pass false to get ONLY calendars the user owns, which filters server-side via calendar_id and reads far less data. Only applies when user_id is set."),
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       query: z.string().optional().describe("Search term to filter by summary/description"),
     },
@@ -204,19 +204,11 @@ export function registerCalendarTools(server: McpServer): void {
         if (params.matter_id) baseParams.matter_id = params.matter_id;
         if (params.query) baseParams.query = params.query;
 
-        if (params.include_attending && !params.user_id) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                error: true,
-                message: "include_attending requires user_id — there's no user to match attendees against. Pass the Clio User ID whose events you want, or drop include_attending.",
-                context: "include_attending_without_user_id",
-              }, null, 2),
-            }],
-            isError: true,
-          };
-        }
+        // NOTE: include_attending is ON BY DEFAULT, so it must NOT be an error
+        // to omit user_id — that combination is simply "no user to match
+        // attendees against", and the no-user_id path already returns every
+        // visible entry (a superset of anything attendee matching could add).
+        // The reported `scope` says which path ran.
 
         // user_id → calendar_id(s). Clio's calendar_entries index filters by
         // `calendar_id` (a Calendar resource ID). The old code passed the raw
@@ -237,7 +229,11 @@ export function registerCalendarTools(server: McpServer): void {
                   count: 0,
                   period: { start: params.start_date, end: params.end_date },
                   entries: [],
-                  note: `No calendar owned by user ${params.user_id} is visible to the firm OAuth user, so no entries match. Use list_calendars(creator_user_id=${params.user_id}) to inspect what's available.`,
+                  // Attendee matching keys off calendar ids too (a person
+                  // attendee is Attendee_base.type "Calendar"), so with no
+                  // resolvable calendar there is nothing to match on EITHER
+                  // side — ownership or attendance.
+                  note: `No calendar owned by user ${params.user_id} is visible to the firm OAuth user, so no entries match — neither events they own nor events they attend (attendee identity is also a Calendar id). Use list_calendars(creator_user_id=${params.user_id}) to inspect what's available.`,
                 }, null, 2),
               }],
             };
@@ -327,8 +323,8 @@ export function registerCalendarTools(server: McpServer): void {
               scope: params.user_id
                 ? (params.include_attending
                     ? "calendars owned by the user + entries they attend on others' calendars"
-                    : "calendars owned by the user only (pass include_attending=true to also catch events others calendared them onto)")
-                : "all calendars visible to the firm OAuth user",
+                    : "calendars owned by the user ONLY — include_attending=false, so events others calendared them onto are excluded")
+                : "all calendars visible to the firm OAuth user (no user_id given)",
               ...(params.include_attending ? { attendee_only_count: attendeeOnlyCount } : {}),
               entries: formatted,
             }, null, 2),
