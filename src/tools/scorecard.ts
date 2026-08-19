@@ -4,6 +4,11 @@ import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
 import { classifyYtdTimeEntries } from "../dashboard/classifiedHours";
+import {
+  ATTENDEE_FIELDS,
+  fetchCalendarIdToUserId,
+  resolveAttendeeUserIds,
+} from "../clio/calendarIdentity";
 
 // --- Firm roster: initials → Clio user ID ---
 const ROSTER = SCORECARD_ROSTER;
@@ -80,14 +85,33 @@ export function registerScorecardTools(server: McpServer): void {
         }).then(entries => entries.filter((e: any) => e.date >= week.start && e.date <= week.end));
 
         // --- Fetch calendar entries for potential calls (week) ---
+        // `attendees` is PLURAL. This asked for a singular `attendee{id,name}`,
+        // which is not a field in Clio's schema, so Clio rejected the whole
+        // request — and the bare `catch` below swallowed it, leaving
+        // potential_calls at 0 for every timekeeper, every week, silently.
+        // Failures are now recorded in `warnings` so a zero means zero
+        // instead of meaning "this never worked".
+        const warnings: string[] = [];
         let weekCalendarEntries: any[] = [];
         try {
           weekCalendarEntries = await fetchAllPages<any>("/calendar_entries", {
-            fields: "id,summary,start_at,attendee{id,name}",
+            fields: `id,summary,start_at,${ATTENDEE_FIELDS}`,
             from: week.start,
             to: week.end,
           });
-        } catch { /* calendar endpoint may not be available */ }
+        } catch (e: any) {
+          warnings.push(`Weekly potential_calls unavailable — /calendar_entries fetch failed: ${e?.message ?? e}`);
+        }
+
+        // Attendee ids are CALENDAR ids, but this scorecard is keyed by Clio
+        // USER id, so the two have to be mapped before counting. Comparing
+        // them directly (as this code used to) matches nothing.
+        let calendarIdToUserId = new Map<number, number>();
+        try {
+          calendarIdToUserId = await fetchCalendarIdToUserId();
+        } catch (e: any) {
+          warnings.push(`potential_calls may undercount — /calendars lookup failed, so attendee calendars could not be resolved to users: ${e?.message ?? e}`);
+        }
 
         // --- Build weekly data per user ---
         const weeklyData: Record<number, { billable: number; nonbillable: number; potential_calls: number }> = {};
@@ -110,9 +134,10 @@ export function registerScorecardTools(server: McpServer): void {
         for (const cal of weekCalendarEntries) {
           const title = (cal.summary || "").toLowerCase();
           if (!title.includes("potential")) continue;
-          const attendeeId = cal.attendee?.id;
-          if (attendeeId && weeklyData[attendeeId]) {
-            weeklyData[attendeeId].potential_calls++;
+          // Credit every roster attendee on the event, not just one — an
+          // entry's attendees are a list, and a call can involve two people.
+          for (const userId of resolveAttendeeUserIds(cal, calendarIdToUserId)) {
+            if (weeklyData[userId]) weeklyData[userId].potential_calls++;
           }
         }
 
@@ -130,11 +155,13 @@ export function registerScorecardTools(server: McpServer): void {
           let monthCalendarEntries: any[] = [];
           try {
             monthCalendarEntries = await fetchAllPages<any>("/calendar_entries", {
-              fields: "id,summary,start_at,attendee{id,name}",
+              fields: `id,summary,start_at,${ATTENDEE_FIELDS}`,
               from: month.start,
               to: month.end,
             });
-          } catch { /* */ }
+          } catch (e: any) {
+            warnings.push(`Monthly potential_calls unavailable — /calendar_entries fetch failed: ${e?.message ?? e}`);
+          }
 
           // Fetch paid bills for collections
           let paidBills: any[] = [];
@@ -213,9 +240,8 @@ export function registerScorecardTools(server: McpServer): void {
           for (const cal of monthCalendarEntries) {
             const title = (cal.summary || "").toLowerCase();
             if (!title.includes("potential")) continue;
-            const attendeeId = cal.attendee?.id;
-            if (attendeeId && monthlyData[attendeeId]) {
-              monthlyData[attendeeId].potential_calls++;
+            for (const userId of resolveAttendeeUserIds(cal, calendarIdToUserId)) {
+              if (monthlyData[userId]) monthlyData[userId].potential_calls++;
             }
           }
 
@@ -277,6 +303,8 @@ export function registerScorecardTools(server: McpServer): void {
 
         const result: any = { weekly: weeklySection };
         if (monthlySection) result.monthly = monthlySection;
+        // Surface partial-data failures instead of reporting a confident 0.
+        if (warnings.length > 0) result.warnings = warnings;
 
         return {
           content: [{
