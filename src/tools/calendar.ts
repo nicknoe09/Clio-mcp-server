@@ -4,8 +4,14 @@ import { fetchAllPages, rawPostSingle, rawPatchSingle, rawDeleteSingle } from ".
 import { getActingClioUserId } from "../clio/actingUser";
 import { isActingUserOwner } from "../clio/owner";
 
+// `attendees` is PLURAL — per Clio's OpenAPI, CalendarEntry.attendees is an
+// array of Attendee_base. (A singular `attendee` is not a valid field; asking
+// for it makes Clio reject the whole request.) Attendee_base.type is an enum
+// of "Contact" | "Calendar", so a *person* attendee is identified by their
+// CALENDAR id — the same Calendar-vs-User distinction that applies to
+// calendar_owner.
 const CALENDAR_FIELDS =
-  "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color}";
+  "id,summary,description,start_at,end_at,all_day,location,recurrence_rule,matter{id,display_number},calendar_owner{id,name},calendar_entry_event_type{id,name,color},attendees{id,name,type,email}";
 
 // Per Clio's Calendar schema (OpenAPI Calendar_base): `visible` is a valid
 // response field, but `writeable` is NOT — `writeable` is only a query-filter
@@ -58,6 +64,42 @@ async function findUserCalendarIds(userId: number): Promise<number[]> {
     fields: "id,name,creator{id,name}",
   });
   return selectUserCalendarIds(calendars, userId);
+}
+
+// Pure: is this entry ON one of the given calendars (i.e. the user OWNS it)?
+// Reads calendar_owner{id} and falls back to the flat calendar_owner_id field
+// (both are on Clio's CalendarEntry response model).
+export function isEntryOwnedBy(entry: any, calendarIds: Set<number>): boolean {
+  const ownerId = entry?.calendar_owner?.id ?? entry?.calendar_owner_id;
+  return ownerId != null && calendarIds.has(ownerId);
+}
+
+// Pure: is the user an ATTENDEE on this entry (someone else's event they were
+// invited to / assigned)? Only attendees of type "Calendar" are people at the
+// firm — per Clio's Attendee_base enum, the other type is "Contact" (clients,
+// opposing counsel), whose ids are Contact ids and must NOT be compared
+// against calendar ids.
+export function isUserAttendingEntry(entry: any, calendarIds: Set<number>): boolean {
+  const attendees = Array.isArray(entry?.attendees) ? entry.attendees : [];
+  return attendees.some(
+    (a: any) => a?.type === "Calendar" && a?.id != null && calendarIds.has(a.id),
+  );
+}
+
+// Pure: why did this entry match — because the user owns the calendar it sits
+// on, because they're an attendee on someone else's, or both? Returns null
+// when the entry doesn't involve the user at all. Callers surface this as
+// `match` so a tickler can tell "my event" from "I was added to this".
+export function classifyEntryMatch(
+  entry: any,
+  calendarIds: Set<number>,
+): "owner" | "attendee" | "both" | null {
+  const owned = isEntryOwnedBy(entry, calendarIds);
+  const attending = isUserAttendingEntry(entry, calendarIds);
+  if (owned && attending) return "both";
+  if (owned) return "owner";
+  if (attending) return "attendee";
+  return null;
 }
 
 // RomSum event type IDs (from /calendar_entry_event_types)
@@ -148,6 +190,7 @@ export function registerCalendarTools(server: McpServer): void {
       start_date: z.string().describe("Start date (YYYY-MM-DD)"),
       end_date: z.string().describe("End date (YYYY-MM-DD)"),
       user_id: z.coerce.number().optional().describe("Filter to entries owned by a Clio **User** (pass the User ID). The tool resolves that user to the Calendar(s) they own and filters on those. Clio's calendar_entries list filter is `calendar_id` (a Calendar resource), NOT a User ID — passing the raw user_id as a calendar filter matches nothing and Clio silently returns every firm entry, so this resolution step is required."),
+      include_attending: z.boolean().optional().default(false).describe("If true, ALSO return entries on OTHER people's calendars where this user is an attendee (events someone else calendared and added them to) — not just events on calendars they own. Clio has NO attendee query filter, so this is done by sweeping the date range once and matching `attendees[]` client-side; it reads more data than the owned-only path, so keep the date range tight. Each returned entry carries `match`: \"owner\", \"attendee\", or \"both\". Requires user_id."),
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       query: z.string().optional().describe("Search term to filter by summary/description"),
     },
@@ -161,6 +204,20 @@ export function registerCalendarTools(server: McpServer): void {
         if (params.matter_id) baseParams.matter_id = params.matter_id;
         if (params.query) baseParams.query = params.query;
 
+        if (params.include_attending && !params.user_id) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: true,
+                message: "include_attending requires user_id — there's no user to match attendees against. Pass the Clio User ID whose events you want, or drop include_attending.",
+                context: "include_attending_without_user_id",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
         // user_id → calendar_id(s). Clio's calendar_entries index filters by
         // `calendar_id` (a Calendar resource ID). The old code passed the raw
         // user_id as `calendar_owner_id`, which is NOT a valid list filter, so
@@ -169,6 +226,7 @@ export function registerCalendarTools(server: McpServer): void {
         // each (a user can own several calendars, and the list filter takes a
         // single calendar_id), merging results and de-duplicating by entry id.
         let entries: any[];
+        const matchByEntryId = new Map<number, "owner" | "attendee" | "both">();
         if (params.user_id) {
           const calendarIds = await findUserCalendarIds(params.user_id);
           if (calendarIds.length === 0) {
@@ -184,17 +242,39 @@ export function registerCalendarTools(server: McpServer): void {
               }],
             };
           }
-          const seen = new Set<number>();
-          entries = [];
-          for (const calendarId of calendarIds) {
-            const page = await fetchAllPages<any>("/calendar_entries", {
-              ...baseParams,
-              calendar_id: calendarId,
-            });
-            for (const e of page) {
-              if (!seen.has(e.id)) {
-                seen.add(e.id);
+          if (params.include_attending) {
+            // Clio exposes NO attendee filter on /calendar_entries (verified
+            // against the OpenAPI spec — the only ownership-ish filter is
+            // calendar_id), so catching "events someone ELSE calendared me
+            // onto" requires sweeping the range once and matching
+            // attendees[] client-side. One unfiltered sweep is cheaper than
+            // per-calendar queries plus a sweep, and it catches both cases.
+            const calendarIdSet = new Set(calendarIds);
+            const swept = await fetchAllPages<any>("/calendar_entries", baseParams);
+            entries = [];
+            for (const e of swept) {
+              const match = classifyEntryMatch(e, calendarIdSet);
+              if (match) {
+                matchByEntryId.set(e.id, match);
                 entries.push(e);
+              }
+            }
+          } else {
+            // Owned-only (default): filter server-side by calendar_id, which
+            // is far less data than sweeping the whole firm's range.
+            const seen = new Set<number>();
+            entries = [];
+            for (const calendarId of calendarIds) {
+              const page = await fetchAllPages<any>("/calendar_entries", {
+                ...baseParams,
+                calendar_id: calendarId,
+              });
+              for (const e of page) {
+                if (!seen.has(e.id)) {
+                  seen.add(e.id);
+                  matchByEntryId.set(e.id, "owner");
+                  entries.push(e);
+                }
               }
             }
           }
@@ -221,7 +301,22 @@ export function registerCalendarTools(server: McpServer): void {
             name: e.calendar_entry_event_type.name,
             color: e.calendar_entry_event_type.color,
           } : null,
+          attendees: Array.isArray(e.attendees)
+            ? e.attendees.map((a: any) => ({
+                id: a.id,
+                name: a.name,
+                // "Calendar" = a person at the firm; "Contact" = client /
+                // third party. The id namespace differs per type.
+                type: a.type,
+                email: a.email,
+              }))
+            : [],
+          // Only meaningful when user_id was supplied; tells a tickler whether
+          // this is the user's own event or one they were added to.
+          ...(matchByEntryId.has(e.id) ? { match: matchByEntryId.get(e.id) } : {}),
         }));
+
+        const attendeeOnlyCount = formatted.filter((e: any) => e.match === "attendee").length;
 
         return {
           content: [{
@@ -229,6 +324,12 @@ export function registerCalendarTools(server: McpServer): void {
             text: JSON.stringify({
               count: formatted.length,
               period: { start: params.start_date, end: params.end_date },
+              scope: params.user_id
+                ? (params.include_attending
+                    ? "calendars owned by the user + entries they attend on others' calendars"
+                    : "calendars owned by the user only (pass include_attending=true to also catch events others calendared them onto)")
+                : "all calendars visible to the firm OAuth user",
+              ...(params.include_attending ? { attendee_only_count: attendeeOnlyCount } : {}),
               entries: formatted,
             }, null, 2),
           }],
