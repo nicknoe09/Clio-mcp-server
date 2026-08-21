@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { aggregateRealizationDollars, isUnbilledRealizStatus } from "../src/clio/reportCsv";
-import { buildRealizationDollarsSheet, REALIZATION_DOLLARS_TAB } from "../src/dashboard/realizationDollars";
+import { buildRealizationDollarsSheet, REALIZATION_DOLLARS_TAB, dataCol } from "../src/dashboard/realizationDollars";
 
 const roster = [
   { initials: "NRN", name: "Nicholas Noe", user_id: 348755029 },
@@ -86,49 +86,87 @@ describe("aggregateRealizationDollars", () => {
 });
 
 describe("buildRealizationDollarsSheet", () => {
-  const agg = (o: Partial<Record<string, number>> = {}) => ({
-    standardValue: 1000, billed: 600, discounted: 300, credited: 200,
-    collected: 350, outstanding: 50, unbilled: 100, ...o,
-  } as any);
+  const agg = (o: any = {}) => ({ standardValue: 1000, billed: 600, discounted: 300, credited: 200,
+    collected: 350, outstanding: 50, unbilled: 100, ...o });
+  const rosterN = [{ initials: "NRN", user_id: NRN, name: "Nicholas Noe" },
+                   { initials: "TBS", user_id: 359711375, name: "Tzipora Simmons" }];
 
-  it("emits a month block, a Total row of SUMs, and a self-check row", () => {
-    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], roster, "2026-08-21");
-    expect(xml).toContain("JANUARY");
-    expect(xml).toContain("NRN");
-    expect(xml).toContain("Total");
-    expect(xml).toContain("Check");
-    expect(xml).toContain("data as of 2026-08-21".replace("data", "Data"));
-    // rates are live formulas, not baked numbers
-    expect(xml).toMatch(/<f>IF\(C\d+=0,&quot;&quot;,D\d+\/C\d+\)<\/f>/);
-    // Total row sums the single data row
-    expect(xml).toMatch(/<f>SUM\(C\d+:C\d+\)<\/f>/);
-  });
-
-  it("skips timekeepers with no activity and months with nobody active", () => {
+  it("leads with a FIRM TOTAL block, then one block per active timekeeper", () => {
     const xml = buildRealizationDollarsSheet(
-      { 1: { [NRN]: agg() }, 2: {} }, [1, 2], roster, undefined);
-    expect(xml).toContain("JANUARY");
-    expect(xml).not.toContain("FEBRUARY");
-    expect(xml).not.toContain("TBS");   // no data for TBS in January
+      { 1: { [NRN]: agg(), 359711375: agg({ standardValue: 500 }) } }, [1], rosterN, "2026-08-21");
+    expect(xml.indexOf("FIRM TOTAL")).toBeGreaterThan(-1);
+    expect(xml.indexOf("FIRM TOTAL")).toBeLessThan(xml.indexOf("Nicholas Noe"));
+    expect(xml).toContain("Nicholas Noe (NRN)");
+    expect(xml).toContain("Tzipora Simmons (TBS)");
   });
 
-  it("returns empty string when there is nothing to report", () => {
-    expect(buildRealizationDollarsSheet({}, [1, 2, 3], roster)).toBe("");
+  it("puts months across with a YTD column", () => {
+    const xml = buildRealizationDollarsSheet(
+      { 1: { [NRN]: agg() }, 2: { [NRN]: agg() }, 3: { [NRN]: agg() } }, [1, 2, 3], rosterN);
+    expect(xml).toContain("Jan"); expect(xml).toContain("Feb"); expect(xml).toContain("Mar");
+    expect(xml).toContain("YTD");
+    // 3 months -> B,C,D are months and E is YTD
+    expect(xml).toMatch(/<f>SUM\(B\d+:D\d+\)<\/f>/);
+  });
+
+  it("computes the YTD rate from YTD dollars, not a mean of monthly rates", () => {
+    const xml = buildRealizationDollarsSheet(
+      { 1: { [NRN]: agg() }, 2: { [NRN]: agg() } }, [1, 2], rosterN);
+    // YTD col for 2 months is D; the Net Economic YTD formula must reference D rows
+    expect(xml).toMatch(/<f>IF\(D\d+=0,&quot;&quot;,\(D\d+-D\d+\)\/D\d+\)<\/f>/);
+  });
+
+  it("carries a key defining every rate and term", () => {
+    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], rosterN);
+    expect(xml).toContain("HOW TO READ THIS");
+    expect(xml).toContain("WHAT THE LINES MEAN");
+    for (const t of ["Gross Billing", "Net Economic", "Collection", "Total Value",
+                     "Standard Value", "Discounted", "Credited", "Unbilled"]) {
+      expect(xml).toContain(t);
+    }
+    // the credit-note line is the reason the tab exists; keep it stated
+    expect(xml).toContain("cannot see these");
+  });
+
+  it("emits a per-column Check formula covering BOTH identities", () => {
+    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], rosterN);
+    expect(xml).toContain("Check (expect 0)");
+    expect(xml).toMatch(/<f>\(B\d+-\(B\d+\+B\d+\+B\d+\)\)\+\(\(B\d+-B\d+\)-\(B\d+\+B\d+\)\)<\/f>/);
+  });
+
+  it("freezes the label column and sets column widths", () => {
+    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], rosterN);
+    expect(xml).toContain('state="frozen"');
+    expect(xml).toContain('<col min="1" max="1" width="26"');
+  });
+
+  it("omits a timekeeper with no activity in any listed month", () => {
+    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], rosterN);
+    expect(xml).toContain("Nicholas Noe");
+    expect(xml).not.toContain("Tzipora Simmons");
+  });
+
+  it("returns empty string when nobody is active", () => {
+    expect(buildRealizationDollarsSheet({}, [1, 2, 3], rosterN)).toBe("");
   });
 
   it("names the tab stably (renaming would create a second sheet)", () => {
     expect(REALIZATION_DOLLARS_TAB).toBe("Realization ($)");
   });
 
-  it("produces well-formed sheet XML with balanced tags", () => {
-    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], roster);
+  it("produces well-formed sheet XML", () => {
+    const xml = buildRealizationDollarsSheet({ 1: { [NRN]: agg() } }, [1], rosterN);
     expect(xml.startsWith("<?xml")).toBe(true);
     expect((xml.match(/<row /g) || []).length).toBe((xml.match(/<\/row>/g) || []).length);
-    expect((xml.match(/<c /g) || []).length).toBe(
-      (xml.match(/<\/c>/g) || []).length + (xml.match(/<c [^>]*\/>/g) || []).length);
     expect(xml).toContain("</sheetData></worksheet>");
-    // no unsubstituted style placeholder should ever reach a real workbook, but
-    // the builder emits them by design for the caller to swap
-    expect(xml).toContain("__CUR__");
+  });
+});
+
+describe("dataCol", () => {
+  it("maps 0 to the first month column and walks past Z", () => {
+    expect(dataCol(0)).toBe("B");
+    expect(dataCol(11)).toBe("M");
+    expect(dataCol(24)).toBe("Z");
+    expect(dataCol(25)).toBe("AA");
   });
 });

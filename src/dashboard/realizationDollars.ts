@@ -12,8 +12,7 @@
 // leaves the hours reading "billed nondiscounted", i.e. fully realized. In dollars
 // both are visible, so this measure cannot be moved by a bookkeeping choice.
 //
-// The workflow metric is kept, unchanged, on its own tab. This one is added
-// beside it rather than replacing it.
+// The workflow metric is kept, unchanged, on its own tab. This one sits beside it.
 //
 // It is a NEW sheet, not extra columns on the Realization tab: that sheet's
 // dimension is A1:O156 with column H absent entirely and I1 holding its How-To
@@ -21,21 +20,42 @@
 // the instructions block. surgicalWriteXlsx registers an unknown sheet name
 // automatically, so returning this under a new key is all that is required.
 //
-// LAYOUT — month-blocked in the same shape as the other rate tabs (col A month
-// label, col B initials), so findTabMonthBlock/ensureTabMonthBlock would work on
-// it if a later change needs to patch rather than rebuild:
+// LAYOUT — one block PER TIMEKEEPER with MONTHS ACROSS, not the month-blocked
+// shape the other rate tabs use. Deliberate: these figures MATURE for roughly 90
+// days after a month closes (unbilled work drains into billed/discounted), so the
+// primary read is one person's trend over time, which a single row makes obvious
+// and a stack of month blocks hides. A FIRM TOTAL block leads, since that is the
+// figure partners actually ask for. Each block is a small financial statement:
 //
-//   C Standard value   D Billed $   E Discounted $   F Credited $
-//   G Collected $      H Outstanding $              I Unbilled $
-//   J Gross billing    K Net economic   L Collection   M Total value
+//              JAN     FEB     ...     YTD
+//   Standard Value   $   $              $      <- all billable work at its rate
+//   Billed           $   $              $
+//   Discounted       $   $              $      <- reduced at issuance
+//   Credited         $   $              $      <- credit notes, applied later
+//   Unbilled         $   $              $
+//   Collected        $   $              $
+//   Outstanding      $   $              $
+//   Gross Billing    %   %              %
+//   Net Economic     %   %              %      <- headline
+//   Collection       %   %              %
+//   Total Value      %   %              %      <- headline
 //
-// TWO IDENTITIES hold by construction (both verified against live Clio reports),
-// and the Total row writes them as live formulas so the sheet checks itself:
-//   C == D + E + I          standard value = billed + discounted + not yet billed
-//   D - F == G + H          billed net of credits = collected + outstanding
+// Rates are FORMULAS over the dollar rows in their own column, so they are
+// auditable and cannot disagree with the figures above them. The YTD rate is
+// computed from YTD dollars, never as an average of monthly rates — averaging
+// rates overweights low-volume months (the same error that was corrected on the
+// Realization tab's firm-average row).
+//
+// TWO IDENTITIES hold by construction, both verified against live firm-wide Clio
+// reports, and the key states them so a reader can check the sheet:
+//   Standard Value == Billed + Discounted + Unbilled
+//   Billed - Credited == Collected + Outstanding
 // ============================================================
-import { xmlCell, xmlRow, STYLE_BOLD, STYLE_CUR, STYLE_PCT, STYLE_GEN } from "../utils/xlsx";
-import { MONTH_NAMES_FULL } from "../domain/roster";
+import {
+  xmlCell, xmlRow, STYLE_BOLD, STYLE_CUR, STYLE_PCT, STYLE_GEN,
+  STYLE_CURB, STYLE_PCTB, STYLE_HDR,
+} from "../utils/xlsx";
+import { MONTH_NAMES_SHORT } from "../domain/roster";
 import type { RealizDollarsAgg } from "../clio/reportCsv";
 
 export type DollarsByMonth = Record<number, Record<number, RealizDollarsAgg>>;
@@ -44,123 +64,221 @@ export type DollarsByMonth = Record<number, Record<number, RealizDollarsAgg>>;
  *  changing this string creates a SECOND tab rather than renaming the first. */
 export const REALIZATION_DOLLARS_TAB = "Realization ($)";
 
-const HEADERS: Array<[string, string]> = [
-  ["B", "Employee"],
-  ["C", "Standard Value"],
-  ["D", "Billed $"],
-  ["E", "Discounted $"],
-  ["F", "Credited $"],
-  ["G", "Collected $"],
-  ["H", "Outstanding $"],
-  ["I", "Unbilled $"],
-  ["J", "Gross Billing"],
-  ["K", "Net Economic"],
-  ["L", "Collection"],
-  ["M", "Total Value"],
-];
+type Member = { initials: string; user_id: number; name?: string };
+
+/** Column letter for the Nth data column. Data starts at B because column A holds
+ *  the row labels, so n=0 -> "B" (Excel column 2). */
+export function dataCol(n: number): string {
+  let s = "", i = n + 2; // +1 for 1-based Excel, +1 to skip the label column A
+  while (i > 0) { const r = (i - 1) % 26; s = String.fromCharCode(65 + r) + s; i = Math.floor((i - 1) / 26); }
+  return s;
+}
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+// Dollar rows, in display order: [label, field]
+const MONEY_ROWS: Array<[string, keyof RealizDollarsAgg]> = [
+  ["Standard Value", "standardValue"],
+  ["Billed", "billed"],
+  ["Discounted", "discounted"],
+  ["Credited", "credited"],
+  ["Unbilled", "unbilled"],
+  ["Collected", "collected"],
+  ["Outstanding", "outstanding"],
+];
+
+// Rate rows: [label, formula from row refs, isHeadline]
+type RateSpec = [string, (r: Record<string, number>, c: string) => string, boolean];
+const RATE_ROWS: RateSpec[] = [
+  ["Gross Billing", (r, c) => `IF(${c}${r.std}=0,"",${c}${r.billed}/${c}${r.std})`, false],
+  ["Net Economic", (r, c) => `IF(${c}${r.std}=0,"",(${c}${r.billed}-${c}${r.cred})/${c}${r.std})`, true],
+  ["Collection", (r, c) => `IF((${c}${r.billed}-${c}${r.cred})=0,"",${c}${r.coll}/(${c}${r.billed}-${c}${r.cred}))`, false],
+  ["Total Value", (r, c) => `IF(${c}${r.std}=0,"",${c}${r.coll}/${c}${r.std})`, true],
+];
+
+const KEY_METRICS: Array<[string, string, string]> = [
+  ["Gross Billing", "Billed ÷ Standard Value", "Of the value of the work we did, how much reached a bill at all."],
+  ["Net Economic", "(Billed − Credited) ÷ Standard Value", "…and survived credit notes. The value we kept a claim on. THE HEADLINE."],
+  ["Collection", "Collected ÷ (Billed − Credited)", "Of what we kept a claim on, how much turned into cash."],
+  ["Total Value", "Collected ÷ Standard Value", "Of the value of the work we did, how much became cash. THE HEADLINE."],
+];
+
+const KEY_TERMS: Array<[string, string]> = [
+  ["Standard Value", "Every billable hour worked that month, valued at the rate it was recorded at — billed, discounted and not-yet-billed alike."],
+  ["Discounted", "Reduced on the invoice when it was issued. Includes a bill written down to $0, which is how a full write-off appears."],
+  ["Credited", "Credit notes applied AFTER the invoice was issued. The hours-based Realization tab cannot see these at all — it is the main reason this tab exists."],
+  ["Unbilled", "Worked but not yet on a bill. Drains into Billed and Discounted over roughly 90 days, which is why a recent month always reads low."],
+  ["Check rows", "Standard Value = Billed + Discounted + Unbilled, and Billed − Credited = Collected + Outstanding. Both should be zero; a few cents is rounding, dollars means something is wrong."],
+];
+
 /**
- * Build the complete "Realization ($)" sheet XML from per-month, per-user dollar
- * aggregates. Rebuilt in full each run rather than patched — the tab is derived
- * entirely from Clio and carries no hand-entered cells, so there is nothing to
- * preserve, and a full rebuild cannot leave a stale month behind.
+ * Build the complete "Realization ($)" sheet XML. Rebuilt in full each run rather
+ * than patched — the tab is derived entirely from Clio and holds no hand-entered
+ * cells, so there is nothing to preserve and a rebuild cannot leave a stale month
+ * behind.
  *
- * `roster` fixes the row order within every month block. A timekeeper with no
- * billable activity in a month is skipped, so an empty month yields no rows and
- * an inactive biller does not dilute the Total row.
+ * A timekeeper with no billable activity in any listed month is omitted entirely
+ * rather than shown as a block of zeros.
  */
 export function buildRealizationDollarsSheet(
   byMonth: DollarsByMonth,
   months: number[],
-  roster: Array<{ initials: string; user_id: number }>,
+  roster: Member[],
   asOf?: string,
 ): string {
+  const active = roster.filter((k) =>
+    months.some((m) => {
+      const d = byMonth[m]?.[k.user_id];
+      return d && (d.standardValue !== 0 || d.billed !== 0 || d.unbilled !== 0);
+    }));
+  if (!active.length) return "";
+
+  const ytdCol = dataCol(months.length);
+  const lastMonthCol = dataCol(months.length - 1);
   const rows: string[] = [];
   let r = 1;
 
+  // ---- title ----
+  rows.push(xmlRow(r++, [xmlCell(`A1`, "ECONOMIC REALIZATION — IN DOLLARS", { style: STYLE_HDR })]));
+  rows.push(xmlRow(r++, [xmlCell(`A2`,
+    "Auto-generated — do not edit. Activity-date basis: each month covers the work DONE that month, wherever it was later billed." +
+    (asOf ? `  Data as of ${asOf}.` : ""), { style: STYLE_GEN })]));
+  r++;
+
+  // ---- key: the four rates ----
   rows.push(xmlRow(r, [
-    xmlCell(`A${r}`, "Economic realization, in dollars (auto-generated — do not edit)", { style: STYLE_BOLD }),
+    xmlCell(`A${r}`, "HOW TO READ THIS", { style: STYLE_HDR }),
+    xmlCell(`B${r}`, "Formula", { style: STYLE_HDR }),
+    xmlCell(`C${r}`, "What it answers", { style: STYLE_HDR }),
   ]));
   r++;
+  for (const [name, formula, meaning] of KEY_METRICS) {
+    rows.push(xmlRow(r, [
+      xmlCell(`A${r}`, name, { style: STYLE_BOLD }),
+      xmlCell(`B${r}`, formula, { style: STYLE_GEN }),
+      xmlCell(`C${r}`, meaning, { style: STYLE_GEN }),
+    ]));
+    r++;
+  }
+  r++;
+
+  // ---- key: the terms ----
   rows.push(xmlRow(r, [
-    xmlCell(`A${r}`,
-      "Gross Billing = Billed ÷ Standard Value. Net Economic = (Billed − Credited) ÷ Standard Value. " +
-      "Collection = Collected ÷ (Billed − Credited). Total Value = Collected ÷ Standard Value." +
-      (asOf ? `  Data as of ${asOf}.` : ""),
-      { style: STYLE_GEN }),
+    xmlCell(`A${r}`, "WHAT THE LINES MEAN", { style: STYLE_HDR }),
+    xmlCell(`B${r}`, "", { style: STYLE_HDR }),
+    xmlCell(`C${r}`, "", { style: STYLE_HDR }),
   ]));
+  r++;
+  for (const [term, meaning] of KEY_TERMS) {
+    rows.push(xmlRow(r, [
+      xmlCell(`A${r}`, term, { style: STYLE_BOLD }),
+      xmlCell(`B${r}`, meaning, { style: STYLE_GEN }),
+    ]));
+    r++;
+  }
   r += 2;
 
-  for (const m of months) {
-    const byUid = byMonth[m];
-    const present = roster.filter((k) => {
-      const d = byUid?.[k.user_id];
-      return d && (d.standardValue !== 0 || d.billed !== 0 || d.unbilled !== 0);
-    });
-    if (!present.length) continue;
+  // ---- one block per timekeeper, firm total first ----
+  const blocks: Array<{ label: string; get: (m: number) => RealizDollarsAgg | undefined }> = [
+    {
+      label: "FIRM TOTAL (listed timekeepers)",
+      get: (m) => {
+        const by = byMonth[m];
+        if (!by) return undefined;
+        const t: RealizDollarsAgg = {
+          standardValue: 0, billed: 0, discounted: 0, credited: 0, collected: 0, outstanding: 0, unbilled: 0,
+        };
+        let any = false;
+        for (const k of active) {
+          const d = by[k.user_id];
+          if (!d) continue;
+          any = true;
+          t.standardValue += d.standardValue; t.billed += d.billed; t.discounted += d.discounted;
+          t.credited += d.credited; t.collected += d.collected; t.outstanding += d.outstanding;
+          t.unbilled += d.unbilled;
+        }
+        return any ? t : undefined;
+      },
+    },
+    ...active.map((k) => ({
+      label: k.name ? `${k.name} (${k.initials})` : k.initials,
+      get: (m: number) => byMonth[m]?.[k.user_id],
+    })),
+  ];
 
-    // Month header: label in col A (what a block scan keys on) + column headings.
-    rows.push(xmlRow(r, [
-      xmlCell(`A${r}`, (MONTH_NAMES_FULL[m - 1] ?? String(m)).toUpperCase(), { style: STYLE_BOLD }),
-      ...HEADERS.map(([col, text]) => xmlCell(`${col}${r}`, text, { style: STYLE_BOLD })),
+  for (const block of blocks) {
+    const hdr = r;
+    // Block title + month column headings on one row, so the title is never
+    // orphaned from its columns when a reader scrolls.
+    rows.push(xmlRow(hdr, [
+      xmlCell(`A${hdr}`, block.label, { style: STYLE_HDR }),
+      ...months.map((m, i) => xmlCell(`${dataCol(i)}${hdr}`, MONTH_NAMES_SHORT[m - 1] ?? String(m), { style: STYLE_HDR })),
+      xmlCell(`${ytdCol}${hdr}`, "YTD", { style: STYLE_HDR }),
     ]));
-    const first = r + 1;
     r++;
 
-    for (const k of present) {
-      const d = byUid[k.user_id];
-      const net = `(D${r}-F${r})`;
-      rows.push(xmlRow(r, [
-        xmlCell(`B${r}`, k.initials, { style: STYLE_GEN }),
-        xmlCell(`C${r}`, round2(d.standardValue), { style: STYLE_CUR }),
-        xmlCell(`D${r}`, round2(d.billed), { style: STYLE_CUR }),
-        xmlCell(`E${r}`, round2(d.discounted), { style: STYLE_CUR }),
-        xmlCell(`F${r}`, round2(d.credited), { style: STYLE_CUR }),
-        xmlCell(`G${r}`, round2(d.collected), { style: STYLE_CUR }),
-        xmlCell(`H${r}`, round2(d.outstanding), { style: STYLE_CUR }),
-        xmlCell(`I${r}`, round2(d.unbilled), { style: STYLE_CUR }),
-        // Rates are formulas, not baked values, so an analyst can audit them and
-        // Excel recalculates if a figure is ever corrected by hand.
-        xmlCell(`J${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",D${r}/C${r})` }),
-        xmlCell(`K${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",${net}/C${r})` }),
-        xmlCell(`L${r}`, null, { style: STYLE_PCT, formula: `IF(${net}=0,"",G${r}/${net})` }),
-        xmlCell(`M${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",G${r}/C${r})` }),
-      ]));
+    const first = r;
+    for (const [label, field] of MONEY_ROWS) {
+      const cells = [xmlCell(`A${r}`, label, { style: STYLE_GEN })];
+      months.forEach((m, i) => {
+        const d = block.get(m);
+        cells.push(xmlCell(`${dataCol(i)}${r}`, d ? round2(d[field] as number) : 0, { style: STYLE_CUR }));
+      });
+      cells.push(xmlCell(`${ytdCol}${r}`, null, {
+        style: STYLE_CURB, formula: `SUM(${dataCol(0)}${r}:${lastMonthCol}${r})`,
+      }));
+      rows.push(xmlRow(r, cells));
+      r++;
+    }
+    // Row numbers the rate formulas point at.
+    const ref = {
+      std: first, billed: first + 1, disc: first + 2, cred: first + 3,
+      unb: first + 4, coll: first + 5, outs: first + 6,
+    };
+
+    for (const [label, mkFormula, headline] of RATE_ROWS) {
+      const cells = [xmlCell(`A${r}`, label, { style: headline ? STYLE_BOLD : STYLE_GEN })];
+      for (let i = 0; i < months.length; i++) {
+        cells.push(xmlCell(`${dataCol(i)}${r}`, null, {
+          style: headline ? STYLE_PCTB : STYLE_PCT, formula: mkFormula(ref, dataCol(i)),
+        }));
+      }
+      // YTD rate from YTD dollars, not a mean of the monthly rates.
+      cells.push(xmlCell(`${ytdCol}${r}`, null, {
+        style: headline ? STYLE_PCTB : STYLE_PCT, formula: mkFormula(ref, ytdCol),
+      }));
+      rows.push(xmlRow(r, cells));
       r++;
     }
 
-    const last = r - 1;
-    const netT = `(D${r}-F${r})`;
+    // Identity checks, one row, both expressions.
     rows.push(xmlRow(r, [
-      xmlCell(`B${r}`, "Total", { style: STYLE_BOLD }),
-      ...["C", "D", "E", "F", "G", "H", "I"].map((c) =>
-        xmlCell(`${c}${r}`, null, { style: STYLE_CUR, formula: `SUM(${c}${first}:${c}${last})` })),
-      xmlCell(`J${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",D${r}/C${r})` }),
-      xmlCell(`K${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",${netT}/C${r})` }),
-      xmlCell(`L${r}`, null, { style: STYLE_PCT, formula: `IF(${netT}=0,"",G${r}/${netT})` }),
-      xmlCell(`M${r}`, null, { style: STYLE_PCT, formula: `IF(C${r}=0,"",G${r}/C${r})` }),
-    ]));
-    r++;
-
-    // Self-check row. Expect 0 to within a few cents — each figure above is
-    // rounded to 2dp before it is written, so summing hundreds of them leaves
-    // rounding noise (measured: $0.04 across a 3,327-row firm-wide month). A
-    // difference in DOLLARS means the report's columns no longer reconcile and
-    // the tab should not be trusted until that is explained.
-    rows.push(xmlRow(r, [
-      xmlCell(`B${r}`, "Check", { style: STYLE_GEN }),
-      xmlCell(`C${r}`, null, { style: STYLE_CUR, formula: `C${r - 1}-(D${r - 1}+E${r - 1}+I${r - 1})` }),
-      xmlCell(`D${r}`, "Std − (Billed+Disc+Unbilled) — expect 0 (cents = rounding)", { style: STYLE_GEN }),
-      xmlCell(`G${r}`, null, { style: STYLE_CUR, formula: `(D${r - 1}-F${r - 1})-(G${r - 1}+H${r - 1})` }),
-      xmlCell(`H${r}`, "(Billed−Credited) − (Collected+Outstanding) — expect 0 (cents = rounding)", { style: STYLE_GEN }),
+      xmlCell(`A${r}`, "Check (expect 0)", { style: STYLE_GEN }),
+      ...months.map((_m, i) => {
+        const c = dataCol(i);
+        return xmlCell(`${c}${r}`, null, {
+          style: STYLE_CUR,
+          formula: `(${c}${ref.std}-(${c}${ref.billed}+${c}${ref.disc}+${c}${ref.unb}))+((${c}${ref.billed}-${c}${ref.cred})-(${c}${ref.coll}+${c}${ref.outs}))`,
+        });
+      }),
+      xmlCell(`${ytdCol}${r}`, null, {
+        style: STYLE_CUR,
+        formula: `(${ytdCol}${ref.std}-(${ytdCol}${ref.billed}+${ytdCol}${ref.disc}+${ytdCol}${ref.unb}))+((${ytdCol}${ref.billed}-${ytdCol}${ref.cred})-(${ytdCol}${ref.coll}+${ytdCol}${ref.outs}))`,
+      }),
     ]));
     r += 2;
   }
 
-  if (rows.filter(Boolean).length <= 2) return "";
+  // Freeze col A and the header band so labels stay visible when scrolling, and
+  // give the label column room for the key text.
+  const widths = `<cols><col min="1" max="1" width="26" customWidth="1"/>` +
+    `<col min="2" max="${months.length + 1}" width="13" customWidth="1"/>` +
+    `<col min="${months.length + 2}" max="${months.length + 2}" width="14" customWidth="1"/></cols>`;
+  const views = `<sheetViews><sheetView workbookViewId="0">` +
+    `<pane xSplit="1" topLeftCell="B1" activePane="topRight" state="frozen"/></sheetView></sheetViews>`;
+
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    views + widths +
     `<sheetData>${rows.filter(Boolean).join("")}</sheetData></worksheet>`;
 }

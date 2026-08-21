@@ -58,6 +58,9 @@ import {
   colLetter,
   patchCell,
   readCell,
+  STYLE_CURB,
+  STYLE_PCTB,
+  STYLE_HDR
 } from "../utils/xlsx";
 
 // ========== SHARED HELPERS ==========
@@ -1874,7 +1877,10 @@ export function registerDocumentTools(server: McpServer): void {
               .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
               .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
               .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
-              .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`);
+              .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`)
+              .split(`s="${STYLE_CURB}"`).join(`s="${ST.currencyBold}"`)
+              .split(`s="${STYLE_PCTB}"`).join(`s="${ST.percentBold}"`)
+              .split(`s="${STYLE_HDR}"`).join(`s="${ST.header}"`);
             const out: Record<string, string> = {};
             if (utilXml && utilPatched > 0) out["Utilization"] = subst(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = subst(realizXml);
@@ -3541,7 +3547,10 @@ export function registerDocumentTools(server: McpServer): void {
                 .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
                 .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
                 .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
-                .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`),
+                .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`)
+                .split(`s="${STYLE_CURB}"`).join(`s="${ST.currencyBold}"`)
+                .split(`s="${STYLE_PCTB}"`).join(`s="${ST.percentBold}"`)
+                .split(`s="${STYLE_HDR}"`).join(`s="${ST.header}"`),
             );
             if (utilXml && utilPatched > 0) out["Utilization"] = substTabPlaceholders(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = substTabPlaceholders(realizXml);
