@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   patchUtilizationBlock, buildFirmAvgRows, ensureTabMonthBlock,
-  appendRealizationFirmAvg, FIRM_AVG_MARKER, type UtilHours,
+  appendRealizationFirmAvg, appendCollectionFirmAvg, FIRM_AVG_MARKER, type UtilHours,
 } from "../src/dashboard/rateTabs";
 import { findTabMonthBlock, patchCell, readCell } from "../src/utils/xlsx";
 
@@ -169,5 +169,65 @@ describe("ensureTabMonthBlock", () => {
     expect(patched).toBe(1); // PAR (only uid 1 has hours)
     expect(xml).toContain(`<c r="C${row}"><v>90</v></c>`);
     expect(xml).toContain(`<c r="G${row}"><v>56.7</v></c>`);
+  });
+});
+
+// Collection-style tab: A=month, B=initials, C=Collected hrs, D=Uncollected hrs,
+// E=rate formula. Mirrors the real sheet, whose row 1 col A holds a "How:" note.
+const collRow = (r: number, ini: string, c: number, d: number) =>
+  `<row r="${r}">${str(`B${r}`, ini)}${num(`C${r}`, c)}${num(`D${r}`, d)}<c r="E${r}"><f>C${r}/(C${r}+D${r})</f><v>0</v></c></row>`;
+const collXml = sheet([
+  `<row r="1">${str("A1", "How: Get these figures from the Dashboard for the year in question")}</row>`,
+  `<row r="2">${str("A2", "JAN")}${str("B2", "Employee")}</row>`,
+  collRow(3, "PAR", 90, 10),
+  collRow(4, "KES", 10, 90),
+  `<row r="5">${str("B5", "Total")}</row>`,
+]);
+
+describe("appendCollectionFirmAvg", () => {
+  it("uses the totals form (ΣC/Σ(C+D)), not a mean of biller rates", () => {
+    const out = appendCollectionFirmAvg(collXml, []);
+    expect(out).toContain(FIRM_AVG_MARKER);
+    expect(out).toContain("Firm Collection Rate");
+    // totals: 100/200 = 0.5. A mean of the two rates (0.9, 0.1) is also 0.5, so
+    // use an asymmetric second month to prove which form is in use.
+    expect(out).toContain(`<v>0.5</v>`);
+  });
+
+  it("distinguishes totals from a mean when volumes differ", () => {
+    const skewed = sheet([
+      `<row r="2">${str("A2", "FEB")}${str("B2", "Employee")}</row>`,
+      collRow(3, "PAR", 990, 10),   // rate 0.99, high volume
+      collRow(4, "KES", 0, 100),    // rate 0.00, low volume
+      `<row r="5">${str("B5", "Total")}</row>`,
+    ]);
+    const out = appendCollectionFirmAvg(skewed, []);
+    // totals: 990/1100 = 0.9; a simple mean would be 0.495
+    expect(out).toContain(`<v>0.9</v>`);
+    expect(out).not.toContain(`<v>0.495</v>`);
+  });
+
+  it("stamps the vintage when given one, since this cohort keeps maturing", () => {
+    expect(appendCollectionFirmAvg(collXml, [], "2026-08-21")).toContain("data as of 2026-08-21");
+    expect(appendCollectionFirmAvg(collXml, [])).not.toContain("data as of");
+  });
+
+  it("is idempotent — re-appending replaces the prior block", () => {
+    const once = appendCollectionFirmAvg(collXml, [], "2026-08-20");
+    const twice = appendCollectionFirmAvg(once, [], "2026-08-21");
+    expect(twice).toContain("data as of 2026-08-21");
+    expect(twice).not.toContain("data as of 2026-08-20");
+    expect((twice.match(/Firm Collection Rate/g) || []).length).toBe(1);
+  });
+
+  it("ignores the sheet's leading How-to note rather than reading it as a month", () => {
+    const out = appendCollectionFirmAvg(collXml, []);
+    expect(out).toContain("January");
+    expect(out).not.toContain("How:January");
+  });
+
+  it("returns the stripped sheet unchanged when no month has data", () => {
+    const empty = sheet([`<row r="1">${str("A1", "Collection")}</row>`]);
+    expect(appendCollectionFirmAvg(empty, [])).toBe(empty);
   });
 });

@@ -253,3 +253,29 @@ export function appendRealizationFirmAvg(xml: string, sharedStrings: string[], a
     `${FIRM_AVG_MARKER} — do not edit) — firm realization rate: total nondiscounted ÷ total billed of listed billers${stamp}`,
     "Firm Realization Rate"));
 }
+
+/**
+ * Refresh the Collection tab's bottom "Firm Average" summary: per-month firm
+ * collection rate on the SUMMED columns (ΣC / Σ(C+D)) of billers with C+D>0 —
+ * the totals form, not a mean of each biller's own rate, for the same reason the
+ * Realization summary uses it (a mean overweights low-volume billers).
+ *
+ * The as-of stamp matters more here than anywhere else on the workbook. This tab
+ * is an invoice-issue cohort whose collected/uncollected split keeps moving for
+ * months as payments arrive, so the same month read at two dates gives two very
+ * different — both correct — numbers. Measured against the prior hand-keyed
+ * workbook: March 2026 was recorded at 32.7% and is actually 91.0%, a 58-point
+ * understatement, because it was keyed weeks after the month closed and never
+ * revisited. Without a vintage a reader cannot tell which reading they hold.
+ */
+export function appendCollectionFirmAvg(xml: string, sharedStrings: string[], asOf?: string): string {
+  const base = stripRowsFromMarker(xml, FIRM_AVG_MARKER, sharedStrings);
+  const summary = firmAvgRateByMonth(base, sharedStrings, ["C", "D"],
+    (v) => (v.C + v.D > 0 ? v.C / (v.C + v.D) : null), "totals");
+  if (!summary.length) return base;
+  const stamp = asOf ? ` — data as of ${asOf}` : "";
+  return appendRowsBeforeSheetClose(base, buildFirmAvgRows(
+    summary, maxRowNumber(base) + 2,
+    `${FIRM_AVG_MARKER} — do not edit) — firm collection rate: total collected ÷ total billed hours of listed billers${stamp}`,
+    "Firm Collection Rate"));
+}
