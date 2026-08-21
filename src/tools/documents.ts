@@ -538,10 +538,15 @@ const WEEKLY_GOALS_ROSTER = [
   { name: "Angela Alanis",   user_id: 358528744, goal: 30, group: "PAR" }, // partner/para
   { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
   { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
-  // Jonathan Barbee (JPB, 360091325) — terminated July 2026; removed from the
-  // weekly goal sheets and monthly summary per firm decision. His historical
-  // sheet stays in Box; dashboard/collections history stays via FIRM_ROSTER.
-  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para — left mid-2026; keep through year-end so her Jan–Jun months stay on the monthly chart, drop for 2027
+  // DEPARTED — deliberately absent from the weekly goal sheets and monthly
+  // summary. Goals are a forward-looking management tool; there is nothing to
+  // set a target against once someone has left. Their historical sheets stay in
+  // Box, and every HISTORY view keeps them via FIRM_ROSTER: 26 Compare rows,
+  // tail collections on their old invoices, bonus attribution (Anna's paralegal
+  // tail still credits KES — see bonus.ts), and their Realization ($) blocks.
+  // Drop from FIRM_ROSTER for 2027, not before.
+  //   Jonathan Barbee (JPB, 360091325) — terminated July 2026.
+  //   Anna Lozano     (AFL, 358108805) — left mid-2026, replaced by Stacy Bakri.
   { name: "Stacy Bakri",     user_id: 360383465, goal: 30, group: "KES" }, // partner/para — Kenny's paralegal, replaced Anna mid-2026
   { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
