@@ -238,13 +238,18 @@ export function appendUtilizationFirmAvg(xml: string, sharedStrings: string[], f
  * mean up) and overstated the firm figure; the totals form matches the tab's
  * per-month "Total" row.
  */
-export function appendRealizationFirmAvg(xml: string, sharedStrings: string[]): string {
+export function appendRealizationFirmAvg(xml: string, sharedStrings: string[], asOf?: string): string {
   const base = stripRowsFromMarker(xml, FIRM_AVG_MARKER, sharedStrings);
   const summary = firmAvgRateByMonth(base, sharedStrings, ["D", "E"],
     (v) => (v.D + v.E > 0 ? v.D / (v.D + v.E) : null), "totals");
   if (!summary.length) return base;
+  // The as-of stamp is not decoration. This tab is an activity-date cohort whose
+  // D/E/F split keeps moving for ~90 days after a month closes (unbilled work
+  // drains into billed), so the same month read at two dates is two different —
+  // both correct — numbers. Without a vintage a reader cannot tell which they have.
+  const stamp = asOf ? ` — data as of ${asOf}` : "";
   return appendRowsBeforeSheetClose(base, buildFirmAvgRows(
     summary, maxRowNumber(base) + 2,
-    `${FIRM_AVG_MARKER} — do not edit) — firm realization rate: total nondiscounted ÷ total billed of listed billers`,
+    `${FIRM_AVG_MARKER} — do not edit) — firm realization rate: total nondiscounted ÷ total billed of listed billers${stamp}`,
     "Firm Realization Rate"));
 }

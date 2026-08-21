@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   parseCSV, matchRosterUser, matchRosterResponsible,
   aggregateRealizationCollections, aggregateFeeAllocationCollectionHrs,
+  aggregateRealizationHours, isUnbilledRealizStatus,
 } from "../src/clio/reportCsv";
 
 const roster = [
@@ -74,5 +75,112 @@ describe("collection HOURS aggregators are equivalent given equal inputs", () =>
     // entry1: 8h * 0.5 = 4 collected, 4 uncollected; entry2: 2h collected
     expect(agg.collectedHrs).toBeCloseTo(6, 6);
     expect(agg.uncollectedHrs).toBeCloseTo(4, 6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Realization-tab D/E/F hours, read from Clio's Realization report rather than
+// inferred. Column names and value shapes below are taken from a live report
+// (MNH, Jan 2026): discount columns arrive NEGATIVE, "Billed Hours" already
+// EXCLUDES the discounted portion, and for a billed entry
+//   Quantity == Billed Hours + |Hours Discounted|
+// ---------------------------------------------------------------------------
+describe("isUnbilledRealizStatus", () => {
+  it("treats no-invoice and draft as unbilled", () => {
+    for (const st of ["", "-", " - ", "Draft", "draft bill"]) {
+      expect(isUnbilledRealizStatus(st)).toBe(true);
+    }
+    expect(isUnbilledRealizStatus(undefined)).toBe(true);
+  });
+  it("treats an issued bill as billed", () => {
+    for (const st of ["Billed", "Paid", "Awaiting Payment"]) {
+      expect(isUnbilledRealizStatus(st)).toBe(false);
+    }
+  });
+});
+
+describe("aggregateRealizationHours", () => {
+  const nameToUid = new Map<string, number>(roster.map((r) => [r.name.toLowerCase(), r.user_id]));
+  const NRN = 348755029;
+  const row = (o: Record<string, string>) => ({
+    User: "Nicholas Noe", "Time Entry Type": "Hourly", "Invoice Status": "Billed",
+    Quantity: "0", "Billed Hours": "0", "Hours Discounted": "0", "Adjusted Hours": "0", ...o,
+  });
+
+  it("reads NEGATIVE Hours Discounted as discounted hours (the live sign convention)", () => {
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "0.4", "Billed Hours": "0", "Hours Discounted": "-0.4" }),
+      row({ Quantity: "0.6", "Billed Hours": "0", "Hours Discounted": "-0.6" }),
+    ], nameToUid)[NRN];
+    expect(agg.billedDiscHrs).toBeCloseTo(1.0, 6);
+    expect(agg.billedNondiscHrs).toBeCloseTo(0, 6);
+    expect(agg.unbilledHrs).toBeCloseTo(0, 6);
+  });
+
+  it("handles an unsigned Hours Discounted identically", () => {
+    const neg = aggregateRealizationHours([row({ Quantity: "2", "Billed Hours": "0", "Hours Discounted": "-2" })], nameToUid)[NRN];
+    const pos = aggregateRealizationHours([row({ Quantity: "2", "Billed Hours": "0", "Hours Discounted": "2" })], nameToUid)[NRN];
+    expect(pos.billedDiscHrs).toBeCloseTo(neg.billedDiscHrs, 6);
+  });
+
+  it("splits a partly-discounted entry so D + E == Quantity", () => {
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "1.0", "Billed Hours": "0.6", "Hours Discounted": "-0.4" }),
+    ], nameToUid)[NRN];
+    expect(agg.billedNondiscHrs).toBeCloseTo(0.6, 6);
+    expect(agg.billedDiscHrs).toBeCloseTo(0.4, 6);
+    expect(agg.billedNondiscHrs + agg.billedDiscHrs).toBeCloseTo(1.0, 6);
+  });
+
+  it("counts a no-invoice entry as unbilled at its full quantity", () => {
+    const agg = aggregateRealizationHours([
+      row({ "Invoice Status": "-", Quantity: "3.5" }),
+      row({ "Invoice Status": "Draft", Quantity: "1.5" }),
+    ], nameToUid)[NRN];
+    expect(agg.unbilledHrs).toBeCloseTo(5.0, 6);
+    expect(agg.billedNondiscHrs).toBeCloseTo(0, 6);
+    expect(agg.billedDiscHrs).toBeCloseTo(0, 6);
+  });
+
+  it("excludes nonbillable time from every bucket", () => {
+    const agg = aggregateRealizationHours([
+      row({ "Time Entry Type": "Non-billable", "Invoice Status": "-", Quantity: "7.6" }),
+      row({ Quantity: "1", "Billed Hours": "1" }),
+    ], nameToUid)[NRN];
+    expect(agg.unbilledHrs).toBeCloseTo(0, 6);
+    expect(agg.billedNondiscHrs).toBeCloseTo(1, 6);
+  });
+
+  it("keeps Adjusted Hours OUT of the discounted bucket, reporting it separately", () => {
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "2", "Billed Hours": "2", "Adjusted Hours": "-0.5" }),
+    ], nameToUid)[NRN];
+    expect(agg.billedDiscHrs).toBeCloseTo(0, 6);
+    expect(agg.adjustedHrs).toBeCloseTo(0.5, 6);
+  });
+
+  it("skips non-roster users", () => {
+    const agg = aggregateRealizationHours([
+      { ...row({ Quantity: "5", "Billed Hours": "5" }), User: "Stranger, Sam" },
+    ], nameToUid);
+    expect(Object.keys(agg)).toHaveLength(0);
+  });
+
+  it("preserves the month's total hours: D + E + F == sum of Quantity", () => {
+    const rows = [
+      row({ Quantity: "10", "Billed Hours": "10" }),
+      row({ Quantity: "4", "Billed Hours": "1.5", "Hours Discounted": "-2.5" }),
+      row({ "Invoice Status": "-", Quantity: "6" }),
+    ];
+    const a = aggregateRealizationHours(rows, nameToUid)[NRN];
+    expect(a.billedNondiscHrs + a.billedDiscHrs + a.unbilledHrs).toBeCloseTo(20, 6);
+  });
+
+  it("buckets a billed row with no billed or discounted hours as unbilled, keeping the total intact", () => {
+    const a = aggregateRealizationHours([
+      row({ "Invoice Status": "Billed", Quantity: "2", "Billed Hours": "0", "Hours Discounted": "0" }),
+    ], nameToUid)[NRN];
+    expect(a.unbilledHrs).toBeCloseTo(2, 6);
+    expect(a.billedNondiscHrs + a.billedDiscHrs).toBeCloseTo(0, 6);
   });
 });

@@ -318,6 +318,135 @@ export function aggregateRealizationCollections(rows: Record<string, string>[], 
   return out;
 }
 
+// Per-timekeeper D/E/F HOURS for the Realization tab, straight from the
+// Realization report — replacing the derived Client Activity split, which could
+// not see the discounts at all.
+//
+// WHY THE DERIVED SPLIT FAILED: aggregateClientActivity infers a discount from
+// Quantity*Price != Total on an ACTIVITY row. But the discount lives on the
+// INVOICE, not the activity — so a discounted line reads as full price and gets
+// counted NONDISCOUNTED. Verified live 2026-08: the workbook recorded 0.0
+// discounted hours for MNH in Jan/Feb/Mar 2026 while the hand-keyed predecessor
+// (typed from Clio's own Firm Dashboard) recorded 16.7/17.3/12.3 — 46.3 hours in
+// Q1 that the arithmetic test never found. No reordering of that test can fix
+// it; the source has to change.
+//
+// The Realization report gives the split directly, per time entry, attributed to
+// the User who did the work. Verified live against MNH Jan 2026:
+//   Quantity 0.4, Rate 275, Billed Hours 0.0, Hours Discounted -0.4
+//   Quantity 0.6, Rate 275, Billed Hours 0.0, Hours Discounted -0.6
+// so for a billed entry:  Quantity == Billed Hours + |Hours Discounted|
+// ("Billed Hours" already EXCLUDES the discounted portion). Discount columns come
+// back NEGATIVE, hence Math.abs — which also makes this correct if Clio ever
+// switches to unsigned.
+//
+// `adjustedHrs` (|Adjusted Hours|) is a SEPARATE Clio adjustment concept, summed
+// here for diagnosis only and deliberately NOT folded into billedDiscHrs — that
+// call needs a look at what actually populates it first.
+export type RealizHoursAgg = {
+  billedNondiscHrs: number;   // -> Realization tab col D
+  billedDiscHrs: number;      // -> col E
+  unbilledHrs: number;        // -> col F
+  adjustedHrs: number;        // diagnostic only; not written to the tab
+};
+
+/** True when a Realization-report row has not reached an issued bill: Clio writes
+ *  "-" (or an empty cell) for an entry with no invoice, and a draft-bill status
+ *  for one sitting in the drawer. */
+export function isUnbilledRealizStatus(invoiceStatus: string | undefined): boolean {
+  const st = (invoiceStatus ?? "").trim().toLowerCase();
+  return st === "" || st === "-" || st.includes("draft");
+}
+
+export function aggregateRealizationHours(
+  rows: Record<string, string>[],
+  nameToUid: Map<string, number>,
+): Record<number, RealizHoursAgg> {
+  const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,]/g, "")) || 0;
+  const out: Record<number, RealizHoursAgg> = {};
+  let anomalies = 0;
+  for (const r of rows) {
+    // Nonbillable time is not part of "billable hours worked" (the tab's
+    // denominator). Every other type — Hourly, and any flat/contingency worked
+    // time — counts, matching the entry-level non_billable semantics used
+    // everywhere else in the dashboard.
+    if ((r["Time Entry Type"] ?? "").trim().toLowerCase() === "non-billable") continue;
+    const uid = nameToUid.get((r["User"] ?? "").trim().toLowerCase());
+    if (uid == null) continue;
+    const slot = (out[uid] ??= { billedNondiscHrs: 0, billedDiscHrs: 0, unbilledHrs: 0, adjustedHrs: 0 });
+    const qty = num(r["Quantity"]);
+    const billedHrs = num(r["Billed Hours"]);
+    const discHrs = Math.abs(num(r["Hours Discounted"]));
+    slot.adjustedHrs += Math.abs(num(r["Adjusted Hours"]));
+    if (isUnbilledRealizStatus(r["Invoice Status"])) {
+      slot.unbilledHrs += qty;
+      continue;
+    }
+    // Reached a bill but produced neither billed nor discounted hours — shouldn't
+    // happen given the identity above. Bucket it as unbilled (the conservative
+    // choice: it keeps the month's total hours intact) and count it.
+    if (billedHrs + discHrs === 0 && qty > 0) {
+      slot.unbilledHrs += qty;
+      anomalies++;
+      continue;
+    }
+    slot.billedNondiscHrs += billedHrs;
+    slot.billedDiscHrs += discHrs;
+  }
+  if (anomalies) {
+    console.warn(`[Dashboard] Realization hours: ${anomalies} billed row(s) had no billed or discounted hours; counted as unbilled`);
+  }
+  return out;
+}
+
+/**
+ * ONE place both Realization-tab patch paths (full build and rate_tabs_only) get
+ * their D/E/F hours for a month, so the two can never drift.
+ *
+ * Default source is the Realization report (`aggregateRealizationHours`).
+ * `legacy: true` restores the old derived Client Activity split
+ * (`aggregateClientActivity`) for one release, so a run can be diffed against
+ * the previous numbers before the old path is deleted — it is known to
+ * under-report discounts and should not be used to produce real figures.
+ */
+export async function fetchRealizationHours(opts: {
+  start_date: string;
+  end_date: string;
+  nameToUid: Map<string, number>;
+  legacy?: boolean;
+  clientActivityReportId?: number;
+  realizationReportId?: number;
+  pollSeconds?: number;
+}): Promise<{
+  agg: Record<number, RealizHoursAgg>;
+  clientActivityReportId?: number;
+  realizationReportId?: number;
+}> {
+  const pollSeconds = opts.pollSeconds ?? 180;
+  if (opts.legacy) {
+    const ca = await getClientActivityCSV({
+      start_date: opts.start_date, end_date: opts.end_date,
+      reportId: opts.clientActivityReportId, pollSeconds,
+    });
+    const legacyAgg = aggregateClientActivity(ca.rows, opts.nameToUid);
+    const agg: Record<number, RealizHoursAgg> = {};
+    for (const [uid, a] of Object.entries(legacyAgg)) {
+      agg[Number(uid)] = {
+        billedNondiscHrs: a.billedNondiscHrs,
+        billedDiscHrs: a.billedDiscHrs,
+        unbilledHrs: a.unbilledHrs,
+        adjustedHrs: 0,
+      };
+    }
+    return { agg, clientActivityReportId: ca.report.id };
+  }
+  const rr = await getRealizationReportCSV({
+    start_date: opts.start_date, end_date: opts.end_date,
+    reportId: opts.realizationReportId, pollSeconds,
+  });
+  return { agg: aggregateRealizationHours(rr.rows, opts.nameToUid), realizationReportId: rr.report.id };
+}
+
 // Same collected/uncollected HOURS, but from the FEE ALLOCATION CSV (already
 // pulled for collections). It carries per-User "Billed Hours", "Billed Time"
 // ($), "Billed Time Collected" ($), "Billed Time Outstanding" ($) — enough to

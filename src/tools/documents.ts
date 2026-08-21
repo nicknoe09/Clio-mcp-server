@@ -73,6 +73,7 @@ import {
   aggregateRealizationCollections,
   aggregateFeeAllocationCollectionHrs,
   aggregateClientActivity,
+  fetchRealizationHours,
   getRevenueReportCSV,
   matchRosterUser,
   matchRosterResponsible,
@@ -1650,6 +1651,7 @@ export function registerDocumentTools(server: McpServer): void {
       box_folder_id: z.string().optional().describe("Deprecated / ignored. The tool always versions the Claude Version 2 workbook in its fixed Box folder."),
       update_existing: z.boolean().optional().describe("Deprecated / ignored. The full dashboard update now always runs; this flag no longer changes behavior."),
       backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. The 'Utilization', 'Realization', and 'Collection' rate tabs follow this same cadence — target month only by default, or every YTD month block when backfill_ytd=true (Realization and Collection generate one Clio report per month when backfilling). NOTE: COLLECTIONS (cols N/S/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
+      realization_hours_source: z.enum(["realization", "client_activity"]).optional().describe("Source for the Realization tab's D/E/F hours. DEFAULT 'realization' — Clio's Realization report, which reports Billed Hours and Hours Discounted per time entry, so the discounted split comes from Clio rather than being inferred. 'client_activity' restores the previous derived split (a discount was inferred from Quantity*Price != Total on the ACTIVITY row) and exists only to diff one run against the old numbers before that path is removed: it CANNOT see invoice-level discounts and is known to under-report them badly (it recorded 0.0 discounted hours for a timekeeper in Jan/Feb/Mar 2026 where Clio's own figures showed 46.3). Do not use it to produce reported figures."),
       billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 0 = no roll-back: each bill is counted in its CALENDAR issue month, matching Rachel's reference). Set to a positive N to roll bills issued on days 1..N of a month back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. N=7 ⇒ May 27–Jun 7 all count as May); if you do, run the month's snapshot after day N of the following month to capture those late-issued bills."),
       rate_tabs_only: z.boolean().optional().describe("RATE-TABS-ONLY refresh. When true, ONLY the 'Utilization', 'Realization', and 'Collection' tabs are rewritten for every month Jan..month, and NOTHING ELSE in the workbook is touched — 26 Compare, Bonus, Attorney Performance and all other sheets are preserved byte-for-byte. Utilization is sourced by READING 26 Compare's existing Billable (col I) / Nonbillable (col H) for each month (no /activities pull, no revenue report needed) and reshaping them (Billable, Nonbillable, Total=Billable+Nonbillable, Untracked=Available−Total) — so Utilization stays exactly consistent with 26 Compare. Realization comes from a per-month Client Activity report and Collection from a per-month Fee Allocation report (the same per-month sources the full build uses). Use this to fix/backfill the rate tabs for closed months WITHOUT retroactively rewriting 26 Compare's frozen snapshots. Ignores backfill_ytd / revenue_csv_box_file_id / billed_cutoff_day (not relevant to this path). pass client_activity_report_id to reuse a pre-generated Client Activity report for the TARGET month's Realization."),
     },
@@ -1779,7 +1781,9 @@ export function registerDocumentTools(server: McpServer): void {
             }
           }
 
-          // -- Realization -- per-month Client Activity report
+          // -- Realization -- per-month Realization report (all YTD months; see
+          // the REFRESH POLICY note on the full-build path for why this tab can
+          // never be a frozen snapshot).
           _step = "rate-tabs-only: patch Realization";
           const realizPath = compareSheetMap["Realization"];
           if (realizPath) {
@@ -1790,9 +1794,13 @@ export function registerDocumentTools(server: McpServer): void {
               const mStart = `${params.year}-${String(m).padStart(2, "0")}-01`;
               const mEnd = `${params.year}-${String(m).padStart(2, "0")}-${String(new Date(params.year, m, 0).getDate()).padStart(2, "0")}`;
               try {
-                const ca = await getClientActivityCSV({ start_date: mStart, end_date: mEnd, reportId: m === params.month ? params.client_activity_report_id : undefined, pollSeconds: 180 });
-                if (m === params.month) clientActivityReportId = ca.report.id;
-                const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const fetched = await fetchRealizationHours({
+                  start_date: mStart, end_date: mEnd, nameToUid,
+                  legacy: params.realization_hours_source === "client_activity",
+                  clientActivityReportId: m === params.month ? params.client_activity_report_id : undefined,
+                });
+                const agg = fetched.agg;
+                if (m === params.month && fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
                 const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 realizXml = ensured.xml;
                 if (ensured.created) console.log(`[dashboard] Realization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
@@ -1814,7 +1822,7 @@ export function registerDocumentTools(server: McpServer): void {
                 console.error(`[dashboard] rate-tabs-only Realization failed (${MONTH_ABBRS[m - 1]}):`, e?.message ?? e);
               }
             }
-            if (realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings);
+            if (realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings, new Date().toISOString().slice(0, 10));
           }
 
           // -- Collection -- per-month Fee Allocation report (issue basis)
@@ -2976,6 +2984,7 @@ export function registerDocumentTools(server: McpServer): void {
           let clientActivityReportId: number | undefined;
           let clientActivityErr: string | undefined;
           let realizationReportId: number | undefined;
+          let realizationHoursReportId: number | undefined;
           let realizationErr: string | undefined;
           let collectionSource: string | undefined;
           // Months to (re)write on the rate tabs: target only, or all YTD when
@@ -3033,10 +3042,27 @@ export function registerDocumentTools(server: McpServer): void {
           }
 
           // -- Realization patch -- (cols D/E/F = billed-nondisc/disc/unbilled hrs)
-          // Per month, from an auto-generated Client Activity report scoped to that
-          // month. Each month is fetched + patched independently so one month's
-          // report failure doesn't abort the rest; the target month can reuse a
-          // pre-generated report via client_activity_report_id.
+          // Per month, from an auto-generated REALIZATION report scoped to that
+          // month (see aggregateRealizationHours for why the old Client Activity
+          // split could not see discounts at all). Each month is fetched + patched
+          // independently so one month's report failure doesn't abort the rest.
+          //
+          // REFRESH POLICY — this tab ALWAYS rewrites every YTD month, ignoring
+          // backfill_ytd. It is not a static snapshot and cannot be: the tab is an
+          // ACTIVITY-DATE cohort (the denominator D+E+F is the hours WORKED that
+          // month, fixed at month close), and what moves afterward is the SPLIT —
+          // F drains into D and E as bills go out, over roughly 90 days. Writing a
+          // month once, shortly after it closes, freezes it at maximum unbilled,
+          // i.e. permanently at its worst reading. Verified live 2026-08: the tab
+          // carried 97.4 unbilled hours for MNH Jan–Jun while only 13.4 of that
+          // work was still unbilled — 84 hours had been billed since those rows
+          // were written. A refresh is safe precisely because the denominator is
+          // fixed: re-running only reclassifies hours among D/E/F and cannot change
+          // the month's total, which is what the static-snapshot rule protects.
+          // (That rule stays right for BILLED $ — invoice-issue basis, genuinely
+          // final at close. The Collection tab has the same maturity problem as
+          // this one and is NOT yet changed.)
+          const realizMonths = Array.from({ length: params.month }, (_, i) => i + 1);
           const realizPath = compareSheetMap["Realization"];
           if (realizPath) {
             try {
@@ -3047,16 +3073,22 @@ export function registerDocumentTools(server: McpServer): void {
             }
           }
           if (realizXml) {
-            for (const m of rateTabMonths) {
+            for (const m of realizMonths) {
               const { start: mStart, end: mEnd } = monthBounds(m);
               try {
-                const ca = await getClientActivityCSV({
-                  start_date: mStart, end_date: mEnd,
-                  reportId: m === params.month ? params.client_activity_report_id : undefined,
-                  pollSeconds: 180,
+                const fetched = await fetchRealizationHours({
+                  start_date: mStart, end_date: mEnd, nameToUid,
+                  legacy: params.realization_hours_source === "client_activity",
+                  clientActivityReportId: m === params.month ? params.client_activity_report_id : undefined,
+                  // Same report kind and same month as the Collection tab's
+                  // override, so reuse it instead of POSTing a duplicate.
+                  realizationReportId: m === params.month ? params.realization_report_id : undefined,
                 });
-                if (m === params.month) clientActivityReportId = ca.report.id;
-                const agg = aggregateClientActivity(ca.rows, nameToUid);
+                const agg = fetched.agg;
+                if (m === params.month) {
+                  if (fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
+                  if (fetched.realizationReportId) realizationHoursReportId = fetched.realizationReportId;
+                }
                 const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 realizXml = ensured.xml;
                 if (ensured.created) console.log(`[dashboard] Realization tab: generated new ${MONTH_ABBRS[m - 1]} block`);
@@ -3110,7 +3142,7 @@ export function registerDocumentTools(server: McpServer): void {
           const firmUtilGoal = utilGoalVals.length ? utilGoalVals.reduce((s, v) => s + v, 0) / utilGoalVals.length : 0;
           try {
             if (utilXml && utilPatched > 0) utilXml = appendUtilizationFirmAvg(utilXml, sharedStrings, firmUtilGoal);
-            if (realizXml && realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings);
+            if (realizXml && realizPatched > 0) realizXml = appendRealizationFirmAvg(realizXml, sharedStrings, new Date().toISOString().slice(0, 10));
           } catch (e: any) {
             console.warn(`[dashboard] firm-average summary append skipped: ${e?.message ?? e}`);
           }
@@ -3524,6 +3556,9 @@ export function registerDocumentTools(server: McpServer): void {
             collection_source: collectionSource,
             client_activity_report_id: clientActivityReportId,
             realization_report_id: realizationReportId,
+            realization_hours_source: params.realization_hours_source ?? "realization",
+            realization_hours_report_id: realizationHoursReportId,
+            realization_months_refreshed: `${monthNames[0]}–${monthName}`,
             // Per-tab status so a partial failure is visible (and which tab to retry).
             tabs: {
               utilization: utilPatched > 0 ? "ok" : (clientActivityErr ? "failed" : "skipped"),
