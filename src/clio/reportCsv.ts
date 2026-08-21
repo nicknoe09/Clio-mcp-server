@@ -335,19 +335,26 @@ export function aggregateRealizationCollections(rows: Record<string, string>[], 
 // the User who did the work. Verified live against MNH Jan 2026:
 //   Quantity 0.4, Rate 275, Billed Hours 0.0, Hours Discounted -0.4
 //   Quantity 0.6, Rate 275, Billed Hours 0.0, Hours Discounted -0.6
-// so for a billed entry:  Quantity == Billed Hours + |Hours Discounted|
-// ("Billed Hours" already EXCLUDES the discounted portion). Discount columns come
+// so for a billed entry:
+//   Quantity == Billed Hours + |Hours Discounted| + |Adjusted Hours|
+// ("Billed Hours" already EXCLUDES both reductions). The reduction columns come
 // back NEGATIVE, hence Math.abs — which also makes this correct if Clio ever
 // switches to unsigned.
 //
-// `adjustedHrs` (|Adjusted Hours|) is a SEPARATE Clio adjustment concept, summed
-// here for diagnosis only and deliberately NOT folded into billedDiscHrs — that
-// call needs a look at what actually populates it first.
+// "Adjusted Hours" is a SECOND, separate reduction Clio records alongside the
+// discount — a write-down of the billed amount rather than a discount proper. It
+// is folded into billedDiscHrs because economically it is the same thing for this
+// tab (value surrendered on an entry that reached a bill), and because every hour
+// has to land in exactly one of D/E/F or the denominator stops equalling the hours
+// actually worked. Measured on the live Jan 2026 report for one timekeeper it is
+// tiny but real — 3 rows of 227, 0.41 hrs / $112 against 32.72 discounted hrs /
+// $8,989 — and those 3 rows were the only ones where the two-term identity failed.
+// `adjustedHrs` keeps the component visible so the split stays auditable.
 export type RealizHoursAgg = {
   billedNondiscHrs: number;   // -> Realization tab col D
-  billedDiscHrs: number;      // -> col E
+  billedDiscHrs: number;      // -> col E  (discounted + adjusted)
   unbilledHrs: number;        // -> col F
-  adjustedHrs: number;        // diagnostic only; not written to the tab
+  adjustedHrs: number;        // the adjusted portion of col E, broken out for audit
 };
 
 /** True when a Realization-report row has not reached an issued bill: Clio writes
@@ -377,21 +384,22 @@ export function aggregateRealizationHours(
     const qty = num(r["Quantity"]);
     const billedHrs = num(r["Billed Hours"]);
     const discHrs = Math.abs(num(r["Hours Discounted"]));
-    slot.adjustedHrs += Math.abs(num(r["Adjusted Hours"]));
+    const adjHrs = Math.abs(num(r["Adjusted Hours"]));
     if (isUnbilledRealizStatus(r["Invoice Status"])) {
       slot.unbilledHrs += qty;
       continue;
     }
-    // Reached a bill but produced neither billed nor discounted hours — shouldn't
-    // happen given the identity above. Bucket it as unbilled (the conservative
-    // choice: it keeps the month's total hours intact) and count it.
-    if (billedHrs + discHrs === 0 && qty > 0) {
+    // Reached a bill but produced no billed, discounted or adjusted hours —
+    // shouldn't happen given the identity above. Bucket it as unbilled (the
+    // conservative choice: it keeps the month's total hours intact) and count it.
+    if (billedHrs + discHrs + adjHrs === 0 && qty > 0) {
       slot.unbilledHrs += qty;
       anomalies++;
       continue;
     }
     slot.billedNondiscHrs += billedHrs;
-    slot.billedDiscHrs += discHrs;
+    slot.billedDiscHrs += discHrs + adjHrs;
+    slot.adjustedHrs += adjHrs;
   }
   if (anomalies) {
     console.warn(`[Dashboard] Realization hours: ${anomalies} billed row(s) had no billed or discounted hours; counted as unbilled`);

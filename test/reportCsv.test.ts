@@ -151,12 +151,31 @@ describe("aggregateRealizationHours", () => {
     expect(agg.billedNondiscHrs).toBeCloseTo(1, 6);
   });
 
-  it("keeps Adjusted Hours OUT of the discounted bucket, reporting it separately", () => {
+  it("folds Adjusted Hours into discounted while keeping the component visible", () => {
+    // Adjusted Hours is a second reduction alongside the discount: it must land in
+    // a bucket or the denominator stops equalling hours worked.
     const agg = aggregateRealizationHours([
-      row({ Quantity: "2", "Billed Hours": "2", "Adjusted Hours": "-0.5" }),
+      row({ Quantity: "2", "Billed Hours": "1.5", "Adjusted Hours": "-0.5" }),
     ], nameToUid)[NRN];
-    expect(agg.billedDiscHrs).toBeCloseTo(0, 6);
+    expect(agg.billedNondiscHrs).toBeCloseTo(1.5, 6);
+    expect(agg.billedDiscHrs).toBeCloseTo(0.5, 6);
     expect(agg.adjustedHrs).toBeCloseTo(0.5, 6);
+    expect(agg.billedNondiscHrs + agg.billedDiscHrs).toBeCloseTo(2, 6);
+  });
+
+  it("holds the three-term identity on real report rows (live Jan 2026 shapes)", () => {
+    // The only 3 rows of 227 that broke the two-term identity were exactly the
+    // rows carrying Adjusted Hours; each closes with the third term.
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "0.4", "Billed Hours": "0.28", "Hours Discounted": "0", "Adjusted Hours": "-0.12" }),
+      row({ Quantity: "0.4", "Billed Hours": "0.28", "Hours Discounted": "0", "Adjusted Hours": "-0.12" }),
+      row({ Quantity: "0.6", "Billed Hours": "0.43", "Hours Discounted": "0", "Adjusted Hours": "-0.17" }),
+      row({ Quantity: "0.4", "Billed Hours": "0", "Hours Discounted": "-0.4" }),
+    ], nameToUid)[NRN];
+    const total = agg.billedNondiscHrs + agg.billedDiscHrs + agg.unbilledHrs;
+    expect(total).toBeCloseTo(1.8, 6);      // 0.4 + 0.4 + 0.6 + 0.4
+    expect(agg.adjustedHrs).toBeCloseTo(0.41, 6);
+    expect(agg.billedDiscHrs).toBeCloseTo(0.81, 6);  // 0.41 adjusted + 0.4 discounted
   });
 
   it("skips non-roster users", () => {
@@ -170,10 +189,11 @@ describe("aggregateRealizationHours", () => {
     const rows = [
       row({ Quantity: "10", "Billed Hours": "10" }),
       row({ Quantity: "4", "Billed Hours": "1.5", "Hours Discounted": "-2.5" }),
+      row({ Quantity: "2", "Billed Hours": "1.2", "Hours Discounted": "-0.5", "Adjusted Hours": "-0.3" }),
       row({ "Invoice Status": "-", Quantity: "6" }),
     ];
     const a = aggregateRealizationHours(rows, nameToUid)[NRN];
-    expect(a.billedNondiscHrs + a.billedDiscHrs + a.unbilledHrs).toBeCloseTo(20, 6);
+    expect(a.billedNondiscHrs + a.billedDiscHrs + a.unbilledHrs).toBeCloseTo(22, 6);
   });
 
   it("buckets a billed row with no billed or discounted hours as unbilled, keeping the total intact", () => {
