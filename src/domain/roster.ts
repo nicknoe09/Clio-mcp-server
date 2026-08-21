@@ -14,14 +14,20 @@ export const FIRM_ROSTER: RosterMember[] = [
   { initials: "NRN", name: "Nicholas Noe", user_id: 348755029 },
   { initials: "NAF", name: "Nicholas Fernelius", user_id: 359380639 },
   { initials: "ACA", name: "Angela Alanis", user_id: 358528744 },
+  // Anna Lozano — left mid-2026 (replaced by Stacy Bakri/SAB). KEEP through 2026
+  // year-end for the same reasons as JPB below: her Jan–Jun dashboard rows stay
+  // updatable, tail collections on her old invoices keep attributing to her 26
+  // Compare row instead of falling into NRB, and bonus.ts still credits her
+  // paralegal tail to KES via paralegal:"SAB,AFL". Drop for 2027. She is off the
+  // weekly goal sheets (see WEEKLY_GOALS_ROSTER).
   { initials: "AFL", name: "Anna Lozano", user_id: 358108805 },
   { initials: "AKG", name: "Kaz Gonzalez", user_id: 358550509 },
   { initials: "TBS", name: "Tzipora Simmons", user_id: 359711375 },
   { initials: "MNH", name: "May Huynh", user_id: 359576660 },
-  // Jonathan Barbee — terminated July 2026. KEEP through 2026 year-end (like
-  // AFL) so his Jan–Jul dashboard rows stay updatable and collections on his
-  // old invoices keep attributing to his 26 Compare row; drop for 2027. He is
-  // already off the weekly goal sheets (see WEEKLY_GOALS_ROSTER).
+  // Jonathan Barbee — terminated July 2026. KEEP through 2026 year-end (same
+  // rationale as AFL above) so his Jan–Jul dashboard rows stay updatable and
+  // collections on his old invoices keep attributing to his 26 Compare row;
+  // drop for 2027. He is off the weekly goal sheets (see WEEKLY_GOALS_ROSTER).
   { initials: "JPB", name: "Jonathan Barbee", user_id: 360091325 },
   { initials: "KGV", name: "Gus Vlahadamis", user_id: 360049685 },
   { initials: "CTD", name: "Courteney Daniel", user_id: 359865560 },

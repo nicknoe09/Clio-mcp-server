@@ -284,6 +284,9 @@ export const STYLE_AMBER = "__AMBER__"; // currency + amber fill (within 10% bel
 export const STYLE_RED   = "__RED__";   // currency + red fill (off goal)
 export const STYLE_CURDASH  = "__CURDASH__";  // "$"#,##0.00, zero shown as "-"
 export const STYLE_CURDASHB = "__CURDASHB__"; // same, bold
+export const STYLE_CURB  = "__CURB__";  // currency, bold (total / YTD columns)
+export const STYLE_PCTB  = "__PCTB__";  // percent, bold (headline rates)
+export const STYLE_HDR   = "__HDR__";   // bold + light fill (block / column headers)
 
 /**
  * On/off-goal color placeholder: green if actual ≥ goal, amber within 10% below,
@@ -548,7 +551,7 @@ export async function getZipSheetMap(zip: JSZip): Promise<Record<string, string>
  * - deletedSheetNames: sheets to remove
  * No ExcelJS involved in the write path.
  */
-export interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; green: string; amber: string; red: string; currencyDash: string; currencyDashBold: string; }
+export interface StyleIndices { general: string; currency: string; decimal: string; percent: string; bold: string; green: string; amber: string; red: string; currencyDash: string; currencyDashBold: string; currencyBold: string; percentBold: string; header: string; }
 
 export async function surgicalWriteXlsx(
   originalBuffer: Buffer,
@@ -575,7 +578,7 @@ export async function surgicalWriteXlsx(
   //    once injected "</numFmts>" into an attribute → invalid XML → Excel threw
   //    out styles.xml. All replacements below use function replacers (literal).
   const stylesFile = zip.file("xl/styles.xml");
-  let newStyleIndices: StyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0", green: "0", amber: "0", red: "0", currencyDash: "0", currencyDashBold: "0" };
+  let newStyleIndices: StyleIndices = { general: "0", currency: "0", decimal: "0", percent: "0", bold: "0", green: "0", amber: "0", red: "0", currencyDash: "0", currencyDashBold: "0", currencyBold: "0", percentBold: "0", header: "0" };
   if (stylesFile) {
     let stylesXml = await stylesFile.async("string");
 
@@ -627,14 +630,15 @@ export async function surgicalWriteXlsx(
       // Add 3 solid pattern fills (green / amber / red) for on/off-goal coloring,
       // and remember their fillIds. Append to <fills count="F"> and bump count
       // (function replacer — no "$" footgun; these strings have no "$").
-      let fillGreen = 0, fillAmber = 0, fillRed = 0;
+      let fillGreen = 0, fillAmber = 0, fillRed = 0, fillHdr = 0;
       const fillsMatch = stylesXml.match(/<fills count="(\d+)">/);
       if (fillsMatch) {
         const fc = parseInt(fillsMatch[1], 10);
-        fillGreen = fc; fillAmber = fc + 1; fillRed = fc + 2;
+        fillGreen = fc; fillAmber = fc + 1; fillRed = fc + 2; fillHdr = fc + 3;
         const mkFill = (rgb: string) => `<fill><patternFill patternType="solid"><fgColor rgb="${rgb}"/><bgColor indexed="64"/></patternFill></fill>`;
-        const addFills = mkFill("FFC6EFCE") + mkFill("FFFFEB9C") + mkFill("FFFFC7CE"); // green, amber, red
-        stylesXml = stylesXml.replace(`<fills count="${fc}">`, () => `<fills count="${fc + 3}">`);
+        // green, amber, red, then a neutral header tint
+        const addFills = mkFill("FFC6EFCE") + mkFill("FFFFEB9C") + mkFill("FFFFC7CE") + mkFill("FFE7EAF0");
+        stylesXml = stylesXml.replace(`<fills count="${fc}">`, () => `<fills count="${fc + 4}">`);
         stylesXml = stylesXml.replace("</fills>", () => addFills + "</fills>");
       }
 
@@ -651,6 +655,10 @@ export async function surgicalWriteXlsx(
         // Dash-zero currency (plain + bold) for the collections-by-matter tab.
         `<xf numFmtId="${dashFmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,
         `<xf numFmtId="${dashFmtId}" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`,
+        // Appended LAST so the indices above keep their positions.
+        `<xf numFmtId="${curFmtId}" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`,  // currency bold
+        `<xf numFmtId="10" fontId="${boldFontId}" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>`,            // percent bold
+        `<xf numFmtId="0" fontId="${boldFontId}" fillId="${fillHdr}" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1"/>`, // header
       ];
       newStyleIndices = {
         general: String(currentCount),
@@ -663,6 +671,9 @@ export async function surgicalWriteXlsx(
         red: String(currentCount + 7),
         currencyDash: String(currentCount + 8),
         currencyDashBold: String(currentCount + 9),
+        currencyBold: String(currentCount + 10),
+        percentBold: String(currentCount + 11),
+        header: String(currentCount + 12),
       };
       const newXfCount = currentCount + newXfs.length;
       stylesXml = stylesXml.replace(`<cellXfs count="${currentCount}">`, () => `<cellXfs count="${newXfCount}">`);

@@ -8,6 +8,7 @@ import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { classifyYtdTimeEntries, type ClassifiedTimeEntry } from "../dashboard/classifiedHours";
 import { buildWorkedHoursSplitByMonth } from "../dashboard/workedHours";
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
+import { buildRealizationDollarsSheet, REALIZATION_DOLLARS_TAB, type DollarsByMonth } from "../dashboard/realizationDollars";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { diagnosticTool } from "../utils/diagnostics";
@@ -57,6 +58,9 @@ import {
   colLetter,
   patchCell,
   readCell,
+  STYLE_CURB,
+  STYLE_PCTB,
+  STYLE_HDR
 } from "../utils/xlsx";
 
 // ========== SHARED HELPERS ==========
@@ -74,6 +78,7 @@ import {
   aggregateFeeAllocationCollectionHrs,
   aggregateClientActivity,
   fetchRealizationHours,
+  type RealizDollarsAgg,
   getRevenueReportCSV,
   matchRosterUser,
   matchRosterResponsible,
@@ -533,10 +538,15 @@ const WEEKLY_GOALS_ROSTER = [
   { name: "Angela Alanis",   user_id: 358528744, goal: 30, group: "PAR" }, // partner/para
   { name: "Nick Fernelius",  user_id: 359380639, goal: 32, group: "PAR" }, // associate
   { name: "Kenny Sumner",    user_id: 344134017, goal: 30, group: "KES" }, // partner/para
-  // Jonathan Barbee (JPB, 360091325) — terminated July 2026; removed from the
-  // weekly goal sheets and monthly summary per firm decision. His historical
-  // sheet stays in Box; dashboard/collections history stays via FIRM_ROSTER.
-  { name: "Anna Lozano",     user_id: 358108805, goal: 30, group: "KES" }, // partner/para — left mid-2026; keep through year-end so her Jan–Jun months stay on the monthly chart, drop for 2027
+  // DEPARTED — deliberately absent from the weekly goal sheets and monthly
+  // summary. Goals are a forward-looking management tool; there is nothing to
+  // set a target against once someone has left. Their historical sheets stay in
+  // Box, and every HISTORY view keeps them via FIRM_ROSTER: 26 Compare rows,
+  // tail collections on their old invoices, bonus attribution (Anna's paralegal
+  // tail still credits KES — see bonus.ts), and their Realization ($) blocks.
+  // Drop from FIRM_ROSTER for 2027, not before.
+  //   Jonathan Barbee (JPB, 360091325) — terminated July 2026.
+  //   Anna Lozano     (AFL, 358108805) — left mid-2026, replaced by Stacy Bakri.
   { name: "Stacy Bakri",     user_id: 360383465, goal: 30, group: "KES" }, // partner/para — Kenny's paralegal, replaced Anna mid-2026
   { name: "May Huynh",       user_id: 359576660, goal: 32, group: "MNH" }, // associate
 ];
@@ -1752,6 +1762,7 @@ export function registerDocumentTools(server: McpServer): void {
           let utilPatched = 0, realizPatched = 0, collectionPatched = 0;
           let clientActivityReportId: number | undefined;
           let clientActivityErr: string | undefined, realizationErr: string | undefined;
+          const realizDollars: DollarsByMonth = {};
 
           // -- Utilization -- from 26 Compare col I/H (read-only; no Clio pull)
           _step = "rate-tabs-only: patch Utilization";
@@ -1800,6 +1811,7 @@ export function registerDocumentTools(server: McpServer): void {
                   clientActivityReportId: m === params.month ? params.client_activity_report_id : undefined,
                 });
                 const agg = fetched.agg;
+                if (Object.keys(fetched.dollars).length) realizDollars[m] = fetched.dollars;
                 if (m === params.month && fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
                 const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 realizXml = ensured.xml;
@@ -1862,14 +1874,25 @@ export function registerDocumentTools(server: McpServer): void {
           // other sheet (26 Compare, Bonus, Attorney Performance, …) untouched.
           _step = "rate-tabs-only: surgical write + upload";
           const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
+            // CUR/DEC were absent here; the dollars tab needs currency, and a
+            // placeholder left unsubstituted would ship a literal "__CUR__" as a
+            // style id and corrupt the sheet.
             const subst = (xml: string): string => xml
               .split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`)
               .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
-              .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`);
+              .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
+              .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
+              .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`)
+              .split(`s="${STYLE_CURB}"`).join(`s="${ST.currencyBold}"`)
+              .split(`s="${STYLE_PCTB}"`).join(`s="${ST.percentBold}"`)
+              .split(`s="${STYLE_HDR}"`).join(`s="${ST.header}"`);
             const out: Record<string, string> = {};
             if (utilXml && utilPatched > 0) out["Utilization"] = subst(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = subst(realizXml);
             if (collectionXml && collectionPatched > 0) out["Collection"] = subst(collectionXml);
+            const dollarsXml = buildRealizationDollarsSheet(
+              realizDollars, rtMonths, rosterRT, new Date().toISOString().slice(0, 10));
+            if (dollarsXml) out[REALIZATION_DOLLARS_TAB] = subst(dollarsXml);
             return out;
           }, new Set<string>());
 
@@ -3063,6 +3086,9 @@ export function registerDocumentTools(server: McpServer): void {
           // final at close. The Collection tab has the same maturity problem as
           // this one and is NOT yet changed.)
           const realizMonths = Array.from({ length: params.month }, (_, i) => i + 1);
+          // Dollars for the "Realization ($)" tab, harvested from the SAME
+          // per-month report rows as the hours above — no extra Clio call.
+          const realizDollars: DollarsByMonth = {};
           const realizPath = compareSheetMap["Realization"];
           if (realizPath) {
             try {
@@ -3085,6 +3111,7 @@ export function registerDocumentTools(server: McpServer): void {
                   realizationReportId: m === params.month ? params.realization_report_id : undefined,
                 });
                 const agg = fetched.agg;
+                if (Object.keys(fetched.dollars).length) realizDollars[m] = fetched.dollars;
                 if (m === params.month) {
                   if (fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
                   if (fetched.realizationReportId) realizationHoursReportId = fetched.realizationReportId;
@@ -3525,11 +3552,17 @@ export function registerDocumentTools(server: McpServer): void {
                 .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
                 .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
                 .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
-                .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`),
+                .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`)
+                .split(`s="${STYLE_CURB}"`).join(`s="${ST.currencyBold}"`)
+                .split(`s="${STYLE_PCTB}"`).join(`s="${ST.percentBold}"`)
+                .split(`s="${STYLE_HDR}"`).join(`s="${ST.header}"`),
             );
             if (utilXml && utilPatched > 0) out["Utilization"] = substTabPlaceholders(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = substTabPlaceholders(realizXml);
             if (collectionXml && collectionPatched > 0) out["Collection"] = substTabPlaceholders(collectionXml);
+            const dollarsXml = buildRealizationDollarsSheet(
+              realizDollars, realizMonths, ROSTER, new Date().toISOString().slice(0, 10));
+            if (dollarsXml) out[REALIZATION_DOLLARS_TAB] = substTabPlaceholders(dollarsXml);
             return out;
           }, deletedSheets);
           const result = await uploadToBox({
