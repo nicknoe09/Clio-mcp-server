@@ -144,14 +144,17 @@ export function buildRealizationDollarsSheet(
     ]));
     r++;
 
-    // Self-check row. These must read 0.00; a non-zero means the report's columns
-    // no longer reconcile and the tab should not be trusted until it is explained.
+    // Self-check row. Expect 0 to within a few cents — each figure above is
+    // rounded to 2dp before it is written, so summing hundreds of them leaves
+    // rounding noise (measured: $0.04 across a 3,327-row firm-wide month). A
+    // difference in DOLLARS means the report's columns no longer reconcile and
+    // the tab should not be trusted until that is explained.
     rows.push(xmlRow(r, [
       xmlCell(`B${r}`, "Check", { style: STYLE_GEN }),
       xmlCell(`C${r}`, null, { style: STYLE_CUR, formula: `C${r - 1}-(D${r - 1}+E${r - 1}+I${r - 1})` }),
-      xmlCell(`D${r}`, "Std − (Billed+Disc+Unbilled) — expect 0", { style: STYLE_GEN }),
+      xmlCell(`D${r}`, "Std − (Billed+Disc+Unbilled) — expect 0 (cents = rounding)", { style: STYLE_GEN }),
       xmlCell(`G${r}`, null, { style: STYLE_CUR, formula: `(D${r - 1}-F${r - 1})-(G${r - 1}+H${r - 1})` }),
-      xmlCell(`H${r}`, "(Billed−Credited) − (Collected+Outstanding) — expect 0", { style: STYLE_GEN }),
+      xmlCell(`H${r}`, "(Billed−Credited) − (Collected+Outstanding) — expect 0 (cents = rounding)", { style: STYLE_GEN }),
     ]));
     r += 2;
   }
