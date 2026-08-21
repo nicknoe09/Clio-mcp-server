@@ -357,12 +357,20 @@ export type RealizHoursAgg = {
   adjustedHrs: number;        // the adjusted portion of col E, broken out for audit
 };
 
-/** True when a Realization-report row has not reached an issued bill: Clio writes
- *  "-" (or an empty cell) for an entry with no invoice, and a draft-bill status
- *  for one sitting in the drawer. */
+/** True when a Realization-report row has not reached an issued bill.
+ *
+ *  Clio's live "Invoice Status" values are "Billed", "Draft" and "Unbilled",
+ *  plus "-" or an empty cell for an entry with no invoice at all. "Unbilled"
+ *  was originally missing from this list, so those rows only reached col F via
+ *  the caller's anomaly fallback — right answer, wrong route, and a spurious
+ *  warning on every run. Anything that is not affirmatively billed is treated as
+ *  unbilled. An UNRECOGNISED status is left to the billed branch on purpose: a
+ *  status that is really unbilled carries no billed/discounted/adjusted hours, so
+ *  the caller's anomaly guard routes it to col F anyway AND logs it — which
+ *  surfaces the new value instead of silently absorbing it. */
 export function isUnbilledRealizStatus(invoiceStatus: string | undefined): boolean {
   const st = (invoiceStatus ?? "").trim().toLowerCase();
-  return st === "" || st === "-" || st.includes("draft");
+  return st === "" || st === "-" || st === "unbilled" || st.includes("draft");
 }
 
 export function aggregateRealizationHours(
@@ -407,6 +415,69 @@ export function aggregateRealizationHours(
   return out;
 }
 
+// Per-timekeeper DOLLARS for the economic-realization tab — the measures an
+// hours-status metric structurally cannot provide (credit notes, collections,
+// value retained). Read from the SAME Realization report row set as
+// aggregateRealizationHours, so this costs no extra Clio call.
+//
+// TWO IDENTITIES, both verified against live reports (MNH, Jan + Jun 2026), make
+// the resulting tab self-checking:
+//
+//   standardValue == billed$ + discounted$ + unbilled$      (Jan closed to $0.00)
+//   billed$ - credited$ == collected$ + outstanding$        (closed to the cent
+//                                                            in both months)
+//
+// "Original Billable Total" is Clio's own pre-reduction value for the entry, so
+// standardValue needs no rate assumption — unlike hours x a modal standard rate.
+// Note it is the value at the entry's APPLICABLE rate, so a matter-rate discount
+// is already baked in and is NOT separately visible here; surfacing rate-level
+// reductions would need a second pass against each timekeeper's standard rate.
+//
+// unbilled$ carries the entry's full value for rows that have not reached a bill,
+// which is what makes the first identity close. It also means the gross-billing
+// ratio matures exactly like the hours metric: a recent month reads low simply
+// because its work has not been billed yet.
+export type RealizDollarsAgg = {
+  standardValue: number;   // Sum of Original Billable Total (all billable work)
+  billed: number;          // Billed Time Amount
+  discounted: number;      // |Amount Discounted| + |Adjusted Amount|
+  credited: number;        // Billed Time Credited  <- the credit-note channel
+  collected: number;       // Billed Time Collected
+  outstanding: number;     // Billed Time Outstanding
+  unbilled: number;        // Original Billable Total on not-yet-billed rows
+};
+
+export const newRealizDollars = (): RealizDollarsAgg => ({
+  standardValue: 0, billed: 0, discounted: 0, credited: 0,
+  collected: 0, outstanding: 0, unbilled: 0,
+});
+
+export function aggregateRealizationDollars(
+  rows: Record<string, string>[],
+  nameToUid: Map<string, number>,
+): Record<number, RealizDollarsAgg> {
+  const num = (x: string | undefined) => parseFloat((x ?? "0").replace(/[$,]/g, "")) || 0;
+  const out: Record<number, RealizDollarsAgg> = {};
+  for (const r of rows) {
+    if ((r["Time Entry Type"] ?? "").trim().toLowerCase() === "non-billable") continue;
+    const uid = nameToUid.get((r["User"] ?? "").trim().toLowerCase());
+    if (uid == null) continue;
+    const slot = (out[uid] ??= newRealizDollars());
+    const orig = num(r["Original Billable Total"]);
+    slot.standardValue += orig;
+    if (isUnbilledRealizStatus(r["Invoice Status"])) {
+      slot.unbilled += orig;
+      continue;
+    }
+    slot.billed += num(r["Billed Time Amount"]);
+    slot.discounted += Math.abs(num(r["Amount Discounted"])) + Math.abs(num(r["Adjusted Amount"]));
+    slot.credited += num(r["Billed Time Credited"]);
+    slot.collected += num(r["Billed Time Collected"]);
+    slot.outstanding += num(r["Billed Time Outstanding"]);
+  }
+  return out;
+}
+
 /**
  * ONE place both Realization-tab patch paths (full build and rate_tabs_only) get
  * their D/E/F hours for a month, so the two can never drift.
@@ -427,6 +498,9 @@ export async function fetchRealizationHours(opts: {
   pollSeconds?: number;
 }): Promise<{
   agg: Record<number, RealizHoursAgg>;
+  /** Per-timekeeper dollars from the SAME rows — empty on the legacy path, whose
+   *  source carries no credit/collection columns. */
+  dollars: Record<number, RealizDollarsAgg>;
   clientActivityReportId?: number;
   realizationReportId?: number;
 }> {
@@ -446,13 +520,17 @@ export async function fetchRealizationHours(opts: {
         adjustedHrs: 0,
       };
     }
-    return { agg, clientActivityReportId: ca.report.id };
+    return { agg, dollars: {}, clientActivityReportId: ca.report.id };
   }
   const rr = await getRealizationReportCSV({
     start_date: opts.start_date, end_date: opts.end_date,
     reportId: opts.realizationReportId, pollSeconds,
   });
-  return { agg: aggregateRealizationHours(rr.rows, opts.nameToUid), realizationReportId: rr.report.id };
+  return {
+    agg: aggregateRealizationHours(rr.rows, opts.nameToUid),
+    dollars: aggregateRealizationDollars(rr.rows, opts.nameToUid),
+    realizationReportId: rr.report.id,
+  };
 }
 
 // Same collected/uncollected HOURS, but from the FEE ALLOCATION CSV (already

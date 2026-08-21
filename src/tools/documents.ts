@@ -8,6 +8,7 @@ import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
 import { classifyYtdTimeEntries, type ClassifiedTimeEntry } from "../dashboard/classifiedHours";
 import { buildWorkedHoursSplitByMonth } from "../dashboard/workedHours";
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
+import { buildRealizationDollarsSheet, REALIZATION_DOLLARS_TAB, type DollarsByMonth } from "../dashboard/realizationDollars";
 import { applyTieredSplit } from "../domain/vd";
 import { DashJob, dashboardJobs, pruneDashboardJobs } from "../utils/jobs";
 import { diagnosticTool } from "../utils/diagnostics";
@@ -74,6 +75,7 @@ import {
   aggregateFeeAllocationCollectionHrs,
   aggregateClientActivity,
   fetchRealizationHours,
+  type RealizDollarsAgg,
   getRevenueReportCSV,
   matchRosterUser,
   matchRosterResponsible,
@@ -1752,6 +1754,7 @@ export function registerDocumentTools(server: McpServer): void {
           let utilPatched = 0, realizPatched = 0, collectionPatched = 0;
           let clientActivityReportId: number | undefined;
           let clientActivityErr: string | undefined, realizationErr: string | undefined;
+          const realizDollars: DollarsByMonth = {};
 
           // -- Utilization -- from 26 Compare col I/H (read-only; no Clio pull)
           _step = "rate-tabs-only: patch Utilization";
@@ -1800,6 +1803,7 @@ export function registerDocumentTools(server: McpServer): void {
                   clientActivityReportId: m === params.month ? params.client_activity_report_id : undefined,
                 });
                 const agg = fetched.agg;
+                if (Object.keys(fetched.dollars).length) realizDollars[m] = fetched.dollars;
                 if (m === params.month && fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
                 const ensured = ensureTabMonthBlock(realizXml, MONTH_ABBRS[m - 1], sharedStrings, ["D", "E", "F"]);
                 realizXml = ensured.xml;
@@ -1862,14 +1866,22 @@ export function registerDocumentTools(server: McpServer): void {
           // other sheet (26 Compare, Bonus, Attorney Performance, …) untouched.
           _step = "rate-tabs-only: surgical write + upload";
           const outputBuffer = await surgicalWriteXlsx(fileBuffer, (ST: StyleIndices) => {
+            // CUR/DEC were absent here; the dollars tab needs currency, and a
+            // placeholder left unsubstituted would ship a literal "__CUR__" as a
+            // style id and corrupt the sheet.
             const subst = (xml: string): string => xml
               .split(`s="${STYLE_PCT}"`).join(`s="${ST.percent}"`)
               .split(`s="${STYLE_BOLD}"`).join(`s="${ST.bold}"`)
-              .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`);
+              .split(`s="${STYLE_GEN}"`).join(`s="${ST.general}"`)
+              .split(`s="${STYLE_CUR}"`).join(`s="${ST.currency}"`)
+              .split(`s="${STYLE_DEC}"`).join(`s="${ST.decimal}"`);
             const out: Record<string, string> = {};
             if (utilXml && utilPatched > 0) out["Utilization"] = subst(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = subst(realizXml);
             if (collectionXml && collectionPatched > 0) out["Collection"] = subst(collectionXml);
+            const dollarsXml = buildRealizationDollarsSheet(
+              realizDollars, rtMonths, rosterRT, new Date().toISOString().slice(0, 10));
+            if (dollarsXml) out[REALIZATION_DOLLARS_TAB] = subst(dollarsXml);
             return out;
           }, new Set<string>());
 
@@ -3063,6 +3075,9 @@ export function registerDocumentTools(server: McpServer): void {
           // final at close. The Collection tab has the same maturity problem as
           // this one and is NOT yet changed.)
           const realizMonths = Array.from({ length: params.month }, (_, i) => i + 1);
+          // Dollars for the "Realization ($)" tab, harvested from the SAME
+          // per-month report rows as the hours above — no extra Clio call.
+          const realizDollars: DollarsByMonth = {};
           const realizPath = compareSheetMap["Realization"];
           if (realizPath) {
             try {
@@ -3085,6 +3100,7 @@ export function registerDocumentTools(server: McpServer): void {
                   realizationReportId: m === params.month ? params.realization_report_id : undefined,
                 });
                 const agg = fetched.agg;
+                if (Object.keys(fetched.dollars).length) realizDollars[m] = fetched.dollars;
                 if (m === params.month) {
                   if (fetched.clientActivityReportId) clientActivityReportId = fetched.clientActivityReportId;
                   if (fetched.realizationReportId) realizationHoursReportId = fetched.realizationReportId;
@@ -3530,6 +3546,9 @@ export function registerDocumentTools(server: McpServer): void {
             if (utilXml && utilPatched > 0) out["Utilization"] = substTabPlaceholders(utilXml);
             if (realizXml && realizPatched > 0) out["Realization"] = substTabPlaceholders(realizXml);
             if (collectionXml && collectionPatched > 0) out["Collection"] = substTabPlaceholders(collectionXml);
+            const dollarsXml = buildRealizationDollarsSheet(
+              realizDollars, realizMonths, ROSTER, new Date().toISOString().slice(0, 10));
+            if (dollarsXml) out[REALIZATION_DOLLARS_TAB] = substTabPlaceholders(dollarsXml);
             return out;
           }, deletedSheets);
           const result = await uploadToBox({
