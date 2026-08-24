@@ -3,7 +3,9 @@ import { SCORECARD_ROSTER, MONTH_NAMES_SHORT } from "../domain/roster";
 import { round2, round1 } from "../utils/num";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchAllPages } from "../clio/pagination";
-import { classifyYtdTimeEntries } from "../dashboard/classifiedHours";
+import {
+  classifyYtdTimeEntries, addToTotals, emptyTotals, type HoursTotals,
+} from "../dashboard/classifiedHours";
 import {
   ATTENDEE_FIELDS,
   fetchCalendarIdToUserId,
@@ -61,6 +63,180 @@ function getWeekKey(dateStr: string): string {
 
 export function registerScorecardTools(server: McpServer): void {
 
+
+  // ============================================================
+  // TOOL 2: generate_weekly_goals (individual goal sheets for TBS, Kaz, etc.)
+  // ============================================================
+  server.tool(
+    "generate_weekly_goals",
+    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking. " +
+    "BILLABLE CLASSIFICATION NOW CONSULTS THE MATTER'S CLIENT AND THE ENTRY'S RATE, not just the Clio non-billable flag. An entry is nonbillable when its native non_billable flag is set, OR — when exclude_internal is true (the DEFAULT) — when either (a) the matter's client is the firm itself, Romano & Sumner, LLC (the structural signal: catches 02888-Admin, 00050-Potential Clients and any future internal matter automatically), or (b) the entry is billable-flagged but carries rate 0 AND amount 0 (the rate-based safety net for internal time booked under another client). " +
+    "Reclassified hours MOVE to nonbillable rather than disappearing, so total tracked time is identical on both bases. Synthetic fee-placeholder entries are still dropped from both buckets. " +
+    "Every level (weekly, monthly, net) reports billable_actual — the ADJUSTED figure, which over_under and utilization_rate are computed from — alongside billable_actual_raw (the legacy flag-only value) and internal_reclassified (the difference, broken out by rule). " +
+    "The firm dashboard (26 Compare col I and the Utilization tab it feeds) uses this same adjusted basis, so utilization still reconciles to it; billable_actual_raw ties to the pre-adjustment col I. Pass exclude_internal=false for legacy behavior, where billable_actual == billable_actual_raw.",
+    {
+      user_id: z.coerce.number().describe("User/timekeeper ID"),
+      year: z.coerce.number().describe("Year (e.g. 2026)"),
+      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
+      hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
+      exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time as nonbillable when computing billable_actual: matters whose client is the firm itself, plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only basis, where billable_actual == billable_actual_raw."),
+    },
+    async (params) => {
+      try {
+        const today = new Date();
+        const endDate = today.toISOString().split("T")[0];
+
+        // Same dashboard filtration as the Excel weekly sheets and 26 Compare
+        // (see dashboard/classifiedHours.ts): the non_billable flag plus the
+        // firm-internal reclassification, fee placeholders dropped. Each bucket
+        // carries BOTH bases so billable_actual_raw needs no second pass.
+        const entries = await classifyYtdTimeEntries({
+          year: params.year, endDate, userIds: [params.user_id],
+          excludeInternal: params.exclude_internal,
+        });
+        const userName = entries[0]?.userName ?? "Unknown";
+
+        const months: Record<string, HoursTotals> = {};
+        const weeks: Record<string, HoursTotals> = {};
+
+        for (const e of entries) {
+          if (e.cls === "excluded") continue; // fee placeholders aren't real worked time
+          const monthKey = e.date.slice(0, 7);
+          const weekKey = getWeekKey(e.date);
+          addToTotals(months[monthKey] ??= emptyTotals(), e);
+          addToTotals(weeks[weekKey] ??= emptyTotals(), e);
+        }
+
+        const monthNames = MONTH_NAMES_SHORT;
+        const monthlySummary = [];
+        let cumBillable = 0, cumBillableRaw = 0, cumGoal = 0;
+        let cumInternal = 0, cumFirmSelf = 0, cumZeroValue = 0, cumFirmSelfRated = 0;
+
+        // Monthly billable goal is derived from the weekly goal so it matches the dashboard:
+        // 47 working weeks/yr ÷ 12 months. 30/wk → 1410/yr → 117.5/mo (partners & paras),
+        // 32/wk → 1504/yr → 125.33/mo (associates).
+        const WORKING_WEEKS_PER_YEAR = 47;
+        const ANNUAL_AVAILABLE_HOURS = 1880;
+        const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
+        const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
+
+        for (let m = 1; m <= 12; m++) {
+          const key = `${params.year}-${String(m).padStart(2, "0")}`;
+          const data = months[key];
+          if (!data) continue;
+          const billable = round1(data.billable);
+          const billableRaw = round1(data.billableRaw);
+          const nonbillable = round1(data.nonbillable);
+          cumBillable += billable;
+          cumBillableRaw += billableRaw;
+          cumInternal += data.internalHours;
+          cumFirmSelf += data.firmSelfClientHours;
+          cumZeroValue += data.zeroValueHours;
+          cumFirmSelfRated += data.firmSelfClientRatedHours;
+          cumGoal += flatMonthlyGoal;
+          monthlySummary.push({
+            month: monthNames[m - 1],
+            // ADJUSTED — over_under and utilization_rate derive from this.
+            billable_actual: billable,
+            // Legacy flag-only figure, unchanged; ties to pre-adjustment col I.
+            billable_actual_raw: billableRaw,
+            internal_reclassified: round1(data.internalHours),
+            billable_goal: flatMonthlyGoal,
+            nonbillable,
+            total_time: round1(billable + nonbillable),
+            over_under: round1(billable - flatMonthlyGoal),
+            total_available_time: flatMonthlyAvailable,
+            utilization_rate: round1((billable / flatMonthlyAvailable) * 100),
+          });
+        }
+
+        const weeklyDetail = Object.entries(weeks)
+          .map(([week, data]) => ({
+            week,
+            billable: round1(data.billable),
+            billable_raw: round1(data.billableRaw),
+            internal_reclassified: round1(data.internalHours),
+            nonbillable: round1(data.nonbillable),
+            total_tracked: round1(data.billable + data.nonbillable),
+            billable_goal: params.weekly_billable_goal,
+            over_under: round1(data.billable - params.weekly_billable_goal),
+          }))
+          .sort((a, b) => {
+            const parseWeek = (w: string) => {
+              const parts = w.split("-")[0].split("/");
+              return new Date(params.year, parseInt(parts[0]) - 1, parseInt(parts[1]));
+            };
+            return parseWeek(a.week).getTime() - parseWeek(b.week).getTime();
+          });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              user: userName,
+              user_id: params.user_id,
+              year: params.year,
+              weekly_billable_goal: params.weekly_billable_goal,
+              exclude_internal: params.exclude_internal,
+              basis: params.exclude_internal
+                ? "billable_actual EXCLUDES firm-internal time (firm-self-client matters + billable-flagged entries with rate 0 and amount 0), which is reclassified as nonbillable; billable_actual_raw is the legacy flag-only figure"
+                : "legacy flag-only basis — billable_actual == billable_actual_raw",
+              net: {
+                billable_actual: round1(cumBillable),
+                billable_actual_raw: round1(cumBillableRaw),
+                internal_reclassified: round1(cumInternal),
+                internal_firm_self_client: round1(cumFirmSelf),
+                internal_zero_rate_and_amount: round1(cumZeroValue),
+                // Firm-self-client hours that carried a RATE. Internal time is
+                // normally $0, so a material figure here means rule (a) caught
+                // real client work filed under the firm's own client (e.g.
+                // 02671-Anike, 01537-Mediation Services) — review before relying
+                // on the adjusted figure. See dashboard/classifiedHours.ts.
+                internal_firm_self_client_rated: round1(cumFirmSelfRated),
+                billable_goal: round1(cumGoal),
+                nonbillable: round1(monthlySummary.reduce((s, m) => s + m.nonbillable, 0)),
+                total_time: round1(cumBillable + monthlySummary.reduce((s, m) => s + m.nonbillable, 0)),
+                over_under: round1(cumBillable - cumGoal),
+                over_under_raw: round1(cumBillableRaw - cumGoal),
+              },
+              monthly: monthlySummary,
+              weekly: weeklyDetail,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+
+/**
+ * ARCHIVED 2026-08-24 — generate_firm_scorecard is no longer registered on the
+ * MCP surface. The firm scorecard is archival.
+ *
+ * Note it never migrated to the shared classifier: both its weekly and monthly
+ * sections still split billable vs nonbillable with the pre-2026-07-09
+ * `price > 0` heuristic (an entry counts as billable iff its rate is above
+ * zero), which is a THIRD basis reconciling to neither 26 Compare col I nor the
+ * weekly goal sheets. e163235 deferred that migration and it was never picked
+ * up. That is also why this tool was not given the exclude_internal treatment:
+ * under `price > 0`, $0 firm-internal time already landed in nonbillable, so it
+ * never carried the bug the adjustment fixes — it carried the mirror-image one
+ * (#186: rated time flagged non-billable leaking into billable).
+ *
+ * The source is retained verbatim (unwired) for reference. To re-expose it,
+ * call this from registerScorecardTools — but migrate it onto
+ * classifiedHours.ts first, or it will report a basis nothing else uses.
+ */
+export function registerArchivedFirmScorecardTool(server: McpServer): void {
   // ============================================================
   // TOOL 1: generate_firm_scorecard (firm-wide, for development meetings)
   // ============================================================
@@ -310,126 +486,6 @@ export function registerScorecardTools(server: McpServer): void {
           content: [{
             type: "text" as const,
             text: JSON.stringify(result, null, 2),
-          }],
-        };
-      } catch (err: any) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({ error: true, message: err.message, status: err.response?.status, clio_error: err.response?.data }),
-          }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // ============================================================
-  // TOOL 2: generate_weekly_goals (individual goal sheets for TBS, Kaz, etc.)
-  // ============================================================
-  server.tool(
-    "generate_weekly_goals",
-    "Generate an individual weekly goals sheet for a timekeeper. Returns monthly and weekly billable/nonbillable hour breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): billable vs nonbillable follows each entry's native Clio non-billable flag (matter names/types and rates are never consulted — internal work booked at a dollar rate but flagged non-billable counts as nonbillable), with only synthetic fee-placeholder entries excluded — so the utilization figures reconcile to the dashboard's Utilization tab.",
-    {
-      user_id: z.coerce.number().describe("User/timekeeper ID"),
-      year: z.coerce.number().describe("Year (e.g. 2026)"),
-      weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
-      hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
-    },
-    async (params) => {
-      try {
-        const today = new Date();
-        const endDate = today.toISOString().split("T")[0];
-
-        // Same dashboard filtration as the Excel weekly sheets and 26 Compare
-        // (see dashboard/classifiedHours.ts): billable vs nonbillable from each
-        // entry's non_billable flag, fee placeholders dropped.
-        const entries = await classifyYtdTimeEntries({
-          year: params.year, endDate, userIds: [params.user_id],
-        });
-        const userName = entries[0]?.userName ?? "Unknown";
-
-        const months: Record<string, { billable: number; nonbillable: number }> = {};
-        const weeks: Record<string, { billable: number; nonbillable: number }> = {};
-
-        for (const e of entries) {
-          if (e.cls === "excluded") continue; // fee placeholders aren't real worked time
-          const monthKey = e.date.slice(0, 7);
-          const weekKey = getWeekKey(e.date);
-          if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
-          if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
-
-          months[monthKey][e.cls] += e.hours;
-          weeks[weekKey][e.cls] += e.hours;
-        }
-
-        const monthNames = MONTH_NAMES_SHORT;
-        const monthlySummary = [];
-        let cumBillable = 0, cumGoal = 0;
-
-        // Monthly billable goal is derived from the weekly goal so it matches the dashboard:
-        // 47 working weeks/yr ÷ 12 months. 30/wk → 1410/yr → 117.5/mo (partners & paras),
-        // 32/wk → 1504/yr → 125.33/mo (associates).
-        const WORKING_WEEKS_PER_YEAR = 47;
-        const ANNUAL_AVAILABLE_HOURS = 1880;
-        const flatMonthlyGoal = round1(params.weekly_billable_goal * WORKING_WEEKS_PER_YEAR / 12);
-        const flatMonthlyAvailable = Math.round(ANNUAL_AVAILABLE_HOURS / 12); // 157
-
-        for (let m = 1; m <= 12; m++) {
-          const key = `${params.year}-${String(m).padStart(2, "0")}`;
-          const data = months[key];
-          if (!data) continue;
-          const billable = round1(data.billable);
-          const nonbillable = round1(data.nonbillable);
-          cumBillable += billable;
-          cumGoal += flatMonthlyGoal;
-          monthlySummary.push({
-            month: monthNames[m - 1],
-            billable_actual: billable,
-            billable_goal: flatMonthlyGoal,
-            nonbillable,
-            total_time: round1(billable + nonbillable),
-            over_under: round1(billable - flatMonthlyGoal),
-            total_available_time: flatMonthlyAvailable,
-            utilization_rate: round1((billable / flatMonthlyAvailable) * 100),
-          });
-        }
-
-        const weeklyDetail = Object.entries(weeks)
-          .map(([week, data]) => ({
-            week,
-            billable: round1(data.billable),
-            nonbillable: round1(data.nonbillable),
-            total_tracked: round1(data.billable + data.nonbillable),
-            billable_goal: params.weekly_billable_goal,
-            over_under: round1(data.billable - params.weekly_billable_goal),
-          }))
-          .sort((a, b) => {
-            const parseWeek = (w: string) => {
-              const parts = w.split("-")[0].split("/");
-              return new Date(params.year, parseInt(parts[0]) - 1, parseInt(parts[1]));
-            };
-            return parseWeek(a.week).getTime() - parseWeek(b.week).getTime();
-          });
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              user: userName,
-              user_id: params.user_id,
-              year: params.year,
-              weekly_billable_goal: params.weekly_billable_goal,
-              net: {
-                billable_actual: round1(cumBillable),
-                billable_goal: round1(cumGoal),
-                nonbillable: round1(monthlySummary.reduce((s, m) => s + m.nonbillable, 0)),
-                total_time: round1(cumBillable + monthlySummary.reduce((s, m) => s + m.nonbillable, 0)),
-                over_under: round1(cumBillable - cumGoal),
-              },
-              monthly: monthlySummary,
-              weekly: weeklyDetail,
-            }, null, 2),
           }],
         };
       } catch (err: any) {

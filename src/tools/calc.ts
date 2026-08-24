@@ -26,7 +26,17 @@ function tierLabel(ytd: number): string {
   return "Tier 3 (77.5%)";
 }
 
-export function registerCalcTools(server: McpServer): void {
+/**
+ * ARCHIVED 2026-08-24 — get_attributable_collections is no longer registered on
+ * the MCP surface. The V&D Of Counsel compensation calculation now lives in a
+ * separate skill, so the server no longer needs a second path to those numbers.
+ *
+ * The source is retained verbatim (unwired) for reference, including the tier
+ * thresholds and staff-split percentages it reads from domain/vd.ts (which is
+ * deliberately left in place — test/vd.test.ts still covers applyTieredSplit).
+ * To re-expose the tool, call this from app.ts as before.
+ */
+export function registerArchivedCalcTools(server: McpServer): void {
   server.tool(
     "get_attributable_collections",
     "V&D Of Counsel compensation calculator per the Services Agreement. Gus and Courteney are treated as a JOINT UNIT for tier thresholds ($250K/$500K). Applies tiered attorney splits (82.5%/80%/77.5%), staff splits (35% V&D after 10hr/month allowance per of counsel). Uses Clio Fee Allocation Report. Always calculates from Jan 1 for accurate YTD tier placement. Optionally specify report_id from list_fee_allocation_reports to use a specific report instead of the latest.",

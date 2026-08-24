@@ -5,7 +5,10 @@ import { buildNonbillableByMonth } from "../dashboard/nonbillable";
 import { buildMonthlyCollections } from "../dashboard/collections";
 import { buildMonthlyBilled } from "../dashboard/billed";
 import { buildExcludedHoursByMonth } from "../dashboard/excludedHours";
-import { classifyYtdTimeEntries, type ClassifiedTimeEntry } from "../dashboard/classifiedHours";
+import {
+  classifyYtdTimeEntries, addToTotals, emptyTotals,
+  type ClassifiedTimeEntry, type HoursTotals,
+} from "../dashboard/classifiedHours";
 import { buildWorkedHoursSplitByMonth } from "../dashboard/workedHours";
 import { patchUtilizationBlock, appendUtilizationFirmAvg, appendRealizationFirmAvg, appendCollectionFirmAvg, ensureTabMonthBlock, type UtilHours } from "../dashboard/rateTabs";
 import { buildRealizationDollarsSheet, REALIZATION_DOLLARS_TAB, type DollarsByMonth } from "../dashboard/realizationDollars";
@@ -171,6 +174,10 @@ interface WeeklyGoalsParams {
   hours_per_day?: number;
   box_folder_id?: string;
   dashboard_file_id?: string;
+  /** Reclassify firm-internal time as nonbillable for billable_actual. Default
+   *  true. Ignored when `entries` is supplied — the batch already classified on
+   *  its own basis and both bases travel on every entry. */
+  exclude_internal?: boolean;
   /** Pre-classified YTD entries (all users OK — filtered to user_id here). The
    *  batch tool classifies the whole roster in one pass and hands each sheet its
    *  slice, so 12 sheets don't redo the /matters + candidate-matter lookups. */
@@ -194,17 +201,24 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   const endDate = new Date().toISOString().split("T")[0];
 
   // Classified with the SAME filtration as the monthly dashboard (26 Compare
-  // cols I/H): billable vs nonbillable comes STRICTLY from Clio's entry-level
-  // non_billable flag (no matter-name/type or rate heuristics), with only the
-  // synthetic fee-placeholder entries excluded — see dashboard/classifiedHours.ts.
+  // cols I/H) — see dashboard/classifiedHours.ts: Clio's entry-level
+  // non_billable flag, PLUS the firm-internal reclassification (matter's client
+  // is the firm itself, or a billable-flagged entry with rate 0 AND amount 0),
+  // with only the synthetic fee-placeholder entries excluded. Every bucket
+  // carries BOTH bases, so the sheet reports the adjusted figure while `figures`
+  // also returns the legacy flag-only one.
+  const excludeInternal = params.exclude_internal !== false;
   const entries = (params.entries
-    ?? await classifyYtdTimeEntries({ year: params.year, endDate, userIds: [params.user_id] })
+    ?? await classifyYtdTimeEntries({
+      year: params.year, endDate, userIds: [params.user_id],
+      excludeInternal,
+    })
   ).filter((e) => e.uid === params.user_id);
   const userName = entries[0]?.userName ?? "Unknown";
 
   // Group by month and week
-  const months: Record<string, { billable: number; nonbillable: number }> = {};
-  const weeks: Record<string, { billable: number; nonbillable: number }> = {};
+  const months: Record<string, HoursTotals> = {};
+  const weeks: Record<string, HoursTotals> = {};
 
   for (const e of entries) {
     if (e.cls === "excluded") continue; // fee placeholders aren't real worked time
@@ -215,11 +229,8 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
     const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
     const weekKey = `${mon.getMonth() + 1}/${mon.getDate()}-${sun.getMonth() + 1}/${sun.getDate()}`;
 
-    if (!months[monthKey]) months[monthKey] = { billable: 0, nonbillable: 0 };
-    if (!weeks[weekKey]) weeks[weekKey] = { billable: 0, nonbillable: 0 };
-
-    months[monthKey][e.cls] += e.hours;
-    weeks[weekKey][e.cls] += e.hours;
+    addToTotals(months[monthKey] ??= emptyTotals(), e);
+    addToTotals(weeks[weekKey] ??= emptyTotals(), e);
   }
 
   function getWorkingDays(year: number, month: number): number {
@@ -276,6 +287,9 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow(["Month", "Billable Goal", "Billable Actual", "Over/Under", "Nonbillable", "Total", "Available", "Utilization %"]).font = { bold: true };
 
   let cumBillable = 0, cumGoal = 0, monthsCounted = 0;
+  // Legacy flag-only YTD billable plus the internal-adjustment breakdown, so the
+  // sheet and its `figures` payload always reconcile the two bases explicitly.
+  let cumBillableRaw = 0, cumInternal = 0, cumFirmSelf = 0, cumZeroValue = 0, cumFirmSelfRated = 0;
   const currentMonth = new Date().getMonth() + 1; // 1-indexed
   const isCurrentYear = params.year === new Date().getFullYear();
 
@@ -291,12 +305,17 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
 
   for (let m = 1; m <= 12; m++) {
     const key = `${params.year}-${String(m).padStart(2, "0")}`;
-    const data = months[key] || { billable: 0, nonbillable: 0 };
+    const data = months[key] || emptyTotals();
     const goal = flatMonthlyGoal;
     const avail = flatMonthlyAvailable;
     // Only accumulate YTD totals for months up to current month (or all months for past years)
     if (!isCurrentYear || m <= currentMonth) {
       cumBillable += data.billable; cumGoal += goal; monthsCounted++;
+      cumBillableRaw += data.billableRaw;
+      cumInternal += data.internalHours;
+      cumFirmSelf += data.firmSelfClientHours;
+      cumZeroValue += data.zeroValueHours;
+      cumFirmSelfRated += data.firmSelfClientRatedHours;
     }
     const ou = round1(data.billable - goal);
     const util = round1((data.billable / availPerMonth) * 100);
@@ -327,8 +346,18 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   ws1.addRow([`${utilGoalPct}%`, `Billable ÷ available hours (${params.weekly_billable_goal}/wk × 47 ÷ 1,880)`]);
   ws1.addRow(["Firm targets: 75% (partners & paralegals), 80% (associates)."])
     .font = { italic: true, color: { argb: "FF666666" } };
-  ws1.addRow(["Hours use the firm dashboard's filtration: billable vs nonbillable follows each entry's Clio non-billable flag (rate and matter are ignored); synthetic fee-placeholder entries are excluded."])
+  ws1.addRow([excludeInternal
+    ? "Hours use the firm dashboard's filtration: billable vs nonbillable follows each entry's Clio non-billable flag, AND firm-internal time is reclassified as nonbillable — matters whose client is Romano & Sumner, LLC (e.g. 02888-Admin, 00050-Potential Clients) plus billable-flagged entries with a $0 rate and $0 amount. Synthetic fee-placeholder entries are excluded."
+    : "Hours use the LEGACY filtration: billable vs nonbillable follows each entry's Clio non-billable flag only (rate and matter are ignored); synthetic fee-placeholder entries are excluded."])
     .font = { italic: true, color: { argb: "FF666666" } };
+  if (excludeInternal && cumInternal > 0.05) {
+    ws1.addRow([`Internal-time adjustment: ${round1(cumInternal)} YTD hrs moved from billable to nonbillable (firm-self-client ${round1(cumFirmSelf)} hrs, $0 rate+amount ${round1(cumZeroValue)} hrs). YTD billable on the legacy flag-only basis: ${round1(cumBillableRaw)} hrs.`])
+      .font = { italic: true, color: { argb: "FF666666" } };
+    if (cumFirmSelfRated > 0.05) {
+      ws1.addRow([`Of that, ${round1(cumFirmSelfRated)} hrs were booked at a RATE on a firm-self-client matter — check whether that is real client work filed under the firm's own client rather than internal time.`])
+        .font = { italic: true, color: { argb: "FFC00000" } };
+    }
+  }
 
   // Weekly sheet: horizontal layout - weeks as columns, metrics as rows
   const ws2 = wb.addWorksheet("Weekly");
@@ -428,10 +457,11 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
   }
   let figures: any = null;
   if (lastStartedIdx >= 0) {
-    const wk = weeks[allWeeks[lastStartedIdx].key] ?? { billable: 0, nonbillable: 0 };
-    let t4Sum = 0, t4Cnt = 0;
+    const wk = weeks[allWeeks[lastStartedIdx].key] ?? emptyTotals();
+    let t4Sum = 0, t4SumRaw = 0, t4Cnt = 0;
     for (let j = Math.max(0, lastStartedIdx - 3); j <= lastStartedIdx; j++) {
       t4Sum += weeks[allWeeks[j].key]?.billable ?? 0;
+      t4SumRaw += weeks[allWeeks[j].key]?.billableRaw ?? 0;
       t4Cnt++;
     }
     figures = {
@@ -442,11 +472,27 @@ async function downloadWeeklyGoals(params: WeeklyGoalsParams): Promise<{
       week_goal: params.weekly_billable_goal,
       week_over_under: round1(wk.billable - params.weekly_billable_goal),
       trailing_4wk_avg_billable: round1(t4Sum / t4Cnt),
+      trailing_4wk_avg_billable_raw: round1(t4SumRaw / t4Cnt),
       ytd_weekly_over_under: round1(cumWeeklyOU),
       ytd_billable: round1(cumBillable),
       ytd_goal: round1(cumGoal),
       ytd_over_under: round1(cumBillable - cumGoal),
       ytd_utilization_pct: ytdUtil,
+      // Legacy flag-only basis, kept so the sheet reconciles to the
+      // pre-adjustment 26 Compare col I. The delta is internal_reclassified.
+      exclude_internal: excludeInternal,
+      week_billable_raw: round1(wk.billableRaw),
+      ytd_billable_raw: round1(cumBillableRaw),
+      ytd_over_under_raw: round1(cumBillableRaw - cumGoal),
+      ytd_utilization_raw_pct: monthsCounted > 0
+        ? round1((cumBillableRaw / (availPerMonth * monthsCounted)) * 100) : 0,
+      internal_reclassified_ytd: round1(cumInternal),
+      internal_firm_self_client_ytd: round1(cumFirmSelf),
+      internal_zero_rate_and_amount_ytd: round1(cumZeroValue),
+      // Firm-self-client hours that carried a RATE — internal time is normally
+      // $0, so a material figure means rule (a) caught real client work filed
+      // under the firm's own client. See dashboard/classifiedHours.ts.
+      internal_firm_self_client_rated_ytd: round1(cumFirmSelfRated),
       prior_month_collections: collectionsValue != null
         ? { month: collectionsLabel, amount: round2(collectionsValue) }
         : null,
@@ -562,6 +608,7 @@ interface MonthlyGoalsSummaryParams {
   year: number;
   box_folder_id?: string;
   close_threshold_pct?: number;
+  exclude_internal?: boolean;
 }
 
 async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): Promise<{
@@ -580,11 +627,14 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
   const endDate = `${params.year}-12-31`;
 
   // Same dashboard filtration as the weekly sheets (classifiedHours.ts): the
-  // chart tracks billable vs goal only, where billable = worked time whose
-  // Clio non_billable flag is false, minus fee placeholders — matching
-  // 26 Compare col I. No matter-name/type or rate heuristics.
+  // chart tracks billable vs goal only, where billable = worked time whose Clio
+  // non_billable flag is false AND which isn't firm-internal (the matter's
+  // client is the firm itself, or the entry is billable-flagged at rate 0 and
+  // amount 0), minus fee placeholders — matching 26 Compare col I. Matter
+  // names/numbers/types are still never consulted.
   const entries = await classifyYtdTimeEntries({
     year: params.year, endDate, userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
+    excludeInternal: params.exclude_internal,
   });
 
   // billableByUser[user_id][monthIdx] = billable hours
@@ -740,399 +790,22 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
 export function registerDocumentTools(server: McpServer): void {
 
   // ============================================================
-  // TOOL 1: download_vd_statement
-  // ============================================================
-  server.tool(
-    "download_vd_statement",
-    "Generate a V&D Of Counsel compensation statement as a downloadable Word document. Includes cover letter from Rachel Trevino, compensation summary with tier breakdown, timekeeper detail, and payment history. Returns a short-lived direct_download_url (1-hour TTL) for the generated .docx.",
-    {
-      month: z.coerce.number().describe("Month number (1-12)"),
-      year: z.coerce.number().describe("Year (e.g. 2026)"),
-    },
-    async (params) => {
-      try {
-        const monthNames = MONTH_NAMES_FULL;
-        const monthName = monthNames[params.month - 1];
-        const startDate = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
-        const endDay = new Date(params.year, params.month, 0).getDate();
-        const endDate = `${params.year}-${String(params.month).padStart(2, "0")}-${endDay}`;
-
-        // Get users
-        const allUsers = await fetchAllPages<any>("/users", { fields: "id,name,enabled" });
-        const users = allUsers.map((u: any) => ({ id: u.id, name: u.name }));
-        const gus = users.find((u) => u.name.toLowerCase().includes("gus"));
-        const courtney = users.find((u) => u.name.toLowerCase().includes("courtney") || u.name.toLowerCase().includes("courteney"));
-        const vdAttorneys = [gus, courtney].filter(Boolean) as { id: number; name: string }[];
-        const vdLastNames = vdAttorneys.map(a => a.name.toLowerCase().split(" ").pop() ?? "");
-
-        // Get fee allocation CSV
-        const { rows: csvRows } = await getFeeAllocationCSV();
-
-        // Filter V&D rows
-        const vdRows = csvRows.filter(r => {
-          const ra = (r["Responsible Attorney"] ?? "").toLowerCase();
-          return vdLastNames.some(ln => ra.includes(ln));
-        });
-
-        // Classify rows
-        const classified = vdRows.map(r => ({
-          responsible: r["Responsible Attorney"] ?? "Unknown",
-          user: r["User"] ?? "Unknown",
-          isAttorneyTime: vdLastNames.some(ln => (r["User"] ?? "").toLowerCase().includes(ln)),
-          collected: parseFloat(r["Billed Time Collected"] || r["Total Funds Collected"] || "0"),
-          hours: parseFloat(r["Billed Hours"] || "0"),
-        }));
-
-        // Calculate splits (pooled tiers)
-        let combinedYTD = 0;
-        const perAtty: Record<string, { attyCollected: number; attyVD: number; attyFirm: number; staffCollected: number; staffVD: number; staffFirm: number; tks: Record<string, { collected: number; hours: number }> }> = {};
-        for (const a of vdAttorneys) {
-          perAtty[a.name] = { attyCollected: 0, attyVD: 0, attyFirm: 0, staffCollected: 0, staffVD: 0, staffFirm: 0, tks: {} };
-        }
-
-        // Attorney time
-        const attyRows = classified.filter(c => c.isAttorneyTime);
-        const totalAttyCollected = attyRows.reduce((s, c) => s + c.collected, 0);
-        const attySplit = applyTieredSplit(totalAttyCollected, combinedYTD);
-        combinedYTD = attySplit.ytdAfter;
-
-        for (const c of attyRows) {
-          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
-          if (!pa) continue;
-          const prop = totalAttyCollected > 0 ? c.collected / totalAttyCollected : 0;
-          pa.attyCollected += c.collected;
-          pa.attyVD += attySplit.vd * prop;
-          pa.attyFirm += attySplit.firm * prop;
-        }
-
-        // Staff time
-        const staffRows = classified.filter(c => !c.isAttorneyTime);
-        for (const c of staffRows) {
-          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
-          if (!pa) continue;
-          const split = applyTieredSplit(c.collected, combinedYTD);
-          combinedYTD = split.ytdAfter;
-          pa.staffCollected += c.collected;
-          pa.staffVD += split.vd;
-          pa.staffFirm += split.firm;
-        }
-
-        // Timekeeper breakdown
-        for (const c of classified) {
-          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
-          if (!pa) continue;
-          if (!pa.tks[c.user]) pa.tks[c.user] = { collected: 0, hours: 0 };
-          pa.tks[c.user].collected += c.collected;
-          pa.tks[c.user].hours += c.hours;
-        }
-
-        // Tier breakdown
-        const tier1 = Math.min(combinedYTD, 250000);
-        const tier2 = Math.min(Math.max(combinedYTD - 250000, 0), 250000);
-        const tier3 = Math.max(combinedYTD - 500000, 0);
-
-        const grandCollected = Object.values(perAtty).reduce((s, a) => s + a.attyCollected + a.staffCollected, 0);
-        const grandVD = Object.values(perAtty).reduce((s, a) => s + a.attyVD + a.staffVD, 0);
-        const grandFirm = Object.values(perAtty).reduce((s, a) => s + a.attyFirm + a.staffFirm, 0);
-
-        // Generate letter date (15th of next month)
-        const nextMonth = params.month === 12 ? 1 : params.month + 1;
-        const nextYear = params.month === 12 ? params.year + 1 : params.year;
-        const letterDate = new Date(nextYear, nextMonth - 1, 15).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-
-        // ===== BUILD DOCUMENT =====
-        const doc = new Document({
-          styles: {
-            default: { document: { run: { font: "Arial", size: 20 } } },
-            paragraphStyles: [
-              { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true, run: { size: 28, bold: true, font: "Arial", color: "2E4057" }, paragraph: { spacing: { before: 240, after: 120 }, outlineLevel: 0 } },
-              { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true, run: { size: 24, bold: true, font: "Arial", color: "2E4057" }, paragraph: { spacing: { before: 180, after: 120 }, outlineLevel: 1 } },
-            ],
-          },
-          sections: [{
-            properties: {
-              ...pageProps,
-              headers: {
-                default: new Header({ children: [
-                  new Paragraph({ alignment: AlignmentType.CENTER, children: [$("Romano & Sumner, PLLC", { size: 28, bold: true, color: "2E4057" })] }),
-                  new Paragraph({ alignment: AlignmentType.CENTER, children: [$("Of Counsel Compensation Statement", { size: 22, color: "666666" })] }),
-                  new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 120 }, children: [$(`Period: ${monthName} ${params.year}`, { size: 20, color: "666666" })] }),
-                ] }),
-              },
-              footers: {
-                default: new Footer({ children: [
-                  new Paragraph({ alignment: AlignmentType.CENTER, children: [
-                    $("Generated from Clio Fee Allocation Report  |  Romano & Sumner, PLLC Confidential  |  Page ", { size: 16, color: "999999" }),
-                    new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: "999999" }),
-                  ] }),
-                ] }),
-              },
-            } as any,
-            children: [
-              // PAGE 1: COVER LETTER
-              makePara(letterDate, { size: 22, spacingAfter: 200 }),
-              makePara(`Re: Of Counsel Compensation - ${monthName} ${params.year}`, { bold: true, size: 22, spacingAfter: 200 }),
-              makePara("Dear Gus and Courteney:", { size: 22, spacingAfter: 200 }),
-              makePara(`Enclosed please find a check in the amount of ${fmt(round2(grandVD))} for V&D compensation for the month of ${monthName} ${params.year}.`, { size: 22, spacingAfter: 120 }),
-              ...vdAttorneys.map(a => {
-                const pa = perAtty[a.name];
-                const total = round2(pa.attyVD + pa.staffVD);
-                return new Paragraph({ spacing: { after: 60 }, children: [
-                  $(`    ${a.name}: `, { size: 22 }),
-                  $(fmt(total), { size: 22, bold: true }),
-                ] });
-              }),
-              makePara("", { spacingAfter: 120 }),
-              makePara("Please see the attached compensation statement for a detailed breakdown of collections, tier calculations, and payment history.", { size: 22, spacingAfter: 200 }),
-              makePara("Please do not hesitate to reach out with any questions.", { size: 22, spacingAfter: 400 }),
-              makePara("Sincerely,", { size: 22, spacingAfter: 400 }),
-              makePara("Rachel Trevino", { size: 22, spacingAfter: 0 }),
-              makePara("Executive Director", { size: 22, spacingAfter: 0 }),
-              makePara("Romano & Sumner, PLLC", { size: 22, spacingAfter: 200 }),
-
-              // PAGE 2: SUMMARY
-              pageBreak(),
-              makePara(`V&D Compensation Statement - ${monthName} ${params.year}`, { bold: true, size: 28, alignment: AlignmentType.CENTER, spacingAfter: 200 }),
-              spacer(),
-              (() => {
-                const rows: string[][] = [];
-                for (const a of vdAttorneys) {
-                  const pa = perAtty[a.name];
-                  const firstName = a.name.split(" ")[0];
-                  rows.push([a.name, "", "", ""]);
-                  rows.push(["  Attorney Time", fmt(round2(pa.attyCollected)), fmt(round2(pa.attyVD)), fmt(round2(pa.attyFirm))]);
-                  rows.push(["  Staff Time (allowance)", fmt(round2(pa.staffCollected)), fmt(round2(pa.staffVD)), fmt(round2(pa.staffFirm))]);
-                  rows.push(["  Staff Time (regular)", fmt(0), fmt(0), fmt(0)]);
-                  rows.push([`  ${firstName} Subtotal`, fmt(round2(pa.attyCollected + pa.staffCollected)), fmt(round2(pa.attyVD + pa.staffVD)), fmt(round2(pa.attyFirm + pa.staffFirm))]);
-                  rows.push(["", "", "", ""]);
-                }
-                rows.push(["V&D Total", fmt(round2(grandCollected)), fmt(round2(grandVD)), fmt(round2(grandFirm))]);
-                rows.push(["", "", "", ""]);
-                rows.push([`Tier 1 ($0-$250K @ 82.5%)`, fmt(round2(tier1)), "", ""]);
-                rows.push([`Tier 2 ($250K-$500K @ 80%)`, fmt(round2(tier2)), "", ""]);
-                rows.push([`Tier 3 ($500K+ @ 77.5%)`, fmt(round2(tier3)), "", ""]);
-                return makeDocxTable(["", "Collected", "V&D Share", "Firm Share"], rows, [3200, 2100, 2100, 1960]);
-              })(),
-              spacer(),
-              makePara(`Amount Due to V&D for ${monthName}: ${fmt(round2(grandVD))}`, { bold: true, size: 24, spacingAfter: 200 }),
-
-              // PAGE 3: DETAIL
-              pageBreak(),
-              h2("Timekeeper Detail"),
-              spacer(),
-              (() => {
-                const rows: string[][] = [];
-                for (const a of vdAttorneys) {
-                  const pa = perAtty[a.name];
-                  for (const [name, data] of Object.entries(pa.tks).sort(([,a],[,b]) => b.collected - a.collected)) {
-                    rows.push([a.name, name, String(round1(data.hours)), fmt(round2(data.collected))]);
-                  }
-                  rows.push(["", "", "", ""]);
-                }
-                return makeDocxTable(["Responsible Attorney", "Timekeeper", "Hours", "Collected"], rows, [2400, 2400, 1280, 3280]);
-              })(),
-              spacer(), spacer(),
-              h2("Payment History (YTD)"),
-              spacer(),
-              ...vdAttorneys.flatMap(a => {
-                const pa = perAtty[a.name];
-                const total = round2(pa.attyCollected + pa.staffCollected);
-                const vd = round2(pa.attyVD + pa.staffVD);
-                return [
-                  makePara(a.name, { bold: true, spacingAfter: 80 }),
-                  makeDocxTable(
-                    ["Month", "Collections", "V&D Share", "Amount Paid", "Date Paid"],
-                    [
-                      [monthName, fmt(total), fmt(vd), "__________", "__________"],
-                      ["YTD Total", fmt(total), fmt(vd), "", ""],
-                    ],
-                    [1800, 1900, 1900, 1900, 1860]
-                  ),
-                  spacer(),
-                ];
-              }),
-            ],
-          }],
-        });
-
-        const buffer = await Packer.toBuffer(doc);
-        const filename = `V&D Compensation Statement - ${monthName} ${params.year}.docx`;
-        const size_kb = Math.round(buffer.length / 1024);
-        console.warn(`[Doc] download_vd_statement — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
-        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              filename,
-              format: "docx",
-              size_kb,
-              direct_download_url: reg.url,
-              expires_at: reg.expires_at,
-              note: "Download the file from direct_download_url within 1 hour.",
-              summary: {
-                period: `${monthName} ${params.year}`,
-                total_vd_compensation: fmt(round2(grandVD)),
-                attorneys: vdAttorneys.map(a => ({ name: a.name, vd: fmt(round2(perAtty[a.name].attyVD + perAtty[a.name].staffVD)) })),
-              },
-            }),
-          }],
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // ============================================================
-  // TOOL 2: download_firm_scorecard
-  // ============================================================
-  server.tool(
-    "download_firm_scorecard",
-    "Generate the firm-wide development meeting scorecard as a downloadable Excel file. Includes weekly and monthly data for all timekeepers. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible.",
-    {
-      week_of: z.string().optional().describe("Date within the target week (YYYY-MM-DD). Defaults to today."),
-      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
-    },
-    async (params) => {
-      try {
-        const ROSTER = SCORECARD_ROSTER;
-
-        const targetDate = params.week_of ?? new Date().toISOString().split("T")[0];
-        const d = new Date(targetDate + "T12:00:00");
-        const day = d.getDay();
-        const monday = new Date(d); monday.setDate(d.getDate() - ((day + 6) % 7));
-        const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
-        const fmtDate = (dt: Date) => dt.toISOString().split("T")[0];
-        const weekStart = fmtDate(monday);
-        const weekEnd = fmtDate(sunday);
-        const weekLabel = `${monday.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${sunday.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
-
-        const monthStart = `${targetDate.slice(0, 7)}-01`;
-        const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-        const monthEnd = fmtDate(mEnd);
-        const monthLabel = d.toLocaleDateString("en-US", { month: "long", year: "numeric" });
-
-        // Fetch time entries for the month (covers the week too)
-        const entries = await fetchAllPages<any>("/activities", {
-          type: "TimeEntry",
-          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
-          created_since: `${monthStart}T00:00:00+00:00`,
-        }).then(e => e.filter((x: any) => x.date >= monthStart && x.date <= monthEnd));
-
-        // Build per-user weekly + monthly data
-        const userData: Record<number, { weekBillable: number; weekNonbillable: number; monthBillable: number; monthNonbillable: number; monthBilledHrs: number; monthUnbilledHrs: number; monthBillableDollars: number }> = {};
-        for (const r of ROSTER) {
-          userData[r.user_id] = { weekBillable: 0, weekNonbillable: 0, monthBillable: 0, monthNonbillable: 0, monthBilledHrs: 0, monthUnbilledHrs: 0, monthBillableDollars: 0 };
-        }
-
-        for (const e of entries) {
-          const uid = e.user?.id;
-          if (!uid || !userData[uid]) continue;
-          // Use rounded_quantity (billed hours) not raw quantity (actual tracked).
-          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
-          const isBillable = (e.price || 0) > 0;
-          const inWeek = e.date >= weekStart && e.date <= weekEnd;
-
-          if (isBillable) {
-            userData[uid].monthBillable += hours;
-            userData[uid].monthBillableDollars += hours * (e.price || 0);
-            if (e.billed) userData[uid].monthBilledHrs += hours; else userData[uid].monthUnbilledHrs += hours;
-            if (inWeek) userData[uid].weekBillable += hours;
-          } else {
-            userData[uid].monthNonbillable += hours;
-            if (inWeek) userData[uid].weekNonbillable += hours;
-          }
-        }
-
-        // Build Excel
-        const wb = new ExcelJS.Workbook();
-
-        // Weekly sheet
-        const ws1 = wb.addWorksheet("Weekly");
-        ws1.columns = [
-          { header: "Initials", key: "initials", width: 10 },
-          { header: "Name", key: "name", width: 25 },
-          { header: "Billable", key: "billable", width: 12 },
-          { header: "Nonbillable", key: "nonbillable", width: 14 },
-          { header: "Total", key: "total", width: 12 },
-        ];
-        ws1.getRow(1).font = { bold: true };
-        ws1.mergeCells("A1:E1");
-        ws1.getCell("A1").value = `Weekly Scorecard: ${weekLabel}`;
-        ws1.getCell("A1").font = { bold: true, size: 14 };
-        ws1.addRow({}); // blank
-        const hRow1 = ws1.addRow(["Initials", "Name", "Billable", "Nonbillable", "Total"]);
-        hRow1.font = { bold: true };
-
-        for (const r of ROSTER) {
-          const d = userData[r.user_id];
-          ws1.addRow([r.initials, r.name, round1(d.weekBillable), round1(d.weekNonbillable), round1(d.weekBillable + d.weekNonbillable)]);
-        }
-
-        // Monthly sheet
-        const ws2 = wb.addWorksheet("Monthly");
-        ws2.mergeCells("A1:H1");
-        ws2.getCell("A1").value = `Monthly Scorecard: ${monthLabel}`;
-        ws2.getCell("A1").font = { bold: true, size: 14 };
-        ws2.addRow({});
-        const hRow2 = ws2.addRow(["Initials", "Name", "Billable Hrs", "Billable $", "Billed Hrs", "Unbilled Hrs", "Nonbillable", "Total"]);
-        hRow2.font = { bold: true };
-
-        for (const r of ROSTER) {
-          const d = userData[r.user_id];
-          ws2.addRow([
-            r.initials, r.name,
-            round1(d.monthBillable), round2(d.monthBillableDollars),
-            round1(d.monthBilledHrs), round1(d.monthUnbilledHrs),
-            round1(d.monthNonbillable),
-            round1(d.monthBillable + d.monthNonbillable),
-          ]);
-        }
-
-        // Format currency column
-        ws2.getColumn(4).numFmt = '"$"#,##0.00';
-
-        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
-        const filename = `Firm Scorecard - ${weekLabel.replace(/\//g, "-")}.xlsx`;
-        const size_kb = Math.round(buffer.byteLength / 1024);
-
-        if (params.box_folder_id !== undefined) {
-          const folderId = params.box_folder_id || "375771584500";
-          const result = await uploadToBox({ buffer, filename, folderId });
-          if (result.uploaded) {
-            return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
-          }
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, filename, size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note }) }] };
-        }
-
-        console.warn(`[Doc] download_firm_scorecard — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
-        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, note: "Download the file from direct_download_url within 1 hour." }) }],
-        };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
-      }
-    }
-  );
-
-  // ============================================================
   // TOOL 3: download_weekly_goals
   // ============================================================
   server.tool(
     "download_weekly_goals",
-    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. Hours use the SAME filtration as the firm dashboard (26 Compare): billable vs nonbillable follows each entry's native Clio non-billable flag (matter names/types and rates are never consulted — internal work booked at a dollar rate but flagged non-billable counts as nonbillable), with only synthetic fee-placeholder entries excluded — so the sheet's Utilization % reconciles to the dashboard's Utilization tab. The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
+    "Generate an individual weekly goals Excel sheet for a specific timekeeper. Includes monthly and weekly breakdowns with goals and over/under tracking. " +
+    "BILLABLE CLASSIFICATION NOW CONSULTS THE MATTER'S CLIENT AND THE ENTRY'S RATE, not just the Clio non-billable flag. An entry counts as nonbillable when its native non_billable flag is set, OR — when exclude_internal is true (the DEFAULT) — when either (a) the matter's client is the firm itself, Romano & Sumner, LLC (the structural signal: catches 02888-Admin, 00050-Potential Clients and any future internal matter automatically), or (b) the entry is billable-flagged but carries rate 0 AND amount 0 (the rate-based safety net for internal time booked under another client). Reclassified hours MOVE to nonbillable rather than disappearing, so total tracked time is identical on both bases; synthetic fee-placeholder entries are still dropped from both. " +
+    "The sheet and its Utilization % are on the ADJUSTED basis; the firm dashboard (26 Compare col I and the Utilization tab) uses the same adjusted basis, so the two still reconcile. " +
+    "The response always includes a `figures` object (current-week and YTD billable vs goal, trailing 4-week average, utilization, prior-month collections) so results can be read without opening the workbook, plus the legacy flag-only twins — ytd_billable_raw, ytd_over_under_raw, ytd_utilization_raw_pct, week_billable_raw, trailing_4wk_avg_billable_raw — and internal_reclassified_ytd broken out by rule, so the two bases always reconcile explicitly. " +
+    "Also returns either box_url (uploaded) or a short-lived direct_download_url (1-hour TTL) the user can click to download the file.",
     {
       user_id: z.coerce.number().describe("User/timekeeper ID"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
       weekly_billable_goal: z.coerce.number().describe("Weekly billable hours goal (30 for partners/paras, 32 for associates). Monthly goal is derived as weekly × 47 ÷ 12 to match the dashboard."),
       hours_per_day: z.coerce.number().optional().default(8).describe("Hours in a work day (default 8)"),
       box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
+      exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time as nonbillable when computing billable hours: matters whose client is the firm itself (Romano & Sumner, LLC), plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only basis, where the billable figure equals its _raw counterpart."),
     },
     async (params) => {
       try {
@@ -1142,6 +815,7 @@ export function registerDocumentTools(server: McpServer): void {
           weekly_billable_goal: params.weekly_billable_goal,
           hours_per_day: params.hours_per_day,
           box_folder_id: params.box_folder_id,
+          exclude_internal: params.exclude_internal,
         });
 
         if (result.box_file_id) {
@@ -1162,7 +836,8 @@ export function registerDocumentTools(server: McpServer): void {
   server.tool(
     "download_all_weekly_goals",
     "Update the weekly goals spreadsheet for all firm timekeepers, uploading to Box in parallel. " +
-    "Hours use the same filtration as the firm dashboard (billable vs nonbillable from each entry's Clio non-billable flag, fee placeholders excluded), classified once for the whole roster. " +
+    "BILLABLE CLASSIFICATION NOW CONSULTS THE MATTER'S CLIENT AND THE ENTRY'S RATE, not just the Clio non-billable flag. An entry counts as nonbillable when its native non_billable flag is set, OR — when exclude_internal is true (the DEFAULT) — when either (a) the matter's client is the firm itself, Romano & Sumner, LLC (the structural signal: catches 02888-Admin, 00050-Potential Clients and any future internal matter automatically), or (b) the entry is billable-flagged but carries rate 0 AND amount 0 (the rate-based safety net for internal time booked under another client). Reclassified hours MOVE to nonbillable rather than disappearing, so total tracked time is identical on both bases; synthetic fee-placeholder entries are still dropped from both. " +
+    "The roster is classified ONCE for the whole firm and each sheet is handed its slice. Each per-person `figures` payload carries both bases (billable plus its _raw twin) and internal_reclassified_ytd. " +
     "The full batch regenerates every sheet from Clio time entries and can exceed the MCP client's ~180s timeout, " +
     "so it runs as a background job: this tool returns a job_id immediately — poll get_dashboard_status with it " +
     "for the per-person results (status, box_url, and key figures for each timekeeper). No arguments required.",
@@ -1171,10 +846,12 @@ export function registerDocumentTools(server: McpServer): void {
       box_folder_id: z.string().optional().describe(
         "Box folder ID to upload to. Omit or pass empty string for default folder."
       ),
+      exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time as nonbillable when computing billable hours: matters whose client is the firm itself (Romano & Sumner, LLC), plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only basis, where the billable figure equals its _raw counterpart."),
     },
-    async ({ year, box_folder_id }) => {
+    async ({ year, box_folder_id, exclude_internal }) => {
       const targetYear = year ?? new Date().getFullYear();
       const folderId = box_folder_id ?? "";
+      const excludeInternal = exclude_internal !== false;
 
       const jobId = `wkgoals_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
       const job: DashJob = { id: jobId, status: "running", started_at: new Date().toISOString() };
@@ -1192,6 +869,7 @@ export function registerDocumentTools(server: McpServer): void {
         year: targetYear,
         endDate: new Date().toISOString().split("T")[0],
         userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
+        excludeInternal,
       });
 
 
@@ -1202,6 +880,7 @@ export function registerDocumentTools(server: McpServer): void {
             weekly_billable_goal: goal,
             year: targetYear,
             box_folder_id: folderId,
+            exclude_internal: excludeInternal,
             entries: allEntries,
           }).then((res: any) => {
             const uploaded = !!res.box_file_id;
@@ -1291,12 +970,13 @@ export function registerDocumentTools(server: McpServer): void {
     "download_monthly_goals_summary",
     "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
     "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
-    "Billable hours use the same filtration as the firm dashboard (each entry's Clio non-billable flag decides billable vs nonbillable; synthetic fee placeholders excluded), so the YTD Utilization % row reconciles to the dashboard. " +
+    "Billable hours use the same filtration as the firm dashboard: each entry's Clio non-billable flag, PLUS the firm-internal reclassification when exclude_internal is true (the default) — matters whose client is the firm itself (Romano & Sumner, LLC) and billable-flagged entries with rate 0 AND amount 0 count as nonbillable, so rate and the matter's client ARE consulted. Synthetic fee placeholders are excluded. 26 Compare col I and its Utilization tab use this same adjusted basis, so the YTD Utilization % row still reconciles to the dashboard. " +
     "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run).",
     {
       year: z.coerce.number().optional().describe("Year (defaults to current year)"),
       box_folder_id: z.string().optional().describe("Box folder ID. Defaults to the Monthly Measureables folder."),
       close_threshold_pct: z.coerce.number().optional().describe("Percent of monthly goal that still counts as 'close' (yellow). Default 90."),
+      exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time as nonbillable when computing billable hours: matters whose client is the firm itself (Romano & Sumner, LLC), plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only basis."),
     },
     async (params) => {
       try {
@@ -1304,6 +984,7 @@ export function registerDocumentTools(server: McpServer): void {
           year: params.year ?? new Date().getFullYear(),
           box_folder_id: params.box_folder_id,
           close_threshold_pct: params.close_threshold_pct,
+          exclude_internal: params.exclude_internal,
         });
 
         if (result.box_file_id) {
@@ -1649,7 +1330,7 @@ export function registerDocumentTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "download_dashboard_update",
-    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable category columns D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888) — an informational breakdown only; TNB col H is the TOTAL of entries flagged non-billable in Clio (the entry-level non_billable flag decides billable vs nonbillable — matter names/types and rates are never consulted — so col H can exceed D+E+F+G when internal matters outside the four categories carry flagged non-billable time); collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual'), by RESPONSIBLE attorney (col S 'Collected Actual' under the Responsible Attorney group), and by ORIGINATING attorney (col V 'Originating'). Fees from billers / responsible / originating attorneys not on the roster are pooled into the 'NRB' row so Σ col N == Σ col S == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL hours WORKED that month whose Clio non_billable flag is false (activity/work-date basis, billed or not), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour billable-flagged entries whose rate doesn't match the timekeeper's standard hourly rate); real worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the 'Utilization' tab (billable = worked billable hours; nonbillable = flagged non-billable hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted nonbillable and collapsed it to ~0; the Total and Untracked columns are recomputed from Billable+Nonbillable so they can't drift from the patched hours) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from auto-generated Clio Client Activity reports — one per month patched) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab (target month only). ALSO patches the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report per patched month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source the target month from a specific pre-generated Realization report. All three rate tabs honor backfill_ytd: a normal run patches only the TARGET month's block, while backfill_ytd=true re-derives EVERY YTD month block (generating one Client Activity / Fee Allocation report per month) — use it for a one-time historical correction of stale months. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization', 'Realization' and 'Collection' tabs (the Realization and Collection tables carry a 'data as of' date, because a maturing cohort read at two dates gives two different, both correct, numbers): one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
+    "Update Rachel's firm dashboard (the 'Claude Version 2' workbook in Box) for the specified month. Sources actual billed figures (billed $, write-offs, line discounts, billable hours — by timekeeper AND responsible attorney), not a hours×rate reconstruction. Revenue source, in priority order: (1) revenue_csv_box_file_id — a month×user 'Revenue Report (Like Classic)' CSV in Box (covers all YTD months in one file); (2) revenue_report_id — same month×user shape from Clio /reports; (3) DEFAULT — replicates Rachel's manual classic method: generates a per-timekeeper classic revenue report for each roster member plus one firm-wide report, for the TARGET MONTH only, on demand (revenue honors the date range). Nonbillable category columns D/E/F/G come from a targeted /activities query on the admin matters (Biz Dev 00706 + Website 00316, Potential Clients 00050, CLE 00707, Other Admin 02888) — an informational breakdown only; TNB col H is the TOTAL of nonbillable time on the ADJUSTED basis: entries flagged non-billable in Clio, PLUS firm-internal time reclassified out of billable (see col I) — so col H can exceed D+E+F+G when internal matters outside the four categories carry flagged non-billable or firm-internal time; collections from per-month PAYMENT-FILTERED Fee Allocation reports (payment-received basis). The month×user sources rewrite all YTD months; the classic default writes the target month only (for hours/billed). Each nonbillable category is the time booked to its admin matter(s); Other Admin = matter 02888-Admin. Collections come from PAYMENT-FILTERED Fee Allocation reports (filter_by_payment=true) generated one-per-month — money actually received each month, FEES ONLY (Billed Time Collected; excludes collected expenses/interest/tax), allocated by working timekeeper (col N 'Collected Actual'), by RESPONSIBLE attorney (col S 'Collected Actual' under the Responsible Attorney group), and by ORIGINATING attorney (col V 'Originating'). Fees from billers / responsible / originating attorneys not on the roster are pooled into the 'NRB' row so Σ col N == Σ col S == Σ col V == firm fees. This is the payment-received basis: it captures payments on prior-year invoices; each month's report period is verified (assertReportPeriod) before it is written. Billed $ (col K) is on the INVOICE-ISSUE-DATE basis (the Billed Time that appeared on bills issued that month — issued invoices only, no unbilled WIP), from one per-month Fee Allocation report, with a configurable billing-month cutoff (billed_cutoff_day, default 0 = count each bill in its calendar issue month, matching Rachel; set N>0 to roll bills issued in the first N days of a month back into the prior month's run). Billable Hours (col I) is ALL hours WORKED that month whose Clio non_billable flag is false AND which are not FIRM-INTERNAL (activity/work-date basis, billed or not), minus ONLY Rachel's synthetic 1-hour contingency/flat fee-placeholder entries (single-hour billable-flagged entries whose rate doesn't match the timekeeper's standard hourly rate); real RATED worked time on contingency/flat matters still counts, and the fee dollars still count in col K and in collections. FIRM-INTERNAL (excluded from col I, moved into col H, when exclude_internal is true — the DEFAULT) means either (a) the matter's client is the firm itself, Romano & Sumner, LLC — the structural signal, catching 02888-Admin, 00050-Potential Clients and any future internal matter automatically — or (b) the entry is billable-flagged but carries rate 0 AND amount 0, the rate-based safety net. So the matter's CLIENT and the entry's RATE/AMOUNT ARE now consulted for billable classification; matter names, numbers, types and practice areas still never are. The adjustment MOVES hours from col I to col H, so col J (total worked) and the Utilization tab's Untracked column are unaffected. Set exclude_internal=false for the legacy flag-only col I. The PARALEGAL HOURS BONUS uses col I, so it is on the adjusted basis too — $0-rate and firm-internal hours do not count toward bonus hours. Each run logs the raw→adjusted col I delta per month. (fee_report_id is deprecated/ignored — the Collection tab now generates its own per-month report; see below.) By default writes ONLY the target month's hours/billable/billed/write-off/discount/collections columns in '26 Compare' (a STATIC monthly snapshot — prior closed months are never changed retroactively); pass backfill_ytd=true for a one-time historical rewrite of all YTD months. Then rebuilds the Bonus Config/Tracker and Attorney Performance tabs and versions the file back to Box. ALSO patches the 'Utilization' tab (billable = worked billable hours; nonbillable = flagged non-billable hours — the SAME figures as 26 Compare cols I and H, NOT the Client Activity Price==0 heuristic, which under-counted nonbillable and collapsed it to ~0; the Total and Untracked columns are recomputed from Billable+Nonbillable so they can't drift from the patched hours) and the 'Realization' tab (billed-nondiscounted/billed-discounted/unbilled hours, from auto-generated Clio Client Activity reports — one per month patched) — pass client_activity_report_id to use a specific pre-generated Client Activity report for the Realization tab (target month only). ALSO patches the 'Collection' tab (Collected / Uncollected HOURS), derived by default from a SINGLE-MONTH Fee Allocation report per patched month (per-user Billed Hours allocated to collected vs uncollected by the Billed Time Collected/Outstanding dollar split) — per-month, NOT the old cumulative YTD report that summed every month into each block (the Feb/Mar blow-up); pass realization_report_id to instead source the target month from a specific pre-generated Realization report. All three rate tabs honor backfill_ytd: a normal run patches only the TARGET month's block, while backfill_ytd=true re-derives EVERY YTD month block (generating one Client Activity / Fee Allocation report per month) — use it for a one-time historical correction of stale months. Report generation (Client Activity for Util/Realiz) auto-retries on transient failures and each tab patches independently — a failure in one tab no longer aborts the others; the result reports per-tab status (ok/failed/skipped) and the report ids used. ALSO appends a 'Firm Average' summary table to the BOTTOM of the 'Utilization', 'Realization' and 'Collection' tabs (the Realization and Collection tables carry a 'data as of' date, because a maturing cohort read at two dates gives two different, both correct, numbers): one row per month with the firm-wide rate computed as the simple MEAN of the listed billers' own monthly rate (utilization = billable/available; realization = nondiscounted/total-billed), excluding inactive timekeepers (no hours / #DIV/0!). The Utilization table also includes a 'Firm Avg Util Goal' column — the mean of each biller's own utilization goal from the '2026 Goals' tab — so actual can be charted against goal. It is appended after the existing month blocks (never inserted mid-sheet, so the template's per-attorney formulas are untouched) and refreshed in place each run, and is regenerated as static values from the hour columns. The workbook is set to fully recalculate on open so the rate/total formulas refresh automatically. Pass revenue_report_id to force a specific revenue report if auto-selection picks the wrong one. If the Box upload fails, returns a short-lived direct_download_url (1-hour TTL) instead.",
     {
       month: z.coerce.number().describe("Month number (1-12)"),
       year: z.coerce.number().describe("Year (e.g. 2026)"),
@@ -1663,6 +1344,7 @@ export function registerDocumentTools(server: McpServer): void {
       backfill_ytd: z.boolean().optional().describe("Controls the HOURS / issue-date BILLED $ snapshot only. When true, (re)writes those columns for EVERY year-to-date month block (Jan..target) — for HOURS only when a month×user revenue source is supplied (revenue_csv_box_file_id / revenue_report_id); the classic default only has the target month's hours. Use for a ONE-TIME historical correction (recommended: pass backfill_ytd=true together with revenue_csv_box_file_id). DEFAULT false: hours/billed are a STATIC monthly snapshot — only the TARGET month is written, so a closed month never changes retroactively. The 'Utilization' rate tab follows this same cadence (worked hours are final at month close). The 'Realization' and 'Collection' tabs do NOT — they ALWAYS rewrite every YTD month and ignore this flag, because both are cohorts whose SPLIT keeps moving after the month closes (Realization: unbilled work drains into billed/discounted over ~90 days; Collection: uncollected drains into collected as payments arrive). Writing either once at month close freezes it at its worst reading — measured on the prior hand-keyed workbook, March collection was recorded at 32.7% against an actual 91.0%. Refreshing is safe because it only reclassifies within a fixed month total, and each generates one Clio report per month. NOTE: COLLECTIONS (cols N/S/V) ignore this flag — they are ALWAYS refreshed for every YTD month (payment-date basis keeps moving via late payments/reversals/re-dates), so each payment is counted in exactly one month and never double-credited across a boundary."),
       realization_hours_source: z.enum(["realization", "client_activity"]).optional().describe("Source for the Realization tab's D/E/F hours. DEFAULT 'realization' — Clio's Realization report, which reports Billed Hours and Hours Discounted per time entry, so the discounted split comes from Clio rather than being inferred. 'client_activity' restores the previous derived split (a discount was inferred from Quantity*Price != Total on the ACTIVITY row) and exists only to diff one run against the old numbers before that path is removed: it CANNOT see invoice-level discounts and is known to under-report them badly (it recorded 0.0 discounted hours for a timekeeper in Jan/Feb/Mar 2026 where Clio's own figures showed 46.3). Do not use it to produce reported figures."),
       billed_cutoff_day: z.coerce.number().optional().describe("Billing-month cutoff day for the issue-date 'Billed $' column (default 0 = no roll-back: each bill is counted in its CALENDAR issue month, matching Rachel's reference). Set to a positive N to roll bills issued on days 1..N of a month back into the PRIOR month's billed total, so an end-of-month billing run that slips into the first days of the next month stays grouped together (e.g. N=7 ⇒ May 27–Jun 7 all count as May); if you do, run the month's snapshot after day N of the following month to capture those late-issued bills."),
+      exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time out of col I and into col H: matters whose client is the firm itself (Romano & Sumner, LLC), plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only col I (the pre-adjustment basis). Also governs the Utilization tab and the paralegal hours bonus, which both derive from col I. Ignored on the rate_tabs_only path, which reads col I/H straight off the sheet."),
       rate_tabs_only: z.boolean().optional().describe("RATE-TABS-ONLY refresh. When true, ONLY the 'Utilization', 'Realization', and 'Collection' tabs are rewritten for every month Jan..month, and NOTHING ELSE in the workbook is touched — 26 Compare, Bonus, Attorney Performance and all other sheets are preserved byte-for-byte. Utilization is sourced by READING 26 Compare's existing Billable (col I) / Nonbillable (col H) for each month (no /activities pull, no revenue report needed) and reshaping them (Billable, Nonbillable, Total=Billable+Nonbillable, Untracked=Available−Total) — so Utilization stays exactly consistent with 26 Compare. Realization comes from a per-month Realization report and Collection from a per-month Fee Allocation report (the same per-month sources the full build uses); both cover every month Jan..month. Use this to fix/backfill the rate tabs for closed months WITHOUT retroactively rewriting 26 Compare's frozen snapshots. Ignores backfill_ytd / revenue_csv_box_file_id / billed_cutoff_day (not relevant to this path). pass client_activity_report_id to reuse a pre-generated Client Activity report for the TARGET month's Realization."),
     },
     async (params) => {
@@ -2004,13 +1686,32 @@ export function registerDocumentTools(server: McpServer): void {
         // entries by work date (the firm's definition; reproduces the reference where
         // the Revenue Report's billed+unbilled overcounts). Real contingency/flat
         // worked time is included; only the 1h fee placeholders below are removed.
-        _step = "building worked hours (time entries, split by the non_billable flag)";
-        // Partitioned per entry by Clio's non_billable flag (the same single
-        // decision the weekly goal sheets use — see classifiedHours.ts):
-        //   billable    = entries where non_billable === false (col I basis)
-        //   nonbillable = entries where non_billable === true  (col H)
-        const { billable: workedBillableByMonth, nonbillable: workedNonbillableByMonth } =
-          await buildWorkedHoursSplitByMonth(params.year, params.month, ROSTER, { months: writeMonths });
+        _step = "building worked hours (time entries, flag + firm-internal split)";
+        // Partitioned per entry by the same single decision the weekly goal
+        // sheets use (see classifiedHours.ts): Clio's non_billable flag, PLUS the
+        // firm-internal reclassification —
+        //   billable    = non_billable === false AND not firm-internal (col I basis)
+        //   nonbillable = non_billable === true, OR firm-internal      (col H)
+        // where firm-internal means the matter's client is the firm itself
+        // (Romano & Sumner, LLC) or the entry is billable-flagged with rate 0 AND
+        // amount 0. The *Raw views are the legacy flag-only figures, kept only to
+        // log how much the adjustment moved — cols H/I are written from the
+        // ADJUSTED views.
+        const {
+          billable: workedBillableByMonth, nonbillable: workedNonbillableByMonth,
+          billableRaw: workedBillableRawByMonth, internal: workedInternalByMonth,
+        } = await buildWorkedHoursSplitByMonth(params.year, params.month, ROSTER, {
+          months: writeMonths,
+          excludeInternal: params.exclude_internal,
+        });
+        for (const m of writeMonths) {
+          const internalFirm = Object.values(workedInternalByMonth[m] ?? {}).reduce((a, b) => a + b, 0);
+          if (internalFirm > 0.05) {
+            const rawFirm = Object.values(workedBillableRawByMonth[m] ?? {}).reduce((a, b) => a + b, 0);
+            const adjFirm = Object.values(workedBillableByMonth[m] ?? {}).reduce((a, b) => a + b, 0);
+            console.log(`[Dashboard] internal-time adjustment ${monthNames[m - 1]}: col I firm billable ${round1(rawFirm)}h raw → ${round1(adjFirm)}h adjusted (${round1(internalFirm)}h of firm-internal / $0 time moved to col H)`);
+          }
+        }
 
         // Synthetic 1-hour fee-placeholder hours (on contingency/flat matters) to back
         // out of col I and the paralegal hours bonus — these aren't real worked time.
@@ -2041,19 +1742,28 @@ export function registerDocumentTools(server: McpServer): void {
             d.potentialClients = cat?.potentialClients ?? 0;
             d.cle = cat?.cle ?? 0;
             d.otherAdmin = cat?.otherAdmin ?? 0;
-            // Hours columns, classified STRICTLY by Clio's entry-level non_billable
-            // flag — no matter-name/type or rate heuristic (rated internal work
-            // flagged non-billable used to leak into col I):
-            //   Nonbillable (col H) = hours where non_billable === true.
-            //   Billable (col I)    = hours where non_billable === false, minus
-            //     Rachel's synthetic 1-hour fee placeholders (excludedHrsByMonth —
-            //     billable-flagged in Clio but not real worked time).
-            //   Total worked (col J) = col H + col I (work-date basis, billed or not).
+            // Hours columns, on the ADJUSTED basis — Clio's entry-level
+            // non_billable flag PLUS the firm-internal reclassification. Matter
+            // names/numbers/types are still never consulted; the matter's CLIENT
+            // and the entry's rate/amount are:
+            //   Nonbillable (col H) = hours where non_billable === true, plus
+            //     firm-internal hours (client is the firm itself, or a
+            //     billable-flagged entry with rate 0 AND amount 0).
+            //   Billable (col I)    = hours where non_billable === false and the
+            //     entry is not firm-internal, minus Rachel's synthetic 1-hour fee
+            //     placeholders (excludedHrsByMonth — billable-flagged in Clio but
+            //     not real worked time).
+            //   Total worked (col J) = col H + col I (work-date basis, billed or
+            //     not). The adjustment MOVES hours between H and I, so col J and
+            //     the Utilization tab's Untracked column are unaffected by it.
             const excl = excludedHrsByMonth[m]?.[r.user_id] ?? 0;
             d.nonbillableHrs = workedNonbillableByMonth[m]?.[r.user_id] ?? 0;
             d.billableHrs = Math.max(0, (workedBillableByMonth[m]?.[r.user_id] ?? 0) - excl);
             d.totalWorkedHrs = d.billableHrs + d.nonbillableHrs;
-            d.workedBillableHrs = d.billableHrs; // paralegal HOURS bonus uses the same figure
+            // Paralegal HOURS bonus uses the same figure as col I, so it is on
+            // the ADJUSTED basis too: $0-rate and firm-internal hours do not
+            // count toward bonus hours.
+            d.workedBillableHrs = d.billableHrs;
             md[r.user_id] = d;
             mrd[r.user_id] = respByMonth[m]?.[r.user_id] ?? { respHrs: 0, respBilled: 0 };
           }
@@ -2093,7 +1803,13 @@ export function registerDocumentTools(server: McpServer): void {
             firmTotal += d.totalWorkedHrs;
             const catSum = d.bizDev + d.potentialClients + d.cle + d.otherAdmin;
             if (catSum > d.nonbillableHrs + 0.05) {
-              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: admin-category hours ${round1(catSum)}h EXCEED flagged nonbillable ${round1(d.nonbillableHrs)}h (Δ${round1(catSum - d.nonbillableHrs)}h) — admin-matter time logged WITHOUT the non_billable flag in Clio. Col H/I follow the flag; fix the entries in Clio.`);
+              // Col H is now the ADJUSTED nonbillable, so admin-matter time
+              // left unflagged in Clio is normally reclassified INTO col H by
+              // rule (a) and no longer trips this guard. If it still trips, the
+              // admin-category hours are on matters that are NOT owned by the
+              // firm's own client — a matter-setup problem, not just a missing
+              // entry flag.
+              console.warn(`[Dashboard] hours reconcile ${r.initials} ${monthName}: admin-category hours ${round1(catSum)}h EXCEED adjusted nonbillable ${round1(d.nonbillableHrs)}h (Δ${round1(catSum - d.nonbillableHrs)}h) — admin-matter time that is neither flagged non-billable nor caught by the firm-internal rules. Check the entries' non_billable flag AND whether those admin matters are filed under the firm's own client in Clio.`);
             }
           }
           console.log(`[Dashboard] worked-hours firm total ${monthName}: ${round1(firmTotal)}h (col J basis = manual Activities total, fee placeholders backed out)`);
@@ -3864,6 +3580,408 @@ export function registerDocumentTools(server: McpServer): void {
         return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }], ...(result.uploaded ? {} : { isError: true }) };
       } catch (e: any) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ tab: SHEET, status: "failed", error: true, message: e?.message ?? String(e) }) }], isError: true };
+      }
+    }
+  );
+}
+
+
+/**
+ * ARCHIVED 2026-08-24 — download_vd_statement and download_firm_scorecard are no
+ * longer registered on the MCP surface.
+ *
+ *  - download_vd_statement: the V&D Of Counsel compensation statement is now
+ *    produced by a separate skill, so the server no longer needs a second path
+ *    to those numbers.
+ *  - download_firm_scorecard: archival. Note it never migrated to the shared
+ *    classifier — it still splits billable vs nonbillable with the pre-2026-07-09
+ *    `price > 0` heuristic, a third basis that reconciles to neither 26 Compare
+ *    nor the weekly goal sheets. That is why it was NOT given the
+ *    exclude_internal treatment: it is retired instead.
+ *
+ * The source is retained verbatim (unwired) for reference. To re-expose either
+ * tool, call this from registerDocumentTools — but migrate download_firm_scorecard
+ * onto classifiedHours.ts first, or it will report a basis nothing else uses.
+ */
+export function registerArchivedDocumentTools(server: McpServer): void {
+  // ============================================================
+  // TOOL 1: download_vd_statement
+  // ============================================================
+  server.tool(
+    "download_vd_statement",
+    "Generate a V&D Of Counsel compensation statement as a downloadable Word document. Includes cover letter from Rachel Trevino, compensation summary with tier breakdown, timekeeper detail, and payment history. Returns a short-lived direct_download_url (1-hour TTL) for the generated .docx.",
+    {
+      month: z.coerce.number().describe("Month number (1-12)"),
+      year: z.coerce.number().describe("Year (e.g. 2026)"),
+    },
+    async (params) => {
+      try {
+        const monthNames = MONTH_NAMES_FULL;
+        const monthName = monthNames[params.month - 1];
+        const startDate = `${params.year}-${String(params.month).padStart(2, "0")}-01`;
+        const endDay = new Date(params.year, params.month, 0).getDate();
+        const endDate = `${params.year}-${String(params.month).padStart(2, "0")}-${endDay}`;
+
+        // Get users
+        const allUsers = await fetchAllPages<any>("/users", { fields: "id,name,enabled" });
+        const users = allUsers.map((u: any) => ({ id: u.id, name: u.name }));
+        const gus = users.find((u) => u.name.toLowerCase().includes("gus"));
+        const courtney = users.find((u) => u.name.toLowerCase().includes("courtney") || u.name.toLowerCase().includes("courteney"));
+        const vdAttorneys = [gus, courtney].filter(Boolean) as { id: number; name: string }[];
+        const vdLastNames = vdAttorneys.map(a => a.name.toLowerCase().split(" ").pop() ?? "");
+
+        // Get fee allocation CSV
+        const { rows: csvRows } = await getFeeAllocationCSV();
+
+        // Filter V&D rows
+        const vdRows = csvRows.filter(r => {
+          const ra = (r["Responsible Attorney"] ?? "").toLowerCase();
+          return vdLastNames.some(ln => ra.includes(ln));
+        });
+
+        // Classify rows
+        const classified = vdRows.map(r => ({
+          responsible: r["Responsible Attorney"] ?? "Unknown",
+          user: r["User"] ?? "Unknown",
+          isAttorneyTime: vdLastNames.some(ln => (r["User"] ?? "").toLowerCase().includes(ln)),
+          collected: parseFloat(r["Billed Time Collected"] || r["Total Funds Collected"] || "0"),
+          hours: parseFloat(r["Billed Hours"] || "0"),
+        }));
+
+        // Calculate splits (pooled tiers)
+        let combinedYTD = 0;
+        const perAtty: Record<string, { attyCollected: number; attyVD: number; attyFirm: number; staffCollected: number; staffVD: number; staffFirm: number; tks: Record<string, { collected: number; hours: number }> }> = {};
+        for (const a of vdAttorneys) {
+          perAtty[a.name] = { attyCollected: 0, attyVD: 0, attyFirm: 0, staffCollected: 0, staffVD: 0, staffFirm: 0, tks: {} };
+        }
+
+        // Attorney time
+        const attyRows = classified.filter(c => c.isAttorneyTime);
+        const totalAttyCollected = attyRows.reduce((s, c) => s + c.collected, 0);
+        const attySplit = applyTieredSplit(totalAttyCollected, combinedYTD);
+        combinedYTD = attySplit.ytdAfter;
+
+        for (const c of attyRows) {
+          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
+          if (!pa) continue;
+          const prop = totalAttyCollected > 0 ? c.collected / totalAttyCollected : 0;
+          pa.attyCollected += c.collected;
+          pa.attyVD += attySplit.vd * prop;
+          pa.attyFirm += attySplit.firm * prop;
+        }
+
+        // Staff time
+        const staffRows = classified.filter(c => !c.isAttorneyTime);
+        for (const c of staffRows) {
+          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
+          if (!pa) continue;
+          const split = applyTieredSplit(c.collected, combinedYTD);
+          combinedYTD = split.ytdAfter;
+          pa.staffCollected += c.collected;
+          pa.staffVD += split.vd;
+          pa.staffFirm += split.firm;
+        }
+
+        // Timekeeper breakdown
+        for (const c of classified) {
+          const pa = Object.entries(perAtty).find(([k]) => c.responsible.toLowerCase().includes(k.toLowerCase().split(" ").pop()!))?.[1];
+          if (!pa) continue;
+          if (!pa.tks[c.user]) pa.tks[c.user] = { collected: 0, hours: 0 };
+          pa.tks[c.user].collected += c.collected;
+          pa.tks[c.user].hours += c.hours;
+        }
+
+        // Tier breakdown
+        const tier1 = Math.min(combinedYTD, 250000);
+        const tier2 = Math.min(Math.max(combinedYTD - 250000, 0), 250000);
+        const tier3 = Math.max(combinedYTD - 500000, 0);
+
+        const grandCollected = Object.values(perAtty).reduce((s, a) => s + a.attyCollected + a.staffCollected, 0);
+        const grandVD = Object.values(perAtty).reduce((s, a) => s + a.attyVD + a.staffVD, 0);
+        const grandFirm = Object.values(perAtty).reduce((s, a) => s + a.attyFirm + a.staffFirm, 0);
+
+        // Generate letter date (15th of next month)
+        const nextMonth = params.month === 12 ? 1 : params.month + 1;
+        const nextYear = params.month === 12 ? params.year + 1 : params.year;
+        const letterDate = new Date(nextYear, nextMonth - 1, 15).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+
+        // ===== BUILD DOCUMENT =====
+        const doc = new Document({
+          styles: {
+            default: { document: { run: { font: "Arial", size: 20 } } },
+            paragraphStyles: [
+              { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true, run: { size: 28, bold: true, font: "Arial", color: "2E4057" }, paragraph: { spacing: { before: 240, after: 120 }, outlineLevel: 0 } },
+              { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true, run: { size: 24, bold: true, font: "Arial", color: "2E4057" }, paragraph: { spacing: { before: 180, after: 120 }, outlineLevel: 1 } },
+            ],
+          },
+          sections: [{
+            properties: {
+              ...pageProps,
+              headers: {
+                default: new Header({ children: [
+                  new Paragraph({ alignment: AlignmentType.CENTER, children: [$("Romano & Sumner, PLLC", { size: 28, bold: true, color: "2E4057" })] }),
+                  new Paragraph({ alignment: AlignmentType.CENTER, children: [$("Of Counsel Compensation Statement", { size: 22, color: "666666" })] }),
+                  new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 120 }, children: [$(`Period: ${monthName} ${params.year}`, { size: 20, color: "666666" })] }),
+                ] }),
+              },
+              footers: {
+                default: new Footer({ children: [
+                  new Paragraph({ alignment: AlignmentType.CENTER, children: [
+                    $("Generated from Clio Fee Allocation Report  |  Romano & Sumner, PLLC Confidential  |  Page ", { size: 16, color: "999999" }),
+                    new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: "999999" }),
+                  ] }),
+                ] }),
+              },
+            } as any,
+            children: [
+              // PAGE 1: COVER LETTER
+              makePara(letterDate, { size: 22, spacingAfter: 200 }),
+              makePara(`Re: Of Counsel Compensation - ${monthName} ${params.year}`, { bold: true, size: 22, spacingAfter: 200 }),
+              makePara("Dear Gus and Courteney:", { size: 22, spacingAfter: 200 }),
+              makePara(`Enclosed please find a check in the amount of ${fmt(round2(grandVD))} for V&D compensation for the month of ${monthName} ${params.year}.`, { size: 22, spacingAfter: 120 }),
+              ...vdAttorneys.map(a => {
+                const pa = perAtty[a.name];
+                const total = round2(pa.attyVD + pa.staffVD);
+                return new Paragraph({ spacing: { after: 60 }, children: [
+                  $(`    ${a.name}: `, { size: 22 }),
+                  $(fmt(total), { size: 22, bold: true }),
+                ] });
+              }),
+              makePara("", { spacingAfter: 120 }),
+              makePara("Please see the attached compensation statement for a detailed breakdown of collections, tier calculations, and payment history.", { size: 22, spacingAfter: 200 }),
+              makePara("Please do not hesitate to reach out with any questions.", { size: 22, spacingAfter: 400 }),
+              makePara("Sincerely,", { size: 22, spacingAfter: 400 }),
+              makePara("Rachel Trevino", { size: 22, spacingAfter: 0 }),
+              makePara("Executive Director", { size: 22, spacingAfter: 0 }),
+              makePara("Romano & Sumner, PLLC", { size: 22, spacingAfter: 200 }),
+
+              // PAGE 2: SUMMARY
+              pageBreak(),
+              makePara(`V&D Compensation Statement - ${monthName} ${params.year}`, { bold: true, size: 28, alignment: AlignmentType.CENTER, spacingAfter: 200 }),
+              spacer(),
+              (() => {
+                const rows: string[][] = [];
+                for (const a of vdAttorneys) {
+                  const pa = perAtty[a.name];
+                  const firstName = a.name.split(" ")[0];
+                  rows.push([a.name, "", "", ""]);
+                  rows.push(["  Attorney Time", fmt(round2(pa.attyCollected)), fmt(round2(pa.attyVD)), fmt(round2(pa.attyFirm))]);
+                  rows.push(["  Staff Time (allowance)", fmt(round2(pa.staffCollected)), fmt(round2(pa.staffVD)), fmt(round2(pa.staffFirm))]);
+                  rows.push(["  Staff Time (regular)", fmt(0), fmt(0), fmt(0)]);
+                  rows.push([`  ${firstName} Subtotal`, fmt(round2(pa.attyCollected + pa.staffCollected)), fmt(round2(pa.attyVD + pa.staffVD)), fmt(round2(pa.attyFirm + pa.staffFirm))]);
+                  rows.push(["", "", "", ""]);
+                }
+                rows.push(["V&D Total", fmt(round2(grandCollected)), fmt(round2(grandVD)), fmt(round2(grandFirm))]);
+                rows.push(["", "", "", ""]);
+                rows.push([`Tier 1 ($0-$250K @ 82.5%)`, fmt(round2(tier1)), "", ""]);
+                rows.push([`Tier 2 ($250K-$500K @ 80%)`, fmt(round2(tier2)), "", ""]);
+                rows.push([`Tier 3 ($500K+ @ 77.5%)`, fmt(round2(tier3)), "", ""]);
+                return makeDocxTable(["", "Collected", "V&D Share", "Firm Share"], rows, [3200, 2100, 2100, 1960]);
+              })(),
+              spacer(),
+              makePara(`Amount Due to V&D for ${monthName}: ${fmt(round2(grandVD))}`, { bold: true, size: 24, spacingAfter: 200 }),
+
+              // PAGE 3: DETAIL
+              pageBreak(),
+              h2("Timekeeper Detail"),
+              spacer(),
+              (() => {
+                const rows: string[][] = [];
+                for (const a of vdAttorneys) {
+                  const pa = perAtty[a.name];
+                  for (const [name, data] of Object.entries(pa.tks).sort(([,a],[,b]) => b.collected - a.collected)) {
+                    rows.push([a.name, name, String(round1(data.hours)), fmt(round2(data.collected))]);
+                  }
+                  rows.push(["", "", "", ""]);
+                }
+                return makeDocxTable(["Responsible Attorney", "Timekeeper", "Hours", "Collected"], rows, [2400, 2400, 1280, 3280]);
+              })(),
+              spacer(), spacer(),
+              h2("Payment History (YTD)"),
+              spacer(),
+              ...vdAttorneys.flatMap(a => {
+                const pa = perAtty[a.name];
+                const total = round2(pa.attyCollected + pa.staffCollected);
+                const vd = round2(pa.attyVD + pa.staffVD);
+                return [
+                  makePara(a.name, { bold: true, spacingAfter: 80 }),
+                  makeDocxTable(
+                    ["Month", "Collections", "V&D Share", "Amount Paid", "Date Paid"],
+                    [
+                      [monthName, fmt(total), fmt(vd), "__________", "__________"],
+                      ["YTD Total", fmt(total), fmt(vd), "", ""],
+                    ],
+                    [1800, 1900, 1900, 1900, 1860]
+                  ),
+                  spacer(),
+                ];
+              }),
+            ],
+          }],
+        });
+
+        const buffer = await Packer.toBuffer(doc);
+        const filename = `V&D Compensation Statement - ${monthName} ${params.year}.docx`;
+        const size_kb = Math.round(buffer.length / 1024);
+        console.warn(`[Doc] download_vd_statement — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              filename,
+              format: "docx",
+              size_kb,
+              direct_download_url: reg.url,
+              expires_at: reg.expires_at,
+              note: "Download the file from direct_download_url within 1 hour.",
+              summary: {
+                period: `${monthName} ${params.year}`,
+                total_vd_compensation: fmt(round2(grandVD)),
+                attorneys: vdAttorneys.map(a => ({ name: a.name, vd: fmt(round2(perAtty[a.name].attyVD + perAtty[a.name].staffVD)) })),
+              },
+            }),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============================================================
+  // TOOL 2: download_firm_scorecard
+  // ============================================================
+  server.tool(
+    "download_firm_scorecard",
+    "Generate the firm-wide development meeting scorecard as a downloadable Excel file. Includes weekly and monthly data for all timekeepers. Returns a short-lived direct_download_url (1-hour TTL); if box_folder_id is provided the file is also versioned to Box when possible.",
+    {
+      week_of: z.string().optional().describe("Date within the target week (YYYY-MM-DD). Defaults to today."),
+      box_folder_id: z.string().optional().describe("Box folder ID. If provided and the generated file has an existing overwrite target, the tool versions it in Box. Otherwise (omitted or upload fails) the tool returns a short-lived direct_download_url (1-hour TTL) the user can click to download the file directly — no base64 inlined in the MCP response."),
+    },
+    async (params) => {
+      try {
+        const ROSTER = SCORECARD_ROSTER;
+
+        const targetDate = params.week_of ?? new Date().toISOString().split("T")[0];
+        const d = new Date(targetDate + "T12:00:00");
+        const day = d.getDay();
+        const monday = new Date(d); monday.setDate(d.getDate() - ((day + 6) % 7));
+        const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+        const fmtDate = (dt: Date) => dt.toISOString().split("T")[0];
+        const weekStart = fmtDate(monday);
+        const weekEnd = fmtDate(sunday);
+        const weekLabel = `${monday.toLocaleDateString("en-US", { month: "short", day: "numeric" })} - ${sunday.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+
+        const monthStart = `${targetDate.slice(0, 7)}-01`;
+        const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+        const monthEnd = fmtDate(mEnd);
+        const monthLabel = d.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+
+        // Fetch time entries for the month (covers the week too)
+        const entries = await fetchAllPages<any>("/activities", {
+          type: "TimeEntry",
+          fields: "id,date,quantity,rounded_quantity,price,billed,user{id,name}",
+          created_since: `${monthStart}T00:00:00+00:00`,
+        }).then(e => e.filter((x: any) => x.date >= monthStart && x.date <= monthEnd));
+
+        // Build per-user weekly + monthly data
+        const userData: Record<number, { weekBillable: number; weekNonbillable: number; monthBillable: number; monthNonbillable: number; monthBilledHrs: number; monthUnbilledHrs: number; monthBillableDollars: number }> = {};
+        for (const r of ROSTER) {
+          userData[r.user_id] = { weekBillable: 0, weekNonbillable: 0, monthBillable: 0, monthNonbillable: 0, monthBilledHrs: 0, monthUnbilledHrs: 0, monthBillableDollars: 0 };
+        }
+
+        for (const e of entries) {
+          const uid = e.user?.id;
+          if (!uid || !userData[uid]) continue;
+          // Use rounded_quantity (billed hours) not raw quantity (actual tracked).
+          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
+          const isBillable = (e.price || 0) > 0;
+          const inWeek = e.date >= weekStart && e.date <= weekEnd;
+
+          if (isBillable) {
+            userData[uid].monthBillable += hours;
+            userData[uid].monthBillableDollars += hours * (e.price || 0);
+            if (e.billed) userData[uid].monthBilledHrs += hours; else userData[uid].monthUnbilledHrs += hours;
+            if (inWeek) userData[uid].weekBillable += hours;
+          } else {
+            userData[uid].monthNonbillable += hours;
+            if (inWeek) userData[uid].weekNonbillable += hours;
+          }
+        }
+
+        // Build Excel
+        const wb = new ExcelJS.Workbook();
+
+        // Weekly sheet
+        const ws1 = wb.addWorksheet("Weekly");
+        ws1.columns = [
+          { header: "Initials", key: "initials", width: 10 },
+          { header: "Name", key: "name", width: 25 },
+          { header: "Billable", key: "billable", width: 12 },
+          { header: "Nonbillable", key: "nonbillable", width: 14 },
+          { header: "Total", key: "total", width: 12 },
+        ];
+        ws1.getRow(1).font = { bold: true };
+        ws1.mergeCells("A1:E1");
+        ws1.getCell("A1").value = `Weekly Scorecard: ${weekLabel}`;
+        ws1.getCell("A1").font = { bold: true, size: 14 };
+        ws1.addRow({}); // blank
+        const hRow1 = ws1.addRow(["Initials", "Name", "Billable", "Nonbillable", "Total"]);
+        hRow1.font = { bold: true };
+
+        for (const r of ROSTER) {
+          const d = userData[r.user_id];
+          ws1.addRow([r.initials, r.name, round1(d.weekBillable), round1(d.weekNonbillable), round1(d.weekBillable + d.weekNonbillable)]);
+        }
+
+        // Monthly sheet
+        const ws2 = wb.addWorksheet("Monthly");
+        ws2.mergeCells("A1:H1");
+        ws2.getCell("A1").value = `Monthly Scorecard: ${monthLabel}`;
+        ws2.getCell("A1").font = { bold: true, size: 14 };
+        ws2.addRow({});
+        const hRow2 = ws2.addRow(["Initials", "Name", "Billable Hrs", "Billable $", "Billed Hrs", "Unbilled Hrs", "Nonbillable", "Total"]);
+        hRow2.font = { bold: true };
+
+        for (const r of ROSTER) {
+          const d = userData[r.user_id];
+          ws2.addRow([
+            r.initials, r.name,
+            round1(d.monthBillable), round2(d.monthBillableDollars),
+            round1(d.monthBilledHrs), round1(d.monthUnbilledHrs),
+            round1(d.monthNonbillable),
+            round1(d.monthBillable + d.monthNonbillable),
+          ]);
+        }
+
+        // Format currency column
+        ws2.getColumn(4).numFmt = '"$"#,##0.00';
+
+        const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+        const filename = `Firm Scorecard - ${weekLabel.replace(/\//g, "-")}.xlsx`;
+        const size_kb = Math.round(buffer.byteLength / 1024);
+
+        if (params.box_folder_id !== undefined) {
+          const folderId = params.box_folder_id || "375771584500";
+          const result = await uploadToBox({ buffer, filename, folderId });
+          if (result.uploaded) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, filename, size_kb: result.size_kb, box_file_id: result.box_file_id, box_url: result.box_url }) }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, filename, size_kb: result.size_kb, direct_download_url: result.direct_download_url, expires_at: result.expires_at, reason: result.reason, note: result.note }) }] };
+        }
+
+        console.warn(`[Doc] download_firm_scorecard — returning direct_download_url filename=${filename} size_kb=${size_kb}`);
+        const reg = registerDownload(buffer, filename, mimeForFilename(filename));
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ filename, format: "xlsx", size_kb, direct_download_url: reg.url, expires_at: reg.expires_at, note: "Download the file from direct_download_url within 1 hour." }) }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
       }
     }
   );
