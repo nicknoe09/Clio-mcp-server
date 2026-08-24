@@ -27,7 +27,6 @@ import { registerReconcileTools } from "./tools/reconcile";
 import { registerScorecardTools } from "./tools/scorecard";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerCustomFieldTools } from "./tools/customFields";
-import { registerCalcTools } from "./tools/calc";
 import { registerDocumentTools } from "./tools/documents";
 import { registerAuditTools } from "./tools/audit";
 import { registerAuditTimeTools } from "./tools/auditTime";
@@ -75,7 +74,13 @@ export function createMcpServer(): McpServer {
     registerScorecardTools(server);
     registerCalendarTools(server);
     registerCustomFieldTools(server);
-    registerCalcTools(server);
+    // ARCHIVED 2026-08-24 — get_attributable_collections (V&D Of Counsel comp)
+    // is unwired; that calculation now lives in a separate skill. Source kept
+    // in tools/calc.ts as registerArchivedCalcTools. Also unwired, same date:
+    // generate_firm_scorecard (tools/scorecard.ts →
+    // registerArchivedFirmScorecardTool) and download_firm_scorecard +
+    // download_vd_statement (tools/documents.ts →
+    // registerArchivedDocumentTools) — the firm scorecard is archival.
     registerDocumentTools(server);
     registerAuditTools(server);
     registerAuditTimeTools(server);
