@@ -63,6 +63,20 @@ describe("aggregateRealizationDollars", () => {
     expect(a.billed + a.discounted).toBeCloseTo(a.standardValue, 6);
   });
 
+  it("subtracts an UPWARD Adjusted Amount, keeping identity 1 on a bill above standard", () => {
+    // Regression, from the live April row on matter "03357-Young, Joyce M. -
+    // Estate of": 2.0 hrs at $450 standard, billed at $1,170. Math.abs treated
+    // the +$270 adjustment as a reduction, so the firm's Jan-Jul identity missed
+    // by twice the adjustment ($540 of the observed $540.04 gap; the rest is
+    // rounding).
+    const a = aggregateRealizationDollars([
+      row({ "Original Billable Total": "900.00", "Billed Time Amount": "1170.00",
+            "Adjusted Amount": "270.00" }),
+    ], nameToUid)[NRN];
+    expect(a.discounted).toBeCloseTo(-270, 6);
+    expect(a.billed + a.discounted + a.unbilled).toBeCloseTo(a.standardValue, 6);
+  });
+
   it("keeps credits OUT of discounted — they are a distinct channel", () => {
     // A credit note leaves the invoice at full value; only 'credited' moves.
     const a = aggregateRealizationDollars([

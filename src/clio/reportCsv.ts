@@ -336,25 +336,38 @@ export function aggregateRealizationCollections(rows: Record<string, string>[], 
 //   Quantity 0.4, Rate 275, Billed Hours 0.0, Hours Discounted -0.4
 //   Quantity 0.6, Rate 275, Billed Hours 0.0, Hours Discounted -0.6
 // so for a billed entry:
-//   Quantity == Billed Hours + |Hours Discounted| + |Adjusted Hours|
-// ("Billed Hours" already EXCLUDES both reductions). The reduction columns come
-// back NEGATIVE, hence Math.abs — which also makes this correct if Clio ever
-// switches to unsigned.
+//   Quantity == Billed Hours - Adjusted Hours + |Hours Discounted|
+// ("Billed Hours" already EXCLUDES both reductions.) A DISCOUNT is by definition
+// a reduction and comes back negative, hence Math.abs on that column — which also
+// keeps this correct if Clio ever switches to unsigned.
 //
-// "Adjusted Hours" is a SECOND, separate reduction Clio records alongside the
-// discount — a write-down of the billed amount rather than a discount proper. It
-// is folded into billedDiscHrs because economically it is the same thing for this
-// tab (value surrendered on an entry that reached a bill), and because every hour
-// has to land in exactly one of D/E/F or the denominator stops equalling the hours
-// actually worked. Measured on the live Jan 2026 report for one timekeeper it is
-// tiny but real — 3 rows of 227, 0.41 hrs / $112 against 32.72 discounted hrs /
-// $8,989 — and those 3 rows were the only ones where the two-term identity failed.
-// `adjustedHrs` keeps the component visible so the split stays auditable.
+// "Adjusted Hours" is a SECOND, separate adjustment Clio records alongside the
+// discount — a write-down (or write-UP) of the billed amount rather than a
+// discount proper. It is folded into billedDiscHrs because economically a
+// write-down is the same thing for this tab (value surrendered on an entry that
+// reached a bill), and because every hour has to land in exactly one of D/E/F or
+// the denominator stops equalling the hours actually worked. Measured on the live
+// Jan 2026 report for one timekeeper it is tiny but real — 3 rows of 227, 0.41
+// hrs / $112 against 32.72 discounted hrs / $8,989 — and those 3 rows were the
+// only ones where the two-term identity failed. `adjustedHrs` keeps the component
+// visible so the split stays auditable.
+//
+// The adjustment columns are SIGNED AND BIDIRECTIONAL, so unlike the discount
+// they must NOT be run through Math.abs. Found live 2026-08 on the firm-wide
+// Jan-Jul dollar aggregate, which missed closing by $540.04: matter
+// "03357-Young, Joyce M. - Estate of" carries an April row with Original
+// Billable Total 900.00, Billed Time Amount 1,170.00 and Adjusted Amount
+// +270.00 — an entry billed ABOVE its standard value. Math.abs added that 270
+// to the reductions instead of subtracting it, breaking the identity by twice
+// the adjustment. Negating the signed value handles both directions: a
+// write-down (negative) still adds to the reduction bucket, and a write-up
+// subtracts, which is what makes standardValue == billed + discounted + unbilled
+// hold on a row where billed EXCEEDS standard value.
 export type RealizHoursAgg = {
   billedNondiscHrs: number;   // -> Realization tab col D
-  billedDiscHrs: number;      // -> col E  (discounted + adjusted)
+  billedDiscHrs: number;      // -> col E  (discounted + adjusted-down, less adjusted-up)
   unbilledHrs: number;        // -> col F
-  adjustedHrs: number;        // the adjusted portion of col E, broken out for audit
+  adjustedHrs: number;        // the adjustment portion of col E, broken out for audit
 };
 
 /** True when a Realization-report row has not reached an issued bill.
@@ -392,7 +405,10 @@ export function aggregateRealizationHours(
     const qty = num(r["Quantity"]);
     const billedHrs = num(r["Billed Hours"]);
     const discHrs = Math.abs(num(r["Hours Discounted"]));
-    const adjHrs = Math.abs(num(r["Adjusted Hours"]));
+    // Signed, not absolute: see the note above. A negative Adjusted Hours is a
+    // write-down (hours surrendered); a positive one is a write-up, which has to
+    // come back OUT of the reduction bucket or D + E overstates the hours worked.
+    const adjHrs = -num(r["Adjusted Hours"]);
     if (isUnbilledRealizStatus(r["Invoice Status"])) {
       slot.unbilledHrs += qty;
       continue;
@@ -400,7 +416,9 @@ export function aggregateRealizationHours(
     // Reached a bill but produced no billed, discounted or adjusted hours —
     // shouldn't happen given the identity above. Bucket it as unbilled (the
     // conservative choice: it keeps the month's total hours intact) and count it.
-    if (billedHrs + discHrs + adjHrs === 0 && qty > 0) {
+    // Tested on the three columns separately so a nonzero adjustment can never
+    // cancel against billed hours and fall through this guard.
+    if (billedHrs === 0 && discHrs === 0 && adjHrs === 0 && qty > 0) {
       slot.unbilledHrs += qty;
       anomalies++;
       continue;
@@ -440,7 +458,7 @@ export function aggregateRealizationHours(
 export type RealizDollarsAgg = {
   standardValue: number;   // Sum of Original Billable Total (all billable work)
   billed: number;          // Billed Time Amount
-  discounted: number;      // |Amount Discounted| + |Adjusted Amount|
+  discounted: number;      // |Amount Discounted| - Adjusted Amount (signed: see above)
   credited: number;        // Billed Time Credited  <- the credit-note channel
   collected: number;       // Billed Time Collected
   outstanding: number;     // Billed Time Outstanding
@@ -470,7 +488,10 @@ export function aggregateRealizationDollars(
       continue;
     }
     slot.billed += num(r["Billed Time Amount"]);
-    slot.discounted += Math.abs(num(r["Amount Discounted"])) + Math.abs(num(r["Adjusted Amount"]));
+    // Discount: always a reduction, so absolute. Adjustment: signed and
+    // bidirectional, so negated rather than absolute — see the Young-matter note
+    // on aggregateRealizationHours above.
+    slot.discounted += Math.abs(num(r["Amount Discounted"])) - num(r["Adjusted Amount"]);
     slot.credited += num(r["Billed Time Credited"]);
     slot.collected += num(r["Billed Time Collected"]);
     slot.outstanding += num(r["Billed Time Outstanding"]);
