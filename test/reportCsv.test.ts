@@ -178,6 +178,31 @@ describe("aggregateRealizationHours", () => {
     expect(agg.billedDiscHrs).toBeCloseTo(0.81, 6);  // 0.41 adjusted + 0.4 discounted
   });
 
+  it("subtracts an UPWARD Adjusted Hours instead of adding it", () => {
+    // Regression. Adjusted Hours is signed and bidirectional, so Math.abs turned
+    // an entry billed ABOVE standard into extra discounted hours — wrong twice
+    // over. The hours mirror of the live April dollar row on matter
+    // "03357-Young, Joyce M. - Estate of" (2.0 hrs at $450 billed at $1,170,
+    // Adjusted Amount +$270 == +0.6 hrs).
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "2.0", "Billed Hours": "2.6", "Adjusted Hours": "0.6" }),
+    ], nameToUid)[NRN];
+    expect(agg.adjustedHrs).toBeCloseTo(-0.6, 6);
+    expect(agg.billedDiscHrs).toBeCloseTo(-0.6, 6);
+    // The point of the fix: D + E still equals the hours actually worked.
+    expect(agg.billedNondiscHrs + agg.billedDiscHrs).toBeCloseTo(2.0, 6);
+  });
+
+  it("still routes a billed row with an adjustment but no billed hours to col E", () => {
+    // The anomaly guard tests the three columns separately so a nonzero
+    // adjustment cannot cancel against billed hours and be miscounted unbilled.
+    const agg = aggregateRealizationHours([
+      row({ Quantity: "1.0", "Billed Hours": "0", "Adjusted Hours": "-1.0" }),
+    ], nameToUid)[NRN];
+    expect(agg.billedDiscHrs).toBeCloseTo(1.0, 6);
+    expect(agg.unbilledHrs).toBeCloseTo(0, 6);
+  });
+
   it("skips non-roster users", () => {
     const agg = aggregateRealizationHours([
       { ...row({ Quantity: "5", "Billed Hours": "5" }), User: "Stranger, Sam" },
