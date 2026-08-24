@@ -622,6 +622,7 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
   expires_at?: string;
   reason?: string;
   note?: string;
+  figures?: any;
 }> {
   const closePct = params.close_threshold_pct ?? 90;
   const endDate = `${params.year}-12-31`;
@@ -636,6 +637,13 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
     year: params.year, endDate, userIds: WEEKLY_GOALS_ROSTER.map((r) => r.user_id),
     excludeInternal: params.exclude_internal,
   });
+
+  // Firm-wide adjustment totals, so the sheet's footnote can state how much the
+  // internal reclassification moved instead of just naming the rule. Scoped to
+  // the roster, matching the population the chart actually reports.
+  const rosterIds = new Set(WEEKLY_GOALS_ROSTER.map((r) => r.user_id));
+  const adj = emptyTotals();
+  for (const e of entries) if (rosterIds.has(e.uid)) addToTotals(adj, e);
 
   // billableByUser[user_id][monthIdx] = billable hours
   const billableByUser: Record<number, number[]> = {};
@@ -750,8 +758,34 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
     };
     ws.getCell(rowNum, 2).value = label;
   }
-  ws.getCell(28, 1).value = "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable uses the dashboard's filtration (entries flagged non-billable in Clio and fee placeholders excluded).";
+  // Footnote must state the ACTUAL rule: the internal reclassification consults
+  // the matter's client and the entry's rate, which the old wording denied.
+  const excludeInternal = params.exclude_internal !== false;
+  ws.getCell(28, 1).value = excludeInternal
+    ? "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable excludes entries flagged non-billable in Clio, synthetic fee placeholders, AND firm-internal time — matters whose client is Romano & Sumner, LLC (e.g. 02888-Admin, 00050-Potential Clients) plus billable-flagged entries with a $0 rate and $0 amount."
+    : "Monthly goal = weekly goal × 47 ÷ 12. Current month shows month-to-date. Billable uses the LEGACY flag-only filtration (entries flagged non-billable in Clio and fee placeholders excluded); firm-internal time is NOT excluded.";
   ws.getCell(28, 1).font = { italic: true, color: { argb: "FF666666" } };
+  if (excludeInternal && adj.internalHours > 0.05) {
+    ws.getCell(29, 1).value = `Internal-time adjustment across the roster: ${round1(adj.internalHours)} YTD hrs moved out of billable (firm-self-client ${round1(adj.firmSelfClientHours)} hrs, $0 rate+amount ${round1(adj.zeroValueHours)} hrs). YTD billable on the legacy flag-only basis: ${round1(adj.billableRaw)} hrs.`;
+    ws.getCell(29, 1).font = { italic: true, color: { argb: "FF666666" } };
+    if (adj.firmSelfClientRatedHours > 0.05) {
+      ws.getCell(30, 1).value = `Of that, ${round1(adj.firmSelfClientRatedHours)} hrs were booked at a RATE on a firm-self-client matter — check whether that is real client work filed under the firm's own client rather than internal time.`;
+      ws.getCell(30, 1).font = { italic: true, color: { argb: "FFC00000" } };
+    }
+  }
+
+  // Roster-wide reconciliation of the two bases, so a poller sees the adjustment
+  // without opening the workbook.
+  const figures = {
+    exclude_internal: excludeInternal,
+    months_reported: monthsStarted,
+    ytd_billable: round1(adj.billable),
+    ytd_billable_raw: round1(adj.billableRaw),
+    internal_reclassified_ytd: round1(adj.internalHours),
+    internal_firm_self_client_ytd: round1(adj.firmSelfClientHours),
+    internal_zero_rate_and_amount_ytd: round1(adj.zeroValueHours),
+    internal_firm_self_client_rated_ytd: round1(adj.firmSelfClientRatedHours),
+  };
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   const filename = `Monthly Goals Summary ${params.year}.xlsx`;
@@ -773,6 +807,7 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
       size_kb: result.size_kb,
       box_file_id: result.box_file_id,
       box_url: result.box_url,
+      figures,
     };
   }
   return {
@@ -784,6 +819,7 @@ async function downloadMonthlyGoalsSummary(params: MonthlyGoalsSummaryParams): P
     expires_at: result.expires_at,
     reason: result.reason,
     note: result.note,
+    figures,
   };
 }
 
@@ -971,7 +1007,8 @@ export function registerDocumentTools(server: McpServer): void {
     "Generate the firm-wide monthly goals summary chart: every timekeeper's monthly billable hours side by side, " +
     "color coded against their monthly goal (green = on goal, yellow = close, red = off goal), plus YTD totals. " +
     "Billable hours use the same filtration as the firm dashboard: each entry's Clio non-billable flag, PLUS the firm-internal reclassification when exclude_internal is true (the default) — matters whose client is the firm itself (Romano & Sumner, LLC) and billable-flagged entries with rate 0 AND amount 0 count as nonbillable, so rate and the matter's client ARE consulted. Synthetic fee placeholders are excluded. 26 Compare col I and its Utilization tab use this same adjusted basis, so the YTD Utilization % row still reconciles to the dashboard. " +
-    "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run).",
+    "Saves the workbook to Traction > Measurables > Monthly Measureables (versioned on re-runs, created on first run). " +
+    "Classifying the whole roster's year takes longer than the MCP client's 60s timeout, so this runs as a BACKGROUND JOB: the tool returns a job_id immediately — poll get_dashboard_status with it for the filename, box_url and the internal-time adjustment totals.",
     {
       year: z.coerce.number().optional().describe("Year (defaults to current year)"),
       box_folder_id: z.string().optional().describe("Box folder ID. Defaults to the Monthly Measureables folder."),
@@ -979,48 +1016,36 @@ export function registerDocumentTools(server: McpServer): void {
       exclude_internal: z.boolean().optional().default(true).describe("Reclassify firm-internal time as nonbillable when computing billable hours: matters whose client is the firm itself (Romano & Sumner, LLC), plus billable-flagged entries with rate 0 AND amount 0. Default true. Set false for the legacy flag-only basis."),
     },
     async (params) => {
-      try {
-        const result = await downloadMonthlyGoalsSummary({
-          year: params.year ?? new Date().getFullYear(),
-          box_folder_id: params.box_folder_id,
-          close_threshold_pct: params.close_threshold_pct,
-          exclude_internal: params.exclude_internal,
-        });
+      // Detached like download_all_weekly_goals: one full-year /activities pull
+      // per roster member outlasts the client timeout, and the previous
+      // synchronous form completed the Box write but returned a timeout error —
+      // so callers had no confirmation and no figures for work that HAD landed.
+      const jobId = `mgoals_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      const job: DashJob = { id: jobId, status: "running", started_at: new Date().toISOString() };
+      dashboardJobs.set(jobId, job);
+      pruneDashboardJobs();
 
-        if (result.box_file_id) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: true,
-                filename: result.filename,
-                created: result.created,
-                months_reported: result.months_reported,
-                box_file_id: result.box_file_id,
-                box_url: result.box_url,
-              }),
-            }],
-          };
-        }
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              filename: result.filename,
-              created: result.created,
-              months_reported: result.months_reported,
-              format: "xlsx",
-              size_kb: result.size_kb,
-              direct_download_url: result.direct_download_url,
-              expires_at: result.expires_at,
-              reason: result.reason,
-              note: result.note,
-            }),
-          }],
-        };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: err.message }) }], isError: true };
-      }
+      downloadMonthlyGoalsSummary({
+        year: params.year ?? new Date().getFullYear(),
+        box_folder_id: params.box_folder_id,
+        close_threshold_pct: params.close_threshold_pct,
+        exclude_internal: params.exclude_internal,
+      })
+        .then((res) => { job.result = res; job.status = "done"; job.finished_at = new Date().toISOString(); })
+        .catch((err: any) => { job.status = "error"; job.error = String(err?.message ?? err); job.finished_at = new Date().toISOString(); });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            job_id: jobId,
+            status: "started",
+            year: params.year ?? new Date().getFullYear(),
+            timekeepers: WEEKLY_GOALS_ROSTER.length,
+            message: "Monthly goals summary is running in the background (classifies the whole roster's year). Poll get_dashboard_status with this job_id for the filename, box_url and adjustment totals.",
+          }),
+        }],
+      };
     }
   );
 
