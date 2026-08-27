@@ -186,7 +186,7 @@ curl -X POST https://your-railway-url.up.railway.app/version \
 | `get_tasks` | Tasks with status/assignee/due date filters |
 | `get_bills` | Bills with state/date filters and aging flags |
 | `get_payments` | Individual payments/credits applied to bills (Clio allocations), incl. reversals |
-| `get_ar_aging` | Full AR aging report with bucket grouping |
+| `get_ar_aging` | Full AR aging report. Discrete buckets at 7/15/30/60/90/120/180/360 days (0-7, 8-15, 16-30, 31-60, 61-90, 91-120, 121-180, 181-360, 360+, inclusive both ends, summing to `total_ar`), cumulative `N+` rollups derived from them (`N+` = days_outstanding > N), plus the original five-bucket shape under `buckets`/`legacy_buckets` |
 | `get_wip_report` | Work-in-progress report with aging flags |
 | `get_trust_balances` | Trust/IOLTA balances with low-balance and dormancy flags |
 | `get_user_productivity` | Timekeeper hours and top matters |
