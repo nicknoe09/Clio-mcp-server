@@ -28,7 +28,7 @@ vi.mock("../src/utils/box", () => ({
 
 import ExcelJS from "exceljs";
 import { registerARTools } from "../src/tools/ar";
-import { CUMULATIVE_THRESHOLDS, DISCRETE_BUCKETS, cumulativeKey } from "../src/domain/arAging";
+import { BOUNDARY_RULE_TEXT, CUMULATIVE_THRESHOLDS, DISCRETE_BUCKETS, cumulativeKey } from "../src/domain/arAging";
 import { round2 } from "../src/utils/num";
 
 type ToolHandler = (params: any) => Promise<any>;
@@ -46,6 +46,17 @@ function handlers(): Map<string, ToolHandler> {
 
 function payload(result: any): any {
   return JSON.parse(result.content[0].text);
+}
+
+function descriptions(): Map<string, string> {
+  const map = new Map<string, string>();
+  const server = {
+    tool: vi.fn((name: string, description: string) => {
+      map.set(name, description);
+    }),
+  };
+  registerARTools(server as any);
+  return map;
 }
 
 const AS_OF = "2026-08-27";
@@ -836,5 +847,39 @@ describe("get_ar_scorecard — track_config_health", () => {
     expect(missing.find((m: any) => m.name === "Guardianship Litigation").intended_track).toBe("non_gated (by policy)");
     // A config problem does not break the AR maths.
     expect(out.reconciliation_ok).toBe(true);
+  });
+});
+
+// ==========================================================================
+// The tool descriptions ARE the MCP tool-search index — a broken one is a
+// silent documentation failure, and it already happened once: the boundary rule
+// was written as `' + BOUNDARY_RULE_TEXT + '` inside a double-quoted string, so
+// the literal source fragment shipped instead of the rule.
+describe("AR tool descriptions", () => {
+  const TOOLS = ["get_ar_aging", "get_ar_scorecard"];
+
+  it("interpolates the boundary rule instead of shipping the source fragment", () => {
+    const desc = descriptions();
+    for (const name of TOOLS) {
+      const d = desc.get(name);
+      expect(d, `${name} not registered`).toBeDefined();
+      // The rule itself must be present, verbatim.
+      expect(d, name).toContain(BOUNDARY_RULE_TEXT);
+      // …and no un-evaluated concatenation fragment may survive.
+      expect(d, name).not.toContain("BOUNDARY_RULE_TEXT");
+      expect(d, name).not.toMatch(/['"]\s*\+\s*[A-Z_]{4,}\s*\+\s*['"]/);
+    }
+  });
+
+  it("states the bucket set and the boundary direction in both tools", () => {
+    const desc = descriptions();
+    for (const name of TOOLS) {
+      const d = desc.get(name)!;
+      expect(d, name).toContain("day 30 is in 16-30");
+      expect(d, name).toMatch(/days_outstanding > N/);
+      for (const label of ["0-7", "8-15", "16-30", "121-180", "181-360", "360+"]) {
+        expect(d, `${name} missing bucket ${label}`).toContain(label);
+      }
+    }
   });
 });
