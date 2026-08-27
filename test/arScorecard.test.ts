@@ -72,8 +72,8 @@ const MATTERS = [
   { id: 102, pa: "Family Law", attorney: "Paul Romano", client: "Beta LLC", desc: "Divorce" },
   { id: 103, pa: null, attorney: "Kenny Sumner", client: "Gamma Inc", desc: "Estate administration work" },
   { id: 104, pa: "Probate", attorney: "Kenny Sumner", client: "Delta Trust", desc: "Dependent Administration of Estate" },
-  { id: 105, pa: "Representative", attorney: "Kenny Sumner", client: "Epsilon Ltd", desc: "Dependent Administration of Estate" },
-  { id: 106, pa: "Representative", attorney: "Paul Romano", client: "Zeta Group", desc: "Dependent Administration of Estate" },
+  { id: 105, pa: "Representative (R&S Serving)", attorney: "Kenny Sumner", client: "Epsilon Ltd", desc: "Dependent Administration of Estate" },
+  { id: 106, pa: "Representative (R&S Serving)", attorney: "Paul Romano", client: "Zeta Group", desc: "Dependent Administration of Estate" },
 ];
 
 const matterStub = (id: number) => {
@@ -424,17 +424,18 @@ describe("get_ar_scorecard — tagging consistency flags", () => {
   it("flags practice_area drift between matters sharing a description pattern", async () => {
     const out = await scorecard();
     const flag = out.tagging_consistency_flags.find((f: any) => f.matter_id === 104);
-    // 105 and 106 are both "Representative"; 104 is the odd one out.
+    // 105 and 106 are both "Representative (R&S Serving)" (gated); 104 is
+    // Probate (non-gated) — the odd one out.
     expect(flag.rules).toContain("same_pattern_different_practice_area");
     expect(out.tagging_consistency_flags.map((f: any) => f.matter_id)).not.toContain(105);
     expect(out.tagging_consistency_flags.map((f: any) => f.matter_id)).not.toContain(106);
   });
 
   it("does not treat two DIFFERENT gated practice_areas on similar matters as drift", async () => {
-    // "Guardianship" and "Guardianship Litigation" are both Gated. Same
-    // description pattern, different practice_area, same track → normal
-    // taxonomy, not drift. Only a disagreement that moves AR between tracks
-    // changes a reported number, so only that gets flagged.
+    // "Guardianship" and "Appointment" are both Gated. Same description
+    // pattern, different practice_area, same track → normal taxonomy, not
+    // drift. Only a disagreement that moves AR between tracks changes a
+    // reported number, so only that gets flagged.
     const bill = (id: number, mid: number, pa: string, desc: string) => ({
       id, number: `INV-${id}`, kind: "revenue_kind", state: "awaiting_payment",
       issued_at: dueLocal(40), due_at: dueLocal(10), balance: 100, total: 100,
@@ -447,7 +448,7 @@ describe("get_ar_scorecard — tagging consistency flags", () => {
     });
     const bills = [
       bill(1, 201, "Guardianship", "Guardianship of Minor"),
-      bill(2, 202, "Guardianship Litigation", "Guardianship of Minor - contested"),
+      bill(2, 202, "Appointment", "Guardianship of Minor - court appointed"),
       bill(3, 203, "Estate Planning", "Guardianship Designation"),
     ];
     paginationMocks.fetchAllPages.mockImplementation(async (path: string, params: any) => {
@@ -466,6 +467,42 @@ describe("get_ar_scorecard — tagging consistency flags", () => {
     // 203 is Estate Planning (non_gated) — that one really does move AR
     // between tracks, so it stays flagged.
     expect(flagged).toContain(203);
+  });
+
+  it("does not flag Guardianship Litigation, which is non-gated BY POLICY", async () => {
+    // Its description reads gated and it sits beside Guardianship (which IS
+    // gated), but the firm is paid up front on it, so its non-gated coding is
+    // deliberate. Flagging it would put every such matter on the work queue.
+    const bill = (id: number, mid: number, pa: string, desc: string) => ({
+      id, number: `INV-${id}`, kind: "revenue_kind", state: "awaiting_payment",
+      issued_at: dueLocal(40), due_at: dueLocal(10), balance: 100, total: 100,
+      matters: [{
+        id: mid, display_number: `0${mid}-Client ${mid}`, description: desc,
+        client: { id: mid, name: `Client ${mid}` },
+        responsible_attorney: { id: 1, name: "Paul Romano" },
+      }],
+      _pa: pa,
+    });
+    const bills = [
+      bill(1, 401, "Guardianship", "Guardianship of Minor"),
+      bill(2, 402, "Guardianship Litigation", "Guardianship of Minor - contested"),
+    ];
+    paginationMocks.fetchAllPages.mockImplementation(async (path: string, params: any) => {
+      if (path === "/bills" && params?.state === "awaiting_payment") return bills;
+      if (path === "/bills" && params?.state === "paid") return [];
+      if (path === "/matters") {
+        return bills.map((b) => ({ id: b.matters[0].id, practice_area: { name: b._pa } }));
+      }
+      return [];
+    });
+
+    const out = await scorecard();
+    expect(out.tagging_consistency_flags.map((f: any) => f.matter_id)).not.toContain(402);
+    // It is exempt from the heuristic but still reported as client-pay AR.
+    expect(out.firm_by_track.non_gated.total_ar).toBe(100);
+    expect(out.firm_by_track.gated.total_ar).toBe(100);
+    // And its presence must not drag the gated Guardianship matter onto the list.
+    expect(out.tagging_consistency_flags.map((f: any) => f.matter_id)).not.toContain(401);
   });
 
   it("does not flag correctly-tagged gated matters, and never reclassifies", async () => {
@@ -755,5 +792,49 @@ describe("get_wip_report — unchanged after the shared-helper extraction", () =
     const out = await wip({ responsible_attorney_id: 2 });
     expect(out.matters.map((m: any) => m.matter_id)).toEqual([322]);
     expect(out.summary.total_firm_wip).toBe(200);
+  });
+});
+
+// ==========================================================================
+// The track split matches practice_area names exactly, so a renamed practice
+// area stops matching and its AR silently joins the Non-Gated headline. This is
+// the guard that makes that visible instead of silent.
+describe("get_ar_scorecard — track_config_health", () => {
+  it("reports ok when every configured practice area is present in Clio", async () => {
+    const out = await scorecard();
+    // The fixture covers Guardianship + Representative (R&S Serving) + Probate,
+    // but not every configured name, so check the shape and the AR-bearing side.
+    expect(out.track_config_health).toBeDefined();
+    expect(out.track_config_health.unmapped_practice_areas_with_ar.map((p: any) => p.name))
+      .toEqual(["Family Law"]); // matter 102, defaults to non_gated
+    expect(out.track_config_health.unmapped_practice_areas_with_ar[0]).toMatchObject({
+      defaulted_track: "non_gated",
+      total_ar: 2000.20,
+      invoices: 1,
+    });
+  });
+
+  it("names a configured practice area that matches nothing in Clio", async () => {
+    // Simulate the "Representative" rename: Clio only knows Guardianship, so
+    // every other configured name is unmatched and must be reported.
+    paginationMocks.fetchAllPages.mockImplementation(async (path: string, params: any) => {
+      if (path === "/bills" && params?.state === "awaiting_payment") return arBills(dueLocal);
+      if (path === "/bills" && params?.state === "paid") return [];
+      if (path === "/matters") return [{ id: 101, practice_area: { name: "Guardianship" } }];
+      return [];
+    });
+    const out = await scorecard();
+    expect(out.track_config_health.ok).toBe(false);
+    const missing = out.track_config_health.configured_not_found_in_clio;
+    const names = missing.map((m: any) => m.name);
+    expect(names).toContain("Representative (R&S Serving)");
+    expect(names).toContain("Dependent Administration (Client Serving)");
+    expect(names).toContain("Guardianship Litigation");
+    expect(names).not.toContain("Guardianship");
+    // Each entry says which track the config intended.
+    expect(missing.find((m: any) => m.name === "Representative (R&S Serving)").intended_track).toBe("gated");
+    expect(missing.find((m: any) => m.name === "Guardianship Litigation").intended_track).toBe("non_gated (by policy)");
+    // A config problem does not break the AR maths.
+    expect(out.reconciliation_ok).toBe(true);
   });
 });

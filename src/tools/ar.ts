@@ -52,12 +52,29 @@ const SCORECARD_MATTER_FIELDS = "id,practice_area{name}";
 // choice in the split — it is intentionally kept in ONE place so get_ar_aging
 // (or any future tool) can share it.
 // ====================================================================
+// NOTE: these are matched EXACTLY (trimmed, case-sensitive) against Clio's
+// practice_area name, so every entry must be the practice area's literal name in
+// Clio — including any parenthetical suffix. A renamed or misspelled entry
+// silently matches nothing and sends that whole practice area's AR to the
+// Non-Gated (headline) track. `track_config_health` in the scorecard output
+// reports any entry here that matched no matter, so that can't stay invisible.
 export const GATED_PRACTICE_AREAS = new Set<string>([
   "Appointment",
+  // The client serves as dependent administrator; payment is court-approved out
+  // of the estate, so aging reflects court/estate timelines, not collection
+  // failure. Added per firm policy 2026-08.
+  "Dependent Administration (Client Serving)",
   "Guardianship",
-  "Guardianship Litigation",
   "Mental Comm",
-  "Representative",
+  "Representative (R&S Serving)",
+]);
+// Guardianship Litigation is deliberately NOT gated: the firm is paid up front
+// by the client, who is reimbursed for fees later, so its aging IS a collection
+// signal and belongs in the client-pay headline. Kept as an explicit named
+// exclusion (rather than just absent) because its name reads gated and it sits
+// next to Guardianship, which IS gated. Changed per firm policy 2026-08.
+export const NON_GATED_BY_POLICY_PRACTICE_AREAS = new Set<string>([
+  "Guardianship Litigation",
 ]);
 // Probate is paced by estate liquidity, but per firm policy it is client-pay
 // (Non-Gated) in the general case, so it defaults to the non_gated track. It is
@@ -76,6 +93,13 @@ export const SEMI_GATED_PRACTICE_AREAS = new Set<string>(["Probate"]);
 // reclassifies a matter and never changes a reported figure — classification is
 // always driven by practice_area via classifyTrack().
 // ====================================================================
+// A matter whose practice_area is a DELIBERATE non-gated classification is not
+// tagging drift, however gated its description reads — Guardianship Litigation
+// is the case in point: it is named like gated work, sits beside Guardianship
+// (which is gated), and would otherwise flag on every single matter. Excluded
+// from both heuristics below so the flag list stays a real work queue.
+export const HEURISTIC_EXEMPT_PRACTICE_AREAS = NON_GATED_BY_POLICY_PRACTICE_AREAS;
+
 export const GATED_DESCRIPTION_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
   { label: "Dependent Administration", re: /\bdependent\s+administration\b/i },
   { label: "Temporary Administration", re: /\btemporary\s+administration\b/i },
@@ -711,7 +735,7 @@ export function registerARTools(server: McpServer): void {
     "get_ar_scorecard",
     "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown, the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). " +
       "AGING BUCKETS: every scope (firm, firm_by_track, by_attorney) carries discrete_buckets — mutually exclusive buckets at the 7/15/30/60/90/120/180/360-day thresholds: 0-7, 8-15, 16-30, 31-60, 61-90, 91-120, 121-180, 181-360, 360+ — and cumulative_buckets — rollups 7+, 15+, 30+, 60+, 90+, 120+, 180+, 360+ DERIVED from the discrete buckets (so 360+ is a subset of 180+ and the two views can never drift). " + BOUNDARY_RULE_TEXT + " The pre-existing scalar fields are unchanged and now alias the rollups exactly (ar_60plus = over_60, ar_90plus = over_90, ar_120plus = over_120). " +
-      "TRACKS: AR splits into Gated vs. Non-Gated by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area, surfaced with the SPECIFIC matters (firm_by_track.unclassified.matters gives matter_id, matter_number, client_name, description, attorney and $) so they can actually be tagged. " +
+      "TRACKS: AR splits into Gated vs. Non-Gated by each matter's practice_area (firm_by_track), matched EXACTLY against Clio's practice_area name. Gated = work whose aging reflects court/estate payment timelines rather than collection failure: Appointment, Dependent Administration (Client Serving), Guardianship, Mental Comm, Representative (R&S Serving). Non-Gated = client-pay, the headline collections metric; it includes Probate by firm policy and explicitly includes Guardianship Litigation, which is NOT gated because the firm is paid up front by the client who is reimbursed for fees later, so its aging is a real collection signal. Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated). Unclassified = matters with no practice_area, surfaced with the SPECIFIC matters (firm_by_track.unclassified.matters gives matter_id, matter_number, client_name, description, attorney and $) so they can actually be tagged. A track_config_health section reports any configured practice-area name that matched NO matter in Clio (a rename or typo, which would silently move that work into the Non-Gated headline) plus any practice area carrying AR that no rule names and so defaults to Non-Gated. " +
       "by_attorney entries carry the blended metrics they always did PLUS gated / non_gated / unclassified sub-objects (and semi_gated when probate_treatment='separate') with the same metrics, so per-attorney gated AR needs no second pull. " +
       "stale_ar_365plus is a collectability-review tier (days_outstanding > 360, i.e. exactly the 360+ rollup) reported firm-wide, per track and per attorney with $, invoice count, oldest invoice and a full triage list — these balances are still inside total_ar, they are just no longer invisible inside the 90+/120+ headline. " +
       "tagging_consistency_flags is a HEURISTIC list (never an auto-correction) of matters whose description reads like court-gated work (Dependent/Temporary/Permanent Administration, Guardianship, Ad Litem, Mental Commitment) but whose practice_area does not classify it that way, plus matters that share a description pattern yet disagree on practice_area — so tagging drift between similarly-named matters is caught instead of found by hand. " +
@@ -1193,9 +1217,13 @@ export function registerARTools(server: McpServer): void {
           }
 
           // Which gated-pattern keyword(s) each matter's description matches.
-          // display_number embeds the matter name, so both are searched.
-          const patternsOf = (m: MatterInfo) =>
-            GATED_DESCRIPTION_PATTERNS.filter((p) => p.re.test(`${m.description} ${m.matter}`)).map((p) => p.label);
+          // display_number embeds the matter name, so both are searched. A
+          // practice_area that is non-gated BY POLICY yields no patterns at all,
+          // so it neither gets flagged nor skews the rule-2 majority.
+          const patternsOf = (m: MatterInfo) => {
+            if (m.practice_area && HEURISTIC_EXEMPT_PRACTICE_AREAS.has(m.practice_area.trim())) return [];
+            return GATED_DESCRIPTION_PATTERNS.filter((p) => p.re.test(`${m.description} ${m.matter}`)).map((p) => p.label);
+          };
 
           const reasons = new Map<string, { info: MatterInfo; rules: string[]; why: string[] }>();
           const addReason = (key: string, info: MatterInfo, rule: string, why: string) => {
@@ -1434,6 +1462,61 @@ export function registerARTools(server: McpServer): void {
         })();
 
         // ================================================================
+        // Track-config health
+        // ================================================================
+        // The track split matches practice_area names EXACTLY, so a practice area
+        // that is renamed in Clio (or mistyped here) stops matching and its AR
+        // silently moves into the Non-Gated headline. That is not a hypothetical:
+        // "Representative" sat in the gated set while Clio's actual name was
+        // "Representative (R&S Serving)", so that work reported as client-pay.
+        // This section makes both directions visible every run.
+        const track_config_health = (() => {
+          const observed = new Set<string>();
+          for (const v of practiceAreaByMatter.values()) {
+            const n = (v ?? "").trim();
+            if (n) observed.add(n);
+          }
+          const configured = new Map<string, string>();
+          for (const n of GATED_PRACTICE_AREAS) configured.set(n, "gated");
+          for (const n of SEMI_GATED_PRACTICE_AREAS) configured.set(n, "semi_gated");
+          for (const n of NON_GATED_BY_POLICY_PRACTICE_AREAS) configured.set(n, "non_gated (by policy)");
+
+          // Configured names that match no matter in Clio — almost always a
+          // rename or a typo, and always a silent misclassification.
+          const configured_not_found_in_clio = [...configured.entries()]
+            .filter(([name]) => !observed.has(name))
+            .map(([name, intended_track]) => ({ name, intended_track }));
+
+          // Practice areas carrying AR that no rule names, so they fall through
+          // to Non-Gated by default. Usually correct — surfaced so "correct by
+          // default" stays a decision rather than an accident.
+          const arByPa = new Map<string, { total_ar: number; invoices: number }>();
+          for (const r of rows) {
+            const n = (r.practice_area ?? "").trim();
+            if (!n || configured.has(n)) continue;
+            const e = arByPa.get(n) ?? { total_ar: 0, invoices: 0 };
+            e.total_ar = round2(e.total_ar + r.balance);
+            e.invoices += 1;
+            arByPa.set(n, e);
+          }
+          const unmapped_practice_areas_with_ar = [...arByPa.entries()]
+            .map(([name, v]) => ({ name, defaulted_track: "non_gated" as const, ...v }))
+            .sort((a, b) => b.total_ar - a.total_ar);
+
+          if (configured_not_found_in_clio.length) {
+            console.warn(`[get_ar_scorecard] TRACK CONFIG WARNING: configured practice areas matched no matter in Clio — ${JSON.stringify(configured_not_found_in_clio)}`);
+          }
+          return {
+            ok: configured_not_found_in_clio.length === 0,
+            note:
+              "practice_area names are matched exactly (trimmed, case-sensitive). A configured name that " +
+              "matches nothing in Clio silently sends that work to the Non-Gated headline track.",
+            configured_not_found_in_clio,
+            unmapped_practice_areas_with_ar,
+          };
+        })();
+
+        // ================================================================
         // Reconciliation (extended): tracks AND discrete buckets AND the
         // legacy 90+/120+ fields must all agree, to the cent.
         // ================================================================
@@ -1635,6 +1718,7 @@ export function registerARTools(server: McpServer): void {
                   firm_by_track,
                   reconciliation_ok,
                   reconciliation,
+                  track_config_health,
                   probate_treatment: probateTreatment,
                   stale_ar_365plus,
                   tagging_consistency_flags,
