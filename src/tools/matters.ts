@@ -1,8 +1,14 @@
 import { z } from "zod/v4";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { fetchAllPages, rawGetSingle, rawPostSingle } from "../clio/pagination";
+import { fetchAllPages, rawGetSingle, rawPostSingle, rawPatchSingle } from "../clio/pagination";
 import { resolveCustomFieldsForCreate, type CustomFieldInput } from "../clio/customFieldResolver";
 import { buildCustomRatePayload, applyCustomRate, type UserRate } from "../clio/matterRate";
+import {
+  resolvePracticeAreaByName,
+  buildPracticeAreaPatch,
+  isAlreadySet,
+  type PracticeAreaLite,
+} from "../clio/practiceArea";
 
 const MATTER_FIELDS =
   "id,display_number,description,status,open_date,billing_method,responsible_attorney{id,name},client{id,name},practice_area{name}";
@@ -13,6 +19,37 @@ const MATTER_CREATE_READBACK_FIELDS =
   "id,display_number,description,status,open_date,billing_method," +
   "client{id,name},responsible_attorney{id,name},originating_attorney{id,name}," +
   "practice_area{id,name},custom_field_values{id,field_name,value}";
+
+function ok(payload: any) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
+}
+
+function fail(err: any, interpretation?: string) {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        error: true,
+        message: err.message,
+        status: err.response?.status,
+        interpretation,
+        clio_error: err.response?.data,
+      }, null, 2),
+    }],
+    isError: true,
+  };
+}
+
+/** Refusal that never touched Clio — no HTTP error to report, just a reason. */
+function refuse(message: string, extra?: Record<string, any>) {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({ error: true, changed: false, message, ...extra }, null, 2),
+    }],
+    isError: true,
+  };
+}
 
 export function registerMatterTools(server: McpServer): void {
   // get_matters
@@ -422,6 +459,128 @@ export function registerMatterTools(server: McpServer): void {
           }],
           isError: true,
         };
+      }
+    }
+  );
+
+
+  // list_practice_areas — the firm's practice-area picklist, with IDs.
+  server.tool(
+    "list_practice_areas",
+    "List the firm's practice areas from Clio (GET /practice_areas), with the ID of each. Clio references practice areas by ID and never by name, so this is how you get the practice_area_id that create_matter and set_matter_practice_area need. Read-only.",
+    {},
+    async () => {
+      try {
+        const areas = await fetchAllPages<any>("/practice_areas", { fields: "id,name" });
+        return ok({
+          count: areas.length,
+          practice_areas: areas
+            .map((a: any) => ({ id: a.id, name: a.name }))
+            .sort((x: any, y: any) => String(x.name ?? "").localeCompare(String(y.name ?? ""))),
+        });
+      } catch (err: any) {
+        return fail(err);
+      }
+    }
+  );
+
+  // set_matter_practice_area — move one existing matter to a practice area.
+  server.tool(
+    "set_matter_practice_area",
+    "Change the practice area on an EXISTING matter (PATCH /matters/{id}). Give either practice_area_id (from list_practice_areas) or practice_area_name, which is resolved against the firm's list by exact name, ignoring case and extra spaces. Refuses rather than guessing when a name matches nothing or matches more than one area, and reports the practice area the matter had before the change so the edit is auditable. If the matter already has the target practice area, nothing is written. One matter per call — loop over a list rather than passing several.",
+    {
+      matter_id: z.coerce.number().describe("Clio matter ID of the matter to change"),
+      practice_area_id: z.coerce.number().optional().describe("Target practice area ID (from list_practice_areas). Takes precedence over practice_area_name."),
+      practice_area_name: z.string().optional().describe("Target practice area name, e.g. 'Dependent Administration'. Matched exactly (case- and whitespace-insensitive) against the firm's list."),
+    },
+    async (params) => {
+      try {
+        if (params.practice_area_id === undefined && params.practice_area_name === undefined) {
+          return refuse(
+            "Give either practice_area_id or practice_area_name. Use list_practice_areas to see the firm's areas and their IDs."
+          );
+        }
+
+        // Resolve the target ID. A name is resolved against Clio's own list so
+        // a typo becomes a refusal here rather than a 422 (or worse, a silent
+        // write to the wrong area).
+        let targetId: number;
+        let targetName: string | null = null;
+        if (params.practice_area_id !== undefined) {
+          targetId = params.practice_area_id;
+        } else {
+          const areas = (await fetchAllPages<any>("/practice_areas", { fields: "id,name" })) as PracticeAreaLite[];
+          const resolved = resolvePracticeAreaByName(params.practice_area_name!, areas);
+          if (!resolved.ok && resolved.reason === "not_found") {
+            return refuse(
+              `No practice area named "${params.practice_area_name}" exists in Clio. Nothing was changed.`,
+              {
+                available: areas
+                  .map((a) => ({ id: a.id, name: a.name }))
+                  .sort((x, y) => String(x.name ?? "").localeCompare(String(y.name ?? ""))),
+                next_step:
+                  "Create the practice area in Clio (Settings -> Practice Areas), or pass one of the names above.",
+              }
+            );
+          }
+          if (!resolved.ok) {
+            return refuse(
+              `More than one practice area in Clio is named "${params.practice_area_name}". Nothing was changed — pass practice_area_id to say which one.`,
+              { matches: resolved.matches }
+            );
+          }
+          targetId = resolved.id;
+          targetName = resolved.name;
+        }
+
+        // Read the matter first, so the response can show before -> after and
+        // so an already-correct matter is not written to at all.
+        const beforeResp = await rawGetSingle(`/matters/${params.matter_id}`, {
+          fields: "id,display_number,description,practice_area{id,name}",
+        });
+        const before = beforeResp?.data ?? beforeResp;
+        const previous = before?.practice_area ?? null;
+
+        if (isAlreadySet(previous, targetId)) {
+          return ok({
+            changed: false,
+            reason: "already_set",
+            matter: {
+              id: before?.id,
+              display_number: before?.display_number ?? null,
+              description: before?.description ?? null,
+            },
+            practice_area: previous,
+          });
+        }
+
+        await rawPatchSingle(`/matters/${params.matter_id}`, buildPracticeAreaPatch(targetId));
+
+        // Read back rather than trusting the PATCH echo, so what is reported is
+        // what Clio actually stored.
+        const afterResp = await rawGetSingle(`/matters/${params.matter_id}`, {
+          fields: "id,display_number,description,practice_area{id,name}",
+        });
+        const after = afterResp?.data ?? afterResp;
+
+        return ok({
+          changed: true,
+          matter: {
+            id: after?.id,
+            display_number: after?.display_number ?? null,
+            description: after?.description ?? null,
+          },
+          practice_area_before: previous,
+          practice_area_after: after?.practice_area ?? null,
+          requested: { id: targetId, name: targetName },
+        });
+      } catch (err: any) {
+        const status = err.response?.status;
+        let interpretation: string | undefined;
+        if (status === 404) interpretation = "Matter not found, or the practice_area_id does not exist. Nothing was changed.";
+        else if (status === 422) interpretation = "Clio rejected the change — most often an invalid practice_area_id. See clio_error.";
+        else if (status === 403) interpretation = "Forbidden — the token lacks permission to edit this matter.";
+        return fail(err, interpretation);
       }
     }
   );
