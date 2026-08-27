@@ -3,6 +3,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import ExcelJS from "exceljs";
 import { fetchAllPages } from "../clio/pagination";
 import { uploadToBox, createBoxFile, findBoxFileId, downloadFromBox } from "../utils/box";
+import {
+  DISCRETE_BUCKETS,
+  CUMULATIVE_THRESHOLDS,
+  STALE_THRESHOLD_DAYS,
+  BOUNDARY_RULE_TEXT,
+  bucketizeAging,
+  cumulativeKey,
+  discreteBucketLabel,
+  reconcileDiscreteBuckets,
+  type AgingBuckets,
+  type AgingItem,
+  type BucketReconciliation,
+  type BucketSummary,
+} from "../domain/arAging";
 
 // Box folder that holds the AR Scorecard workbook: Traction > Measurables >
 // Weekly Measureables (an EOS weekly measurable). The file is versioned in place.
@@ -52,6 +66,25 @@ export const GATED_PRACTICE_AREAS = new Set<string>([
 export const SEMI_GATED_PRACTICE_AREAS = new Set<string>(["Probate"]);
 // Everything else with a known practice area = Non-Gated (client-pay).
 
+// ====================================================================
+// Gated-pattern description keywords (tagging-drift heuristic)
+// --------------------------------------------------------------------
+// Matter DESCRIPTIONS that read like court-gated appointment work. Used only to
+// flag likely practice_area tagging drift for human review (two
+// "Dependent Administration" matters carrying different practice_area values
+// silently move AR between the Gated and Non-Gated tracks). This list never
+// reclassifies a matter and never changes a reported figure — classification is
+// always driven by practice_area via classifyTrack().
+// ====================================================================
+export const GATED_DESCRIPTION_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
+  { label: "Dependent Administration", re: /\bdependent\s+administration\b/i },
+  { label: "Temporary Administration", re: /\btemporary\s+administration\b/i },
+  { label: "Permanent Administration", re: /\bpermanent\s+administration\b/i },
+  { label: "Guardianship", re: /\bguardianship\b/i },
+  { label: "Ad Litem", re: /\bad\s+litem\b/i },
+  { label: "Mental Commitment", re: /\bmental\s+(commitment|comm(?:itment)?)\b/i },
+];
+
 export type TrackKey = "gated" | "semi_gated" | "non_gated" | "unclassified";
 
 // Classify a matter's practice_area name into a base track. A null/blank name
@@ -64,6 +97,9 @@ export function classifyTrack(practiceAreaName: string | null | undefined): Trac
   if (SEMI_GATED_PRACTICE_AREAS.has(name)) return "semi_gated";
   return "non_gated";
 }
+
+// Display labels for the tracks (workbook tabs).
+const trackLabel: Record<TrackKey, string> = { gated: "Gated", semi_gated: "Semi-Gated", non_gated: "Non-Gated", unclassified: "Unclassified" };
 
 export type ProbateTreatment = "gated" | "non_gated" | "separate";
 
@@ -89,6 +125,9 @@ interface Invoice {
   balance: number;
   days_outstanding: number;
   responsible_attorney: string | null;
+  // Discrete aging bucket label under the 7/15/30/60/90/120/180/360 scheme
+  // (see src/domain/arAging.ts for the boundary rule).
+  aging_bucket: string;
 }
 
 interface Bucket {
@@ -98,11 +137,157 @@ interface Bucket {
   invoices: Invoice[];
 }
 
+// ====================================================================
+// WIP (unbilled time + expenses) per matter
+// --------------------------------------------------------------------
+// Extracted verbatim from get_wip_report so get_ar_scorecard's optional
+// include_wip cross-reference reports the SAME numbers as the WIP tool itself
+// (same 90-day created_since window, same rounded_quantity basis, same
+// RED/YELLOW ageing flags) rather than a second, subtly different definition.
+// ====================================================================
+export type WipMatterRow = {
+  matter_id: number;
+  matter_number: string;
+  matter_description: string;
+  client: any;
+  responsible_attorney: any;
+  oldest_entry_date: string;
+  days_since_oldest_entry: number;
+  unbilled_hours: number;
+  unbilled_time_value: number;
+  unbilled_expenses: number;
+  combined_wip_value: number;
+  flag: string | null;
+};
+
+export async function computeWipMatters(opts: {
+  responsible_attorney_id?: number;
+}): Promise<{ matters: WipMatterRow[]; red_flag_count: number }> {
+  const defaultStart = new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
+  const timeParams: Record<string, any> = {
+    type: "TimeEntry",
+    billed: false,
+    fields:
+      "id,date,quantity,rounded_quantity,price,matter{id,display_number,description,client,responsible_attorney}",
+    created_since: `${defaultStart}T00:00:00+00:00`,
+  };
+  const expenseParams: Record<string, any> = {
+    type: "ExpenseEntry",
+    billed: false,
+    fields:
+      "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
+    created_since: `${defaultStart}T00:00:00+00:00`,
+  };
+
+  const [timeEntries, expenses] = await Promise.all([
+    fetchAllPages<any>("/activities", timeParams),
+    fetchAllPages<any>("/activities", expenseParams),
+  ]);
+
+  const byMatter: Record<
+    number,
+    {
+      matter: any;
+      unbilled_hours: number;
+      unbilled_time_value: number;
+      unbilled_expenses: number;
+      oldest_entry: string;
+    }
+  > = {};
+
+  for (const e of timeEntries) {
+    const mid = e.matter?.id;
+    if (!mid) continue;
+    if (
+      opts.responsible_attorney_id &&
+      e.matter?.responsible_attorney?.id !== opts.responsible_attorney_id
+    )
+      continue;
+
+    if (!byMatter[mid]) {
+      byMatter[mid] = {
+        matter: e.matter,
+        unbilled_hours: 0,
+        unbilled_time_value: 0,
+        unbilled_expenses: 0,
+        oldest_entry: e.date,
+      };
+    }
+    // Use rounded_quantity (billed increment) not raw quantity, so WIP
+    // matches what the client will actually see invoiced.
+    const hours = (e.rounded_quantity ?? e.quantity) / 3600;
+    byMatter[mid].unbilled_hours += hours;
+    byMatter[mid].unbilled_time_value += hours * (e.price || 0);
+    if (e.date < byMatter[mid].oldest_entry) {
+      byMatter[mid].oldest_entry = e.date;
+    }
+  }
+
+  for (const e of expenses) {
+    const mid = e.matter?.id;
+    if (!mid) continue;
+    if (
+      opts.responsible_attorney_id &&
+      e.matter?.responsible_attorney?.id !== opts.responsible_attorney_id
+    )
+      continue;
+
+    if (!byMatter[mid]) {
+      byMatter[mid] = {
+        matter: e.matter,
+        unbilled_hours: 0,
+        unbilled_time_value: 0,
+        unbilled_expenses: 0,
+        oldest_entry: e.date,
+      };
+    }
+    byMatter[mid].unbilled_expenses += e.price || 0;
+    if (e.date < byMatter[mid].oldest_entry) {
+      byMatter[mid].oldest_entry = e.date;
+    }
+  }
+
+  const today = new Date();
+  let redFlagCount = 0;
+
+  const matters = Object.entries(byMatter).map(([, m]) => {
+    const combinedWip = m.unbilled_time_value + m.unbilled_expenses;
+    const daysSinceOldest = Math.floor(
+      (today.getTime() - new Date(m.oldest_entry).getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    let flag: string | null = null;
+    if (daysSinceOldest > 60) {
+      flag = "RED";
+      redFlagCount++;
+    } else if (daysSinceOldest > 30) {
+      flag = "YELLOW";
+    }
+
+    return {
+      matter_id: m.matter.id,
+      matter_number: m.matter.display_number,
+      matter_description: m.matter.description,
+      client: m.matter.client,
+      responsible_attorney: m.matter.responsible_attorney,
+      oldest_entry_date: m.oldest_entry,
+      days_since_oldest_entry: daysSinceOldest,
+      unbilled_hours: Math.round(m.unbilled_hours * 100) / 100,
+      unbilled_time_value: Math.round(m.unbilled_time_value * 100) / 100,
+      unbilled_expenses: Math.round(m.unbilled_expenses * 100) / 100,
+      combined_wip_value: Math.round(combinedWip * 100) / 100,
+      flag,
+    };
+  });
+
+  return { matters, red_flag_count: redFlagCount };
+}
+
 export function registerARTools(server: McpServer): void {
   // get_ar_aging
   server.tool(
     "get_ar_aging",
-    "Full accounts receivable aging report. Counts ONLY revenue_kind fee bills; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded. Groups outstanding invoices into buckets: Current (0-30), 31-60, 61-90, 91-120, 120+. Includes client emails for direct action.",
+    "Full accounts receivable aging report. Counts ONLY revenue_kind fee bills; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded. Ages every open invoice by days_outstanding (days past due_at, floored at 0) and reports THREE views of the same dollars: (1) discrete_buckets — mutually exclusive buckets at the 7/15/30/60/90/120/180/360-day thresholds: 0-7, 8-15, 16-30, 31-60, 61-90, 91-120, 121-180, 181-360, 360+; these sum to total_ar to the cent and a reconciliation.reconciliation_ok flag proves it; (2) cumulative_buckets — rollups 7+, 15+, 30+, 60+, 90+, 120+, 180+, 360+, each DERIVED from the discrete buckets (so 360+ is a subset of 180+, and the two views can never drift); (3) buckets / legacy_buckets — the original fixed five-bucket shape (current, days_31_60, days_61_90, days_91_120, over_120) with full invoice detail, kept unchanged for backward compatibility. ' + BOUNDARY_RULE_TEXT + ' Every invoice also carries its own aging_bucket label. Includes client emails for direct action.",
     {
       responsible_attorney_id: z
         .number()
@@ -162,6 +347,7 @@ export function registerARTools(server: McpServer): void {
             balance: b.balance,
             days_outstanding: Math.max(daysOut, 0),
             responsible_attorney: m?.responsible_attorney?.name ?? null,
+            aging_bucket: discreteBucketLabel(daysOut),
           };
 
           if (daysOut <= 30) buckets.current.push(invoice);
@@ -197,6 +383,33 @@ export function registerARTools(server: McpServer): void {
             ? Math.max(...allInvoices.map((i) => i.balance))
             : 0;
 
+        // ---- Configurable-granularity buckets (7/15/30/60/90/120/180/360) ----
+        // Discrete buckets are mutually exclusive; the cumulative ("N+") view is
+        // derived from them in src/domain/arAging.ts so the two can never drift.
+        // Both are summaries only — the full invoice arrays stay in the legacy
+        // `buckets` field (every invoice carries days_outstanding and
+        // aging_bucket, so a consumer can re-bucket without a second payload).
+        const aging = bucketizeAging(
+          allInvoices.map<AgingItem>((i) => ({
+            days: i.days_outstanding,
+            balance: i.balance,
+            client: i.client_name,
+          }))
+        );
+        const bucketRecon = reconcileDiscreteBuckets(aging.discrete, totalAR);
+        if (!bucketRecon.ok) {
+          console.warn(
+            `[get_ar_aging] RECONCILIATION FAILED: discrete buckets sum ${bucketRecon.discrete_sum} != total_ar ${totalAR} (delta ${bucketRecon.delta})`
+          );
+        }
+        const legacyBuckets = {
+          current: makeBucket(buckets.current),
+          days_31_60: makeBucket(buckets.days_31_60),
+          days_61_90: makeBucket(buckets.days_61_90),
+          days_91_120: makeBucket(buckets.days_91_120),
+          over_120: makeBucket(buckets.over_120),
+        };
+
         return {
           content: [
             {
@@ -210,13 +423,20 @@ export function registerARTools(server: McpServer): void {
                     largest_balance: largest,
                     total_invoices: allInvoices.length,
                   },
-                  buckets: {
-                    current: makeBucket(buckets.current),
-                    days_31_60: makeBucket(buckets.days_31_60),
-                    days_61_90: makeBucket(buckets.days_61_90),
-                    days_91_120: makeBucket(buckets.days_91_120),
-                    over_120: makeBucket(buckets.over_120),
+                  bucket_rules: BOUNDARY_RULE_TEXT,
+                  discrete_buckets: aging.discrete,
+                  cumulative_buckets: aging.cumulative,
+                  reconciliation: {
+                    reconciliation_ok: bucketRecon.ok,
+                    discrete_bucket_sum: bucketRecon.discrete_sum,
+                    total_ar: bucketRecon.total_ar,
+                    delta: bucketRecon.delta,
                   },
+                  // Original five-bucket shape, unchanged (full invoice detail).
+                  // Exposed under both names: `buckets` for existing consumers,
+                  // `legacy_buckets` for new ones that want to be explicit.
+                  buckets: legacyBuckets,
+                  legacy_buckets: legacyBuckets,
                 },
                 null,
                 2
@@ -259,123 +479,10 @@ export function registerARTools(server: McpServer): void {
     },
     async (params) => {
       try {
-        const defaultStart = new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
-        const timeParams: Record<string, any> = {
-          type: "TimeEntry",
-          billed: false,
-          fields:
-            "id,date,quantity,rounded_quantity,price,matter{id,display_number,description,client,responsible_attorney}",
-          created_since: `${defaultStart}T00:00:00+00:00`,
-        };
-        const expenseParams: Record<string, any> = {
-          type: "ExpenseEntry",
-          billed: false,
-          fields:
-            "id,date,price,matter{id,display_number,description,client,responsible_attorney}",
-          created_since: `${defaultStart}T00:00:00+00:00`,
-        };
-
-        const [timeEntries, expenses] = await Promise.all([
-          fetchAllPages<any>("/activities", timeParams),
-          fetchAllPages<any>("/activities", expenseParams),
-        ]);
-
-        const byMatter: Record<
-          number,
-          {
-            matter: any;
-            unbilled_hours: number;
-            unbilled_time_value: number;
-            unbilled_expenses: number;
-            oldest_entry: string;
-          }
-        > = {};
-
-        for (const e of timeEntries) {
-          const mid = e.matter?.id;
-          if (!mid) continue;
-          if (
-            params.responsible_attorney_id &&
-            e.matter?.responsible_attorney?.id !== params.responsible_attorney_id
-          )
-            continue;
-
-          if (!byMatter[mid]) {
-            byMatter[mid] = {
-              matter: e.matter,
-              unbilled_hours: 0,
-              unbilled_time_value: 0,
-              unbilled_expenses: 0,
-              oldest_entry: e.date,
-            };
-          }
-          // Use rounded_quantity (billed increment) not raw quantity, so WIP
-          // matches what the client will actually see invoiced.
-          const hours = (e.rounded_quantity ?? e.quantity) / 3600;
-          byMatter[mid].unbilled_hours += hours;
-          byMatter[mid].unbilled_time_value += hours * (e.price || 0);
-          if (e.date < byMatter[mid].oldest_entry) {
-            byMatter[mid].oldest_entry = e.date;
-          }
-        }
-
-        for (const e of expenses) {
-          const mid = e.matter?.id;
-          if (!mid) continue;
-          if (
-            params.responsible_attorney_id &&
-            e.matter?.responsible_attorney?.id !== params.responsible_attorney_id
-          )
-            continue;
-
-          if (!byMatter[mid]) {
-            byMatter[mid] = {
-              matter: e.matter,
-              unbilled_hours: 0,
-              unbilled_time_value: 0,
-              unbilled_expenses: 0,
-              oldest_entry: e.date,
-            };
-          }
-          byMatter[mid].unbilled_expenses += e.price || 0;
-          if (e.date < byMatter[mid].oldest_entry) {
-            byMatter[mid].oldest_entry = e.date;
-          }
-        }
-
-        const today = new Date();
-        let redFlagCount = 0;
-
-        let matterResults = Object.entries(byMatter).map(([, m]) => {
-          const combinedWip = m.unbilled_time_value + m.unbilled_expenses;
-          const daysSinceOldest = Math.floor(
-            (today.getTime() - new Date(m.oldest_entry).getTime()) /
-              (1000 * 60 * 60 * 24)
-          );
-
-          let flag: string | null = null;
-          if (daysSinceOldest > 60) {
-            flag = "RED";
-            redFlagCount++;
-          } else if (daysSinceOldest > 30) {
-            flag = "YELLOW";
-          }
-
-          return {
-            matter_id: m.matter.id,
-            matter_number: m.matter.display_number,
-            matter_description: m.matter.description,
-            client: m.matter.client,
-            responsible_attorney: m.matter.responsible_attorney,
-            oldest_entry_date: m.oldest_entry,
-            days_since_oldest_entry: daysSinceOldest,
-            unbilled_hours: Math.round(m.unbilled_hours * 100) / 100,
-            unbilled_time_value: Math.round(m.unbilled_time_value * 100) / 100,
-            unbilled_expenses: Math.round(m.unbilled_expenses * 100) / 100,
-            combined_wip_value: Math.round(combinedWip * 100) / 100,
-            flag,
-          };
+        const { matters: wipMatters, red_flag_count: redFlagCount } = await computeWipMatters({
+          responsible_attorney_id: params.responsible_attorney_id,
         });
+        let matterResults = wipMatters;
 
         if (params.min_wip_value) {
           matterResults = matterResults.filter(
@@ -602,12 +709,22 @@ export function registerARTools(server: McpServer): void {
   // ============================================================
   server.tool(
     "get_ar_scorecard",
-    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown (incl. 120+), the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). ALSO splits AR into Gated vs. Non-Gated tracks by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area (surfaced explicitly, never hidden). A reconciliation_ok flag confirms the tracks sum to firm.total_ar to the cent. Aging buckets: Current, 1-30, 31-60, 61-90, 91-120, 120+. ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: an 'AR by Track' summary tab shows the tracks side by side (Gated, Non-Gated, Unclassified — the Semi-Gated/Probate column is not shown; Probate is folded per probate_treatment), a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track and trust-request tracking columns), 'By Attorney', 'Top 10 Accounts' and 'Trust Requests' refresh to the current snapshot, two Gated-only tabs ('Gated by Attorney' and 'Gated by Matter', the latter grouping gated matters under each responsible attorney) break out the Gated track, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook, which by DEFAULT is written in the background so metrics return immediately (the Box write can take minutes and would otherwise time out the whole call); set update_workbook=false to skip it, or await_workbook=true to block on the write and get the Box link in the response.",
+    "EOS-scorecard AR metrics from live Clio. AR counts ONLY revenue_kind bills (fees for services rendered) in state=awaiting_payment; trust/retainer funding requests (trust_kind) are advance-deposit requests, not receivables, and are excluded from every AR/aging figure and reported separately. Returns compact weekly measurables — total AR, % and $ over 90 and over 120 days, over 60 days, # invoices 90+, # delinquent clients, oldest invoice age, avg days outstanding — plus a per-responsible-attorney breakdown, the top 10 open balances, and a trust_requests summary (requested/funded/unfunded $, unfunded count, fund rate). " +
+      "AGING BUCKETS: every scope (firm, firm_by_track, by_attorney) carries discrete_buckets — mutually exclusive buckets at the 7/15/30/60/90/120/180/360-day thresholds: 0-7, 8-15, 16-30, 31-60, 61-90, 91-120, 121-180, 181-360, 360+ — and cumulative_buckets — rollups 7+, 15+, 30+, 60+, 90+, 120+, 180+, 360+ DERIVED from the discrete buckets (so 360+ is a subset of 180+ and the two views can never drift). " + BOUNDARY_RULE_TEXT + " The pre-existing scalar fields are unchanged and now alias the rollups exactly (ar_60plus = over_60, ar_90plus = over_90, ar_120plus = over_120). " +
+      "TRACKS: AR splits into Gated vs. Non-Gated by each matter's practice_area (firm_by_track): Gated = court-appointment work whose aging reflects court/estate timelines (Appointment, Guardianship, Guardianship Litigation, Mental Comm, Representative); Non-Gated = client-pay (the headline collections metric), which by firm policy includes Probate; Probate handling is configurable via probate_treatment (default 'non_gated'; 'separate' breaks it out as Semi-Gated, 'gated' folds it into Gated); Unclassified = matters with no practice_area, surfaced with the SPECIFIC matters (firm_by_track.unclassified.matters gives matter_id, matter_number, client_name, description, attorney and $) so they can actually be tagged. " +
+      "by_attorney entries carry the blended metrics they always did PLUS gated / non_gated / unclassified sub-objects (and semi_gated when probate_treatment='separate') with the same metrics, so per-attorney gated AR needs no second pull. " +
+      "stale_ar_365plus is a collectability-review tier (days_outstanding > 360, i.e. exactly the 360+ rollup) reported firm-wide, per track and per attorney with $, invoice count, oldest invoice and a full triage list — these balances are still inside total_ar, they are just no longer invisible inside the 90+/120+ headline. " +
+      "tagging_consistency_flags is a HEURISTIC list (never an auto-correction) of matters whose description reads like court-gated work (Dependent/Temporary/Permanent Administration, Guardianship, Ad Litem, Mental Commitment) but whose practice_area does not classify it that way, plus matters that share a description pattern yet disagree on practice_area — so tagging drift between similarly-named matters is caught instead of found by hand. " +
+      "gated_trust_correlation lists each Gated matter with an outstanding balance next to its own unfunded trust-request amount (a leading indicator of AR about to age); trust dollars are still never added into AR. " +
+      "include_wip=true (default false) adds wip_summary: WIP (unbilled time + expenses, identical to get_wip_report) per attorney and per track, with total_exposure = WIP + AR. " +
+      "reconciliation_ok confirms, to the cent, that the tracks sum to firm.total_ar, that the discrete buckets sum to total_ar at EVERY scope (firm, each track, each attorney), and that the legacy 90+/120+ fields match the cumulative buckets; reconciliation.bucket_failures names any scope that fails. " +
+      "ALSO maintains a standalone 'AR Scorecard.xlsx' in Box that auto-updates: 'AR by Track' shows the tracks side by side, 'Aging Buckets' shows the discrete and cumulative bucket sets per track, a 'Weekly Scorecard' tab appends one row per run (week-over-week trend, incl. per-track, trust-request and 360+ columns), 'By Attorney' (now with Gated/Non-Gated/360+ columns), 'Stale AR 365+', 'Gated by Attorney', 'Gated by Matter', 'Gated AR vs Trust', 'Top 10 Accounts', 'Trust Requests', 'Unclassified Matters' and 'Tagging Flags' refresh to the current snapshot, and one DETAIL tab per responsible attorney lists their full matter×bill AR. Read-only against Clio; the only write is the AR Scorecard workbook, which by DEFAULT is written in the background so metrics return immediately (the Box write can take minutes and would otherwise time out the whole call); set update_workbook=false to skip it, or await_workbook=true to block on the write and get the Box link in the response.",
     {
       as_of_date: z.string().optional().describe("As-of date for aging (YYYY-MM-DD, default today)"),
       update_workbook: z.boolean().optional().default(true).describe("Also update the AR Scorecard workbook in Box (default true). Set false for metrics-only."),
       await_workbook: z.boolean().optional().default(false).describe("Wait for the Box workbook write to finish and return its result/link inline. Default false: the workbook is written in the BACKGROUND so metrics return immediately. The Box write can take minutes (the Box client alone allows a 5-minute request timeout), which is far longer than the MCP call timeout — awaiting it is what makes the whole call fail on the workbook leg even though every metric is already computed. Set true only when you need the Box link in this response and can tolerate that risk."),
       probate_treatment: z.enum(["gated", "non_gated", "separate"]).optional().default("non_gated").describe("How to treat Probate AR. 'non_gated' (default): Probate is client-pay, folded into non_gated. 'gated': fold into gated. 'separate': break Probate out under semi_gated for review."),
+      include_wip: z.boolean().optional().default(false).describe("Also join in WIP (unbilled time + expenses, same definition as get_wip_report) so the response reports TOTAL revenue exposure (WIP + AR) per attorney and per track, not just billed/outstanding AR. Default false: the WIP join needs two extra full /activities sweeps and roughly doubles the call's fetch time, so it is opt-in."),
     },
     async (params) => {
       try {
@@ -623,7 +740,9 @@ export function registerARTools(server: McpServer): void {
         // scorecard (mirrors the resilient paid-bill fetch used elsewhere).
         const probateTreatment: ProbateTreatment = params.probate_treatment ?? "non_gated";
 
-        const [awaitingBills, paidBills, allMatters] = await Promise.all([
+        const includeWip = params.include_wip === true;
+
+        const [awaitingBills, paidBills, allMatters, wipData] = await Promise.all([
           fetchAllPages<any>("/bills", { fields: SCORECARD_BILL_FIELDS, state: "awaiting_payment" }),
           fetchAllPages<any>("/bills", { fields: SCORECARD_BILL_FIELDS, state: "paid" }).catch((e: any) => {
             console.warn(`[get_ar_scorecard] paid-bills fetch failed (${e?.message ?? e}); funded trust requests will be incomplete`);
@@ -640,6 +759,15 @@ export function registerARTools(server: McpServer): void {
             console.warn(`[get_ar_scorecard] matters fetch failed (${e?.message ?? e}); AR will be reported as unclassified`);
             return [] as any[];
           }),
+          // Optional WIP cross-reference (include_wip). Uses the same helper —
+          // and therefore the same definition — as get_wip_report. A failure
+          // degrades to "no WIP section" rather than failing the scorecard.
+          includeWip
+            ? computeWipMatters({}).catch((e: any) => {
+                console.warn(`[get_ar_scorecard] WIP fetch failed (${e?.message ?? e}); wip_summary will be omitted`);
+                return null;
+              })
+            : Promise.resolve(null),
         ]);
 
         // matter_id → practice_area name (null when the matter has none). Clio
@@ -674,7 +802,18 @@ export function registerARTools(server: McpServer): void {
           return dn || desc || "—";
         };
 
-        type Row = { balance: number; days: number; client: string; matter: string; attorney: string; bill: string; issued: string; due: string; bucket: string; track: TrackKey };
+        type Row = {
+          balance: number; days: number; client: string; matter: string; attorney: string;
+          bill: string; issued: string; due: string; bucket: string; track: TrackKey;
+          // Added for the unclassified-matter list (Fix 4), the tagging-drift
+          // heuristic (Fix 5) and the gated↔trust join (Fix 7): the raw matter
+          // identifiers/description and the PRE-folding practice area, so those
+          // sections don't have to re-derive them from a display label.
+          matter_id: number | null; matter_number: string; matter_description: string;
+          practice_area: string | null; base_track: TrackKey;
+          // Discrete bucket label under the new 7/15/30/60/90/120/180/360 scheme.
+          aging_bucket: string;
+        };
         const rows: Row[] = [];
 
         // --- AR rows: revenue_kind ONLY (whitelist). A trust_kind bill is a
@@ -698,6 +837,7 @@ export function registerARTools(server: McpServer): void {
             (m?.id != null && practiceAreaByMatter.has(m.id)
               ? practiceAreaByMatter.get(m.id)
               : m?.practice_area?.name) ?? null;
+          const baseTrack = classifyTrack(paName);
           rows.push({
             balance: bal,
             days,
@@ -708,7 +848,13 @@ export function registerARTools(server: McpServer): void {
             issued: b.issued_at ? String(b.issued_at).slice(0, 10) : "",
             due: b.due_at ? String(b.due_at).slice(0, 10) : "",
             bucket: bucketLabel(days),
-            track: effectiveTrack(classifyTrack(paName), probateTreatment),
+            track: effectiveTrack(baseTrack, probateTreatment),
+            matter_id: m?.id ?? null,
+            matter_number: String(m?.display_number ?? ""),
+            matter_description: String(m?.description ?? ""),
+            practice_area: paName,
+            base_track: baseTrack,
+            aging_bucket: discreteBucketLabel(days),
           });
         }
 
@@ -724,6 +870,7 @@ export function registerARTools(server: McpServer): void {
           const balance = Math.max(0, balRaw);
           const isFunded = balRaw <= 0 || b.state === "paid";
           trustRows.push({
+            matter_id: m?.id ?? null,
             attorney: m?.responsible_attorney?.name ?? "(Unassigned)",
             client: m?.client?.name ?? b.client?.name ?? "Unknown",
             matter: matterLabel(m),
@@ -755,6 +902,51 @@ export function registerARTools(server: McpServer): void {
         const avgDays = totalAR > 0 ? Math.round(rows.reduce((s, r) => s + r.days * r.balance, 0) / totalAR) : 0;
         const pct = (n: number) => (totalAR > 0 ? Math.round((n / totalAR) * 1000) / 10 : 0); // one-decimal %
 
+        // ---- Configurable-granularity aging buckets ----
+        // One shared definition (src/domain/arAging.ts) drives the firm,
+        // per-track, per-attorney and stale-AR views, and the cumulative ("N+")
+        // rollups are DERIVED from the discrete buckets so they can never drift.
+        const toAgingItems = (rs: Row[]): AgingItem[] =>
+          rs.map((r) => ({ days: r.days, balance: r.balance, client: r.client }));
+        const bucketsFor = (rs: Row[]): AgingBuckets => bucketizeAging(toAgingItems(rs));
+        const firmAging = bucketsFor(rows);
+
+        // ---- Stale AR / collectability review (Fix 3) ----
+        // A 95-day invoice and a five-year-old invoice both land in "90+" and
+        // "120+", which quietly inflates the headline with balances that are
+        // almost certainly uncollectable. This slice pulls the oldest tier out so
+        // it can be triaged/written off on a cadence. The threshold is the top
+        // discrete bucket boundary (days_outstanding > 360), so a stale slice is
+        // always exactly its scope's cumulative "360+" bucket and the two can
+        // never disagree.
+        const isStale = (r: Row) => r.days > STALE_THRESHOLD_DAYS;
+        const staleSlice = (scopeRows: Row[]): StaleSlice => {
+          const stale = scopeRows.filter(isStale);
+          const scopeTotal = scopeRows.reduce((s, r) => s + r.balance, 0);
+          const total = stale.reduce((s, r) => s + r.balance, 0);
+          const oldest = stale.reduce<Row | null>((mx, r) => (!mx || r.days > mx.days ? r : mx), null);
+          return {
+            total_ar: round2(total),
+            invoices: stale.length,
+            delinquent_clients: new Set(stale.map((r) => r.client)).size,
+            pct_of_scope_ar: scopeTotal > 0 ? Math.round((total / scopeTotal) * 1000) / 10 : 0,
+            oldest_invoice_days: oldest?.days ?? 0,
+            oldest_invoice: oldest
+              ? {
+                  bill: oldest.bill,
+                  client: oldest.client,
+                  matter: oldest.matter,
+                  matter_id: oldest.matter_id,
+                  matter_number: oldest.matter_number,
+                  issued: oldest.issued,
+                  due: oldest.due,
+                  days_past_due: oldest.days,
+                  balance: round2(oldest.balance),
+                }
+              : null,
+          };
+        };
+
         const firm = {
           as_of: asOfStr,
           total_ar: totalAR,
@@ -784,6 +976,7 @@ export function registerARTools(server: McpServer): void {
         const computeTrackMetrics = (tr: Row[]): TrackMetrics => {
           const ts = (f: (r: Row) => boolean) => round2(tr.filter(f).reduce((s, r) => s + r.balance, 0));
           const total = round2(tr.reduce((s, r) => s + r.balance, 0));
+          const trackBuckets = bucketsFor(tr);
           const t90 = ts((r) => r.days >= 91);
           const t120 = ts((r) => r.days >= 121);
           const tpct = (n: number) => (total > 0 ? Math.round((n / total) * 1000) / 10 : 0);
@@ -803,6 +996,10 @@ export function registerARTools(server: McpServer): void {
             oldest_invoice_days: tr.reduce((mx, r) => Math.max(mx, r.days), 0),
             avg_days_outstanding: total > 0 ? Math.round(tr.reduce((s, r) => s + r.days * r.balance, 0) / total) : 0,
             invoices: tr.length,
+            // Same bucket scheme as the firm view, computed over this track's
+            // own rows (never apportioned from the firm figures).
+            discrete_buckets: trackBuckets.discrete,
+            cumulative_buckets: trackBuckets.cumulative,
           };
         };
 
@@ -816,7 +1013,11 @@ export function registerARTools(server: McpServer): void {
           unclassified: computeTrackMetrics(trackRows.unclassified),
         };
 
-        const firm_by_track: Record<string, TrackMetrics> = { gated: trackMetrics.gated };
+        // `unclassified` additionally carries the specific matters (attached
+        // below, once the matter list has been built) so the bucket is actionable.
+        const firm_by_track: Record<string, TrackMetrics & { matters?: UnclassifiedMatter[] }> = {
+          gated: trackMetrics.gated,
+        };
         if (probateTreatment === "separate") firm_by_track.semi_gated = trackMetrics.semi_gated;
         firm_by_track.non_gated = trackMetrics.non_gated;
         firm_by_track.unclassified = trackMetrics.unclassified;
@@ -832,40 +1033,478 @@ export function registerARTools(server: McpServer): void {
             trackMetrics.unclassified.total_ar
         );
         const reconciliation_delta = round2(trackTotalSum - firm.total_ar);
-        const reconciliation_ok = Math.abs(reconciliation_delta) <= 0.01;
-        if (!reconciliation_ok) {
+        const track_totals_ok = Math.abs(reconciliation_delta) <= 0.01;
+        if (!track_totals_ok) {
           console.warn(`[get_ar_scorecard] RECONCILIATION FAILED: tracks sum ${trackTotalSum} != firm.total_ar ${firm.total_ar} (delta ${reconciliation_delta})`);
+        }
+
+        // ---- Per responsible attorney ----
+        // The blended (all-tracks) figures are unchanged — same field names, same
+        // arithmetic — and each entry now ALSO carries the same metrics computed
+        // per track (gated / non_gated / unclassified, plus semi_gated when
+        // probate_treatment="separate"), the new aging buckets, and the attorney's
+        // stale-AR slice. The per-track slices sum back to the attorney total, so
+        // "what's my gated AR" no longer needs a second pull.
+        const attySlice = (rs: Row[]): AttyTrackSlice => {
+          const total = rs.reduce((s, r) => s + r.balance, 0);
+          const a90 = rs.filter((r) => r.days >= 91).reduce((s, r) => s + r.balance, 0);
+          const a120 = rs.filter((r) => r.days >= 121).reduce((s, r) => s + r.balance, 0);
+          return {
+            total_ar: round2(total),
+            ar_90plus: round2(a90),
+            ar_90plus_pct: total > 0 ? Math.round((a90 / total) * 1000) / 10 : 0,
+            ar_120plus: round2(a120),
+            ar_120plus_pct: total > 0 ? Math.round((a120 / total) * 1000) / 10 : 0,
+            invoices: rs.length,
+          };
+        };
+        const rowsByAttorney = new Map<string, Row[]>();
+        for (const r of rows) {
+          const list = rowsByAttorney.get(r.attorney);
+          if (list) list.push(r);
+          else rowsByAttorney.set(r.attorney, [r]);
+        }
+        const byAttorney: AttySummary[] = [...rowsByAttorney.entries()]
+          .map(([attorney, attRows]) => {
+            const buckets = bucketsFor(attRows);
+            const ofTrack = (t: TrackKey) => attySlice(attRows.filter((r) => r.track === t));
+            const entry: AttySummary = {
+              attorney,
+              ...attySlice(attRows),
+              discrete_buckets: buckets.discrete,
+              cumulative_buckets: buckets.cumulative,
+              gated: ofTrack("gated"),
+              non_gated: ofTrack("non_gated"),
+              unclassified: ofTrack("unclassified"),
+              stale_ar_365plus: staleSlice(attRows),
+            };
+            if (probateTreatment === "separate") entry.semi_gated = ofTrack("semi_gated");
+            return entry;
+          })
+          .sort((a, b) => b.total_ar - a.total_ar);
+
+        // ================================================================
+        // Stale AR (collectability review) — firm + by track + by attorney
+        // ================================================================
+        const staleRows = rows.filter(isStale);
+        const stale_ar_365plus = {
+          threshold_days: STALE_THRESHOLD_DAYS,
+          definition:
+            `Invoices with days_outstanding > ${STALE_THRESHOLD_DAYS} — the top discrete aging bucket. ` +
+            `Reported as the same dollars as cumulative_buckets.${cumulativeKey(STALE_THRESHOLD_DAYS)} at every scope, ` +
+            `so the two views can never disagree. These balances are still INSIDE firm.total_ar (nothing is netted ` +
+            `out silently); this section exists so they can be triaged or written off on a cadence instead of ` +
+            `sitting unnoticed inside the 90+/120+ headline.`,
+          firm: staleSlice(rows),
+          by_track: (() => {
+            const out: Record<string, StaleSlice> = { gated: staleSlice(trackRows.gated) };
+            if (probateTreatment === "separate") out.semi_gated = staleSlice(trackRows.semi_gated);
+            out.non_gated = staleSlice(trackRows.non_gated);
+            out.unclassified = staleSlice(trackRows.unclassified);
+            return out;
+          })(),
+          by_attorney: byAttorney
+            .filter((a) => a.stale_ar_365plus.invoices > 0)
+            .map((a) => ({ attorney: a.attorney, ...a.stale_ar_365plus }))
+            .sort((a, b) => b.total_ar - a.total_ar),
+          // Full triage list — this tier is small by construction, and the point
+          // of the section is that someone can act on it.
+          invoices: [...staleRows]
+            .sort((a, b) => b.days - a.days)
+            .map((r) => ({
+              bill: r.bill,
+              client: r.client,
+              matter: r.matter,
+              matter_id: r.matter_id,
+              matter_number: r.matter_number,
+              attorney: r.attorney,
+              track: r.track,
+              issued: r.issued,
+              due: r.due,
+              days_past_due: r.days,
+              balance: round2(r.balance),
+            })),
+        };
+
+        // ================================================================
+        // Unclassified matters (Fix 4) — actionable, not just a total
+        // ================================================================
+        // $-small but should be zero: these matters have no practice_area, so
+        // their AR can't be assigned to the Gated or Non-Gated track. Listing the
+        // matter ids/numbers turns "unclassified: $4,607" into a work list.
+        const unclassifiedMatters: UnclassifiedMatter[] = (() => {
+          const byMatter = new Map<string, UnclassifiedMatter>();
+          for (const r of trackRows.unclassified) {
+            const key = r.matter_id != null ? `id:${r.matter_id}` : `label:${r.matter}`;
+            const existing = byMatter.get(key);
+            if (existing) {
+              existing.total_ar = round2(existing.total_ar + r.balance);
+              existing.invoices += 1;
+              existing.oldest_invoice_days = Math.max(existing.oldest_invoice_days, r.days);
+            } else {
+              byMatter.set(key, {
+                matter_id: r.matter_id,
+                matter_number: r.matter_number || r.matter,
+                client_name: r.client,
+                matter_description: r.matter_description,
+                responsible_attorney: r.attorney,
+                total_ar: round2(r.balance),
+                invoices: 1,
+                oldest_invoice_days: r.days,
+              });
+            }
+          }
+          return [...byMatter.values()].sort((a, b) => b.total_ar - a.total_ar);
+        })();
+        firm_by_track.unclassified = { ...trackMetrics.unclassified, matters: unclassifiedMatters };
+
+        // ================================================================
+        // Tagging consistency flags (Fix 5) — heuristic, never auto-corrected
+        // ================================================================
+        // Two matters with the same "Dependent Administration"-style description
+        // can carry different practice_area values (the Key vs. Shotwell case),
+        // which silently moves AR between the Gated and Non-Gated tracks. These
+        // two heuristics catch that drift; both are for HUMAN review only —
+        // nothing here reclassifies a matter or changes any reported figure.
+        const tagging_consistency_flags: TaggingFlag[] = (() => {
+          // One record per matter that carries AR, with its description + PA.
+          type MatterInfo = {
+            matter_id: number | null; matter_number: string; matter: string;
+            client: string; description: string; practice_area: string | null;
+            base_track: TrackKey; track: TrackKey; ar_balance: number;
+          };
+          const matters = new Map<string, MatterInfo>();
+          for (const r of rows) {
+            const key = r.matter_id != null ? `id:${r.matter_id}` : `label:${r.matter}`;
+            const existing = matters.get(key);
+            if (existing) existing.ar_balance = round2(existing.ar_balance + r.balance);
+            else
+              matters.set(key, {
+                matter_id: r.matter_id,
+                matter_number: r.matter_number || r.matter,
+                matter: r.matter,
+                client: r.client,
+                description: r.matter_description,
+                practice_area: r.practice_area,
+                base_track: r.base_track,
+                track: r.track,
+                ar_balance: round2(r.balance),
+              });
+          }
+
+          // Which gated-pattern keyword(s) each matter's description matches.
+          // display_number embeds the matter name, so both are searched.
+          const patternsOf = (m: MatterInfo) =>
+            GATED_DESCRIPTION_PATTERNS.filter((p) => p.re.test(`${m.description} ${m.matter}`)).map((p) => p.label);
+
+          const reasons = new Map<string, { info: MatterInfo; rules: string[]; why: string[] }>();
+          const addReason = (key: string, info: MatterInfo, rule: string, why: string) => {
+            const e = reasons.get(key) ?? { info, rules: [], why: [] };
+            if (!e.rules.includes(rule)) e.rules.push(rule);
+            e.why.push(why);
+            reasons.set(key, e);
+          };
+
+          // Rule 1 — the description reads like gated (court-appointment) work
+          // but the practice_area does not classify it that way.
+          for (const [key, m] of matters) {
+            const hits = patternsOf(m);
+            if (!hits.length) continue;
+            if (m.base_track === "gated") continue;
+            const paText =
+              m.practice_area === null ? "no practice_area is set" : `practice_area is "${m.practice_area}"`;
+            addReason(
+              key,
+              m,
+              "gated_keyword_vs_practice_area",
+              `description matches gated pattern ${hits.map((h) => `"${h}"`).join(", ")} but ${paText}, ` +
+                `which classifies as "${m.base_track}"`
+            );
+          }
+
+          // Rule 2 — matters sharing the same description pattern are coded to
+          // practice_areas that land in DIFFERENT tracks. The modal track is
+          // treated as the firm's intent and the odd matters out are flagged.
+          // Keyed on track, not on the raw practice_area string, because two
+          // gated practice_areas (say Guardianship and Guardianship Litigation)
+          // on similarly-named matters is normal taxonomy, not drift — only a
+          // disagreement that moves AR between the Gated and Non-Gated tracks
+          // changes a reported number. This is also the "vice versa" direction:
+          // it catches a gated-PA matter sitting among Probate ones.
+          const byPattern = new Map<string, Array<[string, MatterInfo]>>();
+          for (const [key, m] of matters) {
+            for (const label of patternsOf(m)) {
+              const list = byPattern.get(label) ?? [];
+              list.push([key, m]);
+              byPattern.set(label, list);
+            }
+          }
+          for (const [label, group] of byPattern) {
+            if (group.length < 2) continue;
+            const trackCounts = new Map<TrackKey, number>();
+            for (const [, m] of group) {
+              trackCounts.set(m.base_track, (trackCounts.get(m.base_track) ?? 0) + 1);
+            }
+            if (trackCounts.size < 2) continue; // same track everywhere → no drift
+            const [majorityTrack, majorityCount] = [...trackCounts.entries()].sort(
+              (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+            )[0];
+            // The practice_area(s) the majority is coded to, for the message.
+            const majorityPas = [
+              ...new Set(
+                group.filter(([, m]) => m.base_track === majorityTrack).map(([, m]) => m.practice_area ?? "(none)")
+              ),
+            ];
+            for (const [key, m] of group) {
+              if (m.base_track === majorityTrack) continue;
+              addReason(
+                key,
+                m,
+                "same_pattern_different_practice_area",
+                `${group.length} matters match "${label}" but disagree on track — this one is ` +
+                  `practice_area "${m.practice_area ?? "(none)"}" (${m.base_track}) while ${majorityCount} of them ` +
+                  `are ${majorityTrack} (${majorityPas.map((pa) => `"${pa}"`).join(", ")})`
+              );
+            }
+          }
+
+          return [...reasons.values()]
+            .map(({ info, rules, why }) => ({
+              matter_id: info.matter_id,
+              matter_number: info.matter_number,
+              client_name: info.client,
+              matter_description: info.description,
+              practice_area: info.practice_area,
+              classified_track: info.track,
+              ar_balance: info.ar_balance,
+              rules,
+              suspected_mismatch_reason: why.join("; "),
+            }))
+            .sort((a, b) => b.ar_balance - a.ar_balance);
+        })();
+
+        // ================================================================
+        // Gated AR ↔ unfunded trust request correlation (Fix 7)
+        // ================================================================
+        // For court-gated matters an unfunded trust/retainer request is a leading
+        // indicator of AR about to age. The Trust Requests and Gated AR views were
+        // previously unjoinable; this section puts the two figures side by side
+        // per matter. Trust dollars are still NEVER added into any AR figure.
+        const gated_trust_correlation = (() => {
+          const unfundedByMatter = new Map<number, { amount: number; requests: number; oldest_days: number }>();
+          for (const t of trustRows) {
+            if (t.status !== "Unfunded" || t.matter_id == null) continue;
+            const e = unfundedByMatter.get(t.matter_id) ?? { amount: 0, requests: 0, oldest_days: 0 };
+            e.amount = round2(e.amount + t.balance);
+            e.requests += 1;
+            e.oldest_days = Math.max(e.oldest_days, t.days);
+            unfundedByMatter.set(t.matter_id, e);
+          }
+
+          const byMatter = new Map<number | string, {
+            matter_id: number | null; matter_number: string; matter: string; client: string;
+            attorney: string; ar_balance: number; ar_90plus: number; ar_over_360: number;
+            invoices: number; oldest_invoice_days: number;
+          }>();
+          for (const r of trackRows.gated) {
+            const key = r.matter_id ?? `label:${r.matter}`;
+            const e = byMatter.get(key) ?? {
+              matter_id: r.matter_id, matter_number: r.matter_number || r.matter, matter: r.matter,
+              client: r.client, attorney: r.attorney, ar_balance: 0, ar_90plus: 0, ar_over_360: 0,
+              invoices: 0, oldest_invoice_days: 0,
+            };
+            e.ar_balance = round2(e.ar_balance + r.balance);
+            if (r.days >= 91) e.ar_90plus = round2(e.ar_90plus + r.balance);
+            if (isStale(r)) e.ar_over_360 = round2(e.ar_over_360 + r.balance);
+            e.invoices += 1;
+            e.oldest_invoice_days = Math.max(e.oldest_invoice_days, r.days);
+            byMatter.set(key, e);
+          }
+
+          const matters = [...byMatter.values()]
+            .filter((m) => m.ar_balance > 0)
+            .map((m) => {
+              const t = m.matter_id != null ? unfundedByMatter.get(m.matter_id) : undefined;
+              return {
+                ...m,
+                unfunded_trust_amount: t?.amount ?? 0,
+                unfunded_trust_requests: t?.requests ?? 0,
+                oldest_unfunded_trust_days: t?.oldest_days ?? 0,
+              };
+            })
+            .sort(
+              (a, b) =>
+                b.unfunded_trust_amount - a.unfunded_trust_amount || b.ar_balance - a.ar_balance
+            );
+
+          const withTrust = matters.filter((m) => m.unfunded_trust_amount > 0);
+          return {
+            note:
+              "Gated-track matters with an outstanding AR balance, each shown next to its own unfunded " +
+              "trust/retainer request amount. Trust request dollars are advance-deposit requests, NOT " +
+              "receivables, and are never included in any AR figure here or elsewhere.",
+            summary: {
+              gated_matters_with_ar: matters.length,
+              gated_matters_with_unfunded_trust: withTrust.length,
+              gated_ar_on_matters_with_unfunded_trust: round2(
+                withTrust.reduce((s, m) => s + m.ar_balance, 0)
+              ),
+              unfunded_trust_total_on_gated_matters: round2(
+                withTrust.reduce((s, m) => s + m.unfunded_trust_amount, 0)
+              ),
+            },
+            matters,
+          };
+        })();
+
+        // ================================================================
+        // Optional WIP cross-reference (Fix 6) — total revenue exposure
+        // ================================================================
+        // WIP + AR per attorney and per track. Same WIP definition as
+        // get_wip_report (shared helper), so the two tools agree. Omitted unless
+        // include_wip=true; null when the WIP fetch failed.
+        const wip_summary = (() => {
+          if (!includeWip) return undefined;
+          if (!wipData) {
+            return {
+              error: true,
+              message: "WIP fetch failed; AR figures above are unaffected. Retry include_wip=true.",
+            };
+          }
+          const arByAttorney = new Map<string, number>();
+          for (const r of rows) arByAttorney.set(r.attorney, (arByAttorney.get(r.attorney) ?? 0) + r.balance);
+          const arByTrack: Record<TrackKey, number> = { gated: 0, semi_gated: 0, non_gated: 0, unclassified: 0 };
+          for (const r of rows) arByTrack[r.track] += r.balance;
+
+          const wipByAttorney = new Map<string, { wip: number; matters: number }>();
+          const wipByTrack: Record<TrackKey, number> = { gated: 0, semi_gated: 0, non_gated: 0, unclassified: 0 };
+          for (const m of wipData.matters) {
+            const attorney = m.responsible_attorney?.name ?? "(Unassigned)";
+            const e = wipByAttorney.get(attorney) ?? { wip: 0, matters: 0 };
+            e.wip += m.combined_wip_value;
+            e.matters += 1;
+            wipByAttorney.set(attorney, e);
+            // Same matter→practice_area join used for the AR tracks.
+            const paName = m.matter_id != null ? practiceAreaByMatter.get(m.matter_id) ?? null : null;
+            wipByTrack[effectiveTrack(classifyTrack(paName), probateTreatment)] += m.combined_wip_value;
+          }
+
+          const totalWip = round2(wipData.matters.reduce((s, m) => s + m.combined_wip_value, 0));
+          const attorneys = [...new Set([...wipByAttorney.keys(), ...arByAttorney.keys()])]
+            .map((attorney) => {
+              const wip = round2(wipByAttorney.get(attorney)?.wip ?? 0);
+              const ar = round2(arByAttorney.get(attorney) ?? 0);
+              return {
+                attorney,
+                wip,
+                ar,
+                total_exposure: round2(wip + ar),
+                matters_with_wip: wipByAttorney.get(attorney)?.matters ?? 0,
+              };
+            })
+            .sort((a, b) => b.total_exposure - a.total_exposure);
+
+          const trackKeys: TrackKey[] =
+            probateTreatment === "separate"
+              ? ["gated", "semi_gated", "non_gated", "unclassified"]
+              : ["gated", "non_gated", "unclassified"];
+          const by_track: Record<string, { wip: number; ar: number; total_exposure: number }> = {};
+          for (const t of trackKeys) {
+            by_track[t] = {
+              wip: round2(wipByTrack[t]),
+              ar: round2(arByTrack[t]),
+              total_exposure: round2(wipByTrack[t] + arByTrack[t]),
+            };
+          }
+
+          return {
+            note:
+              "WIP = unbilled time (at rounded_quantity) + unbilled expenses, identical to get_wip_report " +
+              "(including its 90-day created_since window). total_exposure = WIP + AR.",
+            firm: {
+              total_wip: totalWip,
+              total_ar: firm.total_ar,
+              total_exposure: round2(totalWip + firm.total_ar),
+              matters_with_wip: wipData.matters.length,
+              red_flag_matters: wipData.red_flag_count,
+            },
+            by_track,
+            by_attorney: attorneys,
+          };
+        })();
+
+        // ================================================================
+        // Reconciliation (extended): tracks AND discrete buckets AND the
+        // legacy 90+/120+ fields must all agree, to the cent.
+        // ================================================================
+        const firmBucketRecon = reconcileDiscreteBuckets(firmAging.discrete, firm.total_ar);
+        const bucketFailures: Array<{ scope: string } & BucketReconciliation> = [];
+        const checkBuckets = (scope: string, recon: BucketReconciliation) => {
+          if (!recon.ok) bucketFailures.push({ scope, ...recon });
+          return recon.ok;
+        };
+        let discrete_buckets_ok = checkBuckets("firm", firmBucketRecon);
+        for (const t of ["gated", "semi_gated", "non_gated", "unclassified"] as TrackKey[]) {
+          discrete_buckets_ok =
+            checkBuckets(
+              `track:${t}`,
+              reconcileDiscreteBuckets(trackMetrics[t].discrete_buckets, trackMetrics[t].total_ar)
+            ) && discrete_buckets_ok;
+        }
+        for (const a of byAttorney) {
+          discrete_buckets_ok =
+            checkBuckets(
+              `attorney:${a.attorney}`,
+              reconcileDiscreteBuckets(a.discrete_buckets, a.total_ar)
+            ) && discrete_buckets_ok;
+        }
+        // The legacy scalar fields must equal the cumulative buckets they now
+        // alias (ar_60plus/ar_90plus/ar_120plus = over_60/over_90/over_120), and
+        // stale AR must equal the 360+ rollup. If a boundary rule ever changes,
+        // this is what catches it.
+        const legacyAlignmentChecks: Array<{ field: string; legacy: number; bucket: number }> = [
+          { field: "ar_60plus", legacy: firm.ar_60plus, bucket: firmAging.cumulative[cumulativeKey(60)].total },
+          { field: "ar_90plus", legacy: firm.ar_90plus, bucket: firmAging.cumulative[cumulativeKey(90)].total },
+          { field: "ar_120plus", legacy: firm.ar_120plus, bucket: firmAging.cumulative[cumulativeKey(120)].total },
+          {
+            field: "stale_ar_365plus.firm.total_ar",
+            legacy: stale_ar_365plus.firm.total_ar,
+            bucket: firmAging.cumulative[cumulativeKey(STALE_THRESHOLD_DAYS)].total,
+          },
+        ];
+        const legacyAlignmentFailures = legacyAlignmentChecks.filter(
+          (c) => Math.abs(round2(c.legacy - c.bucket)) > 0.01
+        );
+        const legacy_alignment_ok = legacyAlignmentFailures.length === 0;
+
+        const reconciliation_ok = track_totals_ok && discrete_buckets_ok && legacy_alignment_ok;
+        if (!discrete_buckets_ok) {
+          console.warn(`[get_ar_scorecard] RECONCILIATION FAILED: discrete buckets do not sum to total_ar — ${JSON.stringify(bucketFailures)}`);
+        }
+        if (!legacy_alignment_ok) {
+          console.warn(`[get_ar_scorecard] RECONCILIATION FAILED: legacy 90+/120+ fields disagree with the cumulative buckets — ${JSON.stringify(legacyAlignmentFailures)}`);
         }
         const reconciliation = {
           reconciliation_ok,
+          // --- track split (unchanged keys) ---
+          track_totals_ok,
           track_total_sum: trackTotalSum,
           firm_total_ar: firm.total_ar,
           delta: reconciliation_delta,
+          // --- new: discrete bucket exclusivity/exhaustiveness ---
+          discrete_buckets_ok,
+          firm_discrete_bucket_sum: firmBucketRecon.discrete_sum,
+          firm_discrete_bucket_delta: firmBucketRecon.delta,
+          scopes_checked: 1 + 4 + byAttorney.length,
+          bucket_failures: bucketFailures,
+          // --- new: legacy field ↔ cumulative bucket alignment ---
+          legacy_alignment_ok,
+          legacy_alignment_failures: legacyAlignmentFailures,
+          // --- unclassified visibility (unchanged keys) ---
           unclassified_total_ar: trackMetrics.unclassified.total_ar,
           unclassified_invoices: trackMetrics.unclassified.invoices,
+          unclassified_matters: unclassifiedMatters.length,
         };
-
-        // Per responsible attorney (with the 90+/120+ split)
-        const byAttMap = new Map<string, { total: number; ar90: number; ar120: number; count: number }>();
-        for (const r of rows) {
-          const a = byAttMap.get(r.attorney) ?? { total: 0, ar90: 0, ar120: 0, count: 0 };
-          a.total += r.balance;
-          if (r.days >= 91) a.ar90 += r.balance;
-          if (r.days >= 121) a.ar120 += r.balance;
-          a.count += 1;
-          byAttMap.set(r.attorney, a);
-        }
-        const byAttorney = [...byAttMap.entries()]
-          .map(([attorney, v]) => ({
-            attorney,
-            total_ar: round2(v.total),
-            ar_90plus: round2(v.ar90),
-            ar_90plus_pct: v.total > 0 ? Math.round((v.ar90 / v.total) * 1000) / 10 : 0,
-            ar_120plus: round2(v.ar120),
-            ar_120plus_pct: v.total > 0 ? Math.round((v.ar120 / v.total) * 1000) / 10 : 0,
-            invoices: v.count,
-          }))
-          .sort((a, b) => b.total_ar - a.total_ar);
 
         const top10 = [...rows]
           .sort((a, b) => b.balance - a.balance)
@@ -950,7 +1589,13 @@ export function registerARTools(server: McpServer): void {
         let workbook_result: any = { skipped: true };
         if (params.update_workbook !== false) {
           const runWrite = () =>
-            updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation, gatedByAttorney, gatedByMatter);
+            updateARScorecardWorkbook(firm, byAttorney, top10, detail, trust, trustRows, trackMetrics, probateTreatment, reconciliation, gatedByAttorney, gatedByMatter, {
+              firmAging,
+              stale: stale_ar_365plus,
+              unclassifiedMatters,
+              taggingFlags: tagging_consistency_flags,
+              gatedTrust: gated_trust_correlation,
+            });
           if (params.await_workbook === true) {
             try {
               workbook_result = await runWrite();
@@ -972,7 +1617,43 @@ export function registerARTools(server: McpServer): void {
         }
 
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ firm, firm_by_track, reconciliation_ok, reconciliation, probate_treatment: probateTreatment, trust_requests: trust, by_attorney: byAttorney, top_10_accounts: top10, workbook: workbook_result }, null, 2) }],
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  // Bucket semantics travel with the payload so a downstream
+                  // reader never has to guess whether day 30 is 16-30 or 31-60.
+                  bucket_rules: BOUNDARY_RULE_TEXT,
+                  // `firm` keeps every field it had; discrete_buckets /
+                  // cumulative_buckets are additive.
+                  firm: {
+                    ...firm,
+                    discrete_buckets: firmAging.discrete,
+                    cumulative_buckets: firmAging.cumulative,
+                  },
+                  firm_by_track,
+                  reconciliation_ok,
+                  reconciliation,
+                  probate_treatment: probateTreatment,
+                  stale_ar_365plus,
+                  tagging_consistency_flags,
+                  tagging_consistency_note:
+                    "Heuristic flags for human review only. Nothing here reclassifies a matter or changes any " +
+                    "reported figure — classification is always driven by the matter's practice_area.",
+                  gated_trust_correlation,
+                  trust_requests: trust,
+                  by_attorney: byAttorney,
+                  top_10_accounts: top10,
+                  // Present only when include_wip=true.
+                  wip_summary,
+                  workbook: workbook_result,
+                },
+                null,
+                2
+              ),
+            },
+          ],
         };
       } catch (err: any) {
         return {
@@ -1009,6 +1690,85 @@ type TrackMetrics = {
   ar_120plus: number; ar_120plus_pct: number; invoices_90plus: number;
   delinquent_clients: number; oldest_invoice_days: number; avg_days_outstanding: number;
   invoices: number;
+  // Configurable-granularity aging (7/15/30/60/90/120/180/360). Discrete
+  // buckets are mutually exclusive and sum to total_ar; cumulative buckets are
+  // derived from them. Keyed by bucket key (days_16_30 / over_90).
+  discrete_buckets: Record<string, BucketSummary>;
+  cumulative_buckets: Record<string, BucketSummary>;
+};
+
+// Per-attorney metrics. `AttyTrackSlice` is the metric set that was previously
+// only reported blended across tracks; an AttySummary now carries it once at the
+// top level (unchanged field names) and once per track.
+type AttyTrackSlice = {
+  total_ar: number; ar_90plus: number; ar_90plus_pct: number;
+  ar_120plus: number; ar_120plus_pct: number; invoices: number;
+};
+type AttySummary = AttyTrackSlice & {
+  attorney: string;
+  discrete_buckets: Record<string, BucketSummary>;
+  cumulative_buckets: Record<string, BucketSummary>;
+  gated: AttyTrackSlice;
+  non_gated: AttyTrackSlice;
+  unclassified: AttyTrackSlice;
+  /** Only present when probate_treatment="separate". */
+  semi_gated?: AttyTrackSlice;
+  stale_ar_365plus: StaleSlice;
+};
+
+// Stale-AR (collectability-review) slice for one scope: firm, a track, or an
+// attorney. days_outstanding > STALE_THRESHOLD_DAYS.
+type StaleSlice = {
+  total_ar: number; invoices: number; delinquent_clients: number;
+  /** Stale AR as a % of the AR of the scope it was computed over. */
+  pct_of_scope_ar: number;
+  oldest_invoice_days: number;
+  oldest_invoice: {
+    bill: string; client: string; matter: string; matter_id: number | null;
+    matter_number: string; issued: string; due: string; days_past_due: number; balance: number;
+  } | null;
+};
+
+// A matter carrying AR with no practice_area set — surfaced with identifiers so
+// it can actually be tagged, not just counted.
+type UnclassifiedMatter = {
+  matter_id: number | null; matter_number: string; client_name: string;
+  matter_description: string; responsible_attorney: string;
+  total_ar: number; invoices: number; oldest_invoice_days: number;
+};
+
+// A heuristic tagging-drift flag for human review. Never an auto-correction.
+type TaggingFlag = {
+  matter_id: number | null; matter_number: string; client_name: string;
+  matter_description: string; practice_area: string | null;
+  classified_track: TrackKey; ar_balance: number;
+  rules: string[]; suspected_mismatch_reason: string;
+};
+
+// Shapes handed to the workbook builder for the new tabs.
+type StaleInvoiceRow = {
+  bill: string; client: string; matter: string; matter_id: number | null; matter_number: string;
+  attorney: string; track: TrackKey; issued: string; due: string; days_past_due: number; balance: number;
+};
+type StaleSection = {
+  threshold_days: number;
+  firm: StaleSlice;
+  by_track: Record<string, StaleSlice>;
+  by_attorney: Array<{ attorney: string } & StaleSlice>;
+  invoices: StaleInvoiceRow[];
+};
+type GatedTrustRow = {
+  matter_id: number | null; matter_number: string; matter: string; client: string; attorney: string;
+  ar_balance: number; ar_90plus: number; ar_over_360: number; invoices: number;
+  oldest_invoice_days: number; unfunded_trust_amount: number; unfunded_trust_requests: number;
+  oldest_unfunded_trust_days: number;
+};
+type ScorecardExtras = {
+  firmAging: AgingBuckets;
+  stale: StaleSection;
+  unclassifiedMatters: UnclassifiedMatter[];
+  taggingFlags: TaggingFlag[];
+  gatedTrust: { matters: GatedTrustRow[] };
 };
 
 type TrustSummary = {
@@ -1017,6 +1777,8 @@ type TrustSummary = {
 };
 type TrustRequestRow = {
   attorney: string; client: string; matter: string; bill: string;
+  // Join key for the Gated-AR ↔ unfunded-trust-request correlation.
+  matter_id: number | null;
   issued: string; due: string; days: number;
   requested: number; balance: number; funded: number;
   status: "Funded" | "Unfunded"; dateFunded: string;
@@ -1032,6 +1794,8 @@ type WeeklyRecord = FirmMetrics & {
   non_gated_total_ar: number; non_gated_ar90: number; non_gated_ar90_pct: number;
   gated_total_ar: number; gated_ar90: number; gated_ar90_pct: number;
   unclassified_total_ar: number;
+  // Stale-AR trend (the 360+ collectability-review tier).
+  ar_over_360: number; stale_invoices: number;
 };
 
 const WEEKLY_COLS: Array<{ key: keyof WeeklyRecord; header: string; fmt?: string; width: number }> = [
@@ -1058,6 +1822,9 @@ const WEEKLY_COLS: Array<{ key: keyof WeeklyRecord; header: string; fmt?: string
   { key: "gated_ar90", header: "Gated 90+ $", fmt: '"$"#,##0', width: 14 },
   { key: "gated_ar90_pct", header: "Gated 90+ %", fmt: '0.0"%"', width: 14 },
   { key: "unclassified_total_ar", header: "Unclassified Total AR", fmt: '"$"#,##0', width: 20 },
+  // --- Stale AR (360+) trend columns ---
+  { key: "ar_over_360", header: "360+ $", fmt: '"$"#,##0', width: 13 },
+  { key: "stale_invoices", header: "# Inv 360+", width: 11 },
 ];
 
 type AttyDetail = { attorney: string; bills: Array<{ client: string; matter: string; bill: string; issued: string; due: string; days_past_due: number; bucket: string; balance: number }> };
@@ -1067,7 +1834,7 @@ type GatedMatterRow = { matter: string; client: string; total_ar: number; ar_90p
 type GatedByMatterGroup = { attorney: string; total_ar: number; ar_90plus: number; ar_120plus: number; invoices: number; matters: GatedMatterRow[] };
 async function updateARScorecardWorkbook(
   firm: FirmMetrics,
-  byAttorney: Array<{ attorney: string; total_ar: number; ar_90plus: number; ar_90plus_pct: number; ar_120plus: number; ar_120plus_pct: number; invoices: number }>,
+  byAttorney: AttySummary[],
   top10: Array<{ client: string; matter: string; attorney: string; balance: number; days_past_due: number; track: TrackKey }>,
   detail: AttyDetail[],
   trust: TrustSummary,
@@ -1077,6 +1844,7 @@ async function updateARScorecardWorkbook(
   reconciliation: { reconciliation_ok: boolean; track_total_sum: number; firm_total_ar: number; delta: number; unclassified_total_ar: number; unclassified_invoices: number },
   gatedByAttorney: GatedAttySummary[],
   gatedByMatter: GatedByMatterGroup[],
+  extras: ScorecardExtras,
 ): Promise<any> {
   const r2 = (n: number) => Math.round(n * 100) / 100;
   // 1. Read prior weekly history (if the file already exists).
@@ -1123,6 +1891,8 @@ async function updateARScorecardWorkbook(
     gated_ar90: tracks.gated.ar_90plus,
     gated_ar90_pct: tracks.gated.ar_90plus_pct,
     unclassified_total_ar: tracks.unclassified.total_ar,
+    ar_over_360: extras.stale.firm.total_ar,
+    stale_invoices: extras.stale.firm.invoices,
   };
   merged.push(currentRecord as any);
   merged.sort((a, b) => String(a.as_of).localeCompare(String(b.as_of)));
@@ -1191,6 +1961,77 @@ async function updateARScorecardWorkbook(
     });
   });
 
+  // ---- Aging Buckets (7/15/30/60/90/120/180/360) ----
+  // The discrete block is mutually exclusive and foots to Total AR; the
+  // cumulative block below it is derived from the discrete rows, so 360+ is a
+  // subset of 180+ and so on. Both are shown per track and for the firm.
+  const bucketSheet = wb.addWorksheet("Aging Buckets", { views: [{ state: "frozen" as const, ySplit: 4, xSplit: 1 }] });
+  const bucketCols: Array<{ header: string; key: TrackKey | "firm" }> = [
+    { header: "Gated", key: "gated" },
+    { header: "Non-Gated (headline)", key: "non_gated" },
+    { header: "Unclassified", key: "unclassified" },
+    { header: "Firm Total", key: "firm" },
+  ];
+  bucketSheet.mergeCells(1, 1, 1, bucketCols.length + 2);
+  bucketSheet.getCell(1, 1).value = `AR Aging Buckets — as of ${firm.as_of}`;
+  bucketSheet.getCell(1, 1).font = { bold: true, size: 13 };
+  bucketSheet.mergeCells(2, 1, 3, bucketCols.length + 2);
+  bucketSheet.getCell(2, 1).value = BOUNDARY_RULE_TEXT;
+  bucketSheet.getCell(2, 1).font = { italic: true, size: 9 } as any;
+  bucketSheet.getCell(2, 1).alignment = { wrapText: true, vertical: "top" } as any;
+  bucketSheet.getColumn(1).width = 16;
+  bucketSheet.getColumn(2).width = 12;
+  const bucketHeaders = ["Bucket", "# Invoices", ...bucketCols.map((c) => c.header)];
+  bucketHeaders.forEach((h, i) => {
+    const cell = bucketSheet.getCell(4, i + 1);
+    cell.value = h; cell.font = bold;
+    if (i >= 2) bucketSheet.getColumn(i + 1).width = Math.max(16, h.length + 2);
+  });
+  const bucketValue = (key: TrackKey | "firm", scopeKey: string, view: "discrete" | "cumulative") =>
+    key === "firm"
+      ? extras.firmAging[view][scopeKey]?.total ?? 0
+      : (view === "discrete" ? tracks[key].discrete_buckets : tracks[key].cumulative_buckets)[scopeKey]?.total ?? 0;
+  let bkr = 5;
+  const bucketSectionHeader = (title: string) => {
+    bucketSheet.mergeCells(bkr, 1, bkr, bucketHeaders.length);
+    const c = bucketSheet.getCell(bkr, 1);
+    c.value = title; c.font = bold;
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFEFEF" } } as any;
+    bkr++;
+  };
+  bucketSectionHeader("Discrete (mutually exclusive — sums to Total AR)");
+  for (const b of DISCRETE_BUCKETS) {
+    bucketSheet.getCell(bkr, 1).value = b.label;
+    bucketSheet.getCell(bkr, 2).value = extras.firmAging.discrete[b.key]?.count ?? 0;
+    bucketCols.forEach((c, ci) => {
+      const cell = bucketSheet.getCell(bkr, ci + 3);
+      cell.value = bucketValue(c.key, b.key, "discrete");
+      cell.numFmt = moneyFmt2;
+      if (c.key === "firm") cell.font = bold;
+    });
+    bkr++;
+  }
+  bucketSheet.getCell(bkr, 1).value = "Total AR"; bucketSheet.getCell(bkr, 1).font = bold;
+  bucketCols.forEach((c, ci) => {
+    const cell = bucketSheet.getCell(bkr, ci + 3);
+    cell.value = c.key === "firm" ? firm.total_ar : tracks[c.key].total_ar;
+    cell.numFmt = moneyFmt2; cell.font = bold;
+  });
+  bkr += 2;
+  bucketSectionHeader("Cumulative rollups (derived — each is a subset of the one above)");
+  for (const t of CUMULATIVE_THRESHOLDS) {
+    const key = cumulativeKey(t);
+    bucketSheet.getCell(bkr, 1).value = `${t}+`;
+    bucketSheet.getCell(bkr, 2).value = extras.firmAging.cumulative[key]?.count ?? 0;
+    bucketCols.forEach((c, ci) => {
+      const cell = bucketSheet.getCell(bkr, ci + 3);
+      cell.value = bucketValue(c.key, key, "cumulative");
+      cell.numFmt = moneyFmt2;
+      if (c.key === "firm") cell.font = bold;
+    });
+    bkr++;
+  }
+
   const weekly = wb.addWorksheet("Weekly Scorecard", { views: [{ state: "frozen" as const, ySplit: 2, xSplit: 1 }] });
   weekly.mergeCells(1, 1, 1, WEEKLY_COLS.length);
   weekly.getCell(1, 1).value = "AR Scorecard — Weekly (EOS)";
@@ -1211,9 +2052,19 @@ async function updateARScorecardWorkbook(
   const att = wb.addWorksheet("By Attorney");
   att.getCell(1, 1).value = `By Responsible Attorney — as of ${firm.as_of}`;
   att.getCell(1, 1).font = { bold: true, size: 13 };
-  const attHeaders = ["Attorney", "Total AR", "120+ $", "120+ %", "90+ $", "90+ %", "# Invoices"];
-  const attFmt = ["", '"$"#,##0', '"$"#,##0', '0.0"%"', '"$"#,##0', '0.0"%"', ""];
-  const attWidth = [26, 14, 13, 9, 13, 9, 11];
+  // Blended columns first (unchanged), then the Gated / Non-Gated split so
+  // "what's my gated AR" is answerable on this one tab, then the 360+ tier.
+  const attHeaders = [
+    "Attorney", "Total AR", "120+ $", "120+ %", "90+ $", "90+ %", "# Invoices",
+    "Gated AR", "Gated 90+ $", "Non-Gated AR", "Non-Gated 90+ $", "Unclassified AR",
+    "360+ $", "# Inv 360+",
+  ];
+  const attFmt = [
+    "", '"$"#,##0', '"$"#,##0', '0.0"%"', '"$"#,##0', '0.0"%"', "",
+    '"$"#,##0', '"$"#,##0', '"$"#,##0', '"$"#,##0', '"$"#,##0',
+    '"$"#,##0', "",
+  ];
+  const attWidth = [26, 14, 13, 9, 13, 9, 11, 14, 14, 15, 17, 16, 13, 11];
   attHeaders.forEach((h, i) => { const c = att.getCell(2, i + 1); c.value = h; c.font = bold; att.getColumn(i + 1).width = attWidth[i]; if (attFmt[i]) att.getColumn(i + 1).numFmt = attFmt[i]; });
   byAttorney.forEach((a, ri) => {
     att.getCell(3 + ri, 1).value = a.attorney;
@@ -1223,6 +2074,13 @@ async function updateARScorecardWorkbook(
     att.getCell(3 + ri, 5).value = a.ar_90plus;
     att.getCell(3 + ri, 6).value = a.ar_90plus_pct;
     att.getCell(3 + ri, 7).value = a.invoices;
+    att.getCell(3 + ri, 8).value = a.gated.total_ar;
+    att.getCell(3 + ri, 9).value = a.gated.ar_90plus;
+    att.getCell(3 + ri, 10).value = a.non_gated.total_ar;
+    att.getCell(3 + ri, 11).value = a.non_gated.ar_90plus;
+    att.getCell(3 + ri, 12).value = a.unclassified.total_ar;
+    att.getCell(3 + ri, 13).value = a.stale_ar_365plus.total_ar;
+    att.getCell(3 + ri, 14).value = a.stale_ar_365plus.invoices;
   });
   const totRow = 3 + byAttorney.length;
   att.getCell(totRow, 1).value = "Firm Total"; att.getCell(totRow, 1).font = bold;
@@ -1231,6 +2089,77 @@ async function updateARScorecardWorkbook(
   att.getCell(totRow, 4).value = firm.ar_120plus_pct; att.getCell(totRow, 4).font = bold;
   att.getCell(totRow, 5).value = firm.ar_90plus; att.getCell(totRow, 5).font = bold;
   att.getCell(totRow, 6).value = firm.ar_90plus_pct; att.getCell(totRow, 6).font = bold;
+  att.getCell(totRow, 8).value = tracks.gated.total_ar; att.getCell(totRow, 8).font = bold;
+  att.getCell(totRow, 9).value = tracks.gated.ar_90plus; att.getCell(totRow, 9).font = bold;
+  att.getCell(totRow, 10).value = tracks.non_gated.total_ar; att.getCell(totRow, 10).font = bold;
+  att.getCell(totRow, 11).value = tracks.non_gated.ar_90plus; att.getCell(totRow, 11).font = bold;
+  att.getCell(totRow, 12).value = tracks.unclassified.total_ar; att.getCell(totRow, 12).font = bold;
+  att.getCell(totRow, 13).value = extras.stale.firm.total_ar; att.getCell(totRow, 13).font = bold;
+  att.getCell(totRow, 14).value = extras.stale.firm.invoices; att.getCell(totRow, 14).font = bold;
+
+  // ---- Stale AR (360+) — collectability review ----
+  // Balances older than the top bucket boundary. Still inside Total AR; broken
+  // out here so they get triaged/written off on a cadence instead of quietly
+  // inflating the 90+/120+ headline.
+  const staleWs = wb.addWorksheet("Stale AR 365+", { views: [{ state: "frozen" as const, ySplit: 4 }] });
+  const staleHeaders = ["Responsible Attorney", "Client", "Matter", "Matter #", "Bill #", "Track", "Issued", "Due", "Days Past Due", "Balance"];
+  const staleWidth = [24, 26, 40, 14, 10, 14, 12, 12, 14, 14];
+  staleWs.mergeCells(1, 1, 1, staleHeaders.length);
+  staleWs.getCell(1, 1).value = `Stale AR — collectability review (over ${extras.stale.threshold_days} days) — as of ${firm.as_of}`;
+  staleWs.getCell(1, 1).font = { bold: true, size: 13 };
+  staleWs.mergeCells(2, 1, 2, staleHeaders.length);
+  staleWs.getCell(2, 1).value =
+    `${extras.stale.firm.invoices} invoice(s) / $${extras.stale.firm.total_ar.toFixed(2)} — ` +
+    `${extras.stale.firm.pct_of_scope_ar.toFixed(1)}% of Total AR. Oldest: ${extras.stale.firm.oldest_invoice_days} days. ` +
+    `Gated $${(extras.stale.by_track.gated?.total_ar ?? 0).toFixed(2)} / ` +
+    `Non-Gated $${(extras.stale.by_track.non_gated?.total_ar ?? 0).toFixed(2)} / ` +
+    `Unclassified $${(extras.stale.by_track.unclassified?.total_ar ?? 0).toFixed(2)}. ` +
+    `These balances are still counted inside Total AR — nothing is netted out here.`;
+  staleWs.getCell(2, 1).font = { italic: true } as any;
+  // Per-attorney summary (rows 4..), then the invoice detail below it.
+  staleHeaders.forEach((h, i) => { const c = staleWs.getCell(4, i + 1); c.value = h; c.font = bold; staleWs.getColumn(i + 1).width = staleWidth[i]; });
+  staleWs.getColumn(10).numFmt = moneyFmt2;
+  let srr = 5;
+  if (extras.stale.by_attorney.length) {
+    staleWs.mergeCells(srr, 1, srr, staleHeaders.length);
+    const c = staleWs.getCell(srr, 1);
+    c.value = "By responsible attorney — total $, # invoices, oldest invoice";
+    c.font = bold;
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFEFEF" } } as any;
+    srr++;
+    for (const a of extras.stale.by_attorney) {
+      staleWs.getCell(srr, 1).value = a.attorney;
+      staleWs.getCell(srr, 2).value = `${a.invoices} invoice(s)`;
+      staleWs.getCell(srr, 3).value = a.oldest_invoice ? `oldest: ${a.oldest_invoice.matter}` : "";
+      staleWs.getCell(srr, 4).value = a.oldest_invoice?.matter_number ?? "";
+      staleWs.getCell(srr, 5).value = a.oldest_invoice?.bill ?? "";
+      staleWs.getCell(srr, 9).value = a.oldest_invoice_days;
+      staleWs.getCell(srr, 10).value = a.total_ar;
+      srr++;
+    }
+    srr++;
+  }
+  staleWs.mergeCells(srr, 1, srr, staleHeaders.length);
+  const sdc = staleWs.getCell(srr, 1);
+  sdc.value = "Invoice detail — oldest first";
+  sdc.font = bold;
+  sdc.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFEFEF" } } as any;
+  srr++;
+  for (const inv of extras.stale.invoices) {
+    staleWs.getCell(srr, 1).value = inv.attorney;
+    staleWs.getCell(srr, 2).value = inv.client;
+    staleWs.getCell(srr, 3).value = inv.matter;
+    staleWs.getCell(srr, 4).value = inv.matter_number;
+    staleWs.getCell(srr, 5).value = inv.bill;
+    staleWs.getCell(srr, 6).value = trackLabel[inv.track];
+    staleWs.getCell(srr, 7).value = inv.issued;
+    staleWs.getCell(srr, 8).value = inv.due;
+    staleWs.getCell(srr, 9).value = inv.days_past_due;
+    staleWs.getCell(srr, 10).value = inv.balance;
+    srr++;
+  }
+  staleWs.getCell(srr, 1).value = "Total"; staleWs.getCell(srr, 1).font = bold;
+  staleWs.getCell(srr, 10).value = extras.stale.firm.total_ar; staleWs.getCell(srr, 10).font = bold;
 
   // ---- Gated AR: by responsible attorney (summary) ----
   // Same shape as "By Attorney" but restricted to the Gated track, so partners
@@ -1303,6 +2232,45 @@ async function updateARScorecardWorkbook(
   gMat.getCell(gmr, 5).value = tracks.gated.ar_120plus; gMat.getCell(gmr, 5).font = bold;
   gMat.getCell(gmr, 6).value = tracks.gated.total_ar; gMat.getCell(gmr, 6).font = bold;
 
+  // ---- Gated AR vs. unfunded trust requests ----
+  // The Trust Requests and Gated AR views used to live on separate tabs with no
+  // join key. For gated matters an unfunded trust/retainer request is a leading
+  // indicator of AR about to age, so the two figures belong on one row. Trust
+  // dollars are NEVER added into any AR figure.
+  const gtWs = wb.addWorksheet("Gated AR vs Trust", { views: [{ state: "frozen" as const, ySplit: 3 }] });
+  const gtHeaders = ["Responsible Attorney", "Client", "Matter", "Matter #", "# Invoices", "Gated AR", "AR 90+ $", "AR 360+ $", "Oldest AR (days)", "Unfunded Trust $", "# Trust Requests", "Oldest Request (days)"];
+  const gtFmt = ["", "", "", "", "", moneyFmt2, moneyFmt2, moneyFmt2, "", moneyFmt2, "", ""];
+  const gtWidth = [24, 26, 40, 14, 11, 14, 14, 14, 16, 17, 16, 20];
+  gtWs.mergeCells(1, 1, 1, gtHeaders.length);
+  gtWs.getCell(1, 1).value = `Gated AR vs. Unfunded Trust Requests — as of ${firm.as_of}`;
+  gtWs.getCell(1, 1).font = { bold: true, size: 13 };
+  gtWs.mergeCells(2, 1, 2, gtHeaders.length);
+  gtWs.getCell(2, 1).value =
+    "Gated-track matters with an outstanding AR balance, each next to its own unfunded trust/retainer " +
+    "request. Trust requests are advance-deposit requests, not receivables — they are never included in " +
+    "any AR column here. Sorted by unfunded trust $, then AR.";
+  gtWs.getCell(2, 1).font = { italic: true } as any;
+  gtHeaders.forEach((h, i) => { const c = gtWs.getCell(3, i + 1); c.value = h; c.font = bold; gtWs.getColumn(i + 1).width = gtWidth[i]; if (gtFmt[i]) gtWs.getColumn(i + 1).numFmt = gtFmt[i]; });
+  let gtr = 4;
+  for (const m of extras.gatedTrust.matters) {
+    gtWs.getCell(gtr, 1).value = m.attorney;
+    gtWs.getCell(gtr, 2).value = m.client;
+    gtWs.getCell(gtr, 3).value = m.matter;
+    gtWs.getCell(gtr, 4).value = m.matter_number;
+    gtWs.getCell(gtr, 5).value = m.invoices;
+    gtWs.getCell(gtr, 6).value = m.ar_balance;
+    gtWs.getCell(gtr, 7).value = m.ar_90plus;
+    gtWs.getCell(gtr, 8).value = m.ar_over_360;
+    gtWs.getCell(gtr, 9).value = m.oldest_invoice_days;
+    gtWs.getCell(gtr, 10).value = m.unfunded_trust_amount;
+    gtWs.getCell(gtr, 11).value = m.unfunded_trust_requests;
+    gtWs.getCell(gtr, 12).value = m.oldest_unfunded_trust_days;
+    gtr++;
+  }
+  gtWs.getCell(gtr, 1).value = "Total"; gtWs.getCell(gtr, 1).font = bold;
+  gtWs.getCell(gtr, 6).value = r2(extras.gatedTrust.matters.reduce((s, m) => s + m.ar_balance, 0)); gtWs.getCell(gtr, 6).font = bold;
+  gtWs.getCell(gtr, 10).value = r2(extras.gatedTrust.matters.reduce((s, m) => s + m.unfunded_trust_amount, 0)); gtWs.getCell(gtr, 10).font = bold;
+
   const top = wb.addWorksheet("Top 10 Accounts");
   top.getCell(1, 1).value = `Top 10 Open Balances — as of ${firm.as_of}`;
   top.getCell(1, 1).font = { bold: true, size: 13 };
@@ -1310,7 +2278,6 @@ async function updateARScorecardWorkbook(
   const topWidth = [28, 36, 24, 14, 13, 14];
   topHeaders.forEach((h, i) => { const c = top.getCell(2, i + 1); c.value = h; c.font = bold; top.getColumn(i + 1).width = topWidth[i]; });
   top.getColumn(4).numFmt = '"$"#,##0';
-  const trackLabel: Record<TrackKey, string> = { gated: "Gated", semi_gated: "Semi-Gated", non_gated: "Non-Gated", unclassified: "Unclassified" };
   top10.forEach((t, ri) => {
     top.getCell(3 + ri, 1).value = t.client;
     top.getCell(3 + ri, 2).value = t.matter;
@@ -1361,6 +2328,70 @@ async function updateARScorecardWorkbook(
   }
   trustWs.getCell(trr, 1).value = "Total"; trustWs.getCell(trr, 1).font = bold;
   trustWs.getCell(trr, 8).value = trust.requested_total; trustWs.getCell(trr, 8).font = bold;
+
+  // ---- Unclassified Matters (a work list, not just a total) ----
+  // Matters carrying AR with no practice_area set. Should be zero: until they're
+  // tagged their AR can't be assigned to the Gated or Non-Gated track.
+  const ucWs = wb.addWorksheet("Unclassified Matters", { views: [{ state: "frozen" as const, ySplit: 3 }] });
+  const ucHeaders = ["Matter ID", "Matter #", "Client", "Matter Description", "Responsible Attorney", "# Invoices", "Oldest (days)", "Total AR"];
+  const ucWidth = [12, 16, 26, 40, 24, 11, 13, 14];
+  ucWs.mergeCells(1, 1, 1, ucHeaders.length);
+  ucWs.getCell(1, 1).value = `Matters with NO practice_area — as of ${firm.as_of}`;
+  ucWs.getCell(1, 1).font = { bold: true, size: 13 };
+  ucWs.mergeCells(2, 1, 2, ucHeaders.length);
+  ucWs.getCell(2, 1).value =
+    `${extras.unclassifiedMatters.length} matter(s) / $${tracks.unclassified.total_ar.toFixed(2)} of AR cannot be ` +
+    `assigned to the Gated or Non-Gated track. Set practice_area on each matter below and this tab empties out.`;
+  ucWs.getCell(2, 1).font = { italic: true } as any;
+  ucHeaders.forEach((h, i) => { const c = ucWs.getCell(3, i + 1); c.value = h; c.font = bold; ucWs.getColumn(i + 1).width = ucWidth[i]; });
+  ucWs.getColumn(8).numFmt = moneyFmt2;
+  let ucr = 4;
+  for (const m of extras.unclassifiedMatters) {
+    ucWs.getCell(ucr, 1).value = m.matter_id;
+    ucWs.getCell(ucr, 2).value = m.matter_number;
+    ucWs.getCell(ucr, 3).value = m.client_name;
+    ucWs.getCell(ucr, 4).value = m.matter_description;
+    ucWs.getCell(ucr, 5).value = m.responsible_attorney;
+    ucWs.getCell(ucr, 6).value = m.invoices;
+    ucWs.getCell(ucr, 7).value = m.oldest_invoice_days;
+    ucWs.getCell(ucr, 8).value = m.total_ar;
+    ucr++;
+  }
+  ucWs.getCell(ucr, 1).value = "Total"; ucWs.getCell(ucr, 1).font = bold;
+  ucWs.getCell(ucr, 6).value = tracks.unclassified.invoices; ucWs.getCell(ucr, 6).font = bold;
+  ucWs.getCell(ucr, 8).value = tracks.unclassified.total_ar; ucWs.getCell(ucr, 8).font = bold;
+
+  // ---- Tagging Flags (heuristic, for human review) ----
+  const tfWs = wb.addWorksheet("Tagging Flags", { views: [{ state: "frozen" as const, ySplit: 3 }] });
+  const tfHeaders = ["Matter ID", "Matter #", "Client", "Matter Description", "practice_area", "Classified Track", "AR Balance", "Suspected Mismatch"];
+  const tfWidth = [12, 16, 26, 38, 20, 16, 14, 80];
+  tfWs.mergeCells(1, 1, 1, tfHeaders.length);
+  tfWs.getCell(1, 1).value = `Practice-area tagging consistency flags — as of ${firm.as_of}`;
+  tfWs.getCell(1, 1).font = { bold: true, size: 13 };
+  tfWs.mergeCells(2, 1, 2, tfHeaders.length);
+  tfWs.getCell(2, 1).value =
+    "HEURISTIC — for human review only. Nothing here reclassifies a matter or changes any figure in this " +
+    "workbook. Two rules: (1) the matter description reads like court-gated work but its practice_area does " +
+    "not classify it as Gated; (2) matters sharing the same description pattern disagree on practice_area.";
+  tfWs.getCell(2, 1).font = { italic: true } as any;
+  tfWs.getCell(2, 1).alignment = { wrapText: true, vertical: "top" } as any;
+  tfHeaders.forEach((h, i) => { const c = tfWs.getCell(3, i + 1); c.value = h; c.font = bold; tfWs.getColumn(i + 1).width = tfWidth[i]; });
+  tfWs.getColumn(7).numFmt = moneyFmt2;
+  let tfr = 4;
+  for (const f of extras.taggingFlags) {
+    tfWs.getCell(tfr, 1).value = f.matter_id;
+    tfWs.getCell(tfr, 2).value = f.matter_number;
+    tfWs.getCell(tfr, 3).value = f.client_name;
+    tfWs.getCell(tfr, 4).value = f.matter_description;
+    tfWs.getCell(tfr, 5).value = f.practice_area ?? "(none)";
+    tfWs.getCell(tfr, 6).value = trackLabel[f.classified_track];
+    tfWs.getCell(tfr, 7).value = f.ar_balance;
+    tfWs.getCell(tfr, 8).value = f.suspected_mismatch_reason;
+    tfr++;
+  }
+  if (!extras.taggingFlags.length) {
+    tfWs.getCell(4, 1).value = "No tagging inconsistencies detected.";
+  }
 
   // Detail tabs per responsible attorney: TWO views each —
   //   "{Attorney}"            : every bill, largest balance first
