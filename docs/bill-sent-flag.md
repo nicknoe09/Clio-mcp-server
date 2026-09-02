@@ -77,6 +77,24 @@ entry at a real sent message instead of a bare assertion.
 `mark_bill_sent` is idempotent — a bill that already has an entry is returned
 unchanged unless `force=true` (a genuine re-send).
 
+## Evidentiary weight — pass the message id
+
+A ledger entry is a tracking record, not proof of transmission. If the court
+or the county auditor later disputes receipt, an internal log reads as evidence
+of office practice rather than evidence that this invoice was actually
+transmitted; the sent email, with its attachment, is the primary record, and a
+reply or a signed fee order is stronger still. So:
+
+- Always pass `outlook_message_id` for an emailed invoice — that is what ties
+  the entry to a retained message.
+- Keep the sent email and its attachment; the ledger points at it, it does not
+  replace it.
+- Don't assume a stale never-submitted invoice stays collectible. Chapter 574
+  may set no statewide billing deadline, but the appointing court's standing
+  order, county auditor procedure, and fiscal-year processing all cut against a
+  very old request that nobody can show was ever submitted. That is the real
+  cost of the 8 invoices now more than a year out.
+
 ## Wiring the report
 
 Replace the "In the Interest of" rule with the verified field:

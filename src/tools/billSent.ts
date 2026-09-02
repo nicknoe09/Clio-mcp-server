@@ -305,7 +305,11 @@ export function registerBillSentTools(server: McpServer): void {
         .describe("Who it went to — e.g. 'Harris County Probate Court No. 3' or the client's email address."),
       note: z.string().optional().describe("Anything else worth recording on the matter."),
       outlook_message_id: z.string().optional()
-        .describe("Message id of the sent email, so the entry points at a real sent message rather than a bare assertion."),
+        .describe(
+          "Message id of the sent email. Pass this whenever the invoice went out by email: the ledger entry is a " +
+          "tracking record, and the retained sent message is what actually proves transmission if the court or the " +
+          "county auditor disputes receipt.",
+        ),
       dry_run: z.boolean().optional().default(false)
         .describe("Probe whether Clio accepts a last_sent_at write and stop. Writes nothing — no PATCH value, no ledger entry."),
       force: z.boolean().optional().default(false)
