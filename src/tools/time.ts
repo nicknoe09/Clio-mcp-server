@@ -438,12 +438,12 @@ export function registerTimeTools(server: McpServer): void {
   // PATCH for any billed entry, including draft bills).
   server.tool(
     "apply_entry_revision",
-    "Apply a single revision to a Clio time entry. Used during interactive audit review to update one entry at a time. Can modify the description (note), hourly rate, and/or hours. Transparently routes through /line_items when the entry is on a bill (draft or otherwise) — Clio locks PATCH /activities for billed entries, so the line_item is the editable surface. Returns before/after state plus which path was used.",
+    "Apply a single revision to a Clio time entry. Used during interactive audit review to update one entry at a time. Can modify the description (note), hourly rate, and/or date; hours only while the entry is unbilled. Transparently routes through /line_items when the entry is on a bill (draft or otherwise) — Clio locks PATCH /activities for billed entries, so the line_item is the editable surface for note/rate/date. An hours change on a billed entry is refused with 422 `billed_quantity_silently_ignored` (Clio accepts `quantity` on /line_items and does not apply it; sibling note/rate writes are rolled back) — use prepare_hour_change for that. Returns before/after state plus which path was used.",
     {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID to update"),
       new_note: z.string().optional().describe("Revised description/note for the entry"),
       new_rate: z.coerce.number().optional().describe("Revised hourly rate"),
-      new_hours: z.coerce.number().optional().describe("Revised hours (decimal). Helper handles unit conversion per routing target."),
+      new_hours: z.coerce.number().optional().describe("Revised hours (decimal). Applies only while the entry is UNBILLED. On a billed entry (draft bills included) this is refused with 422 `billed_quantity_silently_ignored` and nothing in the call is applied; use prepare_hour_change."),
       new_date: z.string().optional().describe("Revised date in YYYY-MM-DD format. Use this instead of strip-and-recreate when only the date is changing."),
       update_original_record: z.enum(["true", "false"]).optional().describe("When the entry is on a bill, controls whether Clio also updates the underlying activity record with the same values. Default true (keep records in sync). Set to false if you want bill-line edits without altering the time-entry record."),
     },
@@ -641,12 +641,12 @@ export function registerTimeTools(server: McpServer): void {
   // helper but with a name that signals it handles the billed case.
   server.tool(
     "update_billed_time_entry",
-    "Update a time entry's note/rate/hours regardless of whether it's on a bill. If unbilled, PATCHes /activities/{id}. If on a draft (or any) bill, finds the corresponding line_item and PATCHes /line_items/{id} — the only path Clio allows for entries already added to a bill. Returns which path was used so you can audit.",
+    "Update a time entry's note/rate/date — and its hours ONLY while the entry is unbilled. If unbilled, PATCHes /activities/{id} and every field including hours applies. If on a draft (or any) bill, finds the corresponding line_item and PATCHes /line_items/{id} — the editable surface for note/rate/date on a billed entry, but NOT for hours: Clio accepts `quantity` on /line_items for ActivityLineItem types and silently ignores it, so an hours change is caught by the read-back guard and refused with 422 `billed_quantity_silently_ignored`, with any note/rate sent alongside it rolled back (the call leaves the line untouched). To change hours on a line already on a DRAFT bill, use `prepare_hour_change` instead — and read its caveat: the line leaves the bill until the draft is regenerated in the Clio UI, which also wipes every line-item discount. Returns which path was used so you can audit.",
     {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID"),
       new_note: z.string().optional().describe("Revised description/note"),
       new_rate: z.coerce.number().optional().describe("Hourly rate (dollars)"),
-      new_hours: z.coerce.number().optional().describe("Hours (decimal). Helper handles unit conversion per routing target."),
+      new_hours: z.coerce.number().optional().describe("Hours (decimal). Applies only while the entry is UNBILLED (helper converts to the seconds /activities expects). On an entry that sits on a bill — draft included — this is refused with 422 `billed_quantity_silently_ignored` and nothing in the call is applied; use prepare_hour_change."),
       new_date: z.string().optional().describe("New date YYYY-MM-DD. Use this for date-only changes instead of strip-and-recreate."),
       update_original_record: z.enum(["true", "false"]).optional().describe("When the entry is on a bill, controls whether Clio also updates the underlying activity record. Default true (keep records in sync)."),
     },
