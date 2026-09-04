@@ -5,6 +5,7 @@ import { looksLikePdf } from "../clio/billPdf";
 import { renderBillPdf } from "../clio/billRender";
 import { registerDownload } from "../utils/downloadStore";
 import { diagnosticTool } from "../utils/diagnostics";
+import { fetchSubmissions, indexSubmissions, lookupSubmission } from "./billSent";
 import JSZip from "jszip";
 
 const BILL_FIELDS =
@@ -37,6 +38,13 @@ export function registerBillTools(server: McpServer): void {
         .describe("Filter by bill state"),
       issued_after: z.string().optional().describe("Issued after date (YYYY-MM-DD)"),
       issued_before: z.string().optional().describe("Issued before date (YYYY-MM-DD)"),
+      verify_submissions: z.boolean().optional().default(false).describe(
+        "Join each bill against the submission ledger written by mark_bill_sent and add `submitted_at`, " +
+        "`submission_method`, `submission_recipient`, `submission_logged_by` and `sent_or_submitted`. " +
+        "Set this in the unsent-invoice report: Clio has no send route, so invoices emailed to a court or " +
+        "mailed to a client keep sent=false, and `sent_or_submitted` is what tells a bill that genuinely " +
+        "never went out apart from one Clio merely has no record of sending.",
+      ),
     },
     async (params) => {
       try {
@@ -51,6 +59,14 @@ export function registerBillTools(server: McpServer): void {
 
         const bills = await fetchAllPages<any>("/bills", queryParams);
         const today = new Date();
+
+        // Bills delivered outside Clio (no send route exists in v4) are only
+        // distinguishable from never-sent bills via the submission ledger.
+        const submissionIndex = params.verify_submissions
+          ? indexSubmissions(
+              await fetchSubmissions({ matter_id: params.matter_id, limit: 1000 }),
+            )
+          : null;
 
         const formatted = bills.map((b: any) => {
           const dueDate = b.due_at ? new Date(b.due_at) : null;
@@ -67,6 +83,10 @@ export function registerBillTools(server: McpServer): void {
 
           const last_sent_at = b.last_sent_at ?? null;
           const sent = !!last_sent_at;
+
+          const submission = submissionIndex
+            ? lookupSubmission(submissionIndex, { id: b.id, number: b.number })
+            : null;
 
           return {
             id: b.id,
@@ -98,6 +118,15 @@ export function registerBillTools(server: McpServer): void {
             aging_flag,
             sent,
             last_sent_at,
+            ...(submissionIndex
+              ? {
+                  submitted_at: submission?.sent_at ?? null,
+                  submission_method: submission?.method ?? null,
+                  submission_recipient: submission?.recipient ?? null,
+                  submission_logged_by: submission?.logged_by ?? null,
+                  sent_or_submitted: sent || submission != null,
+                }
+              : {}),
           };
         });
 
@@ -105,6 +134,12 @@ export function registerBillTools(server: McpServer): void {
           Math.round(
             formatted.reduce((s: number, b: any) => s + (b.balance || 0), 0) * 100
           ) / 100;
+
+        // When verifying, lead with the number that matters: bills with no
+        // sent flag AND no submission entry — the ones nobody can show went out.
+        const unverified = submissionIndex
+          ? formatted.filter((b: any) => !b.sent_or_submitted)
+          : null;
 
         return {
           content: [
@@ -114,6 +149,13 @@ export function registerBillTools(server: McpServer): void {
                 {
                   count: formatted.length,
                   total_balance: totalBalance,
+                  ...(unverified
+                    ? {
+                        unverified_count: unverified.length,
+                        unverified_balance:
+                          Math.round(unverified.reduce((s: number, b: any) => s + (b.balance || 0), 0) * 100) / 100,
+                      }
+                    : {}),
                   bills: formatted,
                 },
                 null,
