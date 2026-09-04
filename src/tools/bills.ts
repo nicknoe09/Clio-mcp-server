@@ -280,7 +280,7 @@ export function registerBillTools(server: McpServer): void {
   // order they appear (group_ordering, then date, then id).
   server.tool(
     "get_bill_line_items",
-    "Get all line items on a specific Clio bill, ordered as they appear on the bill. Use this — NOT get_time_entries — when you want exactly the lines on bill X for an invoice review. get_time_entries filters by matter or user, which sweeps in prior-bill entries and unbilled activities; this tool filters by bill_id directly. Returns each line's line_item_id, activity_id, date, hours, rate, total, note, timekeeper, type (ActivityLineItem / NoChargeLineItem / SummaryLineItem), and any discount applied. Includes the bill's number, state, total, balance, and matter for context.",
+    "Get all line items on a specific Clio bill, ordered as they appear on the bill. Use this — NOT get_time_entries — when you want exactly the lines on bill X for an invoice review. get_time_entries filters by matter or user, which sweeps in prior-bill entries and unbilled activities; this tool filters by bill_id directly. Returns each line's line_item_id, activity_id, date, hours, rate, total, note, timekeeper, type (ActivityLineItem / NoChargeLineItem / SummaryLineItem), and any discount applied. `sum_hours` counts SERVICE lines only: an expense line reports hours=1 with rate=total, so including them inflates the figure (bill 23521 read 4.2 hrs against 1.2 hrs of real service time) - expense lines are summed separately as `sum_expense_amount` / `expense_count`, and each carries `is_expense: true`. Detect expenses by `kind == \"Expense\"`, NOT by `type`: across a 724-line scan every line reported type=\"ActivityLineItem\", so type-keyed detection never fires. Includes the bill's number, state, total, balance, and matter for context.",
     {
       bill_id: z.coerce.number().describe("Clio bill ID"),
       include_hidden: z.boolean().optional().default(false).describe("If true, include line items that are present on the bill but hidden (Clio's display=false). Default false matches what the user sees on the rendered bill."),
@@ -342,15 +342,27 @@ export function registerBillTools(server: McpServer): void {
               ? { rate: li.discount.rate, type: li.discount.type }
               : null,
           group_ordering: li.group_ordering ?? null,
+          // Expense lines are ActivityLineItem like everything else; `kind`
+          // is the only field that distinguishes them (verified across 724
+          // lines / 73 draft bills, 2026-09).
+          is_expense: li.kind === "Expense",
         }));
 
-        const sumHours =
-          Math.round(
-            formatted.reduce(
-              (s, li) => s + (typeof li.hours === "number" ? li.hours : 0),
-              0,
-            ) * 100,
-          ) / 100;
+        // An expense line reports quantity=1 and price=total, so it adds a
+        // phantom "1 hour" to any naive sum. Anything consuming sum_hours as
+        // billable service time is wrong on every bill carrying an expense,
+        // so service hours and expense dollars are reported separately.
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        const sumHours = round2(
+          formatted.reduce(
+            (s, li) => s + (!li.is_expense && typeof li.hours === "number" ? li.hours : 0),
+            0,
+          ),
+        );
+        const expenseLines = formatted.filter((li) => li.is_expense);
+        const sumExpenseAmount = round2(
+          expenseLines.reduce((s, li) => s + (typeof li.total === "number" ? li.total : 0), 0),
+        );
         const sumTotal =
           Math.round(
             formatted.reduce(
@@ -376,7 +388,10 @@ export function registerBillTools(server: McpServer): void {
                   matter: bill.matters?.[0] ?? null,
                 },
                 count: formatted.length,
+                // Service lines only — see is_expense / sum_expense_amount.
                 sum_hours: sumHours,
+                expense_count: expenseLines.length,
+                sum_expense_amount: sumExpenseAmount,
                 sum_total: sumTotal,
                 line_items: formatted,
               },

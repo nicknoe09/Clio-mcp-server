@@ -70,6 +70,16 @@ export interface SmartPatchResult {
   bill?: { id: number; state?: string; number?: string };
   before: any;
   after: any;
+  // Present when hours were written through /line_items. Clio rounds the
+  // quantity to the firm's billing increment, so the value that lands can
+  // differ from the value asked for; the caller is told, not left to diff.
+  quantity_rounding?: {
+    requested_hours: number;
+    applied_hours: number;
+    increment_hours: number;
+    increment_source: "billing_settings" | "fallback";
+    rounded: boolean;
+  };
 }
 
 // Clio rejects PATCH bodies that include read-only or computed fields
@@ -207,6 +217,69 @@ export function expectedDiscountedTotal(
   return round2(base - discount.amount);
 }
 
+// ---------------------------------------------------------------------------
+// Billing increment (time rounding grid)
+// ---------------------------------------------------------------------------
+//
+// Clio rounds a written quantity UP to the firm's billing increment. Live
+// 2026-09-03: a 0.25h write on a 0.2h line stored 0.4h. A read-back guard that
+// compares the REQUESTED value against the STORED value therefore reports
+// failure on a write that landed — which is how a rounded change reached a
+// draft bill while the caller was told nothing had happened.
+//
+// The increment is firm configuration and is exposed by the API:
+// GET /settings/billing returns `rounding` in MINUTES (this firm: 12 = 0.2h).
+// Read it, don't hardcode it. Cached for the process — a firm does not change
+// its billing increment mid-run.
+
+// Used only when /settings/billing is unreachable or reports no rounding.
+// FIRM-SPECIFIC AND UNVERIFIED as a general default: 0.2h (12 min) is what
+// this firm's settings happen to say today. It is not a Clio-wide default.
+export const FALLBACK_BILLING_INCREMENT_HOURS = 0.2;
+
+export interface BillingIncrement {
+  hours: number;
+  source: "billing_settings" | "fallback";
+}
+
+let billingIncrementCache: BillingIncrement | null = null;
+
+/** Test seam: drop the cached increment. */
+export function resetBillingIncrementCache(): void {
+  billingIncrementCache = null;
+}
+
+export async function getBillingIncrementHours(): Promise<BillingIncrement> {
+  if (billingIncrementCache) return billingIncrementCache;
+  try {
+    const res = await rawGetSingle("/settings/billing", {
+      fields: "id,rounding,rounded_duration,use_decimal_rounding",
+    });
+    const minutes = Number((res as any)?.data?.rounding);
+    if (Number.isFinite(minutes) && minutes > 0) {
+      billingIncrementCache = {
+        hours: Math.round((minutes / 60) * 1e6) / 1e6,
+        source: "billing_settings",
+      };
+      return billingIncrementCache;
+    }
+  } catch (err: any) {
+    console.error(
+      `[patchTimeEntrySmart] GET /settings/billing failed (${err?.message}); falling back to ${FALLBACK_BILLING_INCREMENT_HOURS}h billing increment.`,
+    );
+  }
+  billingIncrementCache = { hours: FALLBACK_BILLING_INCREMENT_HOURS, source: "fallback" };
+  return billingIncrementCache;
+}
+
+// Snap hours UP to the billing increment, the way Clio does. Pure + exported
+// for unit testing. A non-positive increment means "no grid" — pass through.
+export function snapHoursToIncrement(hours: number, incrementHours: number): number {
+  if (!(incrementHours > 0)) return hours;
+  const steps = Math.ceil(hours / incrementHours - 1e-9);
+  return Math.round(steps * incrementHours * 1e6) / 1e6;
+}
+
 // PATCH a time entry, transparently routing through /line_items when the
 // entry is on a bill. Returns before/after for both paths.
 export async function patchTimeEntrySmart(
@@ -273,7 +346,23 @@ export async function patchTimeEntrySmart(
     quantity: routing.line_item.quantity,
     total: routing.line_item.total,
   };
-  const body = buildLineItemBody(patch);
+  // Snap the requested hours onto the firm's billing increment BEFORE the
+  // write, so the value we send is the value Clio can store and the read-back
+  // comparison below is against a reachable number. Without this, an
+  // off-increment request (0.25h on a 0.2h grid) lands as 0.4h and the guard
+  // reports failure on a write that persisted.
+  let increment: BillingIncrement | null = null;
+  let effectivePatch = patch;
+  let expectedHours: number | undefined;
+  if (patch.hours !== undefined) {
+    increment = await getBillingIncrementHours();
+    expectedHours = snapHoursToIncrement(patch.hours, increment.hours);
+    // Rounding up can only raise the value; re-check the daily ceiling.
+    assertNewHoursSane(expectedHours, { originalHours: routing.line_item.quantity, force: patch.force });
+    if (expectedHours !== patch.hours) effectivePatch = { ...patch, hours: expectedHours };
+  }
+
+  const body = buildLineItemBody(effectivePatch);
   if (Object.keys(body).length === 0) {
     const err: any = new Error(
       `patchTimeEntrySmart: nothing to write to line_item ${lineItemId} from patch ${JSON.stringify(patch)}.`,
@@ -321,22 +410,30 @@ export async function patchTimeEntrySmart(
     throw err;
   }
 
-  // Silent-noop guard. Clio's PATCH /line_items accepts the `quantity` field
-  // in the request body for ActivityLineItem types but **silently ignores
+  // Silent-noop guard. Clio's PATCH /line_items has been observed to accept
+  // the `quantity` field for ActivityLineItem types and **silently ignore
   // it** — the line's quantity is sourced from the underlying activity, and
   // the activity is locked while billed (PATCH /activities/{id} returns 422).
-  // Result: hour-change requests via this helper return 200 OK and look
-  // successful but the line's quantity is unchanged. Detected empirically
-  // 2026-05-04 via direct probe on bill 22263. Surfacing as a loud failure
-  // here (so callers don't silently overcharge or under-bill) and rolling
-  // back any sibling fields (note/price) that DID apply, so the line returns
-  // to its pre-patch state.
-  if (patch.hours !== undefined && typeof after?.quantity === "number") {
-    const requested = patch.hours;
+  // Result: the request returns 200 OK and looks successful but the line's
+  // quantity is unchanged. Detected empirically 2026-05-04 via direct probe
+  // on bill 22263. (It does NOT always no-op: verified live 2026-09-03 on a
+  // draft bill, an on-increment quantity write applied and persisted.)
+  //
+  // The comparison is against `expectedHours` — the requested value snapped
+  // to the billing increment — not the raw request, because Clio rounds to
+  // that grid. Comparing against the raw request turns a rounded-but-applied
+  // write into a false 422 reported after the change already persisted.
+  //
+  // Quantity is NEVER rolled back here (Clio may have locked it, and a
+  // rollback write is itself a write). Only sibling note/price changes are
+  // reverted, and the message says exactly what happened rather than
+  // asserting an atomicity this path does not provide.
+  if (expectedHours !== undefined && typeof after?.quantity === "number") {
     const actual = after.quantity;
-    if (Math.abs(actual - requested) > 0.005) {
+    if (Math.abs(actual - expectedHours) > 0.005) {
       const noteChanged = patch.note !== undefined && after.note !== before.note;
       const priceChanged = patch.price !== undefined && after.price !== before.price;
+      let rolledBack = false;
       if (noteChanged || priceChanged) {
         const rollback = buildLineItemBody({
           note: noteChanged ? (before.note as string | undefined) : undefined,
@@ -344,20 +441,37 @@ export async function patchTimeEntrySmart(
         });
         try {
           await rawPatchSingle(`/line_items/${lineItemId}`, { data: rollback });
+          rolledBack = true;
         } catch (rbErr: any) {
           console.error(`[patchTimeEntrySmart] silent-noop rollback failed on line_item ${lineItemId}: ${rbErr.message}. Note/price may be partially applied; manual fix may be needed.`);
         }
       }
+      const quantityMoved =
+        typeof before.quantity === "number" ? Math.abs(actual - before.quantity) > 0.005 : true;
+      const quantitySentence = quantityMoved
+        ? `The line's quantity DID change and that change PERSISTED: it is now ${actual}h (was ${before.quantity}h). It was not rolled back — this guard never rewrites quantity.`
+        : `The line's quantity did not move: it is still ${actual}h.`;
+      const siblingSentence = !(noteChanged || priceChanged)
+        ? `No sibling fields (note/price) were changed by this call.`
+        : rolledBack
+          ? `Sibling field changes (${[noteChanged ? "note" : null, priceChanged ? "price" : null].filter(Boolean).join(", ")}) were rolled back to their prior values.`
+          : `Sibling field changes (${[noteChanged ? "note" : null, priceChanged ? "price" : null].filter(Boolean).join(", ")}) were applied and the rollback write FAILED — the line is half-applied and needs a manual fix.`;
       const err: any = new Error(
-        `Refused: PATCH /line_items/${lineItemId} appeared to succeed (HTTP 200) but Clio silently ignored the quantity change (requested ${requested}h, line is still ${actual}h). Clio's /line_items endpoint does not allow quantity edits for ActivityLineItem types — the quantity is sourced from the underlying activity, which is locked while billed. To change hours on a billed entry: (a) for the split workflow, use prepare_line_split (it deletes the original and creates new activities); (b) for ad-hoc hour fixes, remove_from_draft_bill first (which unbills the activity and unlocks /activities), then PATCH /activities, then regenerate the draft in Clio UI. Any sibling field changes (note/price) have been rolled back to keep the line atomic.`,
+        `Refused: PATCH /line_items/${lineItemId} returned HTTP 200 but the line did not reach the expected quantity (requested ${patch.hours}h, expected ${expectedHours}h after snapping to the firm's ${increment?.hours}h billing increment, line reads ${actual}h). ${quantitySentence} ${siblingSentence} Clio's /line_items endpoint does not reliably allow quantity edits for ActivityLineItem types — the quantity is sourced from the underlying activity, which is locked while billed. To change hours on a billed entry: (a) for the split workflow, use prepare_line_split (it deletes the original and creates new activities); (b) for ad-hoc hour fixes, remove_from_draft_bill first (which unbills the activity and unlocks /activities), then PATCH /activities, then regenerate the draft in Clio UI. VERIFY THE LINE before retrying.`,
       );
       err.response = {
         status: 422,
         data: {
           context: "billed_quantity_silently_ignored",
-          requested_hours: requested,
+          requested_hours: patch.hours,
+          expected_hours: expectedHours,
           actual_hours: actual,
-          rolled_back_fields: { note: noteChanged, price: priceChanged },
+          before_hours: before.quantity,
+          quantity_persisted: quantityMoved,
+          increment_hours: increment?.hours,
+          increment_source: increment?.source,
+          rolled_back_fields: { note: noteChanged && rolledBack, price: priceChanged && rolledBack },
+          rollback_failed: (noteChanged || priceChanged) && !rolledBack,
           request_body: body,
         },
         request_body: body,
@@ -373,6 +487,17 @@ export async function patchTimeEntrySmart(
     bill: routing.bill,
     before,
     after,
+    ...(patch.hours !== undefined && increment
+      ? {
+          quantity_rounding: {
+            requested_hours: patch.hours,
+            applied_hours: expectedHours as number,
+            increment_hours: increment.hours,
+            increment_source: increment.source,
+            rounded: expectedHours !== patch.hours,
+          },
+        }
+      : {}),
   };
 }
 
