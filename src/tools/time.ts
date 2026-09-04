@@ -61,7 +61,7 @@ export function registerTimeTools(server: McpServer): void {
   // get_time_entries
   server.tool(
     "get_time_entries",
-    "Get time entries with filters. Hours use Clio rounded_quantity (billed hours, rounded to billing increment). To pull the entries sitting on a matter's DRAFT bill, use status=\"draft\" — billed=\"false\" means strictly unbilled (on no bill at all) and deliberately EXCLUDES draft-bill entries. For the lines on one specific bill, prefer get_bill_line_items.",
+    "Get time entries with filters. Hours use Clio rounded_quantity (billed hours, rounded to billing increment). To pull the entries sitting on a matter's DRAFT bill, use status=\"draft\" — billed=\"false\" means strictly unbilled (on no bill at all) and deliberately EXCLUDES draft-bill entries. For the lines on one specific bill, prefer get_bill_line_items. status=\"unbilled\" covers BILLABLE unbilled time only — entries created with non_billable=true are excluded from it and appear under status=\"non_billable\", so an \"unbilled entries\" count taken here will be lower than a count of every not-yet-billed entry on the matter.",
     {
       matter_id: z.coerce.number().optional().describe("Filter by matter ID"),
       user_id: z.coerce.number().optional().describe("Filter by user/timekeeper ID"),
@@ -75,7 +75,7 @@ export function registerTimeTools(server: McpServer): void {
       status: z
         .enum(TIME_ENTRY_STATUSES)
         .optional()
-        .describe("Clio-native status filter, passed through server-side. \"draft\" returns entries sitting on unfinalized draft bills — the supported way to pull a draft bill's entries per matter. Cannot be combined with billed."),
+        .describe("Clio-native status filter, passed through server-side. \"draft\" returns entries sitting on unfinalized draft bills — the supported way to pull a draft bill's entries per matter. \"unbilled\" EXCLUDES non-billable entries (they come back only under \"non_billable\"); pull both if you need every not-yet-billed entry. Cannot be combined with billed."),
     },
     async (params) => {
       try {
@@ -641,12 +641,12 @@ export function registerTimeTools(server: McpServer): void {
   // helper but with a name that signals it handles the billed case.
   server.tool(
     "update_billed_time_entry",
-    "Update a time entry's note/rate/date — and its hours ONLY while the entry is unbilled. If unbilled, PATCHes /activities/{id} and every field including hours applies. If on a draft (or any) bill, finds the corresponding line_item and PATCHes /line_items/{id} — the editable surface for note/rate/date on a billed entry, but NOT for hours: Clio accepts `quantity` on /line_items for ActivityLineItem types and silently ignores it, so an hours change is caught by the read-back guard and refused with 422 `billed_quantity_silently_ignored`, with any note/rate sent alongside it rolled back (the call leaves the line untouched). To change hours on a line already on a DRAFT bill, use `prepare_hour_change` instead — and read its caveat: the line leaves the bill until the draft is regenerated in the Clio UI, which also wipes every line-item discount. Returns which path was used so you can audit.",
+    "Update a time entry's note/rate/date — and its hours ONLY while the entry is unbilled. If unbilled, PATCHes /activities/{id} and every field including hours applies. If on a draft (or any) bill, finds the corresponding line_item and PATCHes /line_items/{id} — the editable surface for note/rate/date on a billed entry, and, on a DRAFT bill, often for hours as well. Hours written this way are SNAPPED UP to the firm's billing increment (read live from GET /settings/billing) before the write, and the applied value is reported back in `quantity_rounding` - ask for 0.25h on a 0.2h grid and the line lands at 0.4h. Clio does not always accept a quantity edit on a billed line (the quantity is sourced from the activity, which is locked while billed); when the read-back shows the line did not reach the snapped value the call is refused with 422 `billed_quantity_silently_ignored`, whose payload states whether the quantity nevertheless persisted and which sibling fields were rolled back. That guard never rewrites quantity. For a predictable hour change on a line already on a DRAFT bill, prefer `prepare_hour_change` — and read its caveat: the line leaves the bill until the draft is regenerated in the Clio UI, which also wipes every line-item discount. Returns which path was used so you can audit.",
     {
       activity_id: z.coerce.number().describe("The Clio activity (time entry) ID"),
       new_note: z.string().optional().describe("Revised description/note"),
       new_rate: z.coerce.number().optional().describe("Hourly rate (dollars)"),
-      new_hours: z.coerce.number().optional().describe("Hours (decimal). Applies only while the entry is UNBILLED (helper converts to the seconds /activities expects). On an entry that sits on a bill — draft included — this is refused with 422 `billed_quantity_silently_ignored` and nothing in the call is applied; use prepare_hour_change."),
+      new_hours: z.coerce.number().optional().describe("Hours (decimal). While UNBILLED, applied as sent (helper converts to the seconds /activities expects). On an entry sitting on a bill - draft included - the value is first snapped UP to the firm's billing increment and the applied value is returned in `quantity_rounding`; if the line does not reach that value the call is refused with 422 `billed_quantity_silently_ignored`, which reports whether the quantity change persisted. prepare_hour_change is the predictable path for billed lines."),
       new_date: z.string().optional().describe("New date YYYY-MM-DD. Use this for date-only changes instead of strip-and-recreate."),
       update_original_record: z.enum(["true", "false"]).optional().describe("When the entry is on a bill, controls whether Clio also updates the underlying activity record. Default true (keep records in sync)."),
     },
@@ -681,6 +681,7 @@ export function registerTimeTools(server: McpServer): void {
               bill: result.bill,
               before: result.before,
               after: result.after,
+              quantity_rounding: result.quantity_rounding,
             }, null, 2),
           }],
         };
@@ -1171,7 +1172,7 @@ export function registerTimeTools(server: McpServer): void {
       hours: z.coerce.number().describe("Duration in decimal hours (e.g. 1.5 for 1h30m). Values above 24 are rejected unless force=true."),
       note: z.string().optional().describe("Description/narrative for the time entry"),
       rate: z.coerce.number().optional().describe("Hourly rate in dollars. If omitted, Clio uses the matter's default rate for the timekeeper (the entry is BILLABLE). To make the entry non-billable, use non_billable=true rather than relying on rate."),
-      non_billable: z.boolean().optional().describe("Set true to mark the entry non-billable (no charge). When omitted/false the entry is billable at the given or default rate."),
+      non_billable: z.boolean().optional().describe("Set true to mark the entry non-billable (no charge). When omitted/false the entry is billable at the given or default rate. A non-billable entry does NOT appear under get_time_entries(status=\"unbilled\") — it is returned only by status=\"non_billable\", which is the usual explanation for two different \"unbilled\" counts on the same matter."),
       force: z.coerce.boolean().optional().describe("Override the 24h/day sanity ceiling on hours (essentially never needed)."),
       activity_description_id: z.coerce.number().optional().describe("Clio activity description ID (pre-defined activity type). Optional."),
     },
